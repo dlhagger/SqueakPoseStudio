@@ -31,10 +31,17 @@ This project incorporates third-party libraries subject to their own licenses, i
 """ }
 
 dependencies = [
+    "hdbscan>=0.8.40",
+    "oneeurofilter>=0.2.1",
+    "pandas>=2.3.3",
     "pyqt6>=6.10.0",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
     "torch",
     "torchvision",
+    "tqdm>=4.67.1",
     "ultralytics>=8.3.233",
+    "umap-learn>=0.5.9.post2",
 ]
 
 [tool.uv.sources]
@@ -56,6 +63,11 @@ explicit = true
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
+]
 
 [project.license-files]
 paths = ["NOTICE"]

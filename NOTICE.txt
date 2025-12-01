@@ -1,0 +1,32 @@
+SqueakPoseStudio – NOTICE
+
+This software was developed by employees of the National Institutes of Health (NIH) 
+as part of their official duties and is a U.S. Government work under 17 U.S.C. §105. 
+It is therefore in the public domain and may be used, modified, or redistributed 
+without restriction, subject to applicable third-party license obligations.
+
+This repository is private and is pending review by the NIH Office of Technology 
+Transfer (OTT). No commercial use rights are granted at this time. All commercial 
+or for-profit licensing inquiries must be directed to OTT. Final licensing terms 
+will be determined by OTT following their review.
+
+Academic and open-source research users may use, modify, and extend this software 
+subject to applicable third-party license obligations.
+
+Third-party components included in this project are governed by their respective 
+licenses:
+
+PyQt6  
+  Licensed under GPLv3 or a commercial license from Riverbank Computing  
+  https://www.riverbankcomputing.com/software/pyqt/license  
+
+Ultralytics YOLO  
+  Licensed under the AGPL-3.0 License  
+  https://github.com/ultralytics/ultralytics/blob/main/LICENSE  
+
+PyTorch & Torchvision  
+  BSD-style licenses  
+  https://github.com/pytorch/pytorch/blob/main/LICENSE  
+
+This NOTICE file is provided for informational and compliance purposes and will be 
+reviewed and finalized by OTT.

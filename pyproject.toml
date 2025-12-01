@@ -1,11 +1,61 @@
 [project]
 name = "SqueakPoseStudio"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tools for small-animal pose estimation, tracking, and behavioral analysis. Built for reproducibility, rapid prototyping, and seamless integration into research pipelines."
 readme = "README.md"
 requires-python = ">=3.12"
+
+authors = [
+    { name = "David Haggerty", email = "david.haggerty@nih.gov" },
+    { name = "Caleb Darden", email = "caleb.darden@nih.gov" },
+    { name = "David Lovinger", email = "lovindav@willco.niaaa.nih.gov" },
+]
+
+license = { text = """
+This software was developed by employees of the National Institutes of Health (NIH)
+as part of their official duties and is a U.S. Government work under 17 U.S.C. §105.
+It is therefore in the public domain and may be used, modified, or redistributed
+without restriction, subject to applicable third-party license obligations.
+
+This repository is private and pending review by the NIH Office of Technology Transfer (OTT).
+Commercial entities seeking to license this software for for-profit use must contact OTT.
+No commercial use rights are granted at this time.
+
+Academic and open-source users may freely build upon this software, again subject to
+third-party license terms.
+
+This project incorporates third-party libraries subject to their own licenses, including:
+- PyQt6 (GPLv3 or Riverbank commercial license)
+- Ultralytics YOLO (AGPL-3.0)
+- PyTorch & Torchvision (BSD-style)
+""" }
+
 dependencies = [
     "pyqt6>=6.10.0",
-    "torch>=2.9.1",
+    "torch",
+    "torchvision",
     "ultralytics>=8.3.233",
 ]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[project.license-files]
+paths = ["NOTICE"]

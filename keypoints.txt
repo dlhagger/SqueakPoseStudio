@@ -1,0 +1,6 @@
+nose
+head
+left_ear
+right_ear
+back
+tail_base

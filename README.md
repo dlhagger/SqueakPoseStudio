@@ -13,7 +13,7 @@ Overview
 
 Demo
 ---------------
-- For a video walkthrough, see: https://www.youtube.com/watch?v=aeKuTOTbb8c
+- For a video walkthrough, see: [https://www.youtube.com/watch?v=aeKuTOTbb8c](https://youtu.be/aeKuTOTbb8c?si=wo0ss4DYnGRMW2T6)
 
 Repository layout
 -----------------

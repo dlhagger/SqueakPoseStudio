@@ -11,6 +11,10 @@ Overview
 - Video inference: batch process videos with a trained model; exports rich CSV metrics per detection + keypoints (normalized coords, areas, timing) to an `inference outputs` folder.
 - Programmatic helper: `dataset_builder.py` generates YOLO pose `dataset.yaml` files with sensible flip indices based on keypoint names.
 
+Demo
+---------------
+- For a video walkthrough, see: https://www.youtube.com/watch?v=aeKuTOTbb8c
+
 Repository layout
 -----------------
 - `squeakpose_studio.py`: main PyQt6 application (labeling, exporting, training, inference).
@@ -21,13 +25,12 @@ Repository layout
 - `runs/`: default Ultralytics training outputs.
 - `classes.txt`, `keypoints.txt`: class and keypoint lists (defaults provided; editable).
 - `fonts/`: optional UI font (Fira Sans).
-- `torch_test_apple_silicon.py`: quick check that PyTorch + MPS is working on Apple Silicon.
+- `torch_ultralytics_checks.py`: quick check that PyTorch + MPS is working on Apple Silicon.
 
 Requirements
 ------------
 - Python >= 3.12
 - PyQt6, torch, torchvision, ultralytics (declared in `pyproject.toml`)
-- OpenCV (`opencv-python`) for video inference
 - Optional: Apple Silicon / CUDA for faster training and inference (device auto-selected in app)
 
 Setup
@@ -43,7 +46,7 @@ pip install -e .
 Running the app
 ---------------
 ```
-python squeakpose_studio.py
+uv run squeakpose_studio.py
 ```
 The app will create `images_to_label`, `images_all`, `labels_all`, `annotations`, and `fonts` if they are missing.
 
@@ -81,7 +84,7 @@ Flip indices are inferred automatically when keypoint names contain “left”/�
 
 Troubleshooting
 ---------------
-- Device selection is automatic (CUDA → MPS → CPU). Run `python torch_test_apple_silicon.py` to verify Apple Silicon/MPS.
+- Device selection is automatic (CUDA → MPS → CPU). Run `python torch_ultralytics_checks.py` to verify.
 - If OpenCV is missing, install `opencv-python` to enable video inference.
 - For missing class/keypoint files, create or edit `classes.txt` and `keypoints.txt` at the project root.
 

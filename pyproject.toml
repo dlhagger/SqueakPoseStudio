@@ -11,25 +11,6 @@ authors = [
     { name = "David Lovinger", email = "lovindav@willco.niaaa.nih.gov" },
 ]
 
-license = { text = """
-This software was developed by employees of the National Institutes of Health (NIH)
-as part of their official duties and is a U.S. Government work under 17 U.S.C. §105.
-It is therefore in the public domain and may be used, modified, or redistributed
-without restriction, subject to applicable third-party license obligations.
-
-This repository is private and pending review by the NIH Office of Technology Transfer (OTT).
-Commercial entities seeking to license this software for for-profit use must contact OTT.
-No commercial use rights are granted at this time.
-
-Academic and open-source users may freely build upon this software, again subject to
-third-party license terms.
-
-This project incorporates third-party libraries subject to their own licenses, including:
-- PyQt6 (GPLv3 or Riverbank commercial license)
-- Ultralytics YOLO (AGPL-3.0)
-- PyTorch & Torchvision (BSD-style)
-""" }
-
 dependencies = [
     "hdbscan>=0.8.40",
     "oneeurofilter>=0.2.1",
@@ -68,6 +49,3 @@ explicit = true
 dev = [
     "ipykernel",
 ]
-
-[project.license-files]
-paths = ["NOTICE"]

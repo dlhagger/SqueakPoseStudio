@@ -90,4 +90,10 @@ Troubleshooting
 
 License & notice
 ----------------
-This code is a U.S. Government work (NIH) and in the public domain, subject to third-party license obligations (PyQt6 GPLv3/commercial, Ultralytics AGPL-3.0, PyTorch BSD-style). The repository is private and pending NIH OTT review; no commercial rights are granted at this time. See `LICENSE` and `NOTICE.txt` for details.
+Temporary Research Use Only License  
+Copyright © 2024 National Institutes of Health
+
+This software is available for academic and non-profit research use under a temporary Research Use Only license. 
+Commercial use may require a separate license from the NIH Office of Technology Transfer.
+All use, redistribution, and modification must additionally comply with the licensing terms of third-party software dependencies incorporated into the system.
+The licensing terms will be updated upon completion of the NIH review.

@@ -91,7 +91,7 @@ Troubleshooting
 License & notice
 ----------------
 Temporary Research Use Only License  
-Copyright © 2024 National Institutes of Health
+Copyright © 2025 National Institutes of Health
 
 This software is available for academic and non-profit research use under a temporary Research Use Only license. 
 Commercial use may require a separate license from the NIH Office of Technology Transfer.

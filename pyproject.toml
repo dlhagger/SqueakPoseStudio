@@ -15,7 +15,7 @@ dependencies = [
     "hdbscan>=0.8.40",
     "oneeurofilter>=0.2.1",
     "pandas>=2.3.3",
-    "pyqt6>=6.10.0",
+    "pyqt6>=6.10.2",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
     "torch",

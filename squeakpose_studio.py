@@ -3349,11 +3349,11 @@ class TrainDialog(QDialog):
     """Dialog scaffold for future YOLO training integration."""
 
     MODEL_OPTIONS = {
-        "YOLOv11n (nano)": "yolo11n.yaml",
-        "YOLOv11s (small)": "yolo11s.yaml",
-        "YOLOv11m (medium)": "yolo11m.yaml",
-        "YOLOv11l (large)": "yolo11l.yaml",
-        "YOLOv11x (xlarge)": "yolo11x.yaml",
+        "YOLOv26n (nano)": "yolo26n.yaml",
+        "YOLOv26s (small)": "yolo26s.yaml",
+        "YOLOv26m (medium)": "yolo26m.yaml",
+        "YOLOv26l (large)": "yolo26l.yaml",
+        "YOLOv26x (xlarge)": "yolo26x.yaml",
     }
 
     def __init__(self, parent, default_dataset: str):

@@ -9,4 +9,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local model artifacts
+sam3.pt
  

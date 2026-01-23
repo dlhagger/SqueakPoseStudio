@@ -29,7 +29,7 @@ Repository layout
 
 Requirements
 ------------
-- Python >= 3.12
+- Python >= 3.12 (3.12 Dev on Linux)
 - PyQt6, torch, torchvision, ultralytics (declared in `pyproject.toml`)
 - Optional: Apple Silicon / CUDA for faster training and inference (device auto-selected in app)
 

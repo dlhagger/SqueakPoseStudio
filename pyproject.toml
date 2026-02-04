@@ -16,6 +16,7 @@ dependencies = [
     "hdbscan>=0.8.41",
     "iprogress>=0.4",
     "ipykernel>=7.1.0",
+    "lightly-train>=0.14.0",
     "oneeurofilter>=0.2.1",
     "pandas>=2.3.3",
     "pyqt6>=6.10.2",

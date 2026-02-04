@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys, os, shutil, json, random, yaml, re, shlex, platform, csv, datetime
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGraphicsView, QGraphicsScene,
@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QLabel, QSplashScreen, QMessageBox,
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
-    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit
+    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QListWidget
 )
 from PyQt6.QtGui import (
     QPixmap, QPen, QBrush, QKeySequence, QFont, QPainter, QShortcut,
@@ -99,6 +99,22 @@ class Keypoint:
         return (self.class_id, self.x / img_w, self.y / img_h, self.name)
 
 
+@dataclass(slots=True)
+class KeypointEntry:
+    name: str
+    display_name: str
+    kp: Keypoint
+    visibility: int
+
+
+@dataclass(slots=True)
+class Annotation:
+    ann_id: int
+    bbox: BoundingBox
+    keypoints: Dict[str, KeypointEntry]
+    order: List[str]
+
+
 # =========================
 # Graphics Items
 # =========================
@@ -127,6 +143,216 @@ class CongratsPopup(QDialog):
         layout.addWidget(ok_btn)
         self.setLayout(layout)
         self.setFixedSize(350, 300)
+
+
+class AddClassDialog(QDialog):
+    def __init__(self, existing_keypoints: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Class")
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.name_edit = QLineEdit()
+        form.addRow("Class name:", self.name_edit)
+
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(0, 200)
+        default_count = max(0, len(existing_keypoints))
+        if default_count == 0:
+            default_count = 6
+        self.count_spin.setValue(default_count)
+        form.addRow("Keypoints:", self.count_spin)
+
+        self.keypoints_edit = QTextEdit()
+        if existing_keypoints:
+            initial_lines = existing_keypoints[:]
+        else:
+            initial_lines = [f"kp_{idx+1}" for idx in range(default_count)]
+        self.keypoints_edit.setPlainText("\n".join(initial_lines))
+        self.count_spin.valueChanged.connect(self._ensure_kp_count)
+
+        info = QLabel("Keypoint names apply to all classes. Enter one per line.")
+        info.setWordWrap(True)
+
+        layout.addLayout(form)
+        layout.addWidget(info)
+        layout.addWidget(self.keypoints_edit, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _ensure_kp_count(self, target: int):
+        lines = [ln for ln in self.keypoints_edit.toPlainText().splitlines() if ln.strip()]
+        current = len(lines)
+        if target > current:
+            for idx in range(target - current):
+                lines.append(f"kp_{current + idx + 1}")
+        elif target < current:
+            lines = lines[:target]
+        self.keypoints_edit.setPlainText("\n".join(lines))
+
+    def get_data(self) -> tuple[str, list[str]]:
+        name = self.name_edit.text().strip()
+        keys = [ln.strip() for ln in self.keypoints_edit.toPlainText().splitlines() if ln.strip()]
+        return name, keys
+
+
+class ClassManagerDialog(QDialog):
+    def __init__(self, classes: list[str], keypoint_map: dict[str, list[str]], canonical: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Classes & Keypoints")
+        self.resize(420, 480)
+
+        self._classes = classes[:]
+        self._kp_map: dict[str, list[str]] = {}
+        for name in self._classes:
+            lst = keypoint_map.get(name, canonical[:])
+            self._kp_map[name] = lst[:]
+        self._canonical_default = canonical[:]
+        self._current_row = -1
+
+        layout = QVBoxLayout(self)
+
+        self.class_list = QListWidget()
+        for name in self._classes:
+            self.class_list.addItem(name)
+        layout.addWidget(QLabel("Classes"))
+        layout.addWidget(self.class_list, 1)
+
+        btn_row = QHBoxLayout()
+        self.add_btn = QPushButton("Add Class")
+        self.add_btn.clicked.connect(self._add_class)
+        btn_row.addWidget(self.add_btn)
+
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self._remove_selected)
+        btn_row.addWidget(self.remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        layout.addWidget(QLabel("Keypoint Names (per class, one per line)"))
+        self.keypoints_edit = QTextEdit()
+        layout.addWidget(self.keypoints_edit, 2)
+
+        self.status_label = QLabel("Keypoint count: 0")
+        layout.addWidget(self.status_label)
+        self.keypoints_edit.textChanged.connect(self._update_count_label)
+        self.class_list.currentRowChanged.connect(self._load_selected_class)
+        if self._classes:
+            self.class_list.setCurrentRow(0)
+        else:
+            self._load_selected_class(-1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.result_classes: Optional[list[str]] = None
+        self.result_keypoints: Optional[list[str]] = None
+        self.result_map: Optional[dict[str, list[str]]] = None
+
+    def _add_class(self):
+        seed = []
+        current = self.class_list.currentRow()
+        if current >= 0 and current < len(self._classes):
+            seed = self._kp_map.get(self._classes[current], [])
+        if not seed:
+            if self._canonical_default:
+                seed = self._canonical_default[:]
+        dlg = AddClassDialog(seed, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, keypoints = dlg.get_data()
+        if not name:
+            QMessageBox.warning(self, "Class name required", "Enter a class name.")
+            return
+        if name in self._classes:
+            QMessageBox.warning(self, "Duplicate class", "That class already exists.")
+            return
+        if not keypoints:
+            keypoints = []
+        self._classes.append(name)
+        self.class_list.addItem(name)
+        self._kp_map[name] = keypoints[:]
+        self.class_list.setCurrentRow(len(self._classes) - 1)
+
+    def _remove_selected(self):
+        row = self.class_list.currentRow()
+        if row < 0 or row >= len(self._classes):
+            return
+        name = self._classes.pop(row)
+        if name in self._kp_map:
+            del self._kp_map[name]
+        item = self.class_list.takeItem(row)
+        del item
+        QMessageBox.information(self, "Class removed", f"Removed '{name}'.")
+        next_row = min(row, len(self._classes) - 1)
+        self.class_list.setCurrentRow(next_row)
+
+    def _update_count_label(self):
+        kp = [ln.strip() for ln in self.keypoints_edit.toPlainText().splitlines() if ln.strip()]
+        self.status_label.setText(f"Keypoint count: {len(kp)}")
+
+    def _load_selected_class(self, row: int):
+        self._save_current_keypoints()
+        self._current_row = row
+        if row < 0 or row >= len(self._classes):
+            self.keypoints_edit.clear()
+            self.status_label.setText("Keypoint count: 0")
+            return
+        name = self._classes[row]
+        kp = self._kp_map.get(name, [])
+        self.keypoints_edit.blockSignals(True)
+        self.keypoints_edit.setPlainText("\n".join(kp))
+        self.keypoints_edit.blockSignals(False)
+        self._update_count_label()
+
+    def _save_current_keypoints(self):
+        if self._current_row < 0 or self._current_row >= len(self._classes):
+            return
+        name = self._classes[self._current_row]
+        kp = [ln.strip() for ln in self.keypoints_edit.toPlainText().splitlines() if ln.strip()]
+        self._kp_map[name] = kp[:]
+
+    def _on_accept(self):
+        self._save_current_keypoints()
+        if not self._classes:
+            QMessageBox.warning(self, "No classes", "Add at least one class.")
+            return
+        defined_any = any(self._kp_map.get(name) for name in self._classes)
+        if not defined_any:
+            QMessageBox.warning(self, "Keypoints required", "Enter at least one keypoint for any class.")
+            return
+        canonical = []
+        seen = set()
+        for name in self._canonical_default:
+            if name not in seen:
+                canonical.append(name)
+                seen.add(name)
+        for cls in self._classes:
+            for kp_name in self._kp_map.get(cls, []):
+                if kp_name not in seen:
+                    canonical.append(kp_name)
+                    seen.add(kp_name)
+        if not canonical:
+            QMessageBox.warning(self, "Keypoints required", "No keypoint names defined.")
+            return
+        self._canonical_default = canonical[:]
+        self.result_classes = self._classes[:]
+        self.result_keypoints = canonical[:]
+        self.result_map = {name: self._kp_map.get(name, [])[:] for name in self._classes}
+        self.accept()
+
+    def get_results(self) -> tuple[list[str], list[str], dict[str, list[str]]]:
+        return (
+            self.result_classes or [],
+            self.result_keypoints or [],
+            self.result_map or {},
+        )
 
 class BoxItem(QGraphicsRectItem):
     HANDLE = 8
@@ -514,8 +740,6 @@ class LabelView(QGraphicsView):
                 end_pos = self.mapToScene(event.position().toPoint())
                 rect = QRectF(self._start_pos, end_pos).normalized()
                 if rect.width() >= 2 and rect.height() >= 2:
-                    # Clear only when committing a valid rectangle
-                    self.app._remove_all_boxes_and_keypoints()
                     self.app.add_bbox(rect)
             if self._temp_rect:
                 self.scene().removeItem(self._temp_rect)
@@ -579,16 +803,14 @@ class VideoView(QGraphicsView):
 
 class LabelingApp(QMainWindow):
 
-    def _ensure_label_files(self, class_file: str, keypoint_file: str) -> tuple[list[str], list[str]]:
+    def _ensure_label_files(self, class_file: str, keypoint_file: str) -> tuple[list[str], list[str], bool]:
         """
         Ensure class and keypoint name files exist WITHOUT any UI prompts.
         - If either path is empty, place files next to the labels directory.
-        - If a file is missing or empty, create it with sensible defaults.
-        - Returns (classes, kp_names).
+        - If a file is missing, create an empty file so the user can fill it.
+        - Returns (classes, kp_names, created_flag).
         """
-        # Defaults
-        default_classes = ["mouse"]
-        default_kps = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
+        created_any = False
 
         # Resolve fallback locations if the provided paths are empty
         project_root = os.path.dirname(self.label_dir) if self.label_dir else os.getcwd()
@@ -618,10 +840,19 @@ class LabelingApp(QMainWindow):
                 pass
 
         # Create files if missing
+        def _touch(path: str) -> bool:
+            try:
+                with open(path, "a", encoding="utf-8"):
+                    return True
+            except Exception:
+                return False
+
         if not os.path.exists(class_file):
-            _write_lines(class_file, default_classes)
+            if _touch(class_file):
+                created_any = True
         if not os.path.exists(keypoint_file):
-            _write_lines(keypoint_file, default_kps)
+            if _touch(keypoint_file):
+                created_any = True
 
         # Read them (if empty, backfill defaults)
         def _read_nonempty_lines(path: str) -> list[str]:
@@ -636,14 +867,231 @@ class LabelingApp(QMainWindow):
         classes = _read_nonempty_lines(class_file)
         kp_names = _read_nonempty_lines(keypoint_file)
 
-        if not classes:
-            classes = default_classes
-            _write_lines(class_file, classes)
-        if not kp_names:
-            kp_names = default_kps
-            _write_lines(keypoint_file, kp_names)
+        return classes, kp_names, created_any
 
-        return classes, kp_names
+    def _load_class_keypoints(self) -> dict[str, list[str]]:
+        data: dict[str, list[str]] = {}
+        if os.path.exists(self.class_keypoints_path):
+            try:
+                with open(self.class_keypoints_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    for name, lst in raw.items():
+                        if isinstance(name, str) and isinstance(lst, list):
+                            cleaned = [str(item) for item in lst if isinstance(item, str)]
+                            if cleaned:
+                                data[name] = cleaned
+            except Exception:
+                data = {}
+        # ensure each known class has an entry
+        for name in self.classes:
+            if name not in data or not data[name]:
+                data[name] = self.kp_names[:]
+        return data
+
+    def _save_class_keypoints(self):
+        try:
+            with open(self.class_keypoints_path, "w", encoding="utf-8") as f:
+                json.dump(self.class_keypoints, f, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Save error", f"Could not write class keypoints file:\n{e}")
+
+    def _kp_names_for_class(self, class_name: str) -> list[str]:
+        return self.class_keypoints.get(class_name, self.kp_names)
+
+    def _kp_names_for_index(self, idx: int) -> list[str]:
+        if idx < 0 or idx >= len(self.classes):
+            return self.kp_names
+        return self._kp_names_for_class(self.classes[idx])
+
+    def _active_kp_names(self) -> list[str]:
+        return self._kp_names_for_index(self.class_selector.currentIndex())
+
+    def _update_class_keypoints(self, class_name: str, kp_list: list[str]):
+        if not kp_list:
+            return
+        self.class_keypoints[class_name] = kp_list[:]
+        self._save_class_keypoints()
+
+    def _refresh_kp_index_lookup(self):
+        self._kp_index_lookup = {name: idx for idx, name in enumerate(self.kp_names)}
+
+    def _ensure_canonical_name(self, name: str) -> int:
+        if name in self._kp_index_lookup:
+            return self._kp_index_lookup[name]
+        self.kp_names.append(name)
+        self._refresh_kp_index_lookup()
+        self._write_list_file(self.keypoint_file, self.kp_names)
+        return self._kp_index_lookup[name]
+
+    def _count_labeled_frames(self) -> tuple[int, int]:
+        total = len(self.images)
+        labeled = 0
+        for img in self.images:
+            base = os.path.splitext(img)[0]
+            label_file = os.path.join(self.label_dir, f"{base}.txt")
+            if os.path.exists(label_file):
+                labeled += 1
+        return labeled, total
+
+    def _update_progress_label(self):
+        if not hasattr(self, "progress_label"):
+            return
+        labeled, total = self._count_labeled_frames()
+        self.progress_label.setText(f"Labeled: {labeled} / {total}")
+
+    def _maybe_prompt_class_manager(self):
+        if getattr(self, "_prompted_class_manager", False):
+            return
+        self._prompted_class_manager = True
+        created = getattr(self, "_created_label_files", False)
+        missing_info = not (self.classes and self.kp_names)
+        if not (created or missing_info):
+            return
+        QTimer.singleShot(200, self._launch_class_manager_initial)
+
+    def _launch_class_manager_initial(self):
+        dlg = ClassManagerDialog(self.classes, self.class_keypoints, self.kp_names, self)
+        dlg.setWindowTitle("Initial Setup — Add Classes & Keypoints")
+        dlg_label = QLabel("Please define your classes and keypoints before labeling.")
+        dlg.layout().insertWidget(0, dlg_label)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            classes, keypoints, kp_map = dlg.get_results()
+            if self._apply_class_manager_results(classes, keypoints, kp_map):
+                self.class_selector.setCurrentIndex(0)
+                self.update_status_bar("Initial setup complete")
+        else:
+            self.update_status_bar("Setup skipped; using defaults until edited.")
+
+    def _write_list_file(self, path: str, items: list[str]):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for item in items:
+                    f.write(item + "\n")
+        except Exception as e:
+            QMessageBox.warning(self, "File write error", f"Could not write {path}:\n{e}")
+
+    def _track_scene_item(self, item: QGraphicsItem):
+        if item not in self._item_refs:
+            self._item_refs.append(item)
+
+    def _untrack_scene_item(self, item: QGraphicsItem):
+        try:
+            self._item_refs.remove(item)
+        except ValueError:
+            pass
+
+    # ---------- Annotation helpers ----------
+
+    def _class_box_item(self, class_id: int) -> Optional[BoxItem]:
+        for item in self.scene.items():
+            if isinstance(item, BoxItem) and item.bbox.class_id == class_id:
+                return item
+        return None
+
+    def _class_keypoint_items(self, class_id: int) -> list[KeypointItem]:
+        return [
+            item for item in self.scene.items()
+            if isinstance(item, KeypointItem) and item.kp.class_id == class_id
+        ]
+
+    def _clear_class_items(self, class_id: int, drop_cache: bool = False):
+        removed = False
+        for item in list(self.scene.items()):
+            if isinstance(item, BoxItem) and item.bbox.class_id == class_id:
+                self.scene.removeItem(item)
+                self._untrack_scene_item(item)
+                removed = True
+            elif isinstance(item, KeypointItem) and item.kp.class_id == class_id:
+                self.scene.removeItem(item)
+                self._untrack_scene_item(item)
+                removed = True
+        if drop_cache:
+            self.annotation_cache.pop(class_id, None)
+        if class_id == self.class_selector.currentIndex():
+            self.bboxes.clear()
+            self.kps.clear()
+            self.current_kp_idx = 0
+            if removed:
+                self._update_status()
+
+    def _clear_all_annotation_items(self):
+        for item in list(self.scene.items()):
+            if isinstance(item, (BoxItem, KeypointItem)):
+                self.scene.removeItem(item)
+                self._untrack_scene_item(item)
+        self.bboxes.clear()
+        self.kps.clear()
+        self.current_kp_idx = 0
+
+    def _sync_active_class_state(self):
+        cid = self.class_selector.currentIndex()
+        box_item = self._class_box_item(cid)
+        self.bboxes = [box_item.bbox] if box_item else []
+        self.kps = [kp_item.kp for kp_item in self._class_keypoint_items(cid)]
+        self.current_kp_idx = min(len(self._active_kp_names()), len(self.kps))
+
+    def _update_item_editability(self):
+        active_cid = self.class_selector.currentIndex()
+        for item in self.scene.items():
+            if isinstance(item, BoxItem):
+                editable = (item.bbox.class_id == active_cid)
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, editable)
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, editable)
+                item.setOpacity(1.0 if editable else 0.4)
+            elif isinstance(item, KeypointItem):
+                editable = (item.kp.class_id == active_cid)
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, editable)
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, editable)
+                item.setOpacity(1.0 if editable else 0.4)
+
+    def _class_is_complete(self, class_id: int) -> bool:
+        entry = self.annotation_cache.get(class_id)
+        if not entry:
+            return False
+        needed = len(self._kp_names_for_index(class_id))
+        if needed == 0:
+            return bool(entry.get("bbox"))
+        return len(entry.get("keypoints", [])) == needed
+
+    def _jump_to_next_pending_class(self):
+        total = len(self.classes)
+        if total <= 1:
+            return
+        current = self.class_selector.currentIndex()
+        pending = []
+        for idx in range(total):
+            if not self._class_is_complete(idx):
+                pending.append(idx)
+        if not pending:
+            return
+        for offset in range(1, total + 1):
+            nxt = (current + offset) % total
+            if nxt in pending:
+                self.class_selector.setCurrentIndex(nxt)
+                self.update_status_bar(f"Next class: {self.classes[nxt]}")
+                return
+
+    def _maybe_autoadvance(self):
+        cid = self.class_selector.currentIndex()
+        names = self._active_kp_names()
+        if not names:
+            if self._class_box_item(cid) and self._cache_active_annotation():
+                self._update_item_editability()
+                self._jump_to_next_pending_class()
+            return
+        if self.current_kp_idx >= len(names):
+            if self._cache_active_annotation():
+                self._update_item_editability()
+                self._jump_to_next_pending_class()
+
+    def _cycle_class(self, direction: int = 1):
+        if not self.classes:
+            return
+        idx = self.class_selector.currentIndex()
+        new_idx = (idx + direction) % len(self.classes)
+        if new_idx != idx:
+            self.class_selector.setCurrentIndex(new_idx)
 
     def refresh_image_list(self):
         """Reload the images_to_label directory file list (used after exporting a frame from video)."""
@@ -652,23 +1100,36 @@ class LabelingApp(QMainWindow):
             self.images = sorted(f for f in os.listdir(self.image_dir) if f.lower().endswith(exts))
         except Exception:
             pass
+        self._update_progress_label()
     def __init__(self, image_dir: str, label_dir: str, class_file: str, keypoint_file: str):
         super().__init__()
         self.image_dir = image_dir
         self.label_dir = label_dir
         os.makedirs(self.label_dir, exist_ok=True)
+        self.class_file = class_file
+        self.keypoint_file = keypoint_file
+        self.base_dir = os.path.dirname(__file__)
 
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
         self.images = sorted(f for f in os.listdir(self.image_dir) if f.lower().endswith(exts))
         self.current_idx = 0
 
         # Ensure classes.txt and keypoints.txt exist (never prompt, always silent)
-        self.classes, self.kp_names = self._ensure_label_files(class_file, keypoint_file)
+        self.classes, self.kp_names, self._created_label_files = self._ensure_label_files(class_file, keypoint_file)
+        self.class_keypoints_path = os.path.join(self.base_dir, "class_keypoints.json")
+        self.class_keypoints = self._load_class_keypoints()
+        self._save_class_keypoints()
+        self._kp_index_lookup: dict[str, int] = {}
+        self._refresh_kp_index_lookup()
+        self.annotation_cache: dict[int, dict] = {}
+        self.template_dir = os.path.join(self.base_dir, "templates")
+        os.makedirs(self.template_dir, exist_ok=True)
 
         self.mode = 'panzoom'
         self.bboxes: List[BoundingBox] = []
         self.kps: List[Keypoint] = []
         self.current_kp_idx = 0
+        self._item_refs: list[QGraphicsItem] = []
         self.predict_model_path: Optional[str] = None
         self.predict_model: Optional[YOLO] = None
         self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled'
@@ -686,6 +1147,8 @@ class LabelingApp(QMainWindow):
         # Build UI and load first image
         self._setup_ui()
         self.load_image()
+        self._update_progress_label()
+        QTimer.singleShot(0, self._maybe_prompt_class_manager)
     def closeEvent(self, event):
         super().closeEvent(event)
 
@@ -746,6 +1209,8 @@ class LabelingApp(QMainWindow):
         # Top bar
         self.class_selector = QComboBox()
         self.class_selector.addItems(self.classes)
+        self.class_selector.currentIndexChanged.connect(self._on_class_changed)
+        self._active_class_id = self.class_selector.currentIndex()
 
         top_layout = QHBoxLayout()
 
@@ -792,6 +1257,12 @@ class LabelingApp(QMainWindow):
         # Model + class
         top_layout.addWidget(QLabel("Class:"))
         top_layout.addWidget(self.class_selector)
+        manage_classes_btn = QPushButton("Manage Classes")
+        manage_classes_btn.clicked.connect(self.open_class_manager)
+        top_layout.addWidget(manage_classes_btn)
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet("font-weight: bold;")
+        top_layout.addWidget(self.progress_label)
         
         # Main layout
         layout = QVBoxLayout()
@@ -819,6 +1290,16 @@ class LabelingApp(QMainWindow):
         load_model_btn = QPushButton("Load Model")
         load_model_btn.clicked.connect(self.load_model)
         bottom_controls.addWidget(load_model_btn)
+
+        self.template_apply_btn = QPushButton("Apply Template")
+        self.template_apply_btn.setToolTip("Apply the saved template for the selected class")
+        self.template_apply_btn.clicked.connect(self.apply_template_for_current_class)
+        bottom_controls.addWidget(self.template_apply_btn)
+
+        self.template_save_btn = QPushButton("Save Template")
+        self.template_save_btn.setToolTip("Capture the current annotation as the class template")
+        self.template_save_btn.clicked.connect(self.save_template_for_current_class)
+        bottom_controls.addWidget(self.template_save_btn)
 
         self.inference_btn = QPushButton("Inference")
         self.inference_btn.setToolTip("Select a video, run YOLO, and export per-frame metrics to CSV")
@@ -892,6 +1373,248 @@ class LabelingApp(QMainWindow):
 
         # Shortcuts
         self._bind_shortcuts()
+
+    # ---------- Class & annotation helpers ----------
+
+    def _on_class_changed(self, index: int):
+        if index < 0 or index >= len(self.classes):
+            return
+        prev = getattr(self, "_active_class_id", index)
+        if prev != index:
+            self._cache_active_annotation(prev)
+        self._active_class_id = index
+        if self.annotation_cache.get(index) and not self._class_box_item(index):
+            self._restore_annotation_for_class(index)
+        else:
+            self._sync_active_class_state()
+            self._update_item_editability()
+            self._update_status()
+
+    def _cache_active_annotation(self, class_id: Optional[int] = None) -> bool:
+        if not self.images:
+            return False
+        cid = self.class_selector.currentIndex() if class_id is None else class_id
+        bbox_item = self._class_box_item(cid)
+        if bbox_item is None:
+            self.annotation_cache.pop(cid, None)
+            return False
+        bbox_item.update_model()
+        required_names = self._kp_names_for_index(cid)
+        kp_items = self._class_keypoint_items(cid)
+        if len(required_names) == 0:
+            bbox = bbox_item.bbox
+            self.annotation_cache[cid] = {
+                "class_id": cid,
+                "bbox": {"x": bbox.x, "y": bbox.y, "w": bbox.w, "h": bbox.h},
+                "keypoints": [],
+            }
+            return True
+        if len(kp_items) != len(required_names):
+            return False
+        kp_map = {}
+        for it in kp_items:
+            kp_map[it.kp.name] = {
+                "name": it.kp.name,
+                "x": it.kp.x,
+                "y": it.kp.y,
+                "vis": int(getattr(it, "visibility", 2))
+            }
+        ordered = []
+        for idx, name in enumerate(required_names):
+            entry = kp_map.get(name)
+            if not entry:
+                return False
+            entry["idx"] = idx
+            entry["canon_idx"] = self._ensure_canonical_name(name)
+            ordered.append(entry)
+        bbox = bbox_item.bbox
+        self.annotation_cache[cid] = {
+            "class_id": cid,
+            "bbox": {"x": bbox.x, "y": bbox.y, "w": bbox.w, "h": bbox.h},
+            "keypoints": ordered,
+        }
+        return True
+
+    def _restore_annotation_for_class(self, cid: int):
+        self._clear_class_items(cid)
+        entry = self.annotation_cache.get(cid)
+        if not entry:
+            if cid == self.class_selector.currentIndex():
+                self._sync_active_class_state()
+                self._update_item_editability()
+            return
+        bbox_data = entry.get("bbox", {})
+        bbox = BoundingBox(
+            bbox_data.get("x", 0.0),
+            bbox_data.get("y", 0.0),
+            bbox_data.get("w", 0.0),
+            bbox_data.get("h", 0.0),
+            cid
+        )
+        item = BoxItem(bbox, self.classes[cid] if cid < len(self.classes) else str(cid))
+        self.scene.addItem(item)
+        self._track_scene_item(item)
+
+        active_names = self._kp_names_for_index(cid)
+        for kp_info in entry.get("keypoints", []):
+            idx = int(kp_info.get("idx", -1))
+            if 0 <= idx < len(active_names):
+                name = active_names[idx]
+            else:
+                name = kp_info.get("name", f"kp_{idx+1}")
+            kp = Keypoint(kp_info.get("x", 0.0), kp_info.get("y", 0.0), cid, name)
+            kp_item = KeypointItem(kp, self.kp_pixel_radius, self.kp_font_px)
+            kp_item.visibility = int(kp_info.get("vis", 2))
+            kp_item.update_appearance()
+            self.scene.addItem(kp_item)
+            self._track_scene_item(kp_item)
+
+        if cid == self.class_selector.currentIndex():
+            self._sync_active_class_state()
+            self._update_status()
+            self._update_item_editability()
+
+    def _load_annotations_from_file(self, label_file: str) -> dict[int, dict]:
+        cache: dict[int, dict] = {}
+        try:
+            with open(label_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    ln = line.strip()
+                    if not ln:
+                        continue
+                    entry = self._parse_label_line(ln)
+                    if entry:
+                        cache[entry["class_id"]] = entry
+        except Exception:
+            pass
+        return cache
+
+    def _parse_label_line(self, line: str) -> Optional[dict]:
+        parts = line.split()
+        if len(parts) < 5:
+            return None
+        try:
+            cid = int(parts[0])
+            xc = float(parts[1]); yc = float(parts[2])
+            w = float(parts[3]); h = float(parts[4])
+            if cid < 0 or cid >= len(self.classes):
+                return None
+        except ValueError:
+            return None
+        x = (xc - w / 2.0) * self.img_w
+        y = (yc - h / 2.0) * self.img_h
+        bbox = {"x": x, "y": y, "w": w * self.img_w, "h": h * self.img_h}
+        canonical_names = self.kp_names
+        kp_data = parts[5:]
+        keypoints = []
+        idx = 0
+        canon_idx = 0
+        while idx + 2 < len(kp_data):
+            try:
+                xn = float(kp_data[idx]); yn = float(kp_data[idx + 1]); vis = int(float(kp_data[idx + 2]))
+            except ValueError:
+                break
+            if canon_idx >= len(canonical_names):
+                generated = f"kp_{canon_idx + 1}"
+                canon_idx_value = self._ensure_canonical_name(generated)
+                canonical_names = self.kp_names
+            else:
+                canon_idx_value = canon_idx
+            name = canonical_names[canon_idx_value]
+            kp = {
+                "idx": canon_idx_value,
+                "canon_idx": canon_idx_value,
+                "name": name,
+                "x": xn * self.img_w,
+                "y": yn * self.img_h,
+                "vis": vis,
+            }
+            keypoints.append(kp)
+            idx += 3
+            canon_idx += 1
+
+        class_names = self._kp_names_for_index(cid)
+        filtered: list[dict] = []
+        kp_by_name = {kp["name"]: kp for kp in keypoints}
+        for idx_cls, name in enumerate(class_names):
+            entry = kp_by_name.get(name)
+            if entry:
+                cp = entry.copy()
+                cp["idx"] = idx_cls
+                filtered.append(cp)
+        return {"class_id": cid, "bbox": bbox, "keypoints": filtered}
+
+    def _annotation_entry_to_line(self, entry: dict) -> str:
+        cid = entry.get("class_id", 0)
+        bbox = entry.get("bbox", {})
+        x = bbox.get("x", 0.0); y = bbox.get("y", 0.0); w = bbox.get("w", 0.0); h = bbox.get("h", 0.0)
+        xc = (x + w / 2.0) / max(1.0, float(self.img_w))
+        yc = (y + h / 2.0) / max(1.0, float(self.img_h))
+        w_norm = w / max(1.0, float(self.img_w))
+        h_norm = h / max(1.0, float(self.img_h))
+        line = f"{cid} {xc:.6f} {yc:.6f} {w_norm:.6f} {h_norm:.6f}"
+        kp_entries = entry.get("keypoints", [])
+        kp_lookup = {}
+        for kp in kp_entries:
+            canon_idx = int(kp.get("canon_idx", -1))
+            if canon_idx >= 0:
+                kp_lookup[canon_idx] = kp
+        for idx in range(len(self.kp_names)):
+            kp = kp_lookup.get(idx)
+            if not kp:
+                line += " 0.000000 0.000000 0"
+                continue
+            vis = int(kp.get("vis", 2))
+            if vis == 0:
+                line += " 0.000000 0.000000 0"
+            else:
+                xn = kp.get("x", 0.0) / max(1.0, float(self.img_w))
+                yn = kp.get("y", 0.0) / max(1.0, float(self.img_h))
+                line += f" {xn:.6f} {yn:.6f} {vis}"
+        return line
+
+    def _render_overlay_from_cache(self, out_path: str):
+        if self.img_w <= 0 or self.img_h <= 0:
+            return
+        rect = QRectF(0, 0, self.img_w, self.img_h)
+        pm = QPixmap(int(rect.width()), int(rect.height()))
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        colors = [
+            Qt.GlobalColor.cyan,
+            Qt.GlobalColor.magenta,
+            Qt.GlobalColor.yellow,
+            Qt.GlobalColor.green,
+            Qt.GlobalColor.red,
+        ]
+        try:
+            for idx, (cid, entry) in enumerate(sorted(self.annotation_cache.items())):
+                color = colors[idx % len(colors)]
+                pen = QPen(color); pen.setWidth(2); pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.GlobalColor.transparent)
+                bbox = entry.get("bbox", {})
+                painter.drawRect(QRectF(bbox.get("x", 0.0), bbox.get("y", 0.0),
+                                        bbox.get("w", 0.0), bbox.get("h", 0.0)))
+                for kp in entry.get("keypoints", []):
+                    vis = int(kp.get("vis", 2))
+                    if vis == 0:
+                        painter.setBrush(QBrush(Qt.GlobalColor.transparent))
+                        painter.setPen(QPen(Qt.GlobalColor.lightGray))
+                    elif vis == 1:
+                        painter.setBrush(QBrush(color))
+                        pen = QPen(color); pen.setStyle(Qt.PenStyle.DashLine); painter.setPen(pen)
+                    else:
+                        painter.setBrush(QBrush(color))
+                        painter.setPen(QPen(color))
+                    painter.drawEllipse(QPointF(kp.get("x", 0.0), kp.get("y", 0.0)), 3, 3)
+        finally:
+            painter.end()
+        try:
+            pm.save(out_path)
+            print(f"✅ Saved annotated image to {out_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to save annotated image: {e}")
 
     # ---------- Navigation helpers ----------
 
@@ -1450,36 +2173,40 @@ class LabelingApp(QMainWindow):
 
     def _apply_prediction(self, results):
         try:
-            self._remove_all_boxes_and_keypoints()
+            self._cache_active_annotation()
 
             # Re-enable predict button / clear busy state
             self._predict_busy = False
             if hasattr(self, 'predict_btn'):
                 self.predict_btn.setEnabled(True)
 
-            # Select highest-confidence detection if multiple; warn if >1
             idx = 0
+            target_cid = self.class_selector.currentIndex()
             if results.boxes is not None and len(results.boxes) > 0:
                 if hasattr(results.boxes, 'conf') and results.boxes.conf is not None:
-                    # pick the highest-confidence index
                     import torch
                     try:
                         idx = int(results.boxes.conf.argmax().item())
                     except Exception:
                         idx = 0
-                else:
-                    idx = 0
                 if len(results.boxes) > 1:
                     self.update_status_bar(f"Prediction returned {len(results.boxes)} detections; using the top-confidence one.")
 
                 xyxy = results.boxes.xyxy.cpu().tolist()[idx]
-                cls = int(results.boxes.cls.cpu().tolist()[idx]) if results.boxes.cls is not None else 0
+                cls = int(results.boxes.cls.cpu().tolist()[idx]) if results.boxes.cls is not None else target_cid
+                if 0 <= cls < len(self.classes):
+                    target_cid = cls
                 x1, y1, x2, y2 = xyxy
                 w, h = x2 - x1, y2 - y1
-                bb = BoundingBox(x1, y1, w, h, cls)
-                item = BoxItem(bb, self.classes[bb.class_id] if bb.class_id < len(self.classes) else str(bb.class_id))
+                bb = BoundingBox(x1, y1, w, h, target_cid)
+                self._clear_class_items(target_cid, drop_cache=True)
+                if target_cid != self.class_selector.currentIndex():
+                    self.class_selector.setCurrentIndex(target_cid)
+                item = BoxItem(bb, self.classes[target_cid] if target_cid < len(self.classes) else str(target_cid))
                 self.scene.addItem(item)
-                self.bboxes.append(bb)
+                self._track_scene_item(item)
+                self.bboxes = [bb]
+                self.kps.clear()
 
             # Apply keypoints for the chosen instance (index matches `idx` above)
             if hasattr(results, 'keypoints') and results.keypoints is not None:
@@ -1487,16 +2214,21 @@ class LabelingApp(QMainWindow):
                 if kps_list:
                     use_idx = min(idx, len(kps_list) - 1)
                     inst = kps_list[use_idx]
+                    kp_names = self._kp_names_for_index(target_cid)
                     for idx_pt, (x, y, vis) in enumerate(inst):
-                        name = self.kp_names[idx_pt] if idx_pt < len(self.kp_names) else f"kp{idx_pt}"
-                        kp_obj = Keypoint(x, y, self.class_selector.currentIndex(), name)
+                        name = kp_names[idx_pt] if idx_pt < len(kp_names) else f"kp{idx_pt}"
+                        kp_obj = Keypoint(x, y, target_cid, name)
                         kp_item = KeypointItem(kp_obj, self.kp_pixel_radius, self.kp_font_px)
                         kp_item.visibility = int(vis) if vis in (0, 1, 2) else (2 if vis > 0 else 1)
                         kp_item.update_appearance()
                         self.scene.addItem(kp_item)
+                        self._track_scene_item(kp_item)
                         self.kps.append(kp_obj)
-                    self.current_kp_idx = min(len(self.kp_names), len(self.kps))
+                    self.current_kp_idx = min(len(kp_names), len(self.kps))
 
+            self._cache_active_annotation()
+            self._update_item_editability()
+            self._maybe_autoadvance()
             self._update_status()
             self.update_status_bar("Prediction applied.")
         except Exception as e:
@@ -1535,11 +2267,12 @@ class LabelingApp(QMainWindow):
         if not self.bboxes:
             self.update_status_bar("Place a bounding box first.")
             return
-        if self.current_kp_idx >= len(self.kp_names):
+        names = self._active_kp_names()
+        if self.current_kp_idx >= len(names):
             self.update_status_bar("All keypoints already placed.")
             return
 
-        name = self.kp_names[self.current_kp_idx]
+        name = names[self.current_kp_idx]
         cid = self.class_selector.currentIndex()
 
         # Use (0,0) for invisibles; YOLO ignores coords when v=0
@@ -1550,16 +2283,18 @@ class LabelingApp(QMainWindow):
 
         # Keep it in the scene so saving picks it up (subtle visual)
         self.scene.addItem(item)
+        self._track_scene_item(item)
         self.kps.append(kp)
 
         # Advance to next missing name
         if hasattr(self, "_sync_current_kp_idx"):
             self._sync_current_kp_idx()
         else:
-            self.current_kp_idx = min(self.current_kp_idx + 1, len(self.kp_names))
+            self.current_kp_idx = min(self.current_kp_idx + 1, len(names))
 
         self._update_status()
         self.update_status_bar(f"Marked '{name}' invisible (v=0).")
+        self._maybe_autoadvance()
 
     def set_selected_invisible(self):
         """Convert selected keypoints to invisible (v=0) without moving them."""
@@ -1586,6 +2321,8 @@ class LabelingApp(QMainWindow):
             'Z': self.undo,
             'V': self.toggle_selected_visibility,
             'R': self._reset_zoom,  # <-- refresh zoom label too
+            'A': self.apply_template_for_current_class,
+            'C': lambda: self._cycle_class(+1),
             Qt.Key.Key_Delete: self.delete_selected,
             Qt.Key.Key_Backspace: self.delete_selected,  # optional: Mac-friendly
             Qt.Key.Key_P: self.prev_index,
@@ -1676,13 +2413,154 @@ class LabelingApp(QMainWindow):
                 it.text_item.setVisible(new_vis)
         self.update_status_bar("Keypoint labels " + ("shown" if new_vis else "hidden"))
 
+    def _apply_class_manager_results(self, classes: list[str], keypoints: list[str], kp_map: dict[str, list[str]]) -> bool:
+        if not classes or not keypoints:
+            return False
+        self._write_list_file(self.class_file, classes)
+        self._write_list_file(self.keypoint_file, keypoints)
+        self.classes = classes
+        self.kp_names = keypoints
+        self.class_keypoints = kp_map
+        self._save_class_keypoints()
+        self._refresh_kp_index_lookup()
+        current_name = self.class_selector.currentText()
+        self.class_selector.blockSignals(True)
+        self.class_selector.clear()
+        self.class_selector.addItems(self.classes)
+        if current_name in self.classes:
+            self.class_selector.setCurrentIndex(self.classes.index(current_name))
+        else:
+            self.class_selector.setCurrentIndex(0)
+        self.class_selector.blockSignals(False)
+        self.annotation_cache.clear()
+        self.load_image()
+        return True
+
+    def open_class_manager(self):
+        dlg = ClassManagerDialog(self.classes, self.class_keypoints, self.kp_names, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        classes, keypoints, kp_map = dlg.get_results()
+        if self._apply_class_manager_results(classes, keypoints, kp_map):
+            self.update_status_bar("Classes and keypoints updated.")
+
+    def _template_path_for_class(self, class_name: str) -> str:
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", class_name)
+        return os.path.join(self.template_dir, f"{safe}.json")
+
+    def save_template_for_current_class(self):
+        if not self._cache_active_annotation():
+            QMessageBox.warning(self, "Template error", "Complete the current class annotation before saving a template.")
+            return
+        cid = self.class_selector.currentIndex()
+        entry = self.annotation_cache.get(cid)
+        if not entry:
+            QMessageBox.warning(self, "Template error", "Nothing to save for this class.")
+            return
+        bbox = entry.get("bbox", {})
+        data = {
+            "class": self.classes[cid],
+            "bbox": {
+                "xc": (bbox.get("x", 0.0) + bbox.get("w", 0.0) / 2.0) / max(1.0, float(self.img_w)),
+                "yc": (bbox.get("y", 0.0) + bbox.get("h", 0.0) / 2.0) / max(1.0, float(self.img_h)),
+                "w": bbox.get("w", 0.0) / max(1.0, float(self.img_w)),
+                "h": bbox.get("h", 0.0) / max(1.0, float(self.img_h)),
+            },
+            "keypoints": [],
+        }
+        for kp in entry.get("keypoints", []):
+            vis = int(kp.get("vis", 2))
+            data["keypoints"].append({
+                "name": kp.get("name", ""),
+                "idx": int(kp.get("idx", len(data["keypoints"]))),
+                "canon_idx": int(kp.get("canon_idx", -1)),
+                "x": 0.0 if vis == 0 else kp.get("x", 0.0) / max(1.0, float(self.img_w)),
+                "y": 0.0 if vis == 0 else kp.get("y", 0.0) / max(1.0, float(self.img_h)),
+                "vis": vis,
+            })
+        path = self._template_path_for_class(self.classes[cid])
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            QMessageBox.information(self, "Template saved", f"Template saved to {path}.")
+        except Exception as e:
+            QMessageBox.warning(self, "Template error", f"Failed to save template:\n{e}")
+
+    def apply_template_for_current_class(self):
+        if not self.images:
+            QMessageBox.warning(self, "Template error", "Load an image before applying templates.")
+            return
+        class_name = self.class_selector.currentText()
+        path = self._template_path_for_class(class_name)
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Template missing", f"No template found for {class_name}.\nSave one first.")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Template error", f"Failed to load template:\n{e}")
+            return
+
+        bbox = data.get("bbox", {})
+        xc = bbox.get("xc", 0.5); yc = bbox.get("yc", 0.5)
+        w = bbox.get("w", 1.0); h = bbox.get("h", 1.0)
+        x = (xc - w / 2.0) * self.img_w
+        y = (yc - h / 2.0) * self.img_h
+        rect = QRectF(x, y, w * self.img_w, h * self.img_h)
+
+        cid = self.class_selector.currentIndex()
+        class_name = self.classes[cid]
+        self._clear_class_items(cid, drop_cache=True)
+        bbox_obj = BoundingBox(rect.x(), rect.y(), rect.width(), rect.height(), cid)
+        item = BoxItem(bbox_obj, class_name)
+        self.scene.addItem(item)
+        self._track_scene_item(item)
+        self.bboxes = [bbox_obj]
+
+        kp_lookup = {}
+        for kp in data.get("keypoints", []):
+            idx = int(kp.get("idx", -1))
+            if idx >= 0:
+                kp_lookup[idx] = kp
+        self.kps.clear()
+        active_names = self._active_kp_names()
+        for idx_name, name in enumerate(active_names):
+            kp_info = kp_lookup.get(idx_name)
+            if kp_info:
+                vis = int(kp_info.get("vis", 2))
+                if vis == 0:
+                    x_pix = 0.0
+                    y_pix = 0.0
+                else:
+                    x_pix = kp_info.get("x", 0.0) * self.img_w
+                    y_pix = kp_info.get("y", 0.0) * self.img_h
+            else:
+                vis = 0
+                x_pix = 0.0
+                y_pix = 0.0
+            kp = Keypoint(x_pix, y_pix, cid, name)
+            kp_item = KeypointItem(kp, self.kp_pixel_radius, self.kp_font_px)
+            kp_item.visibility = vis
+            kp_item.update_appearance()
+            self.scene.addItem(kp_item)
+            self._track_scene_item(kp_item)
+            self.kps.append(kp)
+        self.current_kp_idx = len(active_names)
+        self._cache_active_annotation()
+        self._update_item_editability()
+        self.update_status_bar(f"Applied template for {class_name}.")
+        self._maybe_autoadvance()
+
     def update_status_bar(self, msg: str):
         self.status.showMessage(msg, 2500)
 
     def _kp_text(self) -> str:
         if self.mode == 'keypoint':
-            return f"Next: {self.kp_names[self.current_kp_idx]}  ({self.current_kp_idx}/{len(self.kp_names)})" \
-                   if self.current_kp_idx < len(self.kp_names) else "All keypoints placed"
+            names = self._active_kp_names()
+            if self.current_kp_idx < len(names):
+                return f"Next: {names[self.current_kp_idx]}  ({self.current_kp_idx}/{len(names)})"
+            return "All keypoints placed"
         return ""
 
     # ---------- Image load / navigation ----------
@@ -1692,6 +2570,7 @@ class LabelingApp(QMainWindow):
             self.view._remove_crosshairs()
 
         self.scene.clear()
+        self._item_refs.clear()
         if not self.images:
             return
 
@@ -1713,108 +2592,122 @@ class LabelingApp(QMainWindow):
         base = os.path.splitext(self.images[self.current_idx])[0]
         label_file = os.path.join(self.label_dir, f"{base}.txt")
 
+        self.annotation_cache = {}
         if os.path.exists(label_file):
-            with open(label_file, 'r', encoding='utf-8') as f:
-                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-            if lines:
-                parts = lines[0].split()
-                if len(parts) >= 5:
-                    cid = int(parts[0]); xc = float(parts[1]); yc = float(parts[2])
-                    w = float(parts[3]); h = float(parts[4])
-                    x = (xc - w / 2) * self.img_w
-                    y = (yc - h / 2) * self.img_h
-                    w_pix = w * self.img_w
-                    h_pix = h * self.img_h
-                    bbox = BoundingBox(x, y, w_pix, h_pix, cid)
-                    item = BoxItem(bbox, self.classes[cid] if cid < len(self.classes) else str(cid))
-                    self.scene.addItem(item)
-                    self.bboxes.append(bbox)
+            self.annotation_cache = self._load_annotations_from_file(label_file)
+        for cid in range(len(self.classes)):
+            if cid in self.annotation_cache:
+                self._restore_annotation_for_class(cid)
+        self._sync_active_class_state()
+        self._update_item_editability()
 
-                    kp_data = parts[5:]
-                    for idx in range(0, len(kp_data), 3):
-                        if idx + 2 >= len(kp_data):
-                            break
-                        xn = float(kp_data[idx])
-                        yn = float(kp_data[idx + 1])
-                        vis = int(kp_data[idx + 2])
-                        if idx // 3 < len(self.kp_names):
-                            kp_name = self.kp_names[idx // 3]
-                            x_pix = xn * self.img_w
-                            y_pix = yn * self.img_h
-                            kp = Keypoint(x_pix, y_pix, cid, kp_name)
-                            kp_item = KeypointItem(kp, self.kp_pixel_radius, self.kp_font_px)
-                            kp_item.visibility = vis
-                            kp_item.update_appearance()
-                            self.scene.addItem(kp_item)
-                            self.kps.append(kp)
-
-        self.current_kp_idx = min(len(self.kp_names), len(self.kps))
         self._update_status()
         scene_center = self.scene.sceneRect().center()
         self.view.centerOn(scene_center)
 
     def add_bbox(self, rect: QRectF):
-        self._remove_all_boxes_and_keypoints()
         cid = self.class_selector.currentIndex()
         class_name = self.classes[cid]
+        self._clear_class_items(cid, drop_cache=True)
         bbox = BoundingBox(rect.x(), rect.y(), rect.width(), rect.height(), cid)
         item = BoxItem(bbox, class_name)
         self.scene.addItem(item)
-        self.bboxes.append(bbox)
+        self._track_scene_item(item)
+        self.bboxes = [bbox]
+        self.kps.clear()
+        self.current_kp_idx = 0
+        self._update_item_editability()
         self.update_status_bar("Box added. Switch to Keypoint mode (3).")
+        if not self._active_kp_names():
+            if self._cache_active_annotation():
+                self._update_item_editability()
+                self._jump_to_next_pending_class()
 
     def add_keypoint(self, pos: QPointF):
         if not self.bboxes:
             self.update_status_bar("Place a bounding box first.")
             return
-        if self.current_kp_idx >= len(self.kp_names):
+        names = self._active_kp_names()
+        if self.current_kp_idx >= len(names):
             self.update_status_bar("All keypoints placed for this frame.")
             return
         cid = self.class_selector.currentIndex()
-        name = self.kp_names[self.current_kp_idx]
+        name = names[self.current_kp_idx]
         kp = Keypoint(pos.x(), pos.y(), cid, name)
         item = KeypointItem(kp, self.kp_pixel_radius, self.kp_font_px)
         self.scene.addItem(item)
+        self._track_scene_item(item)
         self.kps.append(kp)
-        self.current_kp_idx += 1
+        self.current_kp_idx = min(self.current_kp_idx + 1, len(names))
         self._update_status()
+        self._maybe_autoadvance()
 
     def delete_selected(self):
+        cid = self.class_selector.currentIndex()
+        changed = False
+        drop_cache = False
         for item in list(self.scene.selectedItems()):
-            if isinstance(item, BoxItem):
-                if item.bbox in self.bboxes:
-                    self.bboxes.remove(item.bbox)
-            if isinstance(item, KeypointItem):
+            if isinstance(item, BoxItem) and item.bbox.class_id == cid:
+                self.scene.removeItem(item)
+                self._untrack_scene_item(item)
+                self.bboxes.clear()
+                self.kps.clear()
+                drop_cache = True
+                changed = True
+            elif isinstance(item, KeypointItem) and item.kp.class_id == cid:
                 if item.kp in self.kps:
                     self.kps.remove(item.kp)
-            self.scene.removeItem(item)
-        self.current_kp_idx = min(self.current_kp_idx, len(self.kp_names), len(self.kps))
-        self._update_status()
+                self.scene.removeItem(item)
+                self._untrack_scene_item(item)
+                changed = True
+        names = self._active_kp_names()
+        self.current_kp_idx = min(self.current_kp_idx, len(names), len(self.kps))
+        if drop_cache:
+            self.annotation_cache.pop(cid, None)
+        if changed:
+            self._update_status()
+            self._update_item_editability()
 
     def undo(self):
+        cid = self.class_selector.currentIndex()
         if self.mode == 'keypoint' and self.kps:
             kp = self.kps.pop()
             for it in list(self.scene.items()):
-                if isinstance(it, KeypointItem) and it.kp is kp:
+                if isinstance(it, KeypointItem) and it.kp is kp and it.kp.class_id == cid:
                     self.scene.removeItem(it)
+                    self._untrack_scene_item(it)
                     break
             self.current_kp_idx = max(0, self.current_kp_idx - 1)
             self._update_status()
         elif self.mode == 'bbox' and self.bboxes:
             bb = self.bboxes.pop()
             for it in list(self.scene.items()):
-                if isinstance(it, BoxItem) and it.bbox is bb:
+                if isinstance(it, BoxItem) and it.bbox is bb and it.bbox.class_id == cid:
                     self.scene.removeItem(it)
+                    self._untrack_scene_item(it)
                     break
             for it in list(self.scene.items()):
-                if isinstance(it, KeypointItem):
+                if isinstance(it, KeypointItem) and it.kp.class_id == cid:
                     self.scene.removeItem(it)
+                    self._untrack_scene_item(it)
             self.kps.clear()
             self.current_kp_idx = 0
+            self.annotation_cache.pop(cid, None)
             self._update_status()
+            self._update_item_editability()
 
     def _is_fully_labeled(self) -> bool:
-        return len(self.bboxes) == 1 and self.current_kp_idx == len(self.kp_names)
+        self._cache_active_annotation()
+        if not self.classes:
+            return False
+        for cid in range(len(self.classes)):
+            entry = self.annotation_cache.get(cid)
+            if not entry:
+                return False
+            required = len(self._kp_names_for_index(cid))
+            if len(entry.get("keypoints", [])) != required:
+                return False
+        return True
 
     def _update_status(self):
         buttons = {'panzoom': self.panzoom_btn, 'bbox': self.bbox_btn,
@@ -1895,22 +2788,21 @@ class LabelingApp(QMainWindow):
             self.center_mode_panel()
             self._layout_overlays()
 
-    def _remove_all_boxes_and_keypoints(self):
-        for it in list(self.scene.items()):
-            if isinstance(it, (BoxItem, KeypointItem)):
-                self.scene.removeItem(it)
-        self.bboxes.clear()
-        self.kps.clear()
-        self.current_kp_idx = 0
+    def _remove_all_boxes_and_keypoints(self, drop_cache: bool = False):
+        self._clear_all_annotation_items()
+        if drop_cache:
+            self.annotation_cache.clear()
         self._update_status()
 
     # ---------- Save ----------
-    def _collect_keypoints_by_name(self) -> dict[str, tuple[Keypoint, int]]:
+    def _collect_keypoints_by_name(self, class_id: Optional[int] = None) -> dict[str, tuple[Keypoint, int]]:
         """Return {kp_name: (Keypoint, visibility)} for all KeypointItems in the scene.
         If there are duplicates by name, the last one found wins."""
+        if class_id is None:
+            class_id = self.class_selector.currentIndex()
         out: dict[str, tuple[Keypoint, int]] = {}
         for it in self.scene.items():
-            if isinstance(it, KeypointItem):
+            if isinstance(it, KeypointItem) and it.kp.class_id == class_id:
                 out[it.kp.name] = (it.kp, getattr(it, "visibility", 2))
         return out
 
@@ -1918,22 +2810,19 @@ class LabelingApp(QMainWindow):
         """Advance index to the first *missing* required name, counting from the start of kp_names."""
         name_to_entry = self._collect_keypoints_by_name()
         count = 0
-        for name in self.kp_names:
+        for name in self._active_kp_names():
             if name in name_to_entry:
                 count += 1
             else:
                 break
-        self.current_kp_idx = min(count, len(self.kp_names))
+        self.current_kp_idx = min(count, len(self._active_kp_names()))
 
     def save_labels(self):
         if not self.images:
             return
 
-        if len(self.bboxes) != 1:
-            QMessageBox.warning(self, "Save Error", "Exactly one bounding box is required per image.")
-            return
-        if self.current_kp_idx != len(self.kp_names):
-            QMessageBox.warning(self, "Save Error", "All keypoints must be placed before saving.")
+        if not self._cache_active_annotation():
+            QMessageBox.warning(self, "Save Error", "Place one bounding box and all keypoints for the selected class before saving.")
             return
 
         base = os.path.splitext(self.images[self.current_idx])[0]
@@ -1951,55 +2840,23 @@ class LabelingApp(QMainWindow):
         annotated_out_path = os.path.join(annotations_dir, f"{base}_annotated.png")
         image_out_path = os.path.join(images_all_dir, self.images[self.current_idx])
 
-        bbox_item = next((it for it in self.scene.items() if isinstance(it, BoxItem)), None)
-        if bbox_item is None:
-            QMessageBox.warning(self, "Save Error", "No bounding box found.")
+        lines = []
+        for class_idx in range(len(self.classes)):
+            entry = self.annotation_cache.get(class_idx)
+            if not entry:
+                continue
+            line = self._annotation_entry_to_line(entry)
+            lines.append(line)
+
+        if not lines:
+            QMessageBox.warning(self, "No annotations", "Nothing to save for this image.")
             return
-        bbox_item.update_model()
-        cid, xc, yc, w, h = bbox_item.bbox.to_yolo(self.img_w, self.img_h)
-        bbox_cid = cid
-
-        # Collect by keypoint name from the scene
-        name_to_entry: dict[str, tuple[Keypoint, int]] = {}
-        for it in self.scene.items():
-            if isinstance(it, KeypointItem):
-                # (Keypoint, visibility). Make sure visibility is an int.
-                it.kp.class_id = bbox_cid
-                name_to_entry[it.kp.name] = (it.kp, int(getattr(it, "visibility", 2)))
-
-        # Verify every required name exists; show which are missing
-        missing = [n for n in self.kp_names if n not in name_to_entry]
-        if missing:
-            # Fill any missing with (0,0, v=0)
-            for n in missing:
-                kp = Keypoint(0.0, 0.0, bbox_cid, n)
-                name_to_entry[n] = (kp, 0)
-
-
-        # Build YOLO line in the **fixed order** defined by self.kp_names
-        line = f"{bbox_cid} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}"
-        for name in self.kp_names:
-            kp, vis = name_to_entry[name]
-            if int(vis) == 0:
-                xn = 0.0
-                yn = 0.0
-            else:
-                xn = kp.x / self.img_w
-                yn = kp.y / self.img_h
-            line += f" {xn:.6f} {yn:.6f} {int(vis)}"
 
         with open(label_out_path, 'w', encoding='utf-8') as f:
-            f.write(line + "\n")
+            f.write("\n".join(lines) + "\n")
         print(f"✅ Saved label to {label_out_path}")
 
-        rect = QRectF(0, 0, self.img_w, self.img_h)
-        pm = QPixmap(int(rect.width()), int(rect.height()))
-        pm.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pm)
-        self.scene.render(painter, target=QRectF(pm.rect()), source=rect)
-        painter.end()
-        pm.save(annotated_out_path)
-        print(f"✅ Saved annotated image to {annotated_out_path}")
+        self._render_overlay_from_cache(annotated_out_path)
 
         src = os.path.join(images_to_label_dir, self.images[self.current_idx])
         if os.path.exists(src):
@@ -2007,6 +2864,9 @@ class LabelingApp(QMainWindow):
             print(f"✅ Copied original image to {image_out_path}")
         else:
             print(f"⚠️ Warning: Original image {src} not found!")
+
+        # Update the labeled frame counter immediately after saving
+        self._update_progress_label()
 
     # ---------- Video ----------
     def export_dataset(self):
@@ -2266,55 +3126,62 @@ class LabelingApp(QMainWindow):
                     QApplication.processEvents()
                     continue
 
-                first = lines[0].split()
-                if len(first) < 5:
-                    warnings.append(f"{fname}: expected at least 5 values, found {len(first)}")
-                    prog.setValue(idx)
-                    QApplication.processEvents()
-                    continue
+                normalized_lines: list[str] = []
+                had_error = False
+                for line_no, raw_line in enumerate(lines, start=1):
+                    parts = raw_line.split()
+                    if len(parts) < 5:
+                        warnings.append(f"{fname}: line {line_no} has <5 values")
+                        had_error = True
+                        continue
+                    try:
+                        cid = int(round(float(parts[0])))
+                        bbox_vals = [float(parts[i]) for i in range(1, 5)]
+                    except Exception as e:
+                        warnings.append(f"{fname}: line {line_no} parse error ({e})")
+                        had_error = True
+                        continue
 
-                try:
-                    cid = int(round(float(first[0])))
-                    bbox_vals = [float(first[i]) for i in range(1, 5)]
-                except Exception as e:
-                    warnings.append(f"{fname}: parse error ({e})")
-                    prog.setValue(idx)
-                    QApplication.processEvents()
-                    continue
-
-                kp_vals_raw = first[5:]
-                normalized_kp: list[tuple[float, float, int]] = []
-
-                for i in range(expected_kp_values // 3):
-                    base_idx = i * 3
-                    if base_idx + 2 < len(kp_vals_raw):
-                        try:
-                            xn = float(kp_vals_raw[base_idx])
-                            yn = float(kp_vals_raw[base_idx + 1])
-                            vis = int(round(float(kp_vals_raw[base_idx + 2])))
-                        except Exception:
+                    kp_vals_raw = parts[5:]
+                    normalized_kp: list[tuple[float, float, int]] = []
+                    for i in range(expected_kp_values // 3):
+                        base_idx = i * 3
+                        if base_idx + 2 < len(kp_vals_raw):
+                            try:
+                                xn = float(kp_vals_raw[base_idx])
+                                yn = float(kp_vals_raw[base_idx + 1])
+                                vis = int(round(float(kp_vals_raw[base_idx + 2])))
+                            except Exception:
+                                xn = 0.0
+                                yn = 0.0
+                                vis = 0
+                        else:
                             xn = 0.0
                             yn = 0.0
                             vis = 0
-                    else:
-                        xn = 0.0
-                        yn = 0.0
-                        vis = 0
-                    vis = max(0, min(2, vis))
-                    normalized_kp.append((xn, yn, vis))
+                        vis = max(0, min(2, vis))
+                        normalized_kp.append((xn, yn, vis))
 
-                line = f"{cid} {bbox_vals[0]:.6f} {bbox_vals[1]:.6f} {bbox_vals[2]:.6f} {bbox_vals[3]:.6f}"
-                for xn, yn, vis in normalized_kp:
-                    line += f" {xn:.6f} {yn:.6f} {vis}"
+                    line_out = f"{cid} {bbox_vals[0]:.6f} {bbox_vals[1]:.6f} {bbox_vals[2]:.6f} {bbox_vals[3]:.6f}"
+                    for xn, yn, vis in normalized_kp:
+                        line_out += f" {xn:.6f} {yn:.6f} {vis}"
+                    normalized_lines.append(line_out)
 
-                original_raw = lines[0]
-                already_single_line = len(lines) == 1
-                line_changed = (not already_single_line) or (line != original_raw)
+                if not normalized_lines:
+                    prog.setValue(idx)
+                    QApplication.processEvents()
+                    continue
+
+                reconstructed = "\n".join(normalized_lines) + "\n"
+                new_line_count = len(normalized_lines)
+                line_changed = had_error or (new_line_count != len(lines)) or any(
+                    nl.strip() != ol for nl, ol in zip(normalized_lines, lines[:new_line_count])
+                ) or (len(lines) != new_line_count)
 
                 if line_changed:
                     try:
                         with open(label_path, "w", encoding="utf-8") as lf:
-                            lf.write(line + "\n")
+                            lf.write(reconstructed)
                     except Exception as e:
                         warnings.append(f"{fname}: write error ({e})")
                         prog.setValue(idx)
@@ -3362,6 +4229,16 @@ class TrainDialog(QDialog):
         self.resize(520, 360)
 
         self.default_dataset = default_dataset
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.project_runs_dir = os.path.join(base_dir, "runs")
+        self.distillations_root = os.path.join(
+            base_dir,
+            "dino_distillation",
+            "DINOv3_Distillation_YOLO-pose",
+            "dino_distillations",
+        )
+        self.dino_exports: list[tuple[str, str]] = []
+        self.dino_manual_path: Optional[str] = None
         self.device = _auto_device()
         self.training_running = False
 
@@ -3380,10 +4257,46 @@ class TrainDialog(QDialog):
         ds_row.addWidget(browse_btn)
         form.addRow("Dataset path:", ds_row)
 
+        # Backbone source selection
+        self.source_combo = QComboBox()
+        self.source_combo.addItems([
+            "Standard YOLO backbone",
+            "DINO distillation export",
+        ])
+        self.source_combo.currentIndexChanged.connect(self._update_source_controls)
+        form.addRow("Backbone source:", self.source_combo)
+
         # Model choice
         self.model_combo = QComboBox()
         self.model_combo.addItems(self.MODEL_OPTIONS.keys())
-        form.addRow("Model size:", self.model_combo)
+        self.model_row = QWidget()
+        model_layout = QHBoxLayout(self.model_row)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.addWidget(self.model_combo)
+        form.addRow("YOLO model:", self.model_row)
+
+        # DINO export selection
+        self.dino_row = QWidget()
+        dino_layout = QVBoxLayout(self.dino_row)
+        dino_layout.setContentsMargins(0, 0, 0, 0)
+        dino_top = QHBoxLayout()
+        self.dino_combo = QComboBox()
+        self.dino_combo.currentIndexChanged.connect(self._on_dino_combo_changed)
+        dino_top.addWidget(self.dino_combo, 1)
+        self.dino_refresh_btn = QPushButton("Refresh")
+        self.dino_refresh_btn.clicked.connect(self._refresh_dino_list)
+        dino_top.addWidget(self.dino_refresh_btn)
+        self.dino_browse_btn = QPushButton("Browse…")
+        self.dino_browse_btn.clicked.connect(self._browse_dino_file)
+        dino_top.addWidget(self.dino_browse_btn)
+        dino_layout.addLayout(dino_top)
+        self.dino_path_edit = QLineEdit()
+        self.dino_path_edit.setReadOnly(True)
+        self.dino_path_edit.setPlaceholderText("No distillation export selected")
+        dino_layout.addWidget(self.dino_path_edit)
+        form.addRow("Distilled export:", self.dino_row)
+        self.dino_row.hide()
+        self._refresh_dino_list()
 
         # Device info
         self.device_label = QLabel(self.device.upper())
@@ -3430,6 +4343,7 @@ class TrainDialog(QDialog):
 
         layout.addWidget(button_box)
 
+        self._update_source_controls()
         self._configure_batch_controls()
 
     def _browse_dataset(self):
@@ -3440,6 +4354,95 @@ class TrainDialog(QDialog):
         )
         if path:
             self.dataset_edit.setText(path)
+
+    def _update_source_controls(self):
+        use_dino = self.source_combo.currentIndex() == 1
+        self.model_row.setVisible(not use_dino)
+        self.dino_row.setVisible(use_dino)
+        if use_dino and not self.dino_exports:
+            self._refresh_dino_list()
+
+    def _refresh_dino_list(self):
+        self.dino_combo.blockSignals(True)
+        self.dino_combo.clear()
+        self.dino_combo.blockSignals(False)
+        exports: list[tuple[str, str]] = []
+        root = getattr(self, "distillations_root", "")
+        if root and os.path.isdir(root):
+            try:
+                for entry in sorted(os.listdir(root)):
+                    run_dir = os.path.join(root, entry)
+                    if not os.path.isdir(run_dir):
+                        continue
+                    exported_dir = os.path.join(run_dir, "exported_models")
+                    candidates: list[str] = []
+                    if os.path.isdir(exported_dir):
+                        preferred = [
+                            os.path.join(exported_dir, "exported_last.pt"),
+                            os.path.join(exported_dir, f"{entry}_last.pt"),
+                        ]
+                        for cand in preferred:
+                            if os.path.isfile(cand):
+                                candidates.append(cand)
+                                break
+                        if not candidates:
+                            for file in sorted(os.listdir(exported_dir)):
+                                if file.endswith(".pt"):
+                                    candidates.append(os.path.join(exported_dir, file))
+                                    break
+                    if not candidates:
+                        continue
+                    exports.append((entry, candidates[0]))
+            except Exception:
+                exports = []
+        self.dino_exports = exports
+        if not exports:
+            self.dino_combo.addItem("No exports found", "")
+            self.dino_combo.setEnabled(False)
+        else:
+            self.dino_combo.setEnabled(True)
+            for label, path in exports:
+                self.dino_combo.addItem(label, path)
+        self.dino_manual_path = None
+        self._on_dino_combo_changed(self.dino_combo.currentIndex())
+
+    def _on_dino_combo_changed(self, index: int):
+        if self.dino_manual_path and index >= 0:
+            # User selected a listed export → clear manual override
+            self.dino_manual_path = None
+        path = self.dino_combo.itemData(index) if index >= 0 else ""
+        if not path:
+            self.dino_path_edit.clear()
+        else:
+            self.dino_path_edit.setText(path)
+
+    def _browse_dino_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select distillation checkpoint (.pt)",
+            self.distillations_root if os.path.isdir(self.distillations_root) else os.getcwd(),
+            "PyTorch weights (*.pt)",
+        )
+        if path:
+            self.dino_manual_path = path
+            self.dino_path_edit.setText(path)
+
+    def _selected_dino_path(self) -> str:
+        if self.dino_manual_path:
+            return self.dino_manual_path
+        idx = self.dino_combo.currentIndex()
+        if idx < 0:
+            return ""
+        data = self.dino_combo.itemData(idx)
+        return data or ""
+
+    def _run_name_from_model(self, model_spec: str, use_dino: bool) -> str:
+        if use_dino or model_spec.lower().endswith((".pt", ".pth", ".yaml", ".yml")):
+            base = os.path.splitext(os.path.basename(model_spec))[0]
+        else:
+            base = os.path.basename(model_spec)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")
+        return safe or "model"
 
     def _configure_batch_controls(self):
         if self.device == 'cuda':
@@ -3514,11 +4517,22 @@ class TrainDialog(QDialog):
             )
             return
 
+        use_dino = self.source_combo.currentIndex() == 1
         model_label = self.model_combo.currentText()
         base_model_cfg = self.MODEL_OPTIONS[model_label]
         epochs = self.epoch_spin.value()
         batch = self.batch_spin.value()
         batch_display = "auto" if batch <= 0 else str(batch)
+        distilled_path = ""
+        if use_dino:
+            distilled_path = self._selected_dino_path()
+            if not distilled_path or not os.path.isfile(distilled_path):
+                QMessageBox.warning(
+                    self,
+                    "Checkpoint required",
+                    "Select a valid DINO distillation export (.pt) before training."
+                )
+                return
 
         if self.device == 'mps' and batch <= 0:
             QMessageBox.warning(
@@ -3530,7 +4544,15 @@ class TrainDialog(QDialog):
             return
 
         task_selection = self.task_combo.currentText()
-        if task_selection.startswith("Auto"):
+        if use_dino:
+            if not task_selection.lower().startswith("pose"):
+                QMessageBox.information(
+                    self,
+                    "Pose task enforced",
+                    "DINO distillation exports are pose heads. Training task set to Pose."
+                )
+            task_value = "pose"
+        elif task_selection.startswith("Auto"):
             inferred_task = self._infer_task_from_yaml(resolved)
             task_value = inferred_task if inferred_task in {"pose", "detect"} else None
         elif task_selection.startswith("Detection"):
@@ -3538,9 +4560,12 @@ class TrainDialog(QDialog):
         else:
             task_value = "pose"
 
-        model_cfg, cfg_notice = self._resolve_model_config(base_model_cfg, task_value)
-        if cfg_notice:
-            self._log(cfg_notice)
+        model_cfg = distilled_path if use_dino else base_model_cfg
+        cfg_notice = None
+        if not use_dino:
+            model_cfg, cfg_notice = self._resolve_model_config(base_model_cfg, task_value)
+            if cfg_notice:
+                self._log(cfg_notice)
 
         try:
             from ultralytics import YOLO
@@ -3549,7 +4574,10 @@ class TrainDialog(QDialog):
                                 f"Could not import ultralytics.YOLO:\n{e}\n\nInstall with:\n  pip install ultralytics")
             return
 
-        self._log(f"Starting training for {model_label} ({model_cfg})")
+        if use_dino:
+            self._log(f"Starting training from DINO export: {model_cfg}")
+        else:
+            self._log(f"Starting training for {model_label} ({model_cfg})")
         self._log(f"- dataset: {resolved}")
         self._log(f"- device: {self.device}")
         self._log(f"- epochs: {epochs}")
@@ -3561,12 +4589,22 @@ class TrainDialog(QDialog):
 
         batch_param = -1 if batch <= 0 else int(batch)
 
+        task_folder = task_value if task_value in ("pose", "detect") else ("pose" if use_dino else "auto")
+        project_dir = os.path.join(self.project_runs_dir, "train", task_folder)
+        try:
+            os.makedirs(project_dir, exist_ok=True)
+        except Exception as e:
+            self._log(f"Warning: could not create runs directory at {project_dir}: {e}")
+        run_name = self._run_name_from_model(model_cfg, use_dino)
+
         params = {
             "data": resolved,
             "epochs": epochs,
             "device": self.device,
             "exist_ok": False,
             "batch": batch_param,
+            "project": project_dir,
+            "name": run_name,
         }
         if task_value:
             params["task"] = task_value
@@ -3642,22 +4680,6 @@ if __name__ == '__main__':
     cls_file = os.path.join(base, 'classes.txt')
     kp_file = os.path.join(base, 'keypoints.txt')
     font_path = os.path.join(base, 'fonts', 'FiraSans-Regular.ttf')
-
-    missing_files = []
-    if not os.path.isfile(cls_file):
-        missing_files.append(("classes.txt", cls_file))
-    if not os.path.isfile(kp_file):
-        missing_files.append(("keypoints.txt", kp_file))
-    if missing_files:
-        splash.close()
-        details = "\n".join(f"- {name}: {path}" for name, path in missing_files)
-        QMessageBox.critical(
-            None,
-            "Project Setup Incomplete",
-            "The label tool needs both classes.txt and keypoints.txt.\n\n"
-            f"Missing file(s):\n{details}\n\nAdd them to the project and restart SqueakPose Studio."
-        )
-        sys.exit(1)
 
     if os.path.exists(font_path):
         font_id = QFontDatabase.addApplicationFont(font_path)

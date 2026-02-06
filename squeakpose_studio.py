@@ -925,9 +925,9 @@ class LabelingApp(QMainWindow):
         return self._kp_index_lookup[name]
 
     def _count_labeled_frames(self) -> tuple[int, int]:
-        total = len(self.images)
+        total = len(self.images_queue)
         labeled = 0
-        for img in self.images:
+        for img in self.images_queue:
             base = os.path.splitext(img)[0]
             label_file = os.path.join(self.label_dir, f"{base}.txt")
             if os.path.exists(label_file):
@@ -938,7 +938,8 @@ class LabelingApp(QMainWindow):
         if not hasattr(self, "progress_label"):
             return
         labeled, total = self._count_labeled_frames()
-        self.progress_label.setText(f"Labeled: {labeled} / {total}")
+        remaining = max(0, total - labeled)
+        self.progress_label.setText(f"Labeled: {labeled} | Remaining: {remaining}")
 
     def _maybe_prompt_class_manager(self):
         if getattr(self, "_prompted_class_manager", False):
@@ -1094,25 +1095,55 @@ class LabelingApp(QMainWindow):
             self.class_selector.setCurrentIndex(new_idx)
 
     def refresh_image_list(self):
-        """Reload the images_to_label directory file list (used after exporting a frame from video)."""
+        """Reload queue/archive file lists (used after exporting a frame from video)."""
+        self._refresh_queue_images()
+        self._refresh_archive_images()
+        if self.nav_filter != 'archive':
+            self.images = self.images_queue[:]
+            if self.current_idx >= len(self.images):
+                self.current_idx = max(0, len(self.images) - 1)
+        else:
+            self.images = self.images_archive[:]
+            if self.current_idx >= len(self.images):
+                self.current_idx = max(0, len(self.images) - 1)
+        self._update_progress_label()
+
+    def _refresh_queue_images(self):
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
         try:
-            self.images = sorted(f for f in os.listdir(self.image_dir) if f.lower().endswith(exts))
+            self.images_queue = sorted(
+                f for f in os.listdir(self.image_dir_queue) if f.lower().endswith(exts)
+            )
         except Exception:
-            pass
-        self._update_progress_label()
+            self.images_queue = []
+
+    def _refresh_archive_images(self):
+        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
+        try:
+            self.images_archive = sorted(
+                f for f in os.listdir(self.image_dir_archive) if f.lower().endswith(exts)
+            )
+        except Exception:
+            self.images_archive = []
     def __init__(self, image_dir: str, label_dir: str, class_file: str, keypoint_file: str):
         super().__init__()
-        self.image_dir = image_dir
+        self.image_dir_queue = image_dir
+        self.image_dir_archive = os.path.join(os.path.dirname(image_dir), "images_all")
         self.label_dir = label_dir
         os.makedirs(self.label_dir, exist_ok=True)
+        os.makedirs(self.image_dir_archive, exist_ok=True)
         self.class_file = class_file
         self.keypoint_file = keypoint_file
         self.base_dir = os.path.dirname(__file__)
 
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-        self.images = sorted(f for f in os.listdir(self.image_dir) if f.lower().endswith(exts))
+        self.images_queue = sorted(f for f in os.listdir(self.image_dir_queue) if f.lower().endswith(exts))
+        self.images_archive = sorted(f for f in os.listdir(self.image_dir_archive) if f.lower().endswith(exts))
+        self.images = self.images_queue[:]
+        self.active_image_dir = self.image_dir_queue
         self.current_idx = 0
+        self._queue_current_idx = 0
+        self._archive_current_idx = 0
 
         # Ensure classes.txt and keypoints.txt exist (never prompt, always silent)
         self.classes, self.kp_names, self._created_label_files = self._ensure_label_files(class_file, keypoint_file)
@@ -1132,7 +1163,7 @@ class LabelingApp(QMainWindow):
         self._item_refs: list[QGraphicsItem] = []
         self.predict_model_path: Optional[str] = None
         self.predict_model: Optional[YOLO] = None
-        self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled'
+        self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled' | 'archive'
 
         # keypoint display (screen-space)
         self.kp_pixel_radius = 4
@@ -1216,7 +1247,7 @@ class LabelingApp(QMainWindow):
 
         # Browse filter selector
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All", "Labeled", "Unlabeled"])
+        self.filter_combo.addItems(["All", "Labeled", "Unlabeled", "Archive"])
         self.filter_combo.setToolTip("Which images to browse with Prev/Next")
         self.filter_combo.currentTextChanged.connect(lambda t: self._set_nav_filter(t.lower()))
         top_layout.addWidget(QLabel("Browse:"))
@@ -1311,7 +1342,7 @@ class LabelingApp(QMainWindow):
 
         # reflect initial nav filter in the dropdown
         try:
-            mapping = {"all": 0, "labeled": 1, "unlabeled": 2}
+            mapping = {"all": 0, "labeled": 1, "unlabeled": 2, "archive": 3}
             self.filter_combo.setCurrentIndex(mapping.get(self.nav_filter, 0))
         except Exception:
             pass
@@ -1620,11 +1651,13 @@ class LabelingApp(QMainWindow):
 
     def _find_next_unlabeled(self, start_from: int) -> int:
         """Return index of next frame without a label file. If none, returns current index."""
-        total = len(self.images)
+        total = len(self.images_queue)
         idx = start_from
+        if total == 0:
+            return 0
         for _ in range(total):
             idx = (idx + 1) % total
-            base = os.path.splitext(self.images[idx])[0]
+            base = os.path.splitext(self.images_queue[idx])[0]
             label_file = os.path.join(self.label_dir, f"{base}.txt")
             if not os.path.exists(label_file):
                 return idx
@@ -1639,6 +1672,8 @@ class LabelingApp(QMainWindow):
     def _filtered_indices(self) -> list[int]:
         if not self.images:
             return []
+        if self.nav_filter == 'archive':
+            return list(range(len(self.images)))
         if self.nav_filter == 'all':
             return list(range(len(self.images)))
         elif self.nav_filter == 'labeled':
@@ -1647,15 +1682,43 @@ class LabelingApp(QMainWindow):
             return [i for i in range(len(self.images)) if not self._is_labeled_index(i)]
 
     def _set_nav_filter(self, mode: str):
-        if mode not in ('all', 'labeled', 'unlabeled'):
+        if mode not in ('all', 'labeled', 'unlabeled', 'archive'):
             return
+        if mode == 'archive':
+            if self.nav_filter != 'archive':
+                self._queue_current_idx = self.current_idx
+            self.nav_filter = 'archive'
+            self.images = self.images_archive[:]
+            self.active_image_dir = self.image_dir_archive
+            if not self.images:
+                self.update_status_bar("No archived images available.")
+                return
+            self.current_idx = min(self._archive_current_idx, len(self.images) - 1)
+            self._archive_current_idx = self.current_idx
+            self.update_status_bar(f"Browsing: archive ({self.current_idx + 1}/{len(self.images)})")
+            self.load_image()
+            return
+
+        # switching back to queue-based views
+        if self.nav_filter == 'archive':
+            self._archive_current_idx = self.current_idx
         self.nav_filter = mode
+        self.images = self.images_queue[:]
+        self.active_image_dir = self.image_dir_queue
+        if not self.images:
+            self.update_status_bar("No images available in the current batch.")
+            return
+        if self._queue_current_idx >= len(self.images):
+            self._queue_current_idx = max(0, len(self.images) - 1)
+        self.current_idx = self._queue_current_idx
+
         fi = self._filtered_indices()
         if not fi:
             self.update_status_bar(f"No images match filter: {mode}.")
             return
         if self.current_idx not in fi:
             self.current_idx = fi[0]
+        self._queue_current_idx = self.current_idx
         self.update_status_bar(f"Browsing: {mode} ({fi.index(self.current_idx)+1}/{len(fi)})")
         self.load_image()
 
@@ -1671,6 +1734,10 @@ class LabelingApp(QMainWindow):
             self.current_idx = fi[(pos - 1) % len(fi)]
         self.mode = 'bbox'
         self.load_image()
+        if self.nav_filter == 'archive':
+            self._archive_current_idx = self.current_idx
+        else:
+            self._queue_current_idx = self.current_idx
 
     def next_index(self):
         fi = self._filtered_indices()
@@ -1684,8 +1751,16 @@ class LabelingApp(QMainWindow):
             self.current_idx = fi[(pos + 1) % len(fi)]
         self.mode = 'bbox'
         self.load_image()
+        if self.nav_filter == 'archive':
+            self._archive_current_idx = self.current_idx
+        else:
+            self._queue_current_idx = self.current_idx
 
     def complete_and_next_unlabeled(self):
+        if self.nav_filter == 'archive':
+            QMessageBox.information(self, "Archive View",
+                                    "Switch to All/Labeled/Unlabeled to continue queue labeling.")
+            return
         if not self._is_fully_labeled():
             QMessageBox.information(self, "Incomplete",
                                     "Place one bounding box and all keypoints to complete this frame.")
@@ -1696,15 +1771,21 @@ class LabelingApp(QMainWindow):
             popup = CongratsPopup(); popup.exec()
             return
         self.current_idx = next_idx
+        self._queue_current_idx = self.current_idx
         self.mode = 'bbox'
         self.load_image()
 
     def skip_to_next_unlabeled(self):
+        if self.nav_filter == 'archive':
+            QMessageBox.information(self, "Archive View",
+                                    "Switch to All/Labeled/Unlabeled to skip within the queue.")
+            return
         next_idx = self._find_next_unlabeled(self.current_idx)
         if next_idx == self.current_idx:
             popup = CongratsPopup(); popup.exec()
             return
         self.current_idx = next_idx
+        self._queue_current_idx = self.current_idx
         self.mode = 'bbox'
         self.load_image()
 
@@ -2131,7 +2212,7 @@ class LabelingApp(QMainWindow):
     def run_prediction_on_current_image(self):
         if not self.predict_model or not self.images:
             return
-        img_path = os.path.join(self.image_dir, self.images[self.current_idx])
+        img_path = os.path.join(self.active_image_dir, self.images[self.current_idx])
 
         if self._predict_busy:
             self.update_status_bar("Prediction already running...")
@@ -2180,53 +2261,74 @@ class LabelingApp(QMainWindow):
             if hasattr(self, 'predict_btn'):
                 self.predict_btn.setEnabled(True)
 
-            idx = 0
-            target_cid = self.class_selector.currentIndex()
+            active_cid = self.class_selector.currentIndex()
+            best_by_class: dict[int, int] = {}
+            xyxy_list: list[list[float]] = []
+            conf_list: list[float] = []
+            cls_list: list[int] = []
             if results.boxes is not None and len(results.boxes) > 0:
-                if hasattr(results.boxes, 'conf') and results.boxes.conf is not None:
-                    import torch
-                    try:
-                        idx = int(results.boxes.conf.argmax().item())
-                    except Exception:
-                        idx = 0
-                if len(results.boxes) > 1:
-                    self.update_status_bar(f"Prediction returned {len(results.boxes)} detections; using the top-confidence one.")
+                xyxy_list = results.boxes.xyxy.cpu().tolist()
+                conf_list = (
+                    results.boxes.conf.cpu().tolist()
+                    if getattr(results.boxes, "conf", None) is not None
+                    else [0.0] * len(xyxy_list)
+                )
+                cls_source = (
+                    results.boxes.cls.cpu().tolist()
+                    if getattr(results.boxes, "cls", None) is not None
+                    else [active_cid] * len(xyxy_list)
+                )
+                cls_list = [int(c) for c in cls_source]
+                for det_idx, (xyxy, conf, cid) in enumerate(zip(xyxy_list, conf_list, cls_list)):
+                    if cid < 0 or cid >= len(self.classes):
+                        continue
+                    prev_idx = best_by_class.get(cid)
+                    if prev_idx is None or conf >= conf_list[prev_idx]:
+                        best_by_class[cid] = det_idx
+                if not best_by_class and xyxy_list:
+                    # fallback: use highest confidence detection for current class
+                    best_idx = max(range(len(xyxy_list)), key=lambda i: conf_list[i])
+                    best_by_class[active_cid] = best_idx
+            else:
+                self.update_status_bar("Prediction returned no detections.")
 
-                xyxy = results.boxes.xyxy.cpu().tolist()[idx]
-                cls = int(results.boxes.cls.cpu().tolist()[idx]) if results.boxes.cls is not None else target_cid
-                if 0 <= cls < len(self.classes):
-                    target_cid = cls
+            kp_data = None
+            if hasattr(results, "keypoints") and results.keypoints is not None:
+                kp_data = results.keypoints.data.cpu().numpy().tolist()
+
+            for cid, det_idx in best_by_class.items():
+                xyxy = xyxy_list[det_idx]
                 x1, y1, x2, y2 = xyxy
                 w, h = x2 - x1, y2 - y1
-                bb = BoundingBox(x1, y1, w, h, target_cid)
-                self._clear_class_items(target_cid, drop_cache=True)
-                if target_cid != self.class_selector.currentIndex():
-                    self.class_selector.setCurrentIndex(target_cid)
-                item = BoxItem(bb, self.classes[target_cid] if target_cid < len(self.classes) else str(target_cid))
+                bb = BoundingBox(x1, y1, w, h, cid)
+                self._clear_class_items(cid, drop_cache=True)
+                item = BoxItem(bb, self.classes[cid] if cid < len(self.classes) else str(cid))
                 self.scene.addItem(item)
                 self._track_scene_item(item)
-                self.bboxes = [bb]
-                self.kps.clear()
 
-            # Apply keypoints for the chosen instance (index matches `idx` above)
-            if hasattr(results, 'keypoints') and results.keypoints is not None:
-                kps_list = results.keypoints.data.cpu().numpy().tolist()
-                if kps_list:
-                    use_idx = min(idx, len(kps_list) - 1)
-                    inst = kps_list[use_idx]
-                    kp_names = self._kp_names_for_index(target_cid)
+                kp_objs: list[Keypoint] = []
+                class_kp_names = self._kp_names_for_index(cid)
+                if kp_data and det_idx < len(kp_data):
+                    inst = kp_data[det_idx]
                     for idx_pt, (x, y, vis) in enumerate(inst):
-                        name = kp_names[idx_pt] if idx_pt < len(kp_names) else f"kp{idx_pt}"
-                        kp_obj = Keypoint(x, y, target_cid, name)
+                        if idx_pt >= len(self.kp_names):
+                            break
+                        canonical_name = self.kp_names[idx_pt]
+                        if canonical_name not in class_kp_names:
+                            continue
+                        kp_obj = Keypoint(x, y, cid, canonical_name)
                         kp_item = KeypointItem(kp_obj, self.kp_pixel_radius, self.kp_font_px)
                         kp_item.visibility = int(vis) if vis in (0, 1, 2) else (2 if vis > 0 else 1)
                         kp_item.update_appearance()
                         self.scene.addItem(kp_item)
                         self._track_scene_item(kp_item)
-                        self.kps.append(kp_obj)
-                    self.current_kp_idx = min(len(kp_names), len(self.kps))
+                        kp_objs.append(kp_obj)
+                if cid == active_cid:
+                    self.bboxes = [bb]
+                    self.kps = kp_objs[:]
+                    self.current_kp_idx = min(len(class_kp_names), len(self.kps))
+                self._cache_active_annotation(cid)
 
-            self._cache_active_annotation()
             self._update_item_editability()
             self._maybe_autoadvance()
             self._update_status()
@@ -2574,7 +2676,7 @@ class LabelingApp(QMainWindow):
         if not self.images:
             return
 
-        img_path = os.path.join(self.image_dir, self.images[self.current_idx])
+        img_path = os.path.join(self.active_image_dir, self.images[self.current_idx])
         pix = QPixmap(img_path)
         if pix.isNull():
             self.update_status_bar(f"Failed to load image: {self.images[self.current_idx]}")
@@ -2828,7 +2930,7 @@ class LabelingApp(QMainWindow):
         base = os.path.splitext(self.images[self.current_idx])[0]
 
         project_root = os.path.dirname(self.label_dir)
-        images_to_label_dir = self.image_dir
+        images_to_label_dir = self.active_image_dir
         images_all_dir = os.path.join(project_root, "images_all")
         labels_all_dir = os.path.join(project_root, "labels_all")
         annotations_dir = os.path.join(project_root, "annotations")
@@ -2860,13 +2962,24 @@ class LabelingApp(QMainWindow):
 
         src = os.path.join(images_to_label_dir, self.images[self.current_idx])
         if os.path.exists(src):
-            shutil.copy2(src, image_out_path)
-            print(f"✅ Copied original image to {image_out_path}")
+            try:
+                if os.path.abspath(src) != os.path.abspath(image_out_path):
+                    shutil.copy2(src, image_out_path)
+                    print(f"✅ Copied original image to {image_out_path}")
+                else:
+                    print(f"ℹ️ Image already stored at {image_out_path}")
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to copy image {src}: {e}")
         else:
             print(f"⚠️ Warning: Original image {src} not found!")
 
         # Update the labeled frame counter immediately after saving
         self._update_progress_label()
+        self._refresh_archive_images()
+        if self.nav_filter == 'archive':
+            self.images = self.images_archive[:]
+            if self.current_idx >= len(self.images):
+                self.current_idx = max(0, len(self.images) - 1)
 
     # ---------- Video ----------
     def export_dataset(self):
@@ -3079,7 +3192,7 @@ class LabelingApp(QMainWindow):
         base = os.path.dirname(__file__)
         labels_dir = self.label_dir
         images_all_dir = os.path.join(base, "images_all")
-        images_to_label_dir = self.image_dir
+        images_to_label_dir = self.image_dir_queue
 
         label_files = [f for f in os.listdir(labels_dir) if f.lower().endswith(".txt")]
         if not label_files:
@@ -3268,7 +3381,7 @@ class VideoReviewDialog(QDialog):
     """
     def __init__(self, parent, model, device: str, kp_names: list[str], classes: list[str]):
         super().__init__(parent)
-        self.setWindowTitle("Video Review (beta)")
+        self.setWindowTitle("Video Review")
         self.resize(980, 700)
 
         self.model = model            # may be None until user loads
@@ -4239,6 +4352,8 @@ class TrainDialog(QDialog):
         )
         self.dino_exports: list[tuple[str, str]] = []
         self.dino_manual_path: Optional[str] = None
+        self.resume_exports: list[tuple[str, str]] = []
+        self.resume_manual_path: Optional[str] = None
         self.device = _auto_device()
         self.training_running = False
 
@@ -4262,6 +4377,7 @@ class TrainDialog(QDialog):
         self.source_combo.addItems([
             "Standard YOLO backbone",
             "DINO distillation export",
+            "Resume previous YOLO run",
         ])
         self.source_combo.currentIndexChanged.connect(self._update_source_controls)
         form.addRow("Backbone source:", self.source_combo)
@@ -4297,6 +4413,29 @@ class TrainDialog(QDialog):
         form.addRow("Distilled export:", self.dino_row)
         self.dino_row.hide()
         self._refresh_dino_list()
+
+        # Resume YOLO selection
+        self.resume_row = QWidget()
+        resume_layout = QVBoxLayout(self.resume_row)
+        resume_layout.setContentsMargins(0, 0, 0, 0)
+        resume_top = QHBoxLayout()
+        self.resume_combo = QComboBox()
+        self.resume_combo.currentIndexChanged.connect(self._on_resume_combo_changed)
+        resume_top.addWidget(self.resume_combo, 1)
+        self.resume_refresh_btn = QPushButton("Refresh")
+        self.resume_refresh_btn.clicked.connect(self._refresh_resume_list)
+        resume_top.addWidget(self.resume_refresh_btn)
+        self.resume_browse_btn = QPushButton("Browse…")
+        self.resume_browse_btn.clicked.connect(self._browse_resume_file)
+        resume_top.addWidget(self.resume_browse_btn)
+        resume_layout.addLayout(resume_top)
+        self.resume_path_edit = QLineEdit()
+        self.resume_path_edit.setReadOnly(True)
+        self.resume_path_edit.setPlaceholderText("No previous run selected")
+        resume_layout.addWidget(self.resume_path_edit)
+        form.addRow("Resume checkpoint:", self.resume_row)
+        self.resume_row.hide()
+        self._refresh_resume_list()
 
         # Device info
         self.device_label = QLabel(self.device.upper())
@@ -4356,11 +4495,16 @@ class TrainDialog(QDialog):
             self.dataset_edit.setText(path)
 
     def _update_source_controls(self):
-        use_dino = self.source_combo.currentIndex() == 1
-        self.model_row.setVisible(not use_dino)
+        idx = self.source_combo.currentIndex()
+        use_dino = idx == 1
+        use_resume = idx == 2
+        self.model_row.setVisible(idx == 0)
         self.dino_row.setVisible(use_dino)
+        self.resume_row.setVisible(use_resume)
         if use_dino and not self.dino_exports:
             self._refresh_dino_list()
+        if use_resume and not self.resume_exports:
+            self._refresh_resume_list()
 
     def _refresh_dino_list(self):
         self.dino_combo.blockSignals(True)
@@ -4434,6 +4578,66 @@ class TrainDialog(QDialog):
         if idx < 0:
             return ""
         data = self.dino_combo.itemData(idx)
+        return data or ""
+
+    def _refresh_resume_list(self):
+        self.resume_combo.blockSignals(True)
+        self.resume_combo.clear()
+        self.resume_combo.blockSignals(False)
+        exports: list[tuple[str, str]] = []
+        runs_root = getattr(self, "project_runs_dir", "")
+        if runs_root and os.path.isdir(runs_root):
+            try:
+                for dirpath, _, filenames in os.walk(runs_root):
+                    if "weights" not in dirpath:
+                        continue
+                    for name in ["best.pt", "last.pt"]:
+                        candidate = os.path.join(dirpath, name)
+                        if os.path.isfile(candidate):
+                            label = os.path.relpath(candidate, runs_root)
+                            exports.append((label, candidate))
+                exports.sort(key=lambda pair: os.path.getmtime(pair[1]))
+            except Exception:
+                exports = []
+        self.resume_exports = exports
+        if not exports:
+            self.resume_combo.addItem("No checkpoints found", "")
+            self.resume_combo.setEnabled(False)
+        else:
+            self.resume_combo.setEnabled(True)
+            for label, path in exports:
+                self.resume_combo.addItem(label, path)
+        self.resume_manual_path = None
+        self._on_resume_combo_changed(self.resume_combo.currentIndex())
+
+    def _on_resume_combo_changed(self, index: int):
+        if self.resume_manual_path and index >= 0:
+            self.resume_manual_path = None
+        path = self.resume_combo.itemData(index) if index >= 0 else ""
+        if not path:
+            self.resume_path_edit.clear()
+        else:
+            self.resume_path_edit.setText(path)
+
+    def _browse_resume_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO checkpoint (.pt)",
+            self.project_runs_dir if os.path.isdir(self.project_runs_dir) else os.getcwd(),
+            "PyTorch weights (*.pt)",
+        )
+        if path:
+            self.resume_manual_path = path
+            self.resume_path_edit.setText(path)
+            self.resume_combo.setCurrentIndex(-1)
+
+    def _selected_resume_path(self) -> str:
+        if self.resume_manual_path:
+            return self.resume_manual_path
+        idx = self.resume_combo.currentIndex()
+        if idx < 0:
+            return ""
+        data = self.resume_combo.itemData(idx)
         return data or ""
 
     def _run_name_from_model(self, model_spec: str, use_dino: bool) -> str:
@@ -4517,13 +4721,16 @@ class TrainDialog(QDialog):
             )
             return
 
-        use_dino = self.source_combo.currentIndex() == 1
+        source_idx = self.source_combo.currentIndex()
+        use_dino = source_idx == 1
+        use_resume = source_idx == 2
         model_label = self.model_combo.currentText()
         base_model_cfg = self.MODEL_OPTIONS[model_label]
         epochs = self.epoch_spin.value()
         batch = self.batch_spin.value()
         batch_display = "auto" if batch <= 0 else str(batch)
         distilled_path = ""
+        resume_path = ""
         if use_dino:
             distilled_path = self._selected_dino_path()
             if not distilled_path or not os.path.isfile(distilled_path):
@@ -4531,6 +4738,15 @@ class TrainDialog(QDialog):
                     self,
                     "Checkpoint required",
                     "Select a valid DINO distillation export (.pt) before training."
+                )
+                return
+        elif use_resume:
+            resume_path = self._selected_resume_path()
+            if not resume_path or not os.path.isfile(resume_path):
+                QMessageBox.warning(
+                    self,
+                    "Checkpoint required",
+                    "Select a valid YOLO checkpoint (.pt) before resuming."
                 )
                 return
 
@@ -4560,9 +4776,9 @@ class TrainDialog(QDialog):
         else:
             task_value = "pose"
 
-        model_cfg = distilled_path if use_dino else base_model_cfg
+        model_cfg = distilled_path if use_dino else (resume_path if use_resume else base_model_cfg)
         cfg_notice = None
-        if not use_dino:
+        if not (use_dino or use_resume):
             model_cfg, cfg_notice = self._resolve_model_config(base_model_cfg, task_value)
             if cfg_notice:
                 self._log(cfg_notice)
@@ -4576,6 +4792,8 @@ class TrainDialog(QDialog):
 
         if use_dino:
             self._log(f"Starting training from DINO export: {model_cfg}")
+        elif use_resume:
+            self._log(f"Resuming training from checkpoint: {model_cfg}")
         else:
             self._log(f"Starting training for {model_label} ({model_cfg})")
         self._log(f"- dataset: {resolved}")
@@ -4595,7 +4813,7 @@ class TrainDialog(QDialog):
             os.makedirs(project_dir, exist_ok=True)
         except Exception as e:
             self._log(f"Warning: could not create runs directory at {project_dir}: {e}")
-        run_name = self._run_name_from_model(model_cfg, use_dino)
+        run_name = self._run_name_from_model(model_cfg, use_dino or use_resume)
 
         params = {
             "data": resolved,

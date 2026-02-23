@@ -21,6 +21,42 @@ from PyQt6.QtCore import (
     Qt, QRectF, QPointF, QTimer, QPoint, QProcess
 )
 
+DEFAULT_CLASS_NAMES = ["mouse"]
+DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
+
+
+def _ensure_qt_plugin_paths() -> None:
+    """Populate Qt plugin env vars when they are unset/empty.
+
+    Some launcher environments (including certain `uv run` + conda combos) can
+    leave Qt plugin paths blank, which yields:
+      "Could not find the Qt platform plugin 'cocoa' in ''"
+    """
+    plugin_root = ""
+    try:
+        plugin_root = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath) or ""
+    except Exception:
+        plugin_root = ""
+
+    if not plugin_root:
+        try:
+            import PyQt6  # local fallback resolution
+            candidate = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "plugins")
+            if os.path.isdir(candidate):
+                plugin_root = candidate
+        except Exception:
+            plugin_root = ""
+
+    if not plugin_root:
+        return
+
+    if not os.environ.get("QT_PLUGIN_PATH"):
+        os.environ["QT_PLUGIN_PATH"] = plugin_root
+
+    platform_dir = os.path.join(plugin_root, "platforms")
+    if os.path.isdir(platform_dir) and not os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = platform_dir
+
 # --- cross-platform UI font helper ---
 def _ui_font(px: int) -> QFont:
     f = QFont()
@@ -807,7 +843,7 @@ class LabelingApp(QMainWindow):
         """
         Ensure class and keypoint name files exist WITHOUT any UI prompts.
         - If either path is empty, place files next to the labels directory.
-        - If a file is missing, create an empty file so the user can fill it.
+        - If files are missing/empty, backfill sensible defaults.
         - Returns (classes, kp_names, created_flag).
         """
         created_any = False
@@ -854,7 +890,7 @@ class LabelingApp(QMainWindow):
             if _touch(keypoint_file):
                 created_any = True
 
-        # Read them (if empty, backfill defaults)
+        # Read current values.
         def _read_nonempty_lines(path: str) -> list[str]:
             try:
                 lines = [l.strip() for l in open(path, "r", encoding="utf-8") if l.strip()]
@@ -866,6 +902,16 @@ class LabelingApp(QMainWindow):
 
         classes = _read_nonempty_lines(class_file)
         kp_names = _read_nonempty_lines(keypoint_file)
+
+        # Backfill defaults so the app is always usable even if initial setup is skipped.
+        if not classes:
+            classes = DEFAULT_CLASS_NAMES[:]
+            _write_lines(class_file, classes)
+            created_any = True
+        if not kp_names:
+            kp_names = DEFAULT_KEYPOINT_NAMES[:]
+            _write_lines(keypoint_file, kp_names)
+            created_any = True
 
         return classes, kp_names, created_any
 
@@ -1128,6 +1174,8 @@ class LabelingApp(QMainWindow):
     def __init__(self, image_dir: str, label_dir: str, class_file: str, keypoint_file: str):
         super().__init__()
         self.image_dir_queue = image_dir
+        # Backward-compatible alias used by some dialogs/tools.
+        self.image_dir = self.image_dir_queue
         self.image_dir_archive = os.path.join(os.path.dirname(image_dir), "images_all")
         self.label_dir = label_dir
         os.makedirs(self.label_dir, exist_ok=True)
@@ -2708,7 +2756,13 @@ class LabelingApp(QMainWindow):
         self.view.centerOn(scene_center)
 
     def add_bbox(self, rect: QRectF):
+        if not self.classes:
+            QMessageBox.warning(self, "No classes", "Define at least one class before adding boxes.")
+            return
         cid = self.class_selector.currentIndex()
+        if cid < 0 or cid >= len(self.classes):
+            QMessageBox.warning(self, "Invalid class", "Select a valid class before adding boxes.")
+            return
         class_name = self.classes[cid]
         self._clear_class_items(cid, drop_cache=True)
         bbox = BoundingBox(rect.x(), rect.y(), rect.width(), rect.height(), cid)
@@ -2984,9 +3038,9 @@ class LabelingApp(QMainWindow):
     # ---------- Video ----------
     def export_dataset(self):
         """Split images_all/labels_all into train/val sets and regenerate dataset.yaml."""
-        base = os.path.dirname(__file__)
-        images_all_dir = os.path.join(base, "images_all")
-        labels_all_dir = os.path.join(base, "labels_all")
+        project_root = os.path.dirname(self.label_dir) if self.label_dir else self.base_dir
+        images_all_dir = self.image_dir_archive
+        labels_all_dir = self.label_dir
 
         if not os.path.isdir(images_all_dir):
             QMessageBox.information(self, "No images_all directory",
@@ -3027,9 +3081,7 @@ class LabelingApp(QMainWindow):
         if not ok_choice:
             return
         pose_mode = dataset_choice.startswith("Pose")
-
-
-        base_datasets_dir = os.path.join(base, "datasets", "pose" if pose_mode else "detect")
+        base_datasets_dir = os.path.join(project_root, "datasets", "pose" if pose_mode else "detect")
         os.makedirs(base_datasets_dir, exist_ok=True)
 
         images_train_dir = os.path.join(base_datasets_dir, "images", "train")
@@ -3189,9 +3241,8 @@ class LabelingApp(QMainWindow):
         self.update_status_bar("Dataset export complete.")
 
     def normalize_labels_all(self):
-        base = os.path.dirname(__file__)
         labels_dir = self.label_dir
-        images_all_dir = os.path.join(base, "images_all")
+        images_all_dir = self.image_dir_archive
         images_to_label_dir = self.image_dir_queue
 
         label_files = [f for f in os.listdir(labels_dir) if f.lower().endswith(".txt")]
@@ -3539,87 +3590,21 @@ class VideoReviewDialog(QDialog):
         self._zoom_out_sc.activated.connect(lambda: self.view.scale(1/1.05, 1/1.05))
         self._zoom_reset_sc = QShortcut(QKeySequence("R"), self)
         self._zoom_reset_sc.activated.connect(self.view.reset_view)
-    def _export_high_confidence_frames(self):
-        """Export the top-N highest-confidence predicted frames to the labeler's images_to_label folder.
-        Skips any frames that are already present on disk (dedupe across restarts)."""
-        # Preconditions
-        if not self.preds:
-            QMessageBox.information(self, "No predictions", "Run prediction first, then try again.")
-            return
-        if self.cap is None or not self.path:
-            QMessageBox.information(self, "No video", "Load a video first.")
-            return
 
-        # Ask for N
-        N, ok = QInputDialog.getInt(self, "Send Highest Confidence", "How many frames?", 25, 1, 100000, 1)
-        if not ok:
-            return
-
-        # Destination
+    def _labeler_image_dir(self) -> Optional[str]:
+        """Return the parent labeler's queue folder for exported frames."""
         parent = self.parent()
-        dest_dir = getattr(parent, "image_dir", None)
-        if not dest_dir:
-            QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label folder.")
-            return
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-        except Exception as e:
-            QMessageBox.warning(self, "Export Error", f"Could not create destination folder:\n{e}")
-            return
+        if parent is None:
+            return None
+        queue_dir = getattr(parent, "image_dir_queue", None)
+        if queue_dir:
+            return queue_dir
+        # Backward compatibility with older attribute naming.
+        legacy_dir = getattr(parent, "image_dir", None)
+        if legacy_dir:
+            return legacy_dir
+        return None
 
-        # Sort by confidence DESC
-        items = sorted(
-            [(idx, float(p.get("conf", 0.0))) for idx, p in self.preds.items() if p.get("ok")],
-            key=lambda t: t[1],
-            reverse=True
-        )
-
-        exported = 0
-        skipped = 0
-        errors = 0
-
-        for frame_idx, _ in items:
-            if exported >= N:
-                break
-
-            out_name = f"{self.base}_f{frame_idx:06d}.png"
-            out_path = os.path.join(dest_dir, out_name)
-
-            # Dedupe across restarts by checking file existence
-            if os.path.exists(out_path):
-                skipped += 1
-                continue
-
-            # Seek and write this frame
-            try:
-                self.cap.set(_cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-                ok, frame = self.cap.read()
-                if not ok or frame is None:
-                    errors += 1
-                    continue
-                # Write BGR frame as PNG
-                if not _cv2.imwrite(out_path, frame):
-                    errors += 1
-                    continue
-                exported += 1
-            except Exception:
-                errors += 1
-                continue
-
-        # Let the labeler refresh its list if available
-        try:
-            if hasattr(parent, "refresh_image_list"):
-                parent.refresh_image_list()
-        except Exception:
-            pass
-
-        QMessageBox.information(
-            self,
-            "Export Complete",
-            f"Exported {exported} frame(s) to images_to_label.\n"
-            f"Skipped {skipped} (already existed).\n"
-            f"Errors: {errors}."
-        )
     # ---------- caching ----------
     def _cache_path(self) -> Optional[str]:
         if not self.path:
@@ -3930,7 +3915,7 @@ class VideoReviewDialog(QDialog):
         """Export the *currently displayed* frame into the labeler's images_to_label folder.
         Skips if this frame index has already been exported (dedupe across restarts)."""
         parent = self.parent()
-        dest_dir = getattr(parent, "image_dir", None)
+        dest_dir = self._labeler_image_dir()
         if not dest_dir:
             QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
             return
@@ -3979,7 +3964,7 @@ class VideoReviewDialog(QDialog):
             QMessageBox.information(self, "No video", "Load a video first.")
             return
         parent = self.parent()
-        dest_dir = getattr(parent, "image_dir", None)
+        dest_dir = self._labeler_image_dir()
         if not dest_dir:
             QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
             return
@@ -4089,8 +4074,7 @@ class VideoReviewDialog(QDialog):
     def _existing_export_indices(self) -> set[int]:
         """Scan the labeler's images_to_label folder for frames already exported for this video."""
         out: set[int] = set()
-        parent = self.parent()
-        dest_dir = getattr(parent, "image_dir", None)
+        dest_dir = self._labeler_image_dir()
         if not dest_dir or not os.path.isdir(dest_dir):
             return out
         try:
@@ -4164,7 +4148,7 @@ class VideoReviewDialog(QDialog):
         selected = pending[:min(n, len(pending))]
 
         parent = self.parent()
-        dest_dir = getattr(parent, "image_dir", None)
+        dest_dir = self._labeler_image_dir()
         if not dest_dir:
             QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
             return
@@ -4377,7 +4361,8 @@ class TrainDialog(QDialog):
         self.source_combo.addItems([
             "Standard YOLO backbone",
             "DINO distillation export",
-            "Resume previous YOLO run",
+            "Continue from YOLO checkpoint",
+            "Resume YOLO run (exact)",
         ])
         self.source_combo.currentIndexChanged.connect(self._update_source_controls)
         form.addRow("Backbone source:", self.source_combo)
@@ -4433,7 +4418,7 @@ class TrainDialog(QDialog):
         self.resume_path_edit.setReadOnly(True)
         self.resume_path_edit.setPlaceholderText("No previous run selected")
         resume_layout.addWidget(self.resume_path_edit)
-        form.addRow("Resume checkpoint:", self.resume_row)
+        form.addRow("Checkpoint:", self.resume_row)
         self.resume_row.hide()
         self._refresh_resume_list()
 
@@ -4497,10 +4482,16 @@ class TrainDialog(QDialog):
     def _update_source_controls(self):
         idx = self.source_combo.currentIndex()
         use_dino = idx == 1
-        use_resume = idx == 2
+        use_checkpoint_continue = idx == 2
+        use_exact_resume = idx == 3
+        use_resume = use_checkpoint_continue or use_exact_resume
         self.model_row.setVisible(idx == 0)
         self.dino_row.setVisible(use_dino)
         self.resume_row.setVisible(use_resume)
+        if use_exact_resume:
+            self.resume_path_edit.setPlaceholderText("Select weights/last.pt from a prior run")
+        else:
+            self.resume_path_edit.setPlaceholderText("No previous run selected")
         if use_dino and not self.dino_exports:
             self._refresh_dino_list()
         if use_resume and not self.resume_exports:
@@ -4588,15 +4579,15 @@ class TrainDialog(QDialog):
         runs_root = getattr(self, "project_runs_dir", "")
         if runs_root and os.path.isdir(runs_root):
             try:
-                for dirpath, _, filenames in os.walk(runs_root):
+                for dirpath, _, _ in os.walk(runs_root):
                     if "weights" not in dirpath:
                         continue
-                    for name in ["best.pt", "last.pt"]:
+                    for name in ("last.pt", "best.pt"):
                         candidate = os.path.join(dirpath, name)
                         if os.path.isfile(candidate):
                             label = os.path.relpath(candidate, runs_root)
                             exports.append((label, candidate))
-                exports.sort(key=lambda pair: os.path.getmtime(pair[1]))
+                exports.sort(key=lambda pair: os.path.getmtime(pair[1]), reverse=True)
             except Exception:
                 exports = []
         self.resume_exports = exports
@@ -4699,31 +4690,35 @@ class TrainDialog(QDialog):
             QMessageBox.information(self, "Training running", "A training session is already in progress.")
             return
 
-        dataset_path = self.dataset_edit.text().strip()
-        if not dataset_path:
-            QMessageBox.warning(self, "Dataset required", "Select a dataset folder before starting training.")
-            return
-        if not os.path.isdir(dataset_path):
-            QMessageBox.warning(self, "Invalid dataset", f"Folder not found:\n{dataset_path}")
-            return
-
-        data_yaml = os.path.join(dataset_path, "dataset.yaml")
-        if os.path.isfile(data_yaml):
-            resolved = data_yaml
-        elif dataset_path.lower().endswith((".yaml", ".yml")) and os.path.isfile(dataset_path):
-            resolved = dataset_path
-        else:
-            QMessageBox.warning(
-                self,
-                "dataset.yaml missing",
-                "Could not find dataset.yaml in the selected folder.\n"
-                "Select the dataset root (contains dataset.yaml) or the YAML file directly."
-            )
-            return
-
         source_idx = self.source_combo.currentIndex()
         use_dino = source_idx == 1
-        use_resume = source_idx == 2
+        use_checkpoint_continue = source_idx == 2
+        use_exact_resume = source_idx == 3
+
+        resolved: Optional[str] = None
+        if not use_exact_resume:
+            dataset_path = self.dataset_edit.text().strip()
+            if not dataset_path:
+                QMessageBox.warning(self, "Dataset required", "Select a dataset folder before starting training.")
+                return
+            if os.path.isdir(dataset_path):
+                data_yaml = os.path.join(dataset_path, "dataset.yaml")
+                if os.path.isfile(data_yaml):
+                    resolved = data_yaml
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "dataset.yaml missing",
+                        "Could not find dataset.yaml in the selected folder.\n"
+                        "Select the dataset root (contains dataset.yaml) or the YAML file directly."
+                    )
+                    return
+            elif dataset_path.lower().endswith((".yaml", ".yml")) and os.path.isfile(dataset_path):
+                resolved = dataset_path
+            else:
+                QMessageBox.warning(self, "Invalid dataset", f"Path not found:\n{dataset_path}")
+                return
+
         model_label = self.model_combo.currentText()
         base_model_cfg = self.MODEL_OPTIONS[model_label]
         epochs = self.epoch_spin.value()
@@ -4740,17 +4735,24 @@ class TrainDialog(QDialog):
                     "Select a valid DINO distillation export (.pt) before training."
                 )
                 return
-        elif use_resume:
+        elif use_checkpoint_continue or use_exact_resume:
             resume_path = self._selected_resume_path()
             if not resume_path or not os.path.isfile(resume_path):
                 QMessageBox.warning(
                     self,
                     "Checkpoint required",
-                    "Select a valid YOLO checkpoint (.pt) before resuming."
+                    "Select a valid YOLO checkpoint (.pt) before continuing."
+                )
+                return
+            if use_exact_resume and os.path.basename(resume_path).lower() != "last.pt":
+                QMessageBox.warning(
+                    self,
+                    "Exact resume requires last.pt",
+                    "For exact run continuation, select a weights/last.pt checkpoint."
                 )
                 return
 
-        if self.device == 'mps' and batch <= 0:
+        if (not use_exact_resume) and self.device == 'mps' and batch <= 0:
             QMessageBox.warning(
                 self,
                 "Batch size required",
@@ -4768,17 +4770,23 @@ class TrainDialog(QDialog):
                     "DINO distillation exports are pose heads. Training task set to Pose."
                 )
             task_value = "pose"
+        elif use_exact_resume:
+            task_value = None
         elif task_selection.startswith("Auto"):
-            inferred_task = self._infer_task_from_yaml(resolved)
+            inferred_task = self._infer_task_from_yaml(resolved) if resolved else None
             task_value = inferred_task if inferred_task in {"pose", "detect"} else None
         elif task_selection.startswith("Detection"):
             task_value = "detect"
         else:
             task_value = "pose"
 
-        model_cfg = distilled_path if use_dino else (resume_path if use_resume else base_model_cfg)
+        model_cfg = (
+            distilled_path
+            if use_dino
+            else (resume_path if (use_checkpoint_continue or use_exact_resume) else base_model_cfg)
+        )
         cfg_notice = None
-        if not (use_dino or use_resume):
+        if not (use_dino or use_checkpoint_continue or use_exact_resume):
             model_cfg, cfg_notice = self._resolve_model_config(base_model_cfg, task_value)
             if cfg_notice:
                 self._log(cfg_notice)
@@ -4792,40 +4800,64 @@ class TrainDialog(QDialog):
 
         if use_dino:
             self._log(f"Starting training from DINO export: {model_cfg}")
-        elif use_resume:
-            self._log(f"Resuming training from checkpoint: {model_cfg}")
+        elif use_checkpoint_continue:
+            self._log(f"Continuing training from checkpoint: {model_cfg}")
+            self._log("- mode: checkpoint fine-tune (uses selected dataset and settings)")
+        elif use_exact_resume:
+            self._log(f"Resuming exact run from checkpoint: {model_cfg}")
+            self._log("- mode: exact resume (uses prior run args/state)")
         else:
             self._log(f"Starting training for {model_label} ({model_cfg})")
-        self._log(f"- dataset: {resolved}")
+        if resolved:
+            self._log(f"- dataset: {resolved}")
+        else:
+            self._log("- dataset: from resume checkpoint")
         self._log(f"- device: {self.device}")
-        self._log(f"- epochs: {epochs}")
-        self._log(f"- batch size: {batch_display}")
+        if use_exact_resume:
+            self._log("- epochs: from resume checkpoint")
+            self._log("- batch size: from resume checkpoint")
+        else:
+            self._log(f"- epochs: {epochs}")
+            self._log(f"- batch size: {batch_display}")
         if task_value:
             self._log(f"- task: {task_value}")
         self._log("Running ultralyticsYOLO.train() — progress will stream to the active terminal.")
         self._log("")
 
-        batch_param = -1 if batch <= 0 else int(batch)
+        if use_exact_resume:
+            params = {
+                "resume": True,
+                "device": self.device,
+            }
+        else:
+            batch_param = -1 if batch <= 0 else int(batch)
 
-        task_folder = task_value if task_value in ("pose", "detect") else ("pose" if use_dino else "auto")
-        project_dir = os.path.join(self.project_runs_dir, "train", task_folder)
-        try:
-            os.makedirs(project_dir, exist_ok=True)
-        except Exception as e:
-            self._log(f"Warning: could not create runs directory at {project_dir}: {e}")
-        run_name = self._run_name_from_model(model_cfg, use_dino or use_resume)
+            task_folder = task_value if task_value in ("pose", "detect") else ("pose" if use_dino else "auto")
+            project_dir = os.path.join(self.project_runs_dir, "train", task_folder)
+            try:
+                os.makedirs(project_dir, exist_ok=True)
+            except Exception as e:
+                self._log(f"Warning: could not create runs directory at {project_dir}: {e}")
 
-        params = {
-            "data": resolved,
-            "epochs": epochs,
-            "device": self.device,
-            "exist_ok": False,
-            "batch": batch_param,
-            "project": project_dir,
-            "name": run_name,
-        }
-        if task_value:
-            params["task"] = task_value
+            if use_checkpoint_continue:
+                checkpoint_run = os.path.basename(os.path.dirname(os.path.dirname(model_cfg)))
+                run_name = self._run_name_from_model(checkpoint_run or model_cfg, use_dino=True)
+                if not run_name.endswith("_continue"):
+                    run_name = f"{run_name}_continue"
+            else:
+                run_name = self._run_name_from_model(model_cfg, use_dino)
+
+            params = {
+                "data": resolved,
+                "epochs": epochs,
+                "device": self.device,
+                "exist_ok": False,
+                "batch": batch_param,
+                "project": project_dir,
+                "name": run_name,
+            }
+            if task_value:
+                params["task"] = task_value
 
         QApplication.processEvents()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -4865,6 +4897,7 @@ class TrainDialog(QDialog):
 # =========================
 
 if __name__ == '__main__':
+    _ensure_qt_plugin_paths()
     app = QApplication(sys.argv)
 
     base = os.path.dirname(__file__)

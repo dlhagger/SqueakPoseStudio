@@ -12,4 +12,17 @@ wheels/
 
 # Local model artifacts
 sam3.pt
+
+# App runtime data
+annotations/
+datasets/
+images_all/
+images_to_label/
+labels_all/
+runs/
+class_keypoints.json
+classes.txt
+keypoints.txt
+*.sqp_preds.json
+tests/test_dataset_builder.py
  

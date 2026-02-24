@@ -18,7 +18,7 @@ from PyQt6.QtGui import (
     QFontInfo
 )
 from PyQt6.QtCore import (
-    Qt, QRectF, QPointF, QTimer, QPoint, QProcess
+    Qt, QRectF, QPointF, QTimer, QPoint, QProcess, QLibraryInfo
 )
 
 DEFAULT_CLASS_NAMES = ["mouse"]
@@ -33,10 +33,16 @@ def _ensure_qt_plugin_paths() -> None:
       "Could not find the Qt platform plugin 'cocoa' in ''"
     """
     plugin_root = ""
+    primary_error: Optional[Exception] = None
+    fallback_reason = ""
     try:
         plugin_root = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath) or ""
-    except Exception:
+    except Exception as exc:
+        primary_error = exc
         plugin_root = ""
+        fallback_reason = f"QLibraryInfo lookup failed: {exc}"
+    if not fallback_reason and not plugin_root:
+        fallback_reason = "QLibraryInfo returned an empty plugins path"
 
     if not plugin_root:
         try:
@@ -44,10 +50,16 @@ def _ensure_qt_plugin_paths() -> None:
             candidate = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "plugins")
             if os.path.isdir(candidate):
                 plugin_root = candidate
+                print(
+                    f"[Qt bootstrap] Warning: using fallback Qt plugins path ({fallback_reason}): {candidate}",
+                    file=sys.stderr,
+                )
         except Exception:
             plugin_root = ""
 
     if not plugin_root:
+        if primary_error is not None:
+            print(f"[Qt bootstrap] Warning: unable to resolve Qt plugins path: {primary_error}", file=sys.stderr)
         return
 
     if not os.environ.get("QT_PLUGIN_PATH"):
@@ -415,10 +427,19 @@ class BoxItem(QGraphicsRectItem):
         pen.setCosmetic(True)
         self.setPen(pen)
 
+        self._label_bg = QGraphicsRectItem(self)
+        self._label_bg.setBrush(QBrush(Qt.GlobalColor.blue))
+        self._label_bg.setPen(QPen(Qt.PenStyle.NoPen))
+        self._label_bg.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._label_bg.setZValue(0.0)
+
         self._label = QGraphicsSimpleTextItem(class_name, self)
         self._label.setFont(_ui_font(12))
-        self._label.setBrush(QBrush(Qt.GlobalColor.blue))
-        self._label.setPos(2, 2)
+        self._label.setBrush(QBrush(Qt.GlobalColor.white))
+        self._label.setZValue(0.1)
+        self._label_pad_x = 4.0
+        self._label_pad_y = 1.0
+        self._reposition_label()
 
         self._drag_edges = 0
         self._press_rect = QRectF()
@@ -426,6 +447,28 @@ class BoxItem(QGraphicsRectItem):
         self._press_item_pos = QPointF()
 
         self.update_model()  # ✅ now exists
+
+    def _reposition_label(self):
+        """Keep class label outside the bbox to avoid keypoint overlap.
+
+        Preferred placement: above top-left corner. If the box is near the top
+        edge of the scene, place the label just below the box instead.
+        """
+        margin = 2.0
+        text_rect = self._label.boundingRect()
+        bg_w = text_rect.width() + (self._label_pad_x * 2.0)
+        bg_h = text_rect.height() + (self._label_pad_y * 2.0)
+        x = margin
+        y = -(bg_h + margin)
+
+        if self.scene():
+            sr = self.scene().sceneRect()
+            # If above would clip off-screen, move label below the box.
+            if self.pos().y() + y < sr.top():
+                y = self.rect().height() + margin
+
+        self._label_bg.setRect(x, y, bg_w, bg_h)
+        self._label.setPos(x + self._label_pad_x, y + self._label_pad_y)
 
     # --- only outline is clickable/selectable ---
     def shape(self) -> QPainterPath:
@@ -530,7 +573,7 @@ class BoxItem(QGraphicsRectItem):
         self.bbox.y = self.pos().y()
         self.bbox.w = self.rect().width()
         self.bbox.h = self.rect().height()
-        self._label.setPos(2, 2)
+        self._reposition_label()
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
@@ -540,6 +583,8 @@ class BoxItem(QGraphicsRectItem):
             nx = min(max(new_pos.x(), sr.left()), sr.right() - r.width())
             ny = min(max(new_pos.y(), sr.top()),  sr.bottom() - r.height())
             return QPointF(nx, ny)
+        elif change == QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged:
+            self._reposition_label()
         elif change in (QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged,
                         QGraphicsItem.GraphicsItemChange.ItemTransformChange):
             self.update_model()
@@ -1189,6 +1234,7 @@ class LabelingApp(QMainWindow):
         self.images_archive = sorted(f for f in os.listdir(self.image_dir_archive) if f.lower().endswith(exts))
         self.images = self.images_queue[:]
         self.active_image_dir = self.image_dir_queue
+        self.current_image_path = ""
         self.current_idx = 0
         self._queue_current_idx = 0
         self._archive_current_idx = 0
@@ -1656,8 +1702,41 @@ class LabelingApp(QMainWindow):
         if self.img_w <= 0 or self.img_h <= 0:
             return
         rect = QRectF(0, 0, self.img_w, self.img_h)
-        pm = QPixmap(int(rect.width()), int(rect.height()))
+        render_w = int(rect.width())
+        render_h = int(rect.height())
+
+        # Build a background from the currently loaded source image when possible.
+        base_pix = QPixmap()
+        if self.current_image_path:
+            base_pix = QPixmap(self.current_image_path)
+        if base_pix.isNull() and self.images:
+            file_name = self.images[self.current_idx]
+            for cand in (
+                os.path.join(self.active_image_dir, file_name),
+                os.path.join(self.image_dir_queue, file_name),
+                os.path.join(self.image_dir_archive, file_name),
+            ):
+                if not os.path.exists(cand):
+                    continue
+                probe = QPixmap(cand)
+                if not probe.isNull():
+                    base_pix = probe
+                    break
+        if base_pix.isNull():
+            for item in self.scene.items():
+                if isinstance(item, QGraphicsPixmapItem):
+                    probe = item.pixmap()
+                    if not probe.isNull():
+                        base_pix = probe
+                        break
+
+        pm = QPixmap(render_w, render_h)
         pm.fill(Qt.GlobalColor.transparent)
+        if not base_pix.isNull():
+            bg = QPainter(pm)
+            bg.drawPixmap(0, 0, render_w, render_h, base_pix)
+            bg.end()
+
         painter = QPainter(pm)
         colors = [
             Qt.GlobalColor.cyan,
@@ -2725,6 +2804,7 @@ class LabelingApp(QMainWindow):
             return
 
         img_path = os.path.join(self.active_image_dir, self.images[self.current_idx])
+        self.current_image_path = img_path
         pix = QPixmap(img_path)
         if pix.isNull():
             self.update_status_bar(f"Failed to load image: {self.images[self.current_idx]}")
@@ -2984,7 +3064,6 @@ class LabelingApp(QMainWindow):
         base = os.path.splitext(self.images[self.current_idx])[0]
 
         project_root = os.path.dirname(self.label_dir)
-        images_to_label_dir = self.active_image_dir
         images_all_dir = os.path.join(project_root, "images_all")
         labels_all_dir = os.path.join(project_root, "labels_all")
         annotations_dir = os.path.join(project_root, "annotations")
@@ -3014,18 +3093,52 @@ class LabelingApp(QMainWindow):
 
         self._render_overlay_from_cache(annotated_out_path)
 
-        src = os.path.join(images_to_label_dir, self.images[self.current_idx])
-        if os.path.exists(src):
+        file_name = self.images[self.current_idx]
+        src_candidates: list[str] = []
+        if self.current_image_path:
+            src_candidates.append(self.current_image_path)
+        if os.path.isabs(file_name):
+            src_candidates.append(file_name)
+        src_candidates.extend([
+            os.path.join(self.active_image_dir, file_name),
+            os.path.join(self.image_dir_queue, file_name),
+            os.path.join(self.image_dir_archive, file_name),
+        ])
+
+        src_path = ""
+        seen: set[str] = set()
+        for cand in src_candidates:
+            norm = os.path.abspath(cand)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.exists(cand):
+                src_path = cand
+                break
+
+        copied_ok = False
+        if src_path:
             try:
-                if os.path.abspath(src) != os.path.abspath(image_out_path):
-                    shutil.copy2(src, image_out_path)
+                if os.path.abspath(src_path) != os.path.abspath(image_out_path):
+                    shutil.copy2(src_path, image_out_path)
                     print(f"✅ Copied original image to {image_out_path}")
                 else:
                     print(f"ℹ️ Image already stored at {image_out_path}")
+                copied_ok = True
             except Exception as e:
-                print(f"⚠️ Warning: Failed to copy image {src}: {e}")
-        else:
-            print(f"⚠️ Warning: Original image {src} not found!")
+                print(f"⚠️ Warning: Failed to copy image {src_path}: {e}")
+
+        if not copied_ok and not os.path.exists(image_out_path):
+            tried = "\n".join(sorted(seen))
+            msg = (
+                f"Could not locate source image for '{file_name}'.\n\n"
+                f"Tried:\n{tried}"
+            )
+            print(f"⚠️ Warning: {msg}")
+            try:
+                QMessageBox.warning(self, "Image copy warning", msg)
+            except Exception:
+                pass
 
         # Update the labeled frame counter immediately after saving
         self._update_progress_label()

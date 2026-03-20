@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsItem,
     QGraphicsSimpleTextItem, QGraphicsLineItem, QVBoxLayout, QHBoxLayout,
+    QGridLayout,
     QComboBox, QPushButton, QLabel, QSplashScreen, QMessageBox,
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
@@ -15,14 +16,236 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import (
     QPixmap, QPen, QBrush, QKeySequence, QFont, QPainter, QShortcut,
     QFontDatabase, QIcon, QCursor, QPainterPath, QPainterPathStroker,
-    QFontInfo
+    QFontInfo, QColor
 )
 from PyQt6.QtCore import (
     Qt, QRectF, QPointF, QTimer, QPoint, QProcess, QLibraryInfo
 )
+from squeakpose_core import (
+    InferenceCsvWriter,
+    effective_prediction_batch,
+    find_duplicate_names,
+    parse_yolo_pose_label_line,
+)
 
 DEFAULT_CLASS_NAMES = ["mouse"]
 DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
+PROJECT_META_FILE = "squeakpose_project.json"
+LAST_PROJECT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".squeakpose_studio_last_project.json")
+
+
+def _project_paths(project_root: str) -> dict[str, str]:
+    root = os.path.abspath(project_root)
+    return {
+        "root": root,
+        "images_to_label": os.path.join(root, "images_to_label"),
+        "images_all": os.path.join(root, "images_all"),
+        "labels_all": os.path.join(root, "labels_all"),
+        "annotations": os.path.join(root, "annotations"),
+        "datasets": os.path.join(root, "datasets"),
+        "runs": os.path.join(root, "runs"),
+        "templates": os.path.join(root, "templates"),
+        "inference_outputs": os.path.join(root, "inference outputs"),
+        "logs": os.path.join(root, "logs"),
+        "classes_file": os.path.join(root, "classes.txt"),
+        "keypoints_file": os.path.join(root, "keypoints.txt"),
+        "class_keypoints_file": os.path.join(root, "class_keypoints.json"),
+    }
+
+
+def _project_window_title(project_root: str) -> str:
+    root = os.path.abspath(project_root)
+    name = os.path.basename(root.rstrip(os.sep)) or root
+    return f"SqueakPose Studio — {name}"
+
+
+def _ensure_project_structure(project_root: str) -> dict[str, str]:
+    paths = _project_paths(project_root)
+    for key in (
+        "images_to_label",
+        "images_all",
+        "labels_all",
+        "annotations",
+        "datasets",
+        "runs",
+        "templates",
+        "inference_outputs",
+        "logs",
+    ):
+        os.makedirs(paths[key], exist_ok=True)
+
+    meta_path = os.path.join(paths["root"], PROJECT_META_FILE)
+    if not os.path.exists(meta_path):
+        payload = {
+            "schema_version": 1,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
+    return paths
+
+
+def _load_last_project() -> Optional[str]:
+    if not os.path.exists(LAST_PROJECT_STATE_FILE):
+        return None
+    try:
+        with open(LAST_PROJECT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        path = str(data.get("last_project", "")).strip()
+        if path and os.path.isdir(path):
+            return os.path.abspath(path)
+    except Exception:
+        return None
+    return None
+
+
+def _save_last_project(project_root: str):
+    payload = {"last_project": os.path.abspath(project_root)}
+    try:
+        with open(LAST_PROJECT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+
+def _default_projects_root() -> str:
+    """Return the default parent directory for SqueakPose projects."""
+    # Linux users may customize their user dirs; honor it when present.
+    if sys.platform.startswith("linux"):
+        xdg_docs = os.environ.get("XDG_DOCUMENTS_DIR", "").strip()
+        if xdg_docs:
+            return os.path.join(os.path.expanduser(xdg_docs), "SqueakPose Studio Projects")
+    documents = os.path.join(os.path.expanduser("~"), "Documents")
+    return os.path.join(documents, "SqueakPose Studio Projects")
+
+
+def _choose_project_root(default_dir: str, parent: Optional[QWidget] = None) -> Optional[str]:
+    start_dir = default_dir if os.path.isdir(default_dir) else os.path.expanduser("~")
+    selected = QFileDialog.getExistingDirectory(
+        parent,
+        "Select Project Folder",
+        start_dir,
+    )
+    if not selected:
+        return None
+    return os.path.abspath(selected)
+
+
+def _create_project_root(default_dir: str, parent: Optional[QWidget] = None) -> Optional[str]:
+    start_dir = default_dir if os.path.isdir(default_dir) else os.path.expanduser("~")
+    parent_dir = QFileDialog.getExistingDirectory(
+        parent,
+        "Select Parent Folder for New Project",
+        start_dir,
+    )
+    if not parent_dir:
+        return None
+
+    project_name, ok = QInputDialog.getText(parent, "New Project", "Project name:")
+    if not ok:
+        return None
+    project_name = project_name.strip()
+    if not project_name:
+        QMessageBox.warning(parent, "Invalid name", "Project name cannot be empty.")
+        return None
+
+    project_root = os.path.abspath(os.path.join(parent_dir, project_name))
+    if os.path.exists(project_root):
+        if not os.path.isdir(project_root):
+            QMessageBox.warning(parent, "Invalid path", "A file exists with that project name.")
+            return None
+        if os.listdir(project_root):
+            confirm = QMessageBox.question(
+                parent,
+                "Use Existing Folder?",
+                "The selected project folder already contains files.\nUse it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return None
+    else:
+        try:
+            os.makedirs(project_root, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(parent, "Create project failed", f"Could not create project folder:\n{e}")
+            return None
+    return project_root
+
+
+class ProjectLauncherDialog(QDialog):
+    """Startup dialog for opening or creating a project."""
+
+    def __init__(self, default_dir: str, logo_path: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.default_dir = default_dir
+        self.project_root: Optional[str] = None
+        self.selection_mode: Optional[str] = None  # "open" | "create"
+
+        self.setWindowTitle("SqueakPose Studio")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        if logo_path and os.path.exists(logo_path):
+            pix = QPixmap(logo_path)
+            if not pix.isNull():
+                logo_label = QLabel()
+                logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                logo_label.setPixmap(
+                    pix.scaled(
+                        220,
+                        220,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                layout.addWidget(logo_label)
+
+        title = QLabel("Open a project or create a new one")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Project folders contain classes, keypoints, images, labels, datasets, runs, and analysis outputs."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+
+        btn_row = QHBoxLayout()
+        open_btn = QPushButton("Open Project")
+        open_btn.clicked.connect(self._open_project)
+        btn_row.addWidget(open_btn)
+
+        create_btn = QPushButton("Create Project")
+        create_btn.clicked.connect(self._create_project)
+        btn_row.addWidget(create_btn)
+        layout.addLayout(btn_row)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(cancel_btn)
+
+    def _open_project(self):
+        chosen = _choose_project_root(self.default_dir, parent=self)
+        if not chosen:
+            return
+        self.project_root = chosen
+        self.selection_mode = "open"
+        self.accept()
+
+    def _create_project(self):
+        chosen = _create_project_root(self.default_dir, parent=self)
+        if not chosen:
+            return
+        self.project_root = chosen
+        self.selection_mode = "create"
+        self.accept()
 
 
 def _ensure_qt_plugin_paths() -> None:
@@ -204,13 +427,9 @@ class AddClassDialog(QDialog):
         self.name_edit = QLineEdit()
         form.addRow("Class name:", self.name_edit)
 
-        self.count_spin = QSpinBox()
-        self.count_spin.setRange(0, 200)
         default_count = max(0, len(existing_keypoints))
         if default_count == 0:
             default_count = 6
-        self.count_spin.setValue(default_count)
-        form.addRow("Keypoints:", self.count_spin)
 
         self.keypoints_edit = QTextEdit()
         if existing_keypoints:
@@ -218,7 +437,9 @@ class AddClassDialog(QDialog):
         else:
             initial_lines = [f"kp_{idx+1}" for idx in range(default_count)]
         self.keypoints_edit.setPlainText("\n".join(initial_lines))
-        self.count_spin.valueChanged.connect(self._ensure_kp_count)
+        self.count_label = QLabel("")
+        self.keypoints_edit.textChanged.connect(self._update_count_label)
+        self._update_count_label()
 
         info = QLabel("Keypoint names apply to all classes. Enter one per line.")
         info.setWordWrap(True)
@@ -226,21 +447,16 @@ class AddClassDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(info)
         layout.addWidget(self.keypoints_edit, 1)
+        layout.addWidget(self.count_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _ensure_kp_count(self, target: int):
+    def _update_count_label(self):
         lines = [ln for ln in self.keypoints_edit.toPlainText().splitlines() if ln.strip()]
-        current = len(lines)
-        if target > current:
-            for idx in range(target - current):
-                lines.append(f"kp_{current + idx + 1}")
-        elif target < current:
-            lines = lines[:target]
-        self.keypoints_edit.setPlainText("\n".join(lines))
+        self.count_label.setText(f"Keypoint count: {len(lines)}")
 
     def get_data(self) -> tuple[str, list[str]]:
         name = self.name_edit.text().strip()
@@ -249,7 +465,14 @@ class AddClassDialog(QDialog):
 
 
 class ClassManagerDialog(QDialog):
-    def __init__(self, classes: list[str], keypoint_map: dict[str, list[str]], canonical: list[str], parent=None):
+    def __init__(
+        self,
+        classes: list[str],
+        keypoint_map: dict[str, list[str]],
+        canonical: list[str],
+        parent=None,
+        schema_locked: bool = False,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Manage Classes & Keypoints")
         self.resize(420, 480)
@@ -261,8 +484,18 @@ class ClassManagerDialog(QDialog):
             self._kp_map[name] = lst[:]
         self._canonical_default = canonical[:]
         self._current_row = -1
+        self._schema_locked = bool(schema_locked)
 
         layout = QVBoxLayout(self)
+
+        if self._schema_locked:
+            lock_info = QLabel(
+                "Schema is locked because labeled data exists.\n"
+                "Allowed: add class, append keypoints.\n"
+                "Blocked: remove/reorder/rename existing classes/keypoints."
+            )
+            lock_info.setWordWrap(True)
+            layout.addWidget(lock_info)
 
         self.class_list = QListWidget()
         for name in self._classes:
@@ -278,6 +511,9 @@ class ClassManagerDialog(QDialog):
         self.remove_btn = QPushButton("Remove Selected")
         self.remove_btn.clicked.connect(self._remove_selected)
         btn_row.addWidget(self.remove_btn)
+        if self._schema_locked:
+            self.remove_btn.setEnabled(False)
+            self.remove_btn.setToolTip("Schema locked after labels exist.")
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -329,6 +565,13 @@ class ClassManagerDialog(QDialog):
         self.class_list.setCurrentRow(len(self._classes) - 1)
 
     def _remove_selected(self):
+        if self._schema_locked:
+            QMessageBox.information(
+                self,
+                "Schema locked",
+                "Cannot remove classes after labeled data exists.",
+            )
+            return
         row = self.class_list.currentRow()
         if row < 0 or row >= len(self._classes):
             return
@@ -375,6 +618,17 @@ class ClassManagerDialog(QDialog):
         if not defined_any:
             QMessageBox.warning(self, "Keypoints required", "Enter at least one keypoint for any class.")
             return
+        for class_name in self._classes:
+            dupes = find_duplicate_names(self._kp_map.get(class_name, []))
+            if dupes:
+                joined = ", ".join(dupes)
+                QMessageBox.warning(
+                    self,
+                    "Duplicate keypoints",
+                    f"Class '{class_name}' has duplicate keypoint names:\n{joined}\n\n"
+                    "Each keypoint name must be unique within a class."
+                )
+                return
         canonical = []
         seen = set()
         for name in self._canonical_default:
@@ -1025,6 +1279,59 @@ class LabelingApp(QMainWindow):
                 labeled += 1
         return labeled, total
 
+    def _detect_schema_locked(self) -> bool:
+        """Schema is considered locked once any non-empty label file exists."""
+        if not self.label_dir or not os.path.isdir(self.label_dir):
+            return False
+        try:
+            for name in os.listdir(self.label_dir):
+                if not name.lower().endswith(".txt"):
+                    continue
+                path = os.path.join(self.label_dir, name)
+                try:
+                    if os.path.getsize(path) > 0:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _schema_is_locked(self) -> bool:
+        if getattr(self, "_schema_locked", False):
+            return True
+        locked = self._detect_schema_locked()
+        self._schema_locked = bool(locked)
+        return self._schema_locked
+
+    def _validate_locked_schema_changes(
+        self,
+        classes_clean: list[str],
+        normalized_map: dict[str, list[str]],
+    ) -> tuple[bool, str]:
+        """When schema is locked, allow only additive edits."""
+        existing_classes = self.classes[:]
+        if len(classes_clean) < len(existing_classes):
+            return False, "Cannot remove classes after labeled data exists."
+        if classes_clean[:len(existing_classes)] != existing_classes:
+            return (
+                False,
+                "Existing class names/order are locked.\n"
+                "Only append new classes at the end.",
+            )
+        for class_name in existing_classes:
+            old_kp = self.class_keypoints.get(class_name, [])[:]
+            new_kp = normalized_map.get(class_name, [])[:]
+            if len(new_kp) < len(old_kp):
+                return False, f"Cannot remove keypoints from class '{class_name}'."
+            if new_kp[:len(old_kp)] != old_kp:
+                return (
+                    False,
+                    f"Class '{class_name}' keypoints are locked.\n"
+                    "Only append new keypoints at the end.",
+                )
+        return True, ""
+
     def _update_progress_label(self):
         if not hasattr(self, "progress_label"):
             return
@@ -1036,16 +1343,28 @@ class LabelingApp(QMainWindow):
         if getattr(self, "_prompted_class_manager", False):
             return
         self._prompted_class_manager = True
+        force_setup = getattr(self, "_force_initial_setup", False)
         created = getattr(self, "_created_label_files", False)
         missing_info = not (self.classes and self.kp_names)
-        if not (created or missing_info):
+        if not (force_setup or created or missing_info):
             return
         QTimer.singleShot(200, self._launch_class_manager_initial)
 
     def _launch_class_manager_initial(self):
-        dlg = ClassManagerDialog(self.classes, self.class_keypoints, self.kp_names, self)
-        dlg.setWindowTitle("Initial Setup — Add Classes & Keypoints")
-        dlg_label = QLabel("Please define your classes and keypoints before labeling.")
+        dlg = ClassManagerDialog(
+            self.classes,
+            self.class_keypoints,
+            self.kp_names,
+            self,
+            schema_locked=self._schema_is_locked(),
+        )
+        if getattr(self, "_force_initial_setup", False):
+            dlg.setWindowTitle("New Project Setup — Add Classes & Keypoints")
+            msg = "Define classes and keypoints for this new project."
+        else:
+            dlg.setWindowTitle("Initial Setup — Add Classes & Keypoints")
+            msg = "Please define your classes and keypoints before labeling."
+        dlg_label = QLabel(msg)
         dlg.layout().insertWidget(0, dlg_label)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             classes, keypoints, kp_map = dlg.get_results()
@@ -1053,6 +1372,17 @@ class LabelingApp(QMainWindow):
                 self.class_selector.setCurrentIndex(0)
                 self.update_status_bar("Initial setup complete")
         else:
+            if getattr(self, "_force_initial_setup", False):
+                confirm = QMessageBox.question(
+                    self,
+                    "Use Defaults?",
+                    "Project setup was canceled.\nContinue with default class/keypoints?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if confirm != QMessageBox.StandardButton.Yes:
+                    QTimer.singleShot(0, self._launch_class_manager_initial)
+                    return
             self.update_status_bar("Setup skipped; using defaults until edited.")
 
     def _write_list_file(self, path: str, items: list[str]):
@@ -1216,18 +1546,32 @@ class LabelingApp(QMainWindow):
             )
         except Exception:
             self.images_archive = []
-    def __init__(self, image_dir: str, label_dir: str, class_file: str, keypoint_file: str):
+    def __init__(
+        self,
+        image_dir: Optional[str],
+        label_dir: Optional[str],
+        class_file: Optional[str],
+        keypoint_file: Optional[str],
+        project_root: Optional[str] = None,
+        force_initial_setup: bool = False,
+    ):
         super().__init__()
-        self.image_dir_queue = image_dir
+        self.app_base_dir = os.path.dirname(__file__)
+        inferred_root = project_root or os.path.dirname(image_dir or "") or os.getcwd()
+        self.project_root = os.path.abspath(inferred_root)
+        self._force_initial_setup = bool(force_initial_setup)
+
+        self.image_dir_queue = image_dir or os.path.join(self.project_root, "images_to_label")
         # Backward-compatible alias used by some dialogs/tools.
         self.image_dir = self.image_dir_queue
-        self.image_dir_archive = os.path.join(os.path.dirname(image_dir), "images_all")
-        self.label_dir = label_dir
+        self.image_dir_archive = os.path.join(self.project_root, "images_all")
+        self.label_dir = label_dir or os.path.join(self.project_root, "labels_all")
+        os.makedirs(self.image_dir_queue, exist_ok=True)
         os.makedirs(self.label_dir, exist_ok=True)
         os.makedirs(self.image_dir_archive, exist_ok=True)
-        self.class_file = class_file
-        self.keypoint_file = keypoint_file
-        self.base_dir = os.path.dirname(__file__)
+        self.class_file = class_file or os.path.join(self.project_root, "classes.txt")
+        self.keypoint_file = keypoint_file or os.path.join(self.project_root, "keypoints.txt")
+        self.base_dir = self.project_root
 
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
         self.images_queue = sorted(f for f in os.listdir(self.image_dir_queue) if f.lower().endswith(exts))
@@ -1240,14 +1584,15 @@ class LabelingApp(QMainWindow):
         self._archive_current_idx = 0
 
         # Ensure classes.txt and keypoints.txt exist (never prompt, always silent)
-        self.classes, self.kp_names, self._created_label_files = self._ensure_label_files(class_file, keypoint_file)
-        self.class_keypoints_path = os.path.join(self.base_dir, "class_keypoints.json")
+        self.classes, self.kp_names, self._created_label_files = self._ensure_label_files(self.class_file, self.keypoint_file)
+        self.class_keypoints_path = os.path.join(self.project_root, "class_keypoints.json")
         self.class_keypoints = self._load_class_keypoints()
         self._save_class_keypoints()
+        self._schema_locked = self._detect_schema_locked()
         self._kp_index_lookup: dict[str, int] = {}
         self._refresh_kp_index_lookup()
         self.annotation_cache: dict[int, dict] = {}
-        self.template_dir = os.path.join(self.base_dir, "templates")
+        self.template_dir = os.path.join(self.project_root, "templates")
         os.makedirs(self.template_dir, exist_ok=True)
 
         self.mode = 'panzoom'
@@ -1264,7 +1609,8 @@ class LabelingApp(QMainWindow):
         self.kp_font_px = 10
         self._precision_active = False
 
-        self._log_path = os.path.join(os.path.dirname(__file__), 'squeakpose_debug.log')
+        self._log_path = os.path.join(self.project_root, "logs", "squeakpose_debug.log")
+        os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
         self._predict_busy = False
         # Auto-select device once at startup
         self._device = _auto_device()
@@ -1277,162 +1623,376 @@ class LabelingApp(QMainWindow):
     def closeEvent(self, event):
         super().closeEvent(event)
 
+    def _setup_menu(self):
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+
+        open_project_action = file_menu.addAction("Open Project…")
+        open_project_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_project_action.triggered.connect(self.open_project_command)
+
+        close_project_action = file_menu.addAction("Close Project")
+        close_project_action.setShortcut(QKeySequence.StandardKey.Close)
+        close_project_action.triggered.connect(self.close_project_command)
+
+        file_menu.addSeparator()
+        quit_action = file_menu.addAction("Quit")
+        quit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        quit_action.triggered.connect(QApplication.instance().quit)
+
+    def _confirm_project_change(self, message: str) -> bool:
+        decision = QMessageBox.question(
+            self,
+            "Switch Project",
+            f"{message}\n\nUnsaved edits in the current view may be lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return decision == QMessageBox.StandardButton.Yes
+
+    def _switch_to_project_root(self, project_root: str, force_initial_setup: bool = False):
+        target_root = os.path.abspath(project_root)
+        if target_root == self.project_root and not force_initial_setup:
+            self.update_status_bar("That project is already open.")
+            return
+
+        paths = _ensure_project_structure(target_root)
+        _save_last_project(target_root)
+
+        new_window = LabelingApp(
+            paths["images_to_label"],
+            paths["labels_all"],
+            paths["classes_file"],
+            paths["keypoints_file"],
+            project_root=paths["root"],
+            force_initial_setup=force_initial_setup,
+        )
+        new_window.setWindowTitle(_project_window_title(paths["root"]))
+        new_window.setGeometry(self.geometry())
+        new_window.show()
+        new_window.raise_()
+        new_window.activateWindow()
+        new_window.update_status_bar(f"Project loaded: {paths['root']}")
+        self.close()
+
+    def open_project_command(self):
+        if not self._confirm_project_change("Open a different project?"):
+            return
+        default_dir = os.path.dirname(self.project_root) if self.project_root else _default_projects_root()
+        project_root = _choose_project_root(default_dir, parent=self)
+        if not project_root:
+            return
+        self._switch_to_project_root(project_root, force_initial_setup=False)
+
+    def close_project_command(self):
+        if not self._confirm_project_change("Close this project and return to the project launcher?"):
+            return
+        default_dir = os.path.dirname(self.project_root) if self.project_root else _default_projects_root()
+        launcher = ProjectLauncherDialog(default_dir, os.path.join(self.app_base_dir, "squeakpose_studio_logo.png"), self)
+        if launcher.exec() != QDialog.DialogCode.Accepted:
+            self.update_status_bar("Close project canceled.")
+            return
+        project_root = launcher.project_root
+        if not project_root:
+            self.update_status_bar("No project selected.")
+            return
+        self._switch_to_project_root(project_root, force_initial_setup=(launcher.selection_mode == "create"))
+
     # ---------- UI Setup ----------
 
     def _setup_ui(self):
         self.setWindowTitle('SqueakPose Studio')
+        self._setup_menu()
         central = QWidget()
         self.setCentralWidget(central)
 
         self.scene = QGraphicsScene()
         self.view = LabelView(self.scene, self)
 
-        # Floating mode panel
-        self.mode_buttons_frame = QFrame(self.view)
-        self.mode_buttons_frame.setStyleSheet("""
-            background-color: rgba(60, 63, 65, 200);
-            border: 1px solid #555;
-            border-radius: 8px;
-        """)
-        self.mode_buttons_frame.setFixedWidth(140)
+        panel_style = """
+            QFrame {
+                background-color: rgba(34, 38, 42, 200);
+                border: 1px solid rgba(128, 141, 152, 130);
+                border-radius: 13px;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                color: #e2e8ee;
+            }
+            QLabel#panelTitle {
+                font-weight: 700;
+                font-size: 10pt;
+                color: #f5f8fb;
+                padding-bottom: 4px;
+                border-bottom: 1px solid rgba(130, 144, 156, 110);
+            }
+            QLabel#fieldLabel {
+                font-size: 9pt;
+                color: #c8d0d8;
+            }
+            QLabel#progressBadge {
+                font-weight: 700;
+                color: #f3f7fb;
+                background-color: rgba(69, 82, 93, 165);
+                border: 1px solid rgba(130, 144, 156, 130);
+                border-radius: 8px;
+                padding: 3px 8px;
+            }
+            QPushButton {
+                background-color: rgba(52, 58, 64, 220);
+                border: 1px solid rgba(133, 146, 158, 120);
+                border-radius: 8px;
+                padding: 4px 10px;
+                color: #eff3f7;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: rgba(67, 75, 83, 230);
+                border-color: rgba(154, 169, 183, 160);
+            }
+            QPushButton:pressed {
+                background-color: rgba(42, 48, 53, 235);
+            }
+            QPushButton:disabled {
+                color: rgba(217, 225, 232, 110);
+                background-color: rgba(44, 49, 54, 180);
+                border-color: rgba(110, 121, 130, 90);
+            }
+            QComboBox {
+                background-color: rgba(43, 49, 54, 218);
+                border: 1px solid rgba(129, 142, 154, 120);
+                border-radius: 8px;
+                padding: 3px 8px;
+                min-height: 24px;
+                color: #eef3f8;
+            }
+            QComboBox::drop-down {
+                border-left: 1px solid rgba(129, 142, 154, 100);
+                width: 18px;
+            }
+            QComboBox::down-arrow {
+                width: 10px;
+                height: 10px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: rgba(35, 40, 45, 242);
+                border: 1px solid rgba(120, 133, 145, 140);
+                selection-background-color: rgba(94, 129, 161, 210);
+                selection-color: #ffffff;
+            }
+        """
 
-        mode_layout = QVBoxLayout(self.mode_buttons_frame)
-        mode_layout.setContentsMargins(8, 8, 8, 8)
-        mode_layout.setSpacing(5)
+        # Main layout: keep canvas clean and place controls as hot-corner overlays.
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.view)
+        central.setLayout(layout)
 
-        self.mode_title = QLabel("Labeling Mode")
-        self.mode_title.setStyleSheet("font-weight: bold; font-size: 10pt; color: #e0e0e0;")
-        mode_layout.addWidget(self.mode_title)
+        def apply_panel_shadow(frame: QFrame):
+            shadow = QGraphicsDropShadowEffect(frame)
+            shadow.setBlurRadius(24)
+            shadow.setOffset(0, 3)
+            shadow.setColor(QColor(0, 0, 0, 120))
+            frame.setGraphicsEffect(shadow)
 
-        self.panzoom_btn = QPushButton('Pan/Zoom (1)')
-        self.bbox_btn = QPushButton('BBox (2)')
-        self.keypoint_btn = QPushButton('Keypoint (3)')
-        self.predict_btn = QPushButton('Predict (4)')
-
-        for btn, mode_name in [(self.panzoom_btn, 'panzoom'),
-                               (self.bbox_btn, 'bbox'),
-                               (self.keypoint_btn, 'keypoint')]:
-            btn.clicked.connect(lambda checked, m=mode_name: self.set_mode(m))
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #3c3f41;
-                    color: #e0e0e0;
-                    border: none;
-                    padding: 8px;
-                    text-align: left;
-                }
-                QPushButton:hover { background-color: #505357; }
-            """)
-            mode_layout.addWidget(btn)
-
-        self.predict_btn.clicked.connect(lambda checked: self.set_mode('predict'))
-        mode_layout.addWidget(self.predict_btn)
-        mode_layout.addStretch()
-        self.mode_buttons_frame.show()
-        self.center_mode_panel()
-
-        # Top bar
+        # Shared widgets/state
         self.class_selector = QComboBox()
         self.class_selector.addItems(self.classes)
         self.class_selector.currentIndexChanged.connect(self._on_class_changed)
         self._active_class_id = self.class_selector.currentIndex()
 
-        top_layout = QHBoxLayout()
+        # -----------------------------
+        # Top-left: navigation + labeling
+        # -----------------------------
+        self.top_left_frame = QFrame(self.view)
+        self.top_left_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.top_left_frame)
+        top_left_layout = QVBoxLayout(self.top_left_frame)
+        top_left_layout.setContentsMargins(12, 11, 12, 11)
+        top_left_layout.setSpacing(8)
 
-        # Browse filter selector
+        top_left_title = QLabel("Navigation & Labeling")
+        top_left_title.setObjectName("panelTitle")
+        top_left_layout.addWidget(top_left_title)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(["All", "Labeled", "Unlabeled", "Archive"])
         self.filter_combo.setToolTip("Which images to browse with Prev/Next")
+        self.filter_combo.setMinimumContentsLength(10)
+        self.filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.filter_combo.setMinimumWidth(132)
         self.filter_combo.currentTextChanged.connect(lambda t: self._set_nav_filter(t.lower()))
-        top_layout.addWidget(QLabel("Browse:"))
-        top_layout.addWidget(self.filter_combo)
+        browse_label = QLabel("Browse")
+        browse_label.setObjectName("fieldLabel")
+        filter_row.addWidget(browse_label)
+        filter_row.addWidget(self.filter_combo)
+        filter_row.addStretch(1)
+        top_left_layout.addLayout(filter_row)
 
-        # Browse (no save)
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
         btn_prev = QPushButton('◀ Prev')
         btn_prev.clicked.connect(self.prev_index)
-        top_layout.addWidget(btn_prev)
+        nav_row.addWidget(btn_prev)
 
         btn_next = QPushButton('Next ▶')
         btn_next.clicked.connect(self.next_index)
-        top_layout.addWidget(btn_next)
+        nav_row.addWidget(btn_next)
 
-        # Workflow
-        btn_complete = QPushButton('Complete → Next Unlabeled')
+        btn_complete = QPushButton('Complete')
+        btn_complete.setToolTip("Save and jump to next unlabeled image")
         btn_complete.clicked.connect(self.complete_and_next_unlabeled)
-        top_layout.addWidget(btn_complete)
+        nav_row.addWidget(btn_complete)
 
-        btn_skip = QPushButton('Skip → Next Unlabeled')
+        btn_skip = QPushButton('Skip')
+        btn_skip.setToolTip("Jump to next unlabeled image")
         btn_skip.clicked.connect(self.skip_to_next_unlabeled)
-        top_layout.addWidget(btn_skip)
+        nav_row.addWidget(btn_skip)
 
-        # Save
         btn_save = QPushButton('Save')
         btn_save.clicked.connect(self.save_labels)
-        top_layout.addWidget(btn_save)
+        nav_row.addWidget(btn_save)
+        top_left_layout.addLayout(nav_row)
 
-        # Spacer so loader/class sit on the right
-        top_layout.addStretch()
+        mode_grid = QGridLayout()
+        mode_grid.setHorizontalSpacing(6)
+        mode_grid.setVerticalSpacing(6)
+        self.panzoom_btn = QPushButton('Pan/Zoom (1)')
+        self.bbox_btn = QPushButton('BBox (2)')
+        self.keypoint_btn = QPushButton('Keypoint (3)')
+        self.predict_btn = QPushButton('Predict (4)')
+        for btn, mode_name in [(self.panzoom_btn, 'panzoom'),
+                               (self.bbox_btn, 'bbox'),
+                               (self.keypoint_btn, 'keypoint')]:
+            btn.clicked.connect(lambda checked, m=mode_name: self.set_mode(m))
+            btn.setMinimumWidth(116)
+            btn.setMinimumHeight(30)
+        self.predict_btn.clicked.connect(lambda checked: self.set_mode('predict'))
+        self.panzoom_btn.setMinimumWidth(116)
+        self.bbox_btn.setMinimumWidth(116)
+        self.keypoint_btn.setMinimumWidth(116)
+        self.predict_btn.setMinimumWidth(116)
+        self.predict_btn.setMinimumHeight(30)
+        mode_grid.addWidget(self.panzoom_btn, 0, 0)
+        mode_grid.addWidget(self.bbox_btn, 0, 1)
+        mode_grid.addWidget(self.keypoint_btn, 1, 0)
+        mode_grid.addWidget(self.predict_btn, 1, 1)
+        top_left_layout.addLayout(mode_grid)
 
-        # --- Video tools (opens a separate review dialog; doesn't touch Images tab) ---
-        btn_video = QPushButton("Video")
-        btn_video.setToolTip("Predict an entire video, then review frames with overlays")
-        btn_video.clicked.connect(self.open_video_reviewer)
-        top_layout.addWidget(btn_video)
-
-        # Model + class
-        top_layout.addWidget(QLabel("Class:"))
-        top_layout.addWidget(self.class_selector)
-        manage_classes_btn = QPushButton("Manage Classes")
+        class_row = QHBoxLayout()
+        class_row.setSpacing(6)
+        class_label = QLabel("Class")
+        class_label.setObjectName("fieldLabel")
+        class_row.addWidget(class_label)
+        class_row.addWidget(self.class_selector, 1)
+        manage_classes_btn = QPushButton("Classes…")
+        manage_classes_btn.setToolTip("Manage classes and per-class keypoints")
         manage_classes_btn.clicked.connect(self.open_class_manager)
-        top_layout.addWidget(manage_classes_btn)
-        self.progress_label = QLabel("")
-        self.progress_label.setStyleSheet("font-weight: bold;")
-        top_layout.addWidget(self.progress_label)
-        
-        # Main layout
-        layout = QVBoxLayout()
-        layout.addLayout(top_layout)
-        layout.addWidget(self.view)
-        bottom_controls = QHBoxLayout()
+        class_row.addWidget(manage_classes_btn)
+        top_left_layout.addLayout(class_row)
 
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(6)
+        self.progress_label = QLabel("")
+        self.progress_label.setObjectName("progressBadge")
+        progress_row.addWidget(self.progress_label)
+        progress_row.addStretch(1)
+        top_left_layout.addLayout(progress_row)
+
+        # -----------------------------
+        # Top-right: video tools
+        # -----------------------------
+        self.top_right_frame = QFrame(self.view)
+        self.top_right_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.top_right_frame)
+        top_right_layout = QVBoxLayout(self.top_right_frame)
+        top_right_layout.setContentsMargins(12, 11, 12, 14)
+        top_right_layout.setSpacing(8)
+        top_right_title = QLabel("Video")
+        top_right_title.setObjectName("panelTitle")
+        top_right_layout.addWidget(top_right_title)
+        btn_video = QPushButton("Video Reviewer")
+        btn_video.setToolTip("Predict an entire video, then review frames with overlays")
+        btn_video.setMinimumHeight(34)
+        btn_video.clicked.connect(self.open_video_reviewer)
+        top_right_layout.addWidget(btn_video)
+        top_right_layout.addSpacing(2)
+
+        # -----------------------------
+        # Bottom-left: training tools
+        # -----------------------------
+        self.bottom_left_frame = QFrame(self.view)
+        self.bottom_left_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.bottom_left_frame)
+        bottom_left_layout = QVBoxLayout(self.bottom_left_frame)
+        bottom_left_layout.setContentsMargins(12, 11, 12, 11)
+        bottom_left_layout.setSpacing(8)
+        bottom_left_title = QLabel("Dataset & Training")
+        bottom_left_title.setObjectName("panelTitle")
+        bottom_left_layout.addWidget(bottom_left_title)
+        training_row = QHBoxLayout()
+        training_row.setSpacing(6)
         btn_normalize = QPushButton("Validate Labels")
         btn_normalize.setToolTip("Rewrite labels_all files and ensure matching images exist in images_all")
+        btn_normalize.setMinimumHeight(30)
         btn_normalize.clicked.connect(self.normalize_labels_all)
-        bottom_controls.addWidget(btn_normalize)
+        training_row.addWidget(btn_normalize)
 
         btn_export_dataset = QPushButton("Export Dataset")
         btn_export_dataset.setToolTip("Split images_all/labels_all into train/val and regenerate dataset.yaml")
+        btn_export_dataset.setMinimumHeight(30)
         btn_export_dataset.clicked.connect(self.export_dataset)
-        bottom_controls.addWidget(btn_export_dataset)
+        training_row.addWidget(btn_export_dataset)
 
         btn_train = QPushButton("Train Model")
         btn_train.setToolTip("Launch a training run for a selected dataset")
+        btn_train.setMinimumHeight(30)
         btn_train.clicked.connect(self.open_train_dialog)
-        bottom_controls.addWidget(btn_train)
+        training_row.addWidget(btn_train)
+        bottom_left_layout.addLayout(training_row)
 
-        bottom_controls.addStretch()
-
+        # -----------------------------
+        # Bottom-right: model + inference
+        # -----------------------------
+        self.bottom_right_frame = QFrame(self.view)
+        self.bottom_right_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.bottom_right_frame)
+        bottom_right_layout = QVBoxLayout(self.bottom_right_frame)
+        bottom_right_layout.setContentsMargins(12, 11, 12, 11)
+        bottom_right_layout.setSpacing(8)
+        bottom_right_title = QLabel("Model & Inference")
+        bottom_right_title.setObjectName("panelTitle")
+        bottom_right_layout.addWidget(bottom_right_title)
+        inference_row = QHBoxLayout()
+        inference_row.setSpacing(6)
         load_model_btn = QPushButton("Load Model")
+        load_model_btn.setMinimumHeight(30)
         load_model_btn.clicked.connect(self.load_model)
-        bottom_controls.addWidget(load_model_btn)
+        inference_row.addWidget(load_model_btn)
 
-        self.template_apply_btn = QPushButton("Apply Template")
+        self.template_apply_btn = QPushButton("Apply Tmpl")
         self.template_apply_btn.setToolTip("Apply the saved template for the selected class")
+        self.template_apply_btn.setMinimumHeight(30)
         self.template_apply_btn.clicked.connect(self.apply_template_for_current_class)
-        bottom_controls.addWidget(self.template_apply_btn)
+        inference_row.addWidget(self.template_apply_btn)
 
-        self.template_save_btn = QPushButton("Save Template")
+        self.template_save_btn = QPushButton("Save Tmpl")
         self.template_save_btn.setToolTip("Capture the current annotation as the class template")
+        self.template_save_btn.setMinimumHeight(30)
         self.template_save_btn.clicked.connect(self.save_template_for_current_class)
-        bottom_controls.addWidget(self.template_save_btn)
+        inference_row.addWidget(self.template_save_btn)
 
         self.inference_btn = QPushButton("Inference")
         self.inference_btn.setToolTip("Select a video, run YOLO, and export per-frame metrics to CSV")
+        self.inference_btn.setMinimumHeight(30)
         self.inference_btn.clicked.connect(self.run_video_inference)
-        bottom_controls.addWidget(self.inference_btn)
-
-        layout.addLayout(bottom_controls)
-        central.setLayout(layout)
+        inference_row.addWidget(self.inference_btn)
+        bottom_right_layout.addLayout(inference_row)
 
         # reflect initial nav filter in the dropdown
         try:
@@ -1441,31 +2001,58 @@ class LabelingApp(QMainWindow):
         except Exception:
             pass
 
+        self._layout_hot_corners()
+
+        hud_style = """
+            QFrame {
+                background-color: rgba(34, 38, 42, 200);
+                border: 1px solid rgba(128, 141, 152, 130);
+                border-radius: 13px;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                color: #e2e8ee;
+            }
+            QLabel#hudTitle {
+                font-weight: 700;
+                font-size: 10pt;
+                color: #f5f8fb;
+                padding-bottom: 2px;
+            }
+            QLabel#zoomValue {
+                font-weight: 700;
+                font-size: 11pt;
+                color: #f3f7fb;
+            }
+        """
+
         # --- legend (bottom-left) ---
         self.legend_frame = QFrame(self.view)
-        self.legend_frame.setStyleSheet("""
-            background-color: rgba(60, 63, 65, 200);
-            border: 1px solid #555;
-            border-radius: 8px;
-        """)
+        self.legend_frame.setStyleSheet(hud_style)
+        apply_panel_shadow(self.legend_frame)
         # don't lock width; let it resize
         self.legend_frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         legend_layout = QVBoxLayout(self.legend_frame)
-        legend_layout.setContentsMargins(8, 8, 8, 8)
-        legend_layout.setSpacing(5)
+        legend_layout.setContentsMargins(10, 9, 10, 9)
+        legend_layout.setSpacing(6)
 
         self.legend_title = QLabel("Keypoint Visibility")
-        self.legend_title.setStyleSheet("font-weight: bold; font-size: 10pt; color: #e0e0e0;")
+        self.legend_title.setStyleSheet(
+            "background: transparent; border: none; font-weight: 700; font-size: 10pt; color: #f5f8fb;"
+        )
         legend_layout.addWidget(self.legend_title)
 
         # multiline, can wrap, can expand
         self.legend_label = QLabel(
             "Keys:  🔴 Visible   🟡 Occluded   ⚪ Invisible (v=0)\n"
-            "L: toggle labels    -/= point size    [ / ] text size    0: mark next invisible    Shift+0: selected → invisible"
+            "L: toggle labels   -/= point size   [/] text size\n"
+            "0: mark next invisible   Shift+0: selected → invisible"
         )
         self.legend_label.setWordWrap(True)
-        self.legend_label.setStyleSheet("font-size: 10pt; color: #e0e0e0;")
+        self.legend_label.setStyleSheet("background: transparent; border: none; font-size: 10pt; color: #e2e8ee;")
         self.legend_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         legend_layout.addWidget(self.legend_label)
 
@@ -1474,19 +2061,18 @@ class LabelingApp(QMainWindow):
 
         # Floating zoom HUD
         self.zoom_frame = QFrame(self.view)
-        self.zoom_frame.setStyleSheet("""
-            background-color: rgba(60, 63, 65, 200);
-            border: 1px solid #555;
-            border-radius: 8px;
-        """)
-        self.zoom_frame.setFixedWidth(120)
+        self.zoom_frame.setStyleSheet(hud_style)
+        apply_panel_shadow(self.zoom_frame)
+        self.zoom_frame.setFixedWidth(132)
 
         zoom_layout = QVBoxLayout(self.zoom_frame)
-        zoom_layout.setContentsMargins(8, 8, 8, 8)
-        zoom_layout.setSpacing(5)
+        zoom_layout.setContentsMargins(10, 8, 10, 8)
+        zoom_layout.setSpacing(4)
 
         self.zoom_label = QLabel("Zoom: 100%")
-        self.zoom_label.setStyleSheet("font-size: 10pt; color: #e0e0e0;")
+        self.zoom_label.setStyleSheet(
+            "background: transparent; border: none; font-weight: 700; font-size: 11pt; color: #f3f7fb;"
+        )
         zoom_layout.addWidget(self.zoom_label)
 
         self.zoom_frame.move(10, 150)
@@ -1601,73 +2187,37 @@ class LabelingApp(QMainWindow):
 
     def _load_annotations_from_file(self, label_file: str) -> dict[int, dict]:
         cache: dict[int, dict] = {}
+        extra_rows = 0
         try:
             with open(label_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     ln = line.strip()
                     if not ln:
                         continue
-                    entry = self._parse_label_line(ln)
+                    entry, had_extra = self._parse_label_line(ln)
+                    if had_extra:
+                        extra_rows += 1
                     if entry:
                         cache[entry["class_id"]] = entry
         except Exception:
             pass
+        if extra_rows > 0:
+            print(
+                f"⚠️ Ignored extra keypoint values in {extra_rows} row(s) while reading {label_file}",
+                file=sys.stderr,
+            )
         return cache
 
-    def _parse_label_line(self, line: str) -> Optional[dict]:
-        parts = line.split()
-        if len(parts) < 5:
-            return None
-        try:
-            cid = int(parts[0])
-            xc = float(parts[1]); yc = float(parts[2])
-            w = float(parts[3]); h = float(parts[4])
-            if cid < 0 or cid >= len(self.classes):
-                return None
-        except ValueError:
-            return None
-        x = (xc - w / 2.0) * self.img_w
-        y = (yc - h / 2.0) * self.img_h
-        bbox = {"x": x, "y": y, "w": w * self.img_w, "h": h * self.img_h}
-        canonical_names = self.kp_names
-        kp_data = parts[5:]
-        keypoints = []
-        idx = 0
-        canon_idx = 0
-        while idx + 2 < len(kp_data):
-            try:
-                xn = float(kp_data[idx]); yn = float(kp_data[idx + 1]); vis = int(float(kp_data[idx + 2]))
-            except ValueError:
-                break
-            if canon_idx >= len(canonical_names):
-                generated = f"kp_{canon_idx + 1}"
-                canon_idx_value = self._ensure_canonical_name(generated)
-                canonical_names = self.kp_names
-            else:
-                canon_idx_value = canon_idx
-            name = canonical_names[canon_idx_value]
-            kp = {
-                "idx": canon_idx_value,
-                "canon_idx": canon_idx_value,
-                "name": name,
-                "x": xn * self.img_w,
-                "y": yn * self.img_h,
-                "vis": vis,
-            }
-            keypoints.append(kp)
-            idx += 3
-            canon_idx += 1
-
-        class_names = self._kp_names_for_index(cid)
-        filtered: list[dict] = []
-        kp_by_name = {kp["name"]: kp for kp in keypoints}
-        for idx_cls, name in enumerate(class_names):
-            entry = kp_by_name.get(name)
-            if entry:
-                cp = entry.copy()
-                cp["idx"] = idx_cls
-                filtered.append(cp)
-        return {"class_id": cid, "bbox": bbox, "keypoints": filtered}
+    def _parse_label_line(self, line: str) -> tuple[Optional[dict], bool]:
+        class_lookup = [self._kp_names_for_index(i) for i in range(len(self.classes))]
+        return parse_yolo_pose_label_line(
+            line,
+            classes_count=len(self.classes),
+            canonical_names=self.kp_names,
+            class_keypoint_lookup=class_lookup,
+            img_w=self.img_w,
+            img_h=self.img_h,
+        )
 
     def _annotation_entry_to_line(self, entry: dict) -> str:
         cid = entry.get("class_id", 0)
@@ -1978,8 +2528,7 @@ class LabelingApp(QMainWindow):
         if not ok:
             return
 
-        parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        output_root = os.path.join(parent_dir, "inference outputs")
+        output_root = os.path.join(self.project_root, "inference outputs")
         try:
             os.makedirs(output_root, exist_ok=True)
         except Exception as e:
@@ -2039,11 +2588,22 @@ class LabelingApp(QMainWindow):
             "speed_postprocess_ms",
         ] + kp_columns
 
-        rows: list[dict] = []
+        rows_written = 0
         canceled = False
         had_error = False
         error_message = ""
         model_path = getattr(self, "predict_model_path", "")
+        csv_handle = None
+        csv_streamer: Optional[InferenceCsvWriter] = None
+
+        try:
+            csv_handle = open(csv_path, "w", newline="", encoding="utf-8")
+            csv_writer = csv.DictWriter(csv_handle, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_streamer = InferenceCsvWriter(csv_writer)
+        except Exception as e:
+            QMessageBox.warning(self, "Write Error", f"Failed to initialize CSV:\n{csv_path}\n\n{e}")
+            return
 
         prog = QProgressDialog("Running inference…", "Cancel", 0, 0 if total_frames <= 0 else total_frames, self)
         prog.setWindowTitle("Video Inference")
@@ -2072,7 +2632,7 @@ class LabelingApp(QMainWindow):
             processed_frames = 0
 
             def process_batch() -> bool:
-                nonlocal frames, frame_indices, rows, canceled, processed_frames, had_error, error_message
+                nonlocal frames, frame_indices, canceled, processed_frames, had_error, error_message, rows_written
                 if not frames:
                     return True
 
@@ -2146,7 +2706,12 @@ class LabelingApp(QMainWindow):
                         }
                         for col in kp_columns:
                             row[col] = ""
-                        rows.append(row)
+                        if csv_streamer is None:
+                            had_error = True
+                            error_message = "CSV writer was not initialized."
+                            return False
+                        csv_streamer.write_row(row)
+                        rows_written = csv_streamer.rows_written
                     else:
                         xyxy = result.boxes.xyxy.cpu().tolist()
                         xywh = result.boxes.xywh.cpu().tolist()
@@ -2226,7 +2791,12 @@ class LabelingApp(QMainWindow):
                                 row[f"kp_{key}_x_norm"] = norm_val[0] if norm_val and norm_val[0] is not None else ""
                                 row[f"kp_{key}_y_norm"] = norm_val[1] if norm_val and norm_val[1] is not None else ""
 
-                            rows.append(row)
+                            if csv_streamer is None:
+                                had_error = True
+                                error_message = "CSV writer was not initialized."
+                                return False
+                            csv_streamer.write_row(row)
+                            rows_written = csv_streamer.rows_written
 
                     processed_frames += 1
                     if total_frames > 0:
@@ -2273,6 +2843,15 @@ class LabelingApp(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
             prog.close()
+            if csv_handle is not None:
+                try:
+                    csv_handle.flush()
+                except Exception:
+                    pass
+                try:
+                    csv_handle.close()
+                except Exception:
+                    pass
             self._predict_busy = was_busy
             if hasattr(self, "predict_btn"):
                 self.predict_btn.setEnabled(True)
@@ -2280,24 +2859,34 @@ class LabelingApp(QMainWindow):
                 self.inference_btn.setEnabled(True)
 
         if had_error:
-            QMessageBox.critical(self, "Inference Error", f"An error occurred during inference:\n{error_message}")
+            if rows_written == 0:
+                try:
+                    if os.path.exists(csv_path):
+                        os.remove(csv_path)
+                except Exception:
+                    pass
+                QMessageBox.critical(self, "Inference Error", f"An error occurred during inference:\n{error_message}")
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Inference Error",
+                    "An error occurred during inference.\n\n"
+                    f"{error_message}\n\n"
+                    f"Partial CSV saved ({rows_written} row(s)):\n{csv_path}"
+                )
             return
 
-        if not rows:
+        if rows_written == 0:
             if canceled:
+                try:
+                    if os.path.exists(csv_path):
+                        os.remove(csv_path)
+                except Exception:
+                    pass
                 QMessageBox.information(self, "Inference Canceled", "Inference canceled before any results were generated.")
             return
 
-        try:
-            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
-        except Exception as e:
-            QMessageBox.warning(self, "Write Error", f"Failed to write CSV:\n{csv_path}\n\n{e}")
-            return
-
-        message = f"Saved {len(rows)} row(s) to:\n{csv_path}"
+        message = f"Saved {rows_written} row(s) to:\n{csv_path}"
         if canceled:
             message = "Inference canceled early.\n" + message
         QMessageBox.information(self, "Inference Complete", message)
@@ -2645,11 +3234,57 @@ class LabelingApp(QMainWindow):
     def _apply_class_manager_results(self, classes: list[str], keypoints: list[str], kp_map: dict[str, list[str]]) -> bool:
         if not classes or not keypoints:
             return False
-        self._write_list_file(self.class_file, classes)
-        self._write_list_file(self.keypoint_file, keypoints)
-        self.classes = classes
-        self.kp_names = keypoints
-        self.class_keypoints = kp_map
+        classes_clean = [name.strip() for name in classes if name and name.strip()]
+        keypoints_clean = [name.strip() for name in keypoints if name and name.strip()]
+        if not classes_clean or not keypoints_clean:
+            return False
+
+        class_dupes = find_duplicate_names(classes_clean)
+        if class_dupes:
+            QMessageBox.warning(
+                self,
+                "Duplicate classes",
+                "Class names must be unique.\n\nDuplicates: " + ", ".join(class_dupes),
+            )
+            return False
+
+        canonical: list[str] = []
+        for name in keypoints_clean:
+            if name not in canonical:
+                canonical.append(name)
+
+        normalized_map: dict[str, list[str]] = {}
+        for class_name in classes_clean:
+            raw_list = kp_map.get(class_name, [])
+            cls_keypoints = [str(name).strip() for name in raw_list if str(name).strip()]
+            dupes = find_duplicate_names(cls_keypoints)
+            if dupes:
+                QMessageBox.warning(
+                    self,
+                    "Duplicate keypoints",
+                    f"Class '{class_name}' has duplicate keypoint names:\n{', '.join(dupes)}",
+                )
+                return False
+            for name in cls_keypoints:
+                if name not in canonical:
+                    canonical.append(name)
+            normalized_map[class_name] = cls_keypoints
+
+        if self._schema_is_locked():
+            allowed, reason = self._validate_locked_schema_changes(classes_clean, normalized_map)
+            if not allowed:
+                QMessageBox.warning(
+                    self,
+                    "Schema Locked",
+                    reason + "\n\nLabeled data already exists for this project.",
+                )
+                return False
+
+        self._write_list_file(self.class_file, classes_clean)
+        self._write_list_file(self.keypoint_file, canonical)
+        self.classes = classes_clean
+        self.kp_names = canonical
+        self.class_keypoints = normalized_map
         self._save_class_keypoints()
         self._refresh_kp_index_lookup()
         current_name = self.class_selector.currentText()
@@ -2666,7 +3301,13 @@ class LabelingApp(QMainWindow):
         return True
 
     def open_class_manager(self):
-        dlg = ClassManagerDialog(self.classes, self.class_keypoints, self.kp_names, self)
+        dlg = ClassManagerDialog(
+            self.classes,
+            self.class_keypoints,
+            self.kp_names,
+            self,
+            schema_locked=self._schema_is_locked(),
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         classes, keypoints, kp_map = dlg.get_results()
@@ -2962,18 +3603,13 @@ class LabelingApp(QMainWindow):
 
         if self.mode == 'keypoint':
             self.legend_frame.show()
-            self._layout_overlays()
             self.zoom_frame.hide()
-            frame_height = self.legend_frame.sizeHint().height()
-            view_height = self.view.viewport().height()
-            self.legend_frame.move(10, view_height - frame_height - 10)
+            self._layout_overlays()
             self.update_status_bar(self._kp_text())
         elif self.mode == 'panzoom':
             self.legend_frame.hide()
             self.zoom_frame.show()
-            frame_height = self.zoom_frame.sizeHint().height()
-            view_height = self.view.viewport().height()
-            self.zoom_frame.move(10, view_height - frame_height - 10)
+            self._layout_overlays()
             self.update_zoom_label()
         else:
             self.legend_frame.hide()
@@ -2988,11 +3624,33 @@ class LabelingApp(QMainWindow):
         zoom = int(self.view.transform().m11() * 100)
         self.zoom_label.setText(f"Zoom: {zoom}%")
 
-    def center_mode_panel(self):
-        frame_height = self.mode_buttons_frame.sizeHint().height()
-        view_height = self.view.viewport().height()
-        y_centered = (view_height - frame_height) // 2
-        self.mode_buttons_frame.move(10, y_centered)
+    def _layout_hot_corners(self):
+        if not hasattr(self, "view"):
+            return
+        vw = self.view.viewport().width()
+        vh = self.view.viewport().height()
+        margin = 10
+        gap = 8
+
+        if hasattr(self, "top_left_frame"):
+            self.top_left_frame.adjustSize()
+            self.top_left_frame.move(margin, margin)
+
+        if hasattr(self, "top_right_frame"):
+            self.top_right_frame.adjustSize()
+            tr_w = self.top_right_frame.sizeHint().width()
+            self.top_right_frame.move(max(margin, vw - tr_w - margin), margin)
+
+        if hasattr(self, "bottom_left_frame"):
+            self.bottom_left_frame.adjustSize()
+            bl_h = self.bottom_left_frame.sizeHint().height()
+            self.bottom_left_frame.move(margin, max(margin, vh - bl_h - margin))
+
+        if hasattr(self, "bottom_right_frame"):
+            self.bottom_right_frame.adjustSize()
+            br_w = self.bottom_right_frame.sizeHint().width()
+            br_h = self.bottom_right_frame.sizeHint().height()
+            self.bottom_right_frame.move(max(margin, vw - br_w - margin), max(margin, vh - br_h - margin))
 
     def _layout_overlays(self):
         """Dynamically position and size legend / zoom overlays."""
@@ -3003,26 +3661,43 @@ class LabelingApp(QMainWindow):
         fm = self.legend_label.fontMetrics()
         ch = fm.horizontalAdvance('M')  # approx width of one character
         # Aim for ~26 characters per line (+ padding), wrap the rest
-        preferred = int(ch * 26 + 20)
+        preferred = int(ch * 30 + 24)
 
         # Clamp between sensible bounds and a fraction of viewport
-        w = max(220, min(preferred, int(vw * 0.32), 360))
+        w = max(250, min(preferred, int(vw * 0.36), 400))
 
-        # Apply width and position bottom-left
+        # Keep visibility overlays above the bottom-left tool panel.
+        bottom_offset = 10
+        if hasattr(self, "bottom_left_frame") and self.bottom_left_frame.isVisible():
+            bottom_offset += self.bottom_left_frame.sizeHint().height() + 8
+
+        # Apply width and position lower-left (above bottom-left controls)
         self.legend_frame.setFixedWidth(w)
         h = self.legend_frame.sizeHint().height()
-        self.legend_frame.move(10, vh - h - 10)
+        self.legend_frame.move(10, vh - h - bottom_offset)
 
         # If you also show the zoom HUD, keep it in the same corner
         if hasattr(self, "zoom_frame") and self.zoom_frame.isVisible():
             zh = self.zoom_frame.sizeHint().height()
-            self.zoom_frame.move(10, vh - zh - 10)
+            self.zoom_frame.move(10, vh - zh - bottom_offset)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, 'mode_buttons_frame'):
-            self.center_mode_panel()
-            self._layout_overlays()
+        self._layout_hot_corners()
+        self._layout_overlays()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Initial widget geometry can settle after the first paint; reflow once
+        # now and once shortly after so corners land correctly on first open.
+        QTimer.singleShot(0, self._relayout_after_show)
+        QTimer.singleShot(40, self._relayout_after_show)
+
+    def _relayout_after_show(self):
+        if not self.isVisible() or not hasattr(self, "view"):
+            return
+        self._layout_hot_corners()
+        self._layout_overlays()
 
     def _remove_all_boxes_and_keypoints(self, drop_cache: bool = False):
         self._clear_all_annotation_items()
@@ -3090,6 +3765,7 @@ class LabelingApp(QMainWindow):
         with open(label_out_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(lines) + "\n")
         print(f"✅ Saved label to {label_out_path}")
+        self._schema_locked = True
 
         self._render_overlay_from_cache(annotated_out_path)
 
@@ -3525,7 +4201,7 @@ class LabelingApp(QMainWindow):
         self.update_status_bar("Label normalization complete.")
 
     def open_train_dialog(self):
-        dlg = TrainDialog(self, default_dataset=os.path.join(os.path.dirname(__file__), "datasets"))
+        dlg = TrainDialog(self, default_dataset=os.path.join(self.project_root, "datasets"))
         dlg.exec()
 
     def open_video_reviewer(self):
@@ -3570,55 +4246,97 @@ class VideoReviewDialog(QDialog):
     def _build_ui(self):
         # --- UI ---
         top = QVBoxLayout(self)
+        top.setContentsMargins(10, 10, 10, 10)
+        top.setSpacing(8)
 
-        # Bar 1: file + params
+        # Header row: load + current-video summary
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.btn_load = QPushButton("Load Video")
         self.btn_load.clicked.connect(self._choose_video)
         row.addWidget(self.btn_load)
 
-        row.addSpacing(8)
-        self.info = QLabel("No video loaded")
-        row.addWidget(self.info)
-        row.addStretch()
+        self.info = QLabel("")
+        self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.info.setMinimumWidth(180)
+        self.info.setWordWrap(False)
+        self.info.setStyleSheet("padding-left: 4px;")
+        self._info_full_text = "No video loaded"
+        self._set_info_text(self._info_full_text)
+        row.addWidget(self.info, 1)
+        top.addLayout(row)
 
-        row.addWidget(QLabel("Start"))
-        self.spin_start = QSpinBox(); self.spin_start.setRange(0, 0); self.spin_start.setValue(0); row.addWidget(self.spin_start)
+        # Control rows (split to keep dialog resizable at narrower widths)
+        controls_row_1 = QHBoxLayout()
+        controls_row_1.setSpacing(8)
+        controls_row_1.addWidget(QLabel("Start"))
+        self.spin_start = QSpinBox()
+        self.spin_start.setRange(0, 0)
+        self.spin_start.setValue(0)
+        self.spin_start.setMaximumWidth(110)
+        controls_row_1.addWidget(self.spin_start)
 
-        row.addWidget(QLabel("End"))
-        self.spin_end = QSpinBox(); self.spin_end.setRange(0, 0); self.spin_end.setValue(0); row.addWidget(self.spin_end)
+        controls_row_1.addWidget(QLabel("End"))
+        self.spin_end = QSpinBox()
+        self.spin_end.setRange(0, 0)
+        self.spin_end.setValue(0)
+        self.spin_end.setMaximumWidth(110)
+        controls_row_1.addWidget(self.spin_end)
 
-        row.addWidget(QLabel("Stride"))
-        self.spin_stride = QSpinBox(); self.spin_stride.setRange(1, 1000); self.spin_stride.setValue(5); row.addWidget(self.spin_stride)
+        controls_row_1.addWidget(QLabel("Stride"))
+        self.spin_stride = QSpinBox()
+        self.spin_stride.setRange(1, 1000)
+        self.spin_stride.setValue(5)
+        self.spin_stride.setMaximumWidth(90)
+        controls_row_1.addWidget(self.spin_stride)
 
-        row.addWidget(QLabel("Conf≥"))
-        self.spin_conf = QDoubleSpinBox(); self.spin_conf.setRange(0.0, 1.0); self.spin_conf.setSingleStep(0.05); self.spin_conf.setValue(0.25); row.addWidget(self.spin_conf)
-
-        row.addWidget(QLabel("IoU"))
-        self.spin_iou = QDoubleSpinBox(); self.spin_iou.setRange(0.0, 1.0); self.spin_iou.setSingleStep(0.05); self.spin_iou.setValue(0.50); row.addWidget(self.spin_iou)
-
-        # keypoint visibility threshold (map kp conf → visible/occluded)
-        row.addWidget(QLabel("kp≥"))
-        self.spin_kpvis = QDoubleSpinBox()
-        self.spin_kpvis.setRange(0.0, 1.0)
-        self.spin_kpvis.setSingleStep(0.05)
-        self.spin_kpvis.setValue(0.50)  # >= → visible (red); < → occluded (yellow)
-        row.addWidget(self.spin_kpvis)
-
-        # Batch size spinner for prediction
-        row.addWidget(QLabel("Batch"))
+        controls_row_1.addWidget(QLabel("Batch"))
         self.spin_batch = QSpinBox()
         self.spin_batch.setRange(-1, 256)
         self.spin_batch.setSpecialValueText("Auto")
         self.spin_batch.setValue(8)  # default batch size
-        row.addWidget(self.spin_batch)
+        self.spin_batch.setToolTip("Auto uses a safe chunk size (8 on CUDA/MPS, 1 on CPU).")
+        self.spin_batch.setMaximumWidth(90)
+        controls_row_1.addWidget(self.spin_batch)
 
-        self.btn_predict = QPushButton("Predict Range (sync)")
+        controls_row_1.addStretch(1)
+        self.btn_predict = QPushButton("Predict Range")
         self.btn_predict.setEnabled(False)
         self.btn_predict.clicked.connect(self._predict_sync)
-        row.addWidget(self.btn_predict)
+        controls_row_1.addWidget(self.btn_predict)
+        top.addLayout(controls_row_1)
 
-        top.addLayout(row)
+        controls_row_2 = QHBoxLayout()
+        controls_row_2.setSpacing(8)
+        controls_row_2.addWidget(QLabel("Conf≥"))
+        self.spin_conf = QDoubleSpinBox()
+        self.spin_conf.setRange(0.0, 1.0)
+        self.spin_conf.setSingleStep(0.05)
+        self.spin_conf.setValue(0.25)
+        self.spin_conf.setDecimals(2)
+        self.spin_conf.setMaximumWidth(90)
+        controls_row_2.addWidget(self.spin_conf)
+
+        controls_row_2.addWidget(QLabel("IoU"))
+        self.spin_iou = QDoubleSpinBox()
+        self.spin_iou.setRange(0.0, 1.0)
+        self.spin_iou.setSingleStep(0.05)
+        self.spin_iou.setValue(0.50)
+        self.spin_iou.setDecimals(2)
+        self.spin_iou.setMaximumWidth(90)
+        controls_row_2.addWidget(self.spin_iou)
+
+        # keypoint visibility threshold (map kp conf → visible/occluded)
+        controls_row_2.addWidget(QLabel("kp≥"))
+        self.spin_kpvis = QDoubleSpinBox()
+        self.spin_kpvis.setRange(0.0, 1.0)
+        self.spin_kpvis.setSingleStep(0.05)
+        self.spin_kpvis.setDecimals(2)
+        self.spin_kpvis.setValue(0.50)  # >= → visible (red); < → occluded (yellow)
+        self.spin_kpvis.setMaximumWidth(90)
+        controls_row_2.addWidget(self.spin_kpvis)
+        controls_row_2.addStretch(1)
+        top.addLayout(controls_row_2)
 
         # Graphics view (pan/zoom enabled)
         self.scene = QGraphicsScene()
@@ -3640,21 +4358,21 @@ class VideoReviewDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         # NEW: bottom-right export button
-        self.btn_send = QPushButton("Send Frame → Images")
+        self.btn_send = QPushButton("Send Frame")
         self.btn_send.setToolTip("Save current frame to the labeler's images_to_label folder")
         self.btn_send.setEnabled(False)
         self.btn_send.clicked.connect(self._export_current_frame_to_images)
         buttons.addButton(self.btn_send, QDialogButtonBox.ButtonRole.ActionRole)
 
         # NEW: export N lowest-confidence frames
-        self.btn_send_low = QPushButton("Send Lowest…")
+        self.btn_send_low = QPushButton("Send Low…")
         self.btn_send_low.setToolTip("Export N lowest-confidence predicted frames to the labeler")
         self.btn_send_low.setEnabled(False)
         self.btn_send_low.clicked.connect(self._export_low_confidence_frames)
         buttons.addButton(self.btn_send_low, QDialogButtonBox.ButtonRole.ActionRole)
 
         # NEW: export N highest-confidence frames
-        self.btn_send_high = QPushButton("Send Highest…")
+        self.btn_send_high = QPushButton("Send High…")
         self.btn_send_high.setToolTip("Export N highest-confidence predicted frames to the labeler")
         self.btn_send_high.setEnabled(False)
         self.btn_send_high.clicked.connect(self._export_high_confidence_frames)
@@ -3703,6 +4421,28 @@ class VideoReviewDialog(QDialog):
         self._zoom_out_sc.activated.connect(lambda: self.view.scale(1/1.05, 1/1.05))
         self._zoom_reset_sc = QShortcut(QKeySequence("R"), self)
         self._zoom_reset_sc.activated.connect(self.view.reset_view)
+
+    def _set_info_text(self, text: str):
+        self._info_full_text = text or ""
+        self._refresh_info_label()
+
+    def _refresh_info_label(self):
+        if not hasattr(self, "info"):
+            return
+        full = getattr(self, "_info_full_text", "") or ""
+        # Elide in the middle so filename prefix/suffix stay visible.
+        width = max(140, int(self.info.width()) - 8)
+        elided = self.info.fontMetrics().elidedText(
+            full,
+            Qt.TextElideMode.ElideMiddle,
+            width,
+        )
+        self.info.setText(elided)
+        self.info.setToolTip(full)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_info_label()
 
     def _labeler_image_dir(self) -> Optional[str]:
         """Return the parent labeler's queue folder for exported frames."""
@@ -3815,7 +4555,7 @@ class VideoReviewDialog(QDialog):
         w = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-        self.info.setText(f"{self.base} — {w}x{h} @ {self.fps:.2f} fps — {self.total} frames")
+        self._set_info_text(f"{self.base} — {w}x{h} @ {self.fps:.2f} fps — {self.total} frames")
         self.spin_start.setRange(0, max(0, self.total - 1)); self.spin_start.setValue(0)
         self.spin_end.setRange(0, max(0, self.total - 1)); self.spin_end.setValue(max(0, self.total - 1))
         self.slider.setRange(0, max(0, self.total - 1))
@@ -3838,7 +4578,8 @@ class VideoReviewDialog(QDialog):
             cached_keys = sorted(self.preds.keys())
             self._seek(cached_keys[0] if cached_keys else 0, show_only=False)
         else:
-            self.slider.setEnabled(False)   # enable after predictions
+            # Timeline scrubbing should work even without predictions.
+            self.slider.setEnabled(True)
             self._seek(0, show_only=True)
 
         # Reset pan/zoom whenever a new video is opened
@@ -3859,10 +4600,11 @@ class VideoReviewDialog(QDialog):
         stride = max(1, int(self.spin_stride.value()))
         conf = float(self.spin_conf.value())
         iou = float(self.spin_iou.value())
-        bs = int(self.spin_batch.value()) if hasattr(self, "spin_batch") else 1
+        requested_batch = int(self.spin_batch.value()) if hasattr(self, "spin_batch") else 1
+        effective_batch = effective_prediction_batch(requested_batch, self.device)
         imgsz = 640
         kpvis = float(self.spin_kpvis.value()) if hasattr(self, "spin_kpvis") else 0.5
-        batch_kwargs = {} if bs <= 0 else {"batch": bs}
+        batch_kwargs = {} if requested_batch <= 0 else {"batch": requested_batch}
 
         if end < start:
             QMessageBox.warning(self, "Range Error", "End must be ≥ Start.")
@@ -3898,7 +4640,7 @@ class VideoReviewDialog(QDialog):
                 frame_indices.append(idx)
 
                 # If we filled a batch or reached the end, run prediction on the batch
-                if len(frames) >= bs or (idx + stride) > end:
+                if len(frames) >= effective_batch or (idx + stride) > end:
                     try:
                         results_list = self.model.predict(
                             source=frames,
@@ -4439,14 +5181,25 @@ class TrainDialog(QDialog):
         self.resize(520, 360)
 
         self.default_dataset = default_dataset
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.project_runs_dir = os.path.join(base_dir, "runs")
-        self.distillations_root = os.path.join(
-            base_dir,
+        self.app_base_dir = os.path.abspath(getattr(parent, "app_base_dir", os.path.dirname(os.path.abspath(__file__))))
+        self.project_root = os.path.abspath(getattr(parent, "project_root", self.app_base_dir))
+        self.project_runs_dir = os.path.join(self.project_root, "runs")
+        project_distillations_root = os.path.join(
+            self.project_root,
             "dino_distillation",
             "DINOv3_Distillation_YOLO-pose",
             "dino_distillations",
         )
+        fallback_distillations_root = os.path.join(
+            self.app_base_dir,
+            "dino_distillation",
+            "DINOv3_Distillation_YOLO-pose",
+            "dino_distillations",
+        )
+        self.distillations_root = (
+            project_distillations_root if os.path.isdir(project_distillations_root) else fallback_distillations_root
+        )
+        os.makedirs(self.project_runs_dir, exist_ok=True)
         self.dino_exports: list[tuple[str, str]] = []
         self.dino_manual_path: Optional[str] = None
         self.resume_exports: list[tuple[str, str]] = []
@@ -5013,37 +5766,33 @@ if __name__ == '__main__':
     _ensure_qt_plugin_paths()
     app = QApplication(sys.argv)
 
-    base = os.path.dirname(__file__)
+    app_base = os.path.dirname(__file__)
 
     app.setApplicationName("SqueakPose Studio")
     app.setApplicationDisplayName("SqueakPose Studio")
 
-    icon_path = os.path.join(base, "squeakpose_studio_logo.png")
+    icon_path = os.path.join(app_base, "squeakpose_studio_logo.png")
     app.setWindowIcon(QIcon(icon_path))
 
-    splash_pix = QPixmap(os.path.join(base, "squeakpose_studio_logo.png"))
+    default_project = _load_last_project() or _default_projects_root()
+    launcher = ProjectLauncherDialog(default_project, icon_path)
+    if launcher.exec() != QDialog.DialogCode.Accepted:
+        sys.exit(0)
+    project_root = launcher.project_root
+    if not project_root:
+        sys.exit(0)
+    project_paths = _ensure_project_structure(project_root)
+    _save_last_project(project_root)
+    force_initial_setup = launcher.selection_mode == "create"
+
+    splash_pix = QPixmap(os.path.join(app_base, "squeakpose_studio_logo.png"))
     splash = QSplashScreen(splash_pix, Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint)
     splash.show(); app.processEvents(); splash.raise_(); splash.activateWindow()
     screen = app.primaryScreen(); screen_geometry = screen.availableGeometry()
     x = (screen_geometry.width() - splash_pix.width()) // 2
     y = (screen_geometry.height() - splash_pix.height()) // 2
     splash.move(x, y)
-
-    # folders
-    for folder in [
-        os.path.join(base, 'images_to_label'),
-        os.path.join(base, 'images_all'),
-        os.path.join(base, 'labels_all'),
-        os.path.join(base, 'annotations'),
-        os.path.join(base, 'fonts')
-    ]:
-        os.makedirs(folder, exist_ok=True)
-
-    img_dir = os.path.join(base, 'images_to_label')
-    lbl_dir = os.path.join(base, 'labels_all')
-    cls_file = os.path.join(base, 'classes.txt')
-    kp_file = os.path.join(base, 'keypoints.txt')
-    font_path = os.path.join(base, 'fonts', 'FiraSans-Regular.ttf')
+    font_path = os.path.join(app_base, 'fonts', 'FiraSans-Regular.ttf')
 
     if os.path.exists(font_path):
         font_id = QFontDatabase.addApplicationFont(font_path)
@@ -5080,14 +5829,26 @@ if __name__ == '__main__':
     app.setStyleSheet(dark_stylesheet)
 
     def start_main_window():
-        window = LabelingApp(img_dir, lbl_dir, cls_file, kp_file)
+        window = LabelingApp(
+            project_paths["images_to_label"],
+            project_paths["labels_all"],
+            project_paths["classes_file"],
+            project_paths["keypoints_file"],
+            project_root=project_paths["root"],
+            force_initial_setup=force_initial_setup,
+        )
+        window.setWindowTitle(_project_window_title(project_paths["root"]))
         splash.finish(window)
         window.show()
         screen = app.primaryScreen(); screen_geometry = screen.availableGeometry()
         window_width = window.frameGeometry().width(); window_height = window.frameGeometry().height()
         x = (screen_geometry.width() - window_width) // 2
         y = (screen_geometry.height() - window_height) // 2
-        window.move(x, y); window.raise_(); window.activateWindow(); window._update_status()
+        window.move(x, y)
+        window.raise_()
+        window.activateWindow()
+        window._update_status()
+        window.update_status_bar(f"Project loaded: {project_paths['root']}")
 
     QTimer.singleShot(1000, start_main_window)
     sys.exit(app.exec())

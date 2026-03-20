@@ -48,7 +48,31 @@ Running the app
 ```
 uv run squeakpose_studio.py
 ```
-The app will create `images_to_label`, `images_all`, `labels_all`, `annotations`, and `fonts` if they are missing.
+On launch, you will be prompted to select a **project folder**. The app stores labeling, datasets, training runs, templates, and inference outputs inside that selected project.
+- Startup now opens a launcher screen with **Open Project** and **Create Project**.
+- Choosing **Create Project** immediately launches class/keypoint setup for the new project.
+- By default, the launcher starts in your Documents projects folder (`Documents/SqueakPose Studio Projects`).
+- In-app project commands are available under **File → Open Project…** and **File → Close Project**.
+- Main controls are organized as hot-corner panels:
+  - top-left: navigation + labeling
+  - top-right: video tools
+  - bottom-left: dataset + training
+  - bottom-right: model + inference
+
+Per-project structure (auto-created)
+------------------------------------
+- `images_to_label/`
+- `images_all/`
+- `labels_all/`
+- `annotations/`
+- `datasets/`
+- `runs/`
+- `inference outputs/`
+- `templates/`
+- `classes.txt`
+- `keypoints.txt`
+- `class_keypoints.json`
+- `squeakpose_project.json`
 
 Labeling workflow
 -----------------
@@ -66,7 +90,7 @@ Dataset export & training
 Video inference
 ---------------
 - Load a trained model via **Load Model**.
-- **Inference** prompts for a video, batch size, and runs YOLO on batches. Results are saved as CSV to an `inference outputs` folder (one level above the repo) with per-frame detection + keypoint metrics and normalized coordinates.
+- **Inference** prompts for a video, batch size, and runs YOLO on batches. Results are saved as CSV to the active project's `inference outputs/` folder with per-frame detection + keypoint metrics and normalized coordinates.
 
 Programmatic helper
 -------------------

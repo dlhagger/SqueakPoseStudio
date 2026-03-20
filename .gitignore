@@ -24,5 +24,3 @@ class_keypoints.json
 classes.txt
 keypoints.txt
 *.sqp_preds.json
-tests/test_dataset_builder.py
- 

@@ -26,6 +26,7 @@ from squeakpose_core import (
     effective_prediction_batch,
     find_duplicate_names,
     parse_yolo_pose_label_line,
+    resolve_default_training_dataset_path,
 )
 
 DEFAULT_CLASS_NAMES = ["mouse"]
@@ -3026,7 +3027,11 @@ class LabelingApp(QMainWindow):
                 class_kp_names = self._kp_names_for_index(cid)
                 if kp_data and det_idx < len(kp_data):
                     inst = kp_data[det_idx]
-                    for idx_pt, (x, y, vis) in enumerate(inst):
+                    for idx_pt, raw_kp in enumerate(inst):
+                        # Standard Ultralytics pose prediction format: (x, y, conf).
+                        if len(raw_kp) < 3:
+                            continue
+                        x, y, kp_conf = raw_kp[0], raw_kp[1], raw_kp[2]
                         if idx_pt >= len(self.kp_names):
                             break
                         canonical_name = self.kp_names[idx_pt]
@@ -3034,7 +3039,9 @@ class LabelingApp(QMainWindow):
                             continue
                         kp_obj = Keypoint(x, y, cid, canonical_name)
                         kp_item = KeypointItem(kp_obj, self.kp_pixel_radius, self.kp_font_px)
-                        kp_item.visibility = int(vis) if vis in (0, 1, 2) else (2 if vis > 0 else 1)
+                        # Keep prediction confidence available for future use, but
+                        # do not infer visibility flags from it.
+                        setattr(kp_item, "pred_conf", kp_conf)
                         kp_item.update_appearance()
                         self.scene.addItem(kp_item)
                         self._track_scene_item(kp_item)
@@ -4201,7 +4208,8 @@ class LabelingApp(QMainWindow):
         self.update_status_bar("Label normalization complete.")
 
     def open_train_dialog(self):
-        dlg = TrainDialog(self, default_dataset=os.path.join(self.project_root, "datasets"))
+        default_dataset = resolve_default_training_dataset_path(self.project_root)
+        dlg = TrainDialog(self, default_dataset=default_dataset)
         dlg.exec()
 
     def open_video_reviewer(self):
@@ -4209,7 +4217,14 @@ class LabelingApp(QMainWindow):
             QMessageBox.warning(self, "OpenCV missing", "Install OpenCV:\n\n  pip install opencv-python")
             return
         # It’s okay if no model is loaded yet; dialog will warn before predicting
-        dlg = VideoReviewDialog(self, self.predict_model, self._device, self.kp_names, self.classes)
+        dlg = VideoReviewDialog(
+            self,
+            self.predict_model,
+            self._device,
+            self.kp_names,
+            self.classes,
+            class_keypoints=self.class_keypoints,
+        )
         dlg.exec()
 
 class VideoReviewDialog(QDialog):
@@ -4219,7 +4234,15 @@ class VideoReviewDialog(QDialog):
       2) Runs YOLO predict synchronously over a chosen frame range (with a modal QProgressDialog)
       3) Lets you scrub a timeline and see bbox+keypoint overlays and confidence
     """
-    def __init__(self, parent, model, device: str, kp_names: list[str], classes: list[str]):
+    def __init__(
+        self,
+        parent,
+        model,
+        device: str,
+        kp_names: list[str],
+        classes: list[str],
+        class_keypoints: Optional[dict[str, list[str]]] = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Video Review")
         self.resize(980, 700)
@@ -4228,6 +4251,7 @@ class VideoReviewDialog(QDialog):
         self.device = device
         self.kp_names = kp_names
         self.classes = classes
+        self.class_keypoints = class_keypoints or {}
         self.model_path = getattr(parent, 'predict_model_path', None)
 
         # runtime state
@@ -5101,6 +5125,10 @@ class VideoReviewDialog(QDialog):
         if not p or not p.get("ok"):
             return
 
+        cls_id = int(p.get("cls", 0))
+        class_name = self.classes[cls_id] if 0 <= cls_id < len(self.classes) else str(cls_id)
+        class_kp_names = self.class_keypoints.get(class_name, self.kp_names)
+
         # ---- Bounding box (blue, thicker) ----
         if p.get("xyxy"):
             x1, y1, x2, y2 = p["xyxy"]
@@ -5110,9 +5138,7 @@ class VideoReviewDialog(QDialog):
             self.scene.addItem(r); self._overlay_items.append(r)
 
             # class + confidence (bigger, blue)
-            cls_id = p.get("cls", 0)
-            cls_name = self.classes[cls_id] if 0 <= cls_id < len(self.classes) else str(cls_id)
-            t = QGraphicsSimpleTextItem(f"{cls_name} {p.get('conf', 0.0):.2f}")
+            t = QGraphicsSimpleTextItem(f"{class_name} {p.get('conf', 0.0):.2f}")
             t.setFont(_ui_font(24))
             t.setBrush(QBrush(Qt.GlobalColor.blue))
             t.setPos(x1 + 2, y1 + 2); t.setZValue(6)
@@ -5138,7 +5164,12 @@ class VideoReviewDialog(QDialog):
             self.scene.addItem(dot); self._overlay_items.append(dot)
 
             # label next to kp
-            name = self.kp_names[i] if i < len(self.kp_names) else f"kp{i}"
+            if i < len(class_kp_names):
+                name = class_kp_names[i]
+            elif i < len(self.kp_names):
+                name = self.kp_names[i]
+            else:
+                name = f"kp{i}"
             lbl = QGraphicsSimpleTextItem(name)
             lbl.setFont(_ui_font(18))
             lbl.setBrush(QBrush(color))

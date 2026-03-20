@@ -132,9 +132,18 @@ def create_dataset_yaml(
     """
     images_train = os.path.join(base_dir, "images", "train")
     images_val = os.path.join(base_dir, "images", "val")
+    labels_train = os.path.join(base_dir, "labels", "train")
+    labels_val = os.path.join(base_dir, "labels", "val")
 
-    if not os.path.isdir(images_train) or not os.path.isdir(images_val):
-        raise FileNotFoundError("Expected images/train and images/val directories to exist.")
+    if (
+        not os.path.isdir(images_train)
+        or not os.path.isdir(images_val)
+        or not os.path.isdir(labels_train)
+        or not os.path.isdir(labels_val)
+    ):
+        raise FileNotFoundError(
+            "Expected images/train, images/val, labels/train, and labels/val directories to exist."
+        )
 
     kp_list = list(kp_names)
     cls_list = list(class_names)

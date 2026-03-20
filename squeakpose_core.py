@@ -6,6 +6,7 @@ in isolation.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 
@@ -30,6 +31,28 @@ def effective_prediction_batch(requested_batch: int, device: str) -> int:
     if requested_batch > 0:
         return requested_batch
     return 8 if (device or "").lower() in {"cuda", "mps"} else 1
+
+
+def resolve_default_training_dataset_path(project_root: str) -> str:
+    """Pick the best default dataset folder for the training dialog.
+
+    Preference order:
+    1. `datasets/pose` if it contains `dataset.yaml`
+    2. `datasets/detect` if it contains `dataset.yaml`
+    3. `datasets` if it contains `dataset.yaml`
+    4. fallback to `datasets` under the project root
+    """
+    root = os.path.abspath(project_root or os.getcwd())
+    datasets_root = os.path.join(root, "datasets")
+    candidates = (
+        os.path.join(datasets_root, "pose"),
+        os.path.join(datasets_root, "detect"),
+        datasets_root,
+    )
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, "dataset.yaml")):
+            return candidate
+    return datasets_root
 
 
 class InferenceCsvWriter:
@@ -115,4 +138,3 @@ def parse_yolo_pose_label_line(
             filtered.append(cp)
 
     return {"class_id": cid, "bbox": bbox, "keypoints": filtered}, had_extra_keypoints
-

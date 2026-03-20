@@ -1,10 +1,13 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from squeakpose_core import (
     InferenceCsvWriter,
     effective_prediction_batch,
     find_duplicate_names,
     parse_yolo_pose_label_line,
+    resolve_default_training_dataset_path,
 )
 
 
@@ -75,7 +78,36 @@ class CoreHelpersTests(unittest.TestCase):
         self.assertEqual(stream.rows_written, 2)
         self.assertEqual(len(fake.rows), 2)
 
+    def test_resolve_default_training_dataset_path_prefers_pose_then_detect(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            datasets = root / "datasets"
+            pose = datasets / "pose"
+            detect = datasets / "detect"
+            pose.mkdir(parents=True, exist_ok=True)
+            detect.mkdir(parents=True, exist_ok=True)
+
+            (detect / "dataset.yaml").write_text("names: [mouse]\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_default_training_dataset_path(str(root)),
+                str(detect),
+            )
+
+            (pose / "dataset.yaml").write_text("names: [mouse]\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_default_training_dataset_path(str(root)),
+                str(pose),
+            )
+
+    def test_resolve_default_training_dataset_path_falls_back_to_datasets_root(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = root / "datasets"
+            self.assertEqual(
+                resolve_default_training_dataset_path(str(root)),
+                str(expected),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
-

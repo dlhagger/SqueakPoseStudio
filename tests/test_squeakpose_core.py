@@ -78,19 +78,27 @@ class CoreHelpersTests(unittest.TestCase):
         self.assertEqual(stream.rows_written, 2)
         self.assertEqual(len(fake.rows), 2)
 
-    def test_resolve_default_training_dataset_path_prefers_pose_then_detect(self):
+    def test_resolve_default_training_dataset_path_prefers_pose_then_segment_then_detect(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             datasets = root / "datasets"
             pose = datasets / "pose"
+            segment = datasets / "segment"
             detect = datasets / "detect"
             pose.mkdir(parents=True, exist_ok=True)
+            segment.mkdir(parents=True, exist_ok=True)
             detect.mkdir(parents=True, exist_ok=True)
 
             (detect / "dataset.yaml").write_text("names: [mouse]\n", encoding="utf-8")
             self.assertEqual(
                 resolve_default_training_dataset_path(str(root)),
                 str(detect),
+            )
+
+            (segment / "dataset.yaml").write_text("task: segment\nnames: [mouse]\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_default_training_dataset_path(str(root)),
+                str(segment),
             )
 
             (pose / "dataset.yaml").write_text("names: [mouse]\n", encoding="utf-8")

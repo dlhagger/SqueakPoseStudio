@@ -6,12 +6,12 @@ from typing import Dict, List, Optional, Tuple
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsItem,
-    QGraphicsSimpleTextItem, QGraphicsLineItem, QVBoxLayout, QHBoxLayout,
+    QGraphicsSimpleTextItem, QGraphicsLineItem, QGraphicsPathItem, QVBoxLayout, QHBoxLayout,
     QGridLayout,
     QComboBox, QPushButton, QLabel, QSplashScreen, QMessageBox,
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
-    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QListWidget
+    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QListWidget, QListView
 )
 from PyQt6.QtGui import (
     QPixmap, QPen, QBrush, QKeySequence, QFont, QPainter, QShortcut,
@@ -31,8 +31,11 @@ from squeakpose_core import (
 
 DEFAULT_CLASS_NAMES = ["mouse"]
 DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
+DEFAULT_SAM3_WEIGHTS = "sam3.pt"
 PROJECT_META_FILE = "squeakpose_project.json"
 LAST_PROJECT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".squeakpose_studio_last_project.json")
+WORKFLOW_POSE = "pose"
+WORKFLOW_SEG = "segmentation"
 
 
 def _project_paths(project_root: str) -> dict[str, str]:
@@ -42,6 +45,7 @@ def _project_paths(project_root: str) -> dict[str, str]:
         "images_to_label": os.path.join(root, "images_to_label"),
         "images_all": os.path.join(root, "images_all"),
         "labels_all": os.path.join(root, "labels_all"),
+        "labels_seg_all": os.path.join(root, "labels_seg_all"),
         "annotations": os.path.join(root, "annotations"),
         "datasets": os.path.join(root, "datasets"),
         "runs": os.path.join(root, "runs"),
@@ -51,6 +55,7 @@ def _project_paths(project_root: str) -> dict[str, str]:
         "classes_file": os.path.join(root, "classes.txt"),
         "keypoints_file": os.path.join(root, "keypoints.txt"),
         "class_keypoints_file": os.path.join(root, "class_keypoints.json"),
+        "classes_seg_file": os.path.join(root, "classes_seg.txt"),
     }
 
 
@@ -66,6 +71,7 @@ def _ensure_project_structure(project_root: str) -> dict[str, str]:
         "images_to_label",
         "images_all",
         "labels_all",
+        "labels_seg_all",
         "annotations",
         "datasets",
         "runs",
@@ -74,6 +80,14 @@ def _ensure_project_structure(project_root: str) -> dict[str, str]:
         "logs",
     ):
         os.makedirs(paths[key], exist_ok=True)
+
+    if not os.path.exists(paths["classes_seg_file"]):
+        try:
+            with open(paths["classes_seg_file"], "w", encoding="utf-8") as f:
+                for name in DEFAULT_CLASS_NAMES:
+                    f.write(name + "\n")
+        except Exception:
+            pass
 
     meta_path = os.path.join(paths["root"], PROJECT_META_FILE)
     if not os.path.exists(meta_path):
@@ -250,48 +264,115 @@ class ProjectLauncherDialog(QDialog):
 
 
 def _ensure_qt_plugin_paths() -> None:
-    """Populate Qt plugin env vars when they are unset/empty.
+    """Validate and set Qt plugin env vars for the active interpreter.
 
-    Some launcher environments (including certain `uv run` + conda combos) can
-    leave Qt plugin paths blank, which yields:
-      "Could not find the Qt platform plugin 'cocoa' in ''"
+    Some launchers (`uv run`, IDE shells, conda activation hooks) leave stale
+    `QT_*` env vars behind, so Qt searches an old/incompatible plugins tree and
+    aborts before the app window opens.
     """
-    plugin_root = ""
+
+    def _expected_platform_plugins() -> tuple[str, ...]:
+        if sys.platform == "darwin":
+            return ("libqcocoa.dylib",)
+        if sys.platform.startswith("win"):
+            return ("qwindows.dll",)
+        if sys.platform.startswith("linux"):
+            # xcb is typical; keep wayland/offscreen as valid fallbacks.
+            return ("libqxcb.so", "libqwayland-egl.so", "libqoffscreen.so")
+        return tuple()
+
+    def _split_env_paths(value: str) -> list[str]:
+        if not value:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for part in value.split(os.pathsep):
+            part = part.strip()
+            if not part:
+                continue
+            norm = os.path.abspath(part)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append(norm)
+        return out
+
+    def _has_platform_plugin(root: str) -> bool:
+        if not root:
+            return False
+        platform_dir = os.path.join(root, "platforms")
+        if not os.path.isdir(platform_dir):
+            return False
+
+        expected = _expected_platform_plugins()
+        if expected:
+            for name in expected:
+                if os.path.isfile(os.path.join(platform_dir, name)):
+                    return True
+            return False
+
+        try:
+            return any(name.lower().startswith(("libq", "q")) for name in os.listdir(platform_dir))
+        except Exception:
+            return False
+
+    # Candidate roots in priority order:
+    # 1) QLibraryInfo (active interpreter), 2) PyQt6 package fallback,
+    # 3) existing QT_PLUGIN_PATH entries.
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add_candidate(path: str):
+        path = os.path.abspath(path or "")
+        if not path or path in seen:
+            return
+        seen.add(path)
+        candidates.append(path)
+
     primary_error: Optional[Exception] = None
-    fallback_reason = ""
     try:
-        plugin_root = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath) or ""
+        _add_candidate(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath) or "")
     except Exception as exc:
         primary_error = exc
-        plugin_root = ""
-        fallback_reason = f"QLibraryInfo lookup failed: {exc}"
-    if not fallback_reason and not plugin_root:
-        fallback_reason = "QLibraryInfo returned an empty plugins path"
 
-    if not plugin_root:
-        try:
-            import PyQt6  # local fallback resolution
-            candidate = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "plugins")
-            if os.path.isdir(candidate):
-                plugin_root = candidate
-                print(
-                    f"[Qt bootstrap] Warning: using fallback Qt plugins path ({fallback_reason}): {candidate}",
-                    file=sys.stderr,
-                )
-        except Exception:
-            plugin_root = ""
+    try:
+        import PyQt6  # local fallback resolution
+        _add_candidate(os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "plugins"))
+    except Exception:
+        pass
 
-    if not plugin_root:
+    for existing in _split_env_paths(os.environ.get("QT_PLUGIN_PATH", "")):
+        _add_candidate(existing)
+
+    valid_roots = [root for root in candidates if _has_platform_plugin(root)]
+    chosen_root = valid_roots[0] if valid_roots else ""
+    if not chosen_root:
         if primary_error is not None:
             print(f"[Qt bootstrap] Warning: unable to resolve Qt plugins path: {primary_error}", file=sys.stderr)
+        elif candidates:
+            print(
+                "[Qt bootstrap] Warning: no candidate Qt plugin root contains a valid platform plugin.",
+                file=sys.stderr,
+            )
         return
 
-    if not os.environ.get("QT_PLUGIN_PATH"):
-        os.environ["QT_PLUGIN_PATH"] = plugin_root
+    platform_dir = os.path.join(chosen_root, "platforms")
 
-    platform_dir = os.path.join(plugin_root, "platforms")
-    if os.path.isdir(platform_dir) and not os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
-        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = platform_dir
+    prev_plugin = os.environ.get("QT_PLUGIN_PATH", "")
+    if prev_plugin and os.path.abspath(prev_plugin) != chosen_root:
+        print(
+            f"[Qt bootstrap] Replacing stale QT_PLUGIN_PATH:\n  old={prev_plugin}\n  new={chosen_root}",
+            file=sys.stderr,
+        )
+    os.environ["QT_PLUGIN_PATH"] = chosen_root
+
+    prev_platform = os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH", "")
+    if prev_platform and os.path.abspath(prev_platform) != platform_dir:
+        print(
+            f"[Qt bootstrap] Replacing stale QT_QPA_PLATFORM_PLUGIN_PATH:\n  old={prev_platform}\n  new={platform_dir}",
+            file=sys.stderr,
+        )
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = platform_dir
 
 # --- cross-platform UI font helper ---
 def _ui_font(px: int) -> QFont:
@@ -318,9 +399,18 @@ try:
 except Exception:
     _cv2 = None
 
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+
 # Ultralytics YOLO
 
 from ultralytics import YOLO
+try:
+    from ultralytics import SAM
+except Exception:
+    SAM = None
 
 # Preferred device order: CUDA → MPS → CPU
 try:
@@ -944,8 +1034,6 @@ class KeypointItem(QGraphicsEllipseItem):
         return super().itemChange(change, value)
 
 
-
-
 # =========================
 # View
 # =========================
@@ -959,6 +1047,10 @@ class LabelView(QGraphicsView):
         self._crosshair_h: Optional[QGraphicsLineItem] = None
         self._temp_rect: Optional[QGraphicsRectItem] = None
         self._drawing_cancelled = False
+        self._seg_brush_active = False
+        self._seg_brush_add = True
+        self._seg_brush_last_pos: Optional[QPointF] = None
+        self._seg_brush_cursor_ring: Optional[QGraphicsEllipseItem] = None
 
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
@@ -990,10 +1082,14 @@ class LabelView(QGraphicsView):
 
     def _remove_crosshairs(self):
         if self._crosshair_v:
-            self.scene().removeItem(self._crosshair_v)
+            owner_scene = self._crosshair_v.scene()
+            if owner_scene is not None:
+                owner_scene.removeItem(self._crosshair_v)
             self._crosshair_v = None
         if self._crosshair_h:
-            self.scene().removeItem(self._crosshair_h)
+            owner_scene = self._crosshair_h.scene()
+            if owner_scene is not None:
+                owner_scene.removeItem(self._crosshair_h)
             self._crosshair_h = None
 
     def _ensure_crosshairs(self):
@@ -1026,17 +1122,104 @@ class LabelView(QGraphicsView):
         scene_pos = self.mapToScene(self.mapFromGlobal(global_pos))
         self._update_crosshairs(scene_pos)
 
+    def _should_show_seg_brush_cursor(self) -> bool:
+        try:
+            return (
+                self.app._is_seg_workflow()
+                and self.app.mode == "segedit"
+                and self.app._is_seg_edit_tool_brush()
+                and self.scene() is not None
+            )
+        except Exception:
+            return False
+
+    def _ensure_seg_brush_cursor_ring(self):
+        if self._seg_brush_cursor_ring is not None and self._seg_brush_cursor_ring.scene() is self.scene():
+            return
+        self._seg_brush_cursor_ring = QGraphicsEllipseItem()
+        pen = QPen(QColor(118, 188, 255, 220))
+        pen.setCosmetic(True)
+        pen.setWidth(2)
+        self._seg_brush_cursor_ring.setPen(pen)
+        self._seg_brush_cursor_ring.setBrush(QBrush(Qt.GlobalColor.transparent))
+        self._seg_brush_cursor_ring.setZValue(9.2)
+        self._seg_brush_cursor_ring.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._seg_brush_cursor_ring.setAcceptHoverEvents(False)
+        self._seg_brush_cursor_ring.setVisible(False)
+        self.scene().addItem(self._seg_brush_cursor_ring)
+
+    def _hide_seg_brush_cursor(self):
+        ring = self._seg_brush_cursor_ring
+        if ring is not None:
+            ring.setVisible(False)
+
+    def _reset_seg_brush_cursor(self):
+        ring = self._seg_brush_cursor_ring
+        if ring is None:
+            return
+        try:
+            if ring.scene() is not None:
+                ring.scene().removeItem(ring)
+        except Exception:
+            pass
+        self._seg_brush_cursor_ring = None
+
+    def _update_seg_brush_cursor(self, scene_pos: QPointF):
+        if not self._should_show_seg_brush_cursor():
+            self._hide_seg_brush_cursor()
+            return
+        self._ensure_seg_brush_cursor_ring()
+        ring = self._seg_brush_cursor_ring
+        if ring is None:
+            return
+        radius = max(2.0, float(getattr(self.app, "seg_brush_radius", 8)))
+        x = float(scene_pos.x())
+        y = float(scene_pos.y())
+        ring.setRect(x - radius, y - radius, radius * 2.0, radius * 2.0)
+        ring.setVisible(True)
+
+    def refresh_seg_brush_cursor(self):
+        if not self._should_show_seg_brush_cursor():
+            self._hide_seg_brush_cursor()
+            return
+        vp = self.viewport().mapFromGlobal(QCursor.pos())
+        if not self.viewport().rect().contains(vp):
+            self._hide_seg_brush_cursor()
+            return
+        self._update_seg_brush_cursor(self.mapToScene(vp))
+
     def _cancel_draw(self):
         self._drawing_cancelled = True
         if self._temp_rect:
-            self.scene().removeItem(self._temp_rect)
+            owner_scene = self._temp_rect.scene()
+            if owner_scene is not None:
+                owner_scene.removeItem(self._temp_rect)
             self._temp_rect = None
         self._start_pos = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.app.update_status_bar("Box drawing cancelled.")
+        if self.app.mode == "segment":
+            self.app._clear_seg_prompt_state()
+            self.app.update_status_bar("Segmentation prompts cleared.")
+        else:
+            self.app.update_status_bar("Box drawing cancelled.")
 
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.position().toPoint())
+        if self.app.mode == "segedit":
+            if event.button() == Qt.MouseButton.LeftButton and self.app._start_seg_brush(scene_pos, add=True):
+                self._seg_brush_active = True
+                self._seg_brush_add = True
+                self._seg_brush_last_pos = scene_pos
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton and self.app._start_seg_brush(scene_pos, add=False):
+                self._seg_brush_active = True
+                self._seg_brush_add = False
+                self._seg_brush_last_pos = scene_pos
+                event.accept()
+                return
+            super().mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             if self.app.mode == 'panzoom':
                 super().mousePressEvent(event)
@@ -1048,12 +1231,26 @@ class LabelView(QGraphicsView):
                 self.setCursor(Qt.CursorShape.CrossCursor)
             elif self.app.mode == 'keypoint':
                 self.app.add_keypoint(scene_pos)
+            elif self.app.mode == 'segment':
+                self.app._add_seg_prompt(scene_pos, positive=True)
+                event.accept()
+                return
+        elif event.button() == Qt.MouseButton.RightButton and self.app.mode == "segment":
+            self.app._add_seg_prompt(scene_pos, positive=False)
+            event.accept()
+            return
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.position().toPoint())
-        if (self.app.mode == 'bbox' and self._start_pos is None) or (self.app.mode == 'keypoint'):
+        self._update_seg_brush_cursor(scene_pos)
+        if self.app.mode == "segedit" and self._seg_brush_active:
+            if self.app._apply_seg_brush(scene_pos, add=self._seg_brush_add, prev_scene_pos=self._seg_brush_last_pos):
+                self._seg_brush_last_pos = scene_pos
+            event.accept()
+            return
+        if (self.app.mode == 'bbox' and self._start_pos is None) or (self.app.mode in {'keypoint', 'segment'}):
             self._update_crosshairs(scene_pos)
         elif self._start_pos and self.app.mode == 'bbox':
             self._remove_crosshairs()
@@ -1070,7 +1267,23 @@ class LabelView(QGraphicsView):
             self._remove_crosshairs()
             super().mouseMoveEvent(event)
 
+    def enterEvent(self, event):
+        self.refresh_seg_brush_cursor()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hide_seg_brush_cursor()
+        super().leaveEvent(event)
+
     def mouseReleaseEvent(self, event):
+        if self.app.mode == "segedit" and self._seg_brush_active:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self.app._apply_seg_brush(scene_pos, add=self._seg_brush_add, prev_scene_pos=self._seg_brush_last_pos)
+            self._seg_brush_active = False
+            self._seg_brush_last_pos = None
+            self.app._finish_seg_brush()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._start_pos and self.app.mode == 'bbox':
             if not self._drawing_cancelled:
                 end_pos = self.mapToScene(event.position().toPoint())
@@ -1078,7 +1291,9 @@ class LabelView(QGraphicsView):
                 if rect.width() >= 2 and rect.height() >= 2:
                     self.app.add_bbox(rect)
             if self._temp_rect:
-                self.scene().removeItem(self._temp_rect)
+                owner_scene = self._temp_rect.scene()
+                if owner_scene is not None:
+                    owner_scene.removeItem(self._temp_rect)
                 self._temp_rect = None
             self._start_pos = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1139,6 +1354,389 @@ class VideoView(QGraphicsView):
 
 class LabelingApp(QMainWindow):
 
+    def _is_pose_workflow(self) -> bool:
+        return getattr(self, "active_workflow", WORKFLOW_POSE) == WORKFLOW_POSE
+
+    def _is_seg_workflow(self) -> bool:
+        return getattr(self, "active_workflow", WORKFLOW_POSE) == WORKFLOW_SEG
+
+    def _workflow_label(self) -> str:
+        return "Pose" if self._is_pose_workflow() else "Segmentation"
+
+    def _ensure_classes_file(self, class_file: str, defaults: list[str]) -> tuple[list[str], bool]:
+        created_any = False
+        project_root = os.path.dirname(class_file) if class_file else os.getcwd()
+        if not class_file:
+            class_file = os.path.join(project_root, "classes.txt")
+
+        try:
+            cf_dir = os.path.dirname(class_file)
+            if cf_dir:
+                os.makedirs(cf_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        if not os.path.exists(class_file):
+            try:
+                with open(class_file, "a", encoding="utf-8"):
+                    pass
+                created_any = True
+            except Exception:
+                pass
+
+        classes: list[str] = []
+        try:
+            with open(class_file, "r", encoding="utf-8") as f:
+                classes = [ln.strip() for ln in f if ln.strip()]
+        except Exception:
+            classes = []
+
+        if not classes:
+            classes = defaults[:] or DEFAULT_CLASS_NAMES[:]
+            try:
+                with open(class_file, "w", encoding="utf-8") as f:
+                    for name in classes:
+                        f.write(name + "\n")
+                created_any = True
+            except Exception:
+                pass
+
+        return classes, created_any
+
+    def _project_meta_path(self) -> str:
+        return os.path.join(self.project_root, PROJECT_META_FILE)
+
+    def _read_project_meta(self) -> dict:
+        path = self._project_meta_path()
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _write_project_meta(self, updates: dict):
+        if not isinstance(updates, dict):
+            return
+        path = self._project_meta_path()
+        payload = self._read_project_meta()
+        if not payload:
+            payload = {
+                "schema_version": 1,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+        for key, value in updates.items():
+            if value is None:
+                payload.pop(str(key), None)
+            else:
+                payload[str(key)] = value
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
+
+    def _meta_normalize_path(self, path: str) -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        if os.path.isabs(raw):
+            return os.path.abspath(raw)
+        return os.path.abspath(os.path.join(self.project_root, raw))
+
+    def _meta_store_path(self, path: str) -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        abs_path = os.path.abspath(raw)
+        try:
+            rel = os.path.relpath(abs_path, self.project_root)
+            if rel == ".":
+                return os.path.basename(abs_path)
+            if not rel.startswith(".."):
+                return rel
+        except Exception:
+            pass
+        return abs_path
+
+    def _load_project_preferences(self):
+        meta = self._read_project_meta()
+        workflow = str(meta.get("active_workflow", "")).strip().lower()
+        if workflow in {WORKFLOW_POSE, WORKFLOW_SEG}:
+            self.active_workflow = workflow
+        sam_path = self._meta_normalize_path(str(meta.get("sam_model_path", "") or ""))
+        if sam_path and os.path.isfile(sam_path):
+            self.sam_model_path = sam_path
+
+    def _save_project_preferences(self):
+        workflow = WORKFLOW_POSE if self._is_pose_workflow() else WORKFLOW_SEG
+        payload = {"active_workflow": workflow}
+        if self.sam_model_path and os.path.isfile(self.sam_model_path):
+            payload["sam_model_path"] = self._meta_store_path(self.sam_model_path)
+        else:
+            payload["sam_model_path"] = None
+        self._write_project_meta(payload)
+
+    def _safe_remove_scene_item(self, item: Optional[QGraphicsItem]):
+        if item is None:
+            return
+        try:
+            owner_scene = item.scene()
+        except Exception:
+            owner_scene = None
+        if owner_scene is None:
+            return
+        try:
+            owner_scene.removeItem(item)
+        except Exception:
+            pass
+
+    def _persist_active_workflow_state(self):
+        if self._is_pose_workflow():
+            self.pose_classes = self.classes[:]
+            self.pose_kp_names = self.kp_names[:]
+            self.pose_class_keypoints = {name: self.class_keypoints.get(name, [])[:] for name in self.classes}
+        else:
+            self.seg_classes = self.classes[:]
+
+    def _bind_workflow_state(self, workflow: str):
+        if workflow == WORKFLOW_POSE:
+            self.active_workflow = WORKFLOW_POSE
+            self.label_dir = self.pose_label_dir
+            self.class_file = self.pose_class_file
+            self.keypoint_file = self.pose_keypoint_file
+            self.class_keypoints_path = self.pose_class_keypoints_path
+            self.classes = self.pose_classes[:]
+            self.kp_names = self.pose_kp_names[:]
+            self.class_keypoints = {name: self.pose_class_keypoints.get(name, [])[:] for name in self.classes}
+            self._schema_locked = self._detect_schema_locked()
+        else:
+            self.active_workflow = WORKFLOW_SEG
+            self.label_dir = self.seg_label_dir
+            self.class_file = self.seg_class_file
+            self.keypoint_file = ""
+            self.class_keypoints_path = ""
+            self.classes = self.seg_classes[:]
+            self.kp_names = []
+            self.class_keypoints = {}
+            self._schema_locked = self._detect_schema_locked()
+
+        self._refresh_kp_index_lookup()
+
+    def _refresh_class_selector_for_workflow(self):
+        current = self.class_selector.currentText() if hasattr(self, "class_selector") else ""
+        self.class_selector.blockSignals(True)
+        self.class_selector.clear()
+        self.class_selector.addItems(self.classes)
+        if current in self.classes:
+            self.class_selector.setCurrentIndex(self.classes.index(current))
+        elif self.classes:
+            self.class_selector.setCurrentIndex(0)
+        self.class_selector.blockSignals(False)
+        self._active_class_id = self.class_selector.currentIndex()
+
+    def _ensure_workflow_selector_items(self):
+        if not hasattr(self, "workflow_selector"):
+            return
+        expected = [
+            ("Pose Workflow (BBox + Keypoints)", WORKFLOW_POSE),
+            ("Segmentation Workflow (SAM)", WORKFLOW_SEG),
+        ]
+        needs_reset = self.workflow_selector.count() != len(expected)
+        if not needs_reset:
+            for idx, (text, data) in enumerate(expected):
+                if (
+                    self.workflow_selector.itemText(idx) != text
+                    or str(self.workflow_selector.itemData(idx)) != data
+                ):
+                    needs_reset = True
+                    break
+        if not needs_reset:
+            return
+
+        current_workflow = getattr(self, "active_workflow", WORKFLOW_POSE)
+        self.workflow_selector.blockSignals(True)
+        self.workflow_selector.clear()
+        for text, data in expected:
+            self.workflow_selector.addItem(text, data)
+        self.workflow_selector.setCurrentIndex(0 if current_workflow == WORKFLOW_POSE else 1)
+        self.workflow_selector.blockSignals(False)
+
+    def _segmentation_labels_exist(self) -> bool:
+        labels_dir = getattr(self, "seg_label_dir", "")
+        if not labels_dir or not os.path.isdir(labels_dir):
+            return False
+        try:
+            for name in os.listdir(labels_dir):
+                if not name.lower().endswith(".txt"):
+                    continue
+                path = os.path.join(labels_dir, name)
+                try:
+                    if os.path.getsize(path) > 0:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _maybe_prompt_seg_class_manager_initial(self):
+        if getattr(self, "_seg_setup_prompted", False):
+            return
+        if not self._is_seg_workflow():
+            return
+        self._seg_setup_prompted = True
+
+        has_real_seg_labels = self._segmentation_labels_exist()
+        default_classes = self.seg_classes == DEFAULT_CLASS_NAMES
+        if has_real_seg_labels or not default_classes:
+            return
+
+        decision = QMessageBox.question(
+            self,
+            "Define Segmentation Classes",
+            "Before labeling in Segmentation workflow, define what objects/classes you want to segment.\n\n"
+            "Open Segmentation Classes now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if decision == QMessageBox.StandardButton.Yes:
+            self._open_seg_class_manager()
+        else:
+            self.update_status_bar("Using default segmentation class ('mouse'). Edit via Seg Classes… anytime.")
+
+    def _reflow_mode_grid(self, is_pose: bool):
+        if not hasattr(self, "mode_grid"):
+            return
+        self.panzoom_btn.setText("Pan/Zoom (1)" if is_pose else "Pan (1)")
+        self.segment_btn.setText("Segment (2)" if is_pose else "Segment Prompt (2)")
+
+        if is_pose:
+            self.mode_grid.addWidget(self.panzoom_btn, 0, 0)
+            self.mode_grid.addWidget(self.bbox_btn, 0, 1)
+            self.mode_grid.addWidget(self.keypoint_btn, 1, 0)
+            self.mode_grid.addWidget(self.predict_btn, 1, 1)
+            self.mode_grid.addWidget(self.segment_btn, 2, 0, 1, 2)
+            self.mode_grid.addWidget(self.seg_edit_btn, 3, 0, 1, 2)
+        else:
+            self.mode_grid.addWidget(self.panzoom_btn, 0, 0)
+            self.mode_grid.addWidget(self.segment_btn, 0, 1)
+            self.mode_grid.addWidget(self.seg_edit_btn, 1, 0, 1, 2)
+            # Hidden in seg workflow, but keep deterministic positions.
+            self.mode_grid.addWidget(self.bbox_btn, 2, 0)
+            self.mode_grid.addWidget(self.keypoint_btn, 2, 1)
+            self.mode_grid.addWidget(self.predict_btn, 3, 0, 1, 2)
+
+    def _update_workflow_ui_state(self):
+        is_pose = self._is_pose_workflow()
+        self._ensure_workflow_selector_items()
+
+        self.save_btn.setEnabled(True)
+        self.complete_btn.setEnabled(True)
+        self.bbox_btn.setEnabled(is_pose)
+        self.segment_btn.setEnabled(not is_pose)
+        self.keypoint_btn.setEnabled(is_pose)
+        self.predict_btn.setEnabled(is_pose)
+        self.seg_edit_btn.setEnabled(not is_pose)
+        self.sam_load_btn.setEnabled(not is_pose)
+        self.sam_run_btn.setEnabled(not is_pose)
+        self.sam_accept_btn.setEnabled(not is_pose)
+        self.sam_clear_btn.setEnabled(not is_pose)
+        self.template_apply_btn.setEnabled(is_pose)
+        self.template_save_btn.setEnabled(is_pose)
+        self.inference_btn.setEnabled(True)
+        self.normalize_btn.setEnabled(True)
+        self.export_dataset_btn.setEnabled(True)
+        self.train_btn.setEnabled(True)
+        self.load_model_btn.setEnabled(True)
+
+        self.manage_classes_btn.setToolTip(
+            "Manage classes and per-class keypoints" if is_pose else "Manage segmentation classes"
+        )
+        self.manage_classes_btn.setText("Classes…")
+        if hasattr(self, "class_label_widget"):
+            self.class_label_widget.setText("Class")
+        if hasattr(self, "bbox_btn"):
+            self.bbox_btn.setVisible(is_pose)
+        if hasattr(self, "keypoint_btn"):
+            self.keypoint_btn.setVisible(is_pose)
+        if hasattr(self, "predict_btn"):
+            self.predict_btn.setVisible(is_pose)
+        if hasattr(self, "segment_btn"):
+            self.segment_btn.setVisible(not is_pose)
+        if hasattr(self, "seg_edit_btn"):
+            self.seg_edit_btn.setVisible(not is_pose)
+        if hasattr(self, "seg_tools_frame"):
+            self.seg_tools_frame.setVisible(not is_pose)
+        self._reflow_mode_grid(is_pose=is_pose)
+        self.save_btn.setText("Save")
+        self.save_btn.setToolTip(
+            "Save labels for current frame" if is_pose else "Save segmentation masks for current frame"
+        )
+
+        if is_pose and self.mode in {"segment", "segedit"}:
+            self.mode = "panzoom"
+        if not is_pose and self.mode not in {"panzoom", "segment", "segedit"}:
+            self.mode = "segment"
+
+        self._clear_seg_edit_handles()
+        self._refresh_seg_brush_size_badge()
+        if hasattr(self, "view") and hasattr(self.view, "refresh_seg_brush_cursor"):
+            self.view.refresh_seg_brush_cursor()
+
+        self._update_status()
+        self._update_progress_label()
+        self._refresh_sam_controls()
+        self._layout_hot_corners()
+        self._layout_overlays()
+
+    def _switch_workflow(self, workflow: str):
+        workflow = WORKFLOW_POSE if workflow == WORKFLOW_POSE else WORKFLOW_SEG
+        if workflow == getattr(self, "active_workflow", WORKFLOW_POSE):
+            return
+        self._ensure_workflow_selector_items()
+        if hasattr(self, "workflow_selector"):
+            idx = 0 if workflow == WORKFLOW_POSE else 1
+            if self.workflow_selector.currentIndex() != idx:
+                self.workflow_selector.blockSignals(True)
+                self.workflow_selector.setCurrentIndex(idx)
+                self.workflow_selector.blockSignals(False)
+        self._persist_active_workflow_state()
+        self._bind_workflow_state(workflow)
+        self._save_project_preferences()
+        if workflow == WORKFLOW_SEG:
+            self.mode = "segment"
+        elif self.mode == "segment":
+            self.mode = "panzoom"
+        self._refresh_class_selector_for_workflow()
+        self.annotation_cache.clear()
+        self._clear_seg_prompt_state()
+        self._update_workflow_ui_state()
+        self.load_image()
+        if self._is_seg_workflow():
+            loaded_now, loaded_path = self._try_autoload_sam_model_from_project_root()
+            self._refresh_sam_controls()
+            if loaded_now:
+                self.update_status_bar(
+                    f"Segmentation workflow enabled. Auto-loaded SAM model: {os.path.basename(loaded_path)}"
+                )
+            elif self.sam_model is not None:
+                self.update_status_bar("Segmentation workflow enabled. SAM model ready.")
+            else:
+                self.update_status_bar("Segmentation workflow enabled. Use Segment mode and SAM prompts.")
+            QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
+        else:
+            self.update_status_bar("Pose workflow enabled.")
+
+    def _on_workflow_changed(self, _index: int):
+        self._ensure_workflow_selector_items()
+        workflow = self.workflow_selector.currentData()
+        self._switch_workflow(str(workflow))
+
     def _ensure_label_files(self, class_file: str, keypoint_file: str) -> tuple[list[str], list[str], bool]:
         """
         Ensure class and keypoint name files exist WITHOUT any UI prompts.
@@ -1148,8 +1746,15 @@ class LabelingApp(QMainWindow):
         """
         created_any = False
 
-        # Resolve fallback locations if the provided paths are empty
-        project_root = os.path.dirname(self.label_dir) if self.label_dir else os.getcwd()
+        # Resolve fallback locations if the provided paths are empty.
+        # Do not rely on self.label_dir here because this helper is called
+        # during early __init__ before workflow-bound paths are fully wired.
+        project_root = (
+            os.path.dirname(class_file or "")
+            or os.path.dirname(keypoint_file or "")
+            or getattr(self, "project_root", "")
+            or os.getcwd()
+        )
         if not class_file:
             class_file = os.path.join(project_root, "classes.txt")
         if not keypoint_file:
@@ -1230,9 +1835,16 @@ class LabelingApp(QMainWindow):
             except Exception:
                 data = {}
         # ensure each known class has an entry
-        for name in self.classes:
+        known_classes = getattr(self, "classes", None)
+        if not known_classes:
+            known_classes = getattr(self, "pose_classes", [])
+        default_kp = getattr(self, "kp_names", None)
+        if default_kp is None:
+            default_kp = getattr(self, "pose_kp_names", DEFAULT_KEYPOINT_NAMES[:])
+
+        for name in known_classes:
             if name not in data or not data[name]:
-                data[name] = self.kp_names[:]
+                data[name] = default_kp[:]
         return data
 
     def _save_class_keypoints(self):
@@ -1406,6 +2018,750 @@ class LabelingApp(QMainWindow):
 
     # ---------- Annotation helpers ----------
 
+    def _seg_class_color(self, class_id: int, alpha: int = 255) -> QColor:
+        hue = int((class_id * 47) % 360)
+        color = QColor.fromHsv(hue, 210, 245, alpha)
+        return color
+
+    def _seg_class_name(self, class_id: int) -> str:
+        if 0 <= int(class_id) < len(self.classes):
+            return self.classes[int(class_id)]
+        return f"class_{int(class_id)}"
+
+    def _is_seg_mask_item(self, item: QGraphicsItem) -> bool:
+        return isinstance(item, QGraphicsPathItem) and hasattr(item, "seg_class_id")
+
+    def _class_seg_mask_item(self, class_id: int) -> Optional[QGraphicsPathItem]:
+        for item in self.scene.items():
+            if (
+                self._is_seg_mask_item(item)
+                and not bool(getattr(item, "seg_preview", False))
+                and int(getattr(item, "seg_class_id", -1)) == class_id
+            ):
+                return item
+        return None
+
+    def _polygon_path(self, points: list[tuple[float, float]]) -> Optional[QPainterPath]:
+        if len(points) < 3:
+            return None
+        path = QPainterPath()
+        first_x, first_y = points[0]
+        path.moveTo(first_x, first_y)
+        for x, y in points[1:]:
+            path.lineTo(x, y)
+        path.closeSubpath()
+        return path
+
+    def _extract_seg_item_points(self, item: Optional[QGraphicsPathItem]) -> list[tuple[float, float]]:
+        if item is None:
+            return []
+        raw = getattr(item, "seg_points", [])
+        out: list[tuple[float, float]] = []
+        for pair in raw:
+            try:
+                x = float(pair[0])
+                y = float(pair[1])
+                out.append((x, y))
+            except Exception:
+                continue
+        return out
+
+    def _clamp_scene_xy(self, x: float, y: float) -> tuple[int, int]:
+        max_w = max(1, int(round(float(self.img_w))) - 1)
+        max_h = max(1, int(round(float(self.img_h))) - 1)
+        xi = int(round(float(x)))
+        yi = int(round(float(y)))
+        if xi < 0:
+            xi = 0
+        elif xi > max_w:
+            xi = max_w
+        if yi < 0:
+            yi = 0
+        elif yi > max_h:
+            yi = max_h
+        return xi, yi
+
+    def _seg_mask_shape(self) -> tuple[int, int]:
+        mask_h = max(1, int(round(float(self.img_h))))
+        mask_w = max(1, int(round(float(self.img_w))))
+        return mask_h, mask_w
+
+    def _seg_mask_from_points(self, points: list[tuple[float, float]]) -> Optional[object]:
+        if _np is None or _cv2 is None or len(points) < 3:
+            return None
+        mask_h, mask_w = self._seg_mask_shape()
+        mask = _np.zeros((mask_h, mask_w), dtype=_np.uint8)
+        poly = _np.array(points, dtype=_np.int32).reshape((-1, 1, 2))
+        _cv2.fillPoly(mask, [poly], 255)
+        return mask
+
+    def _seg_points_from_mask(
+        self,
+        mask: object,
+        anchor_points: Optional[list[tuple[float, float]]] = None,
+    ) -> list[tuple[float, float]]:
+        if _cv2 is None or mask is None:
+            return []
+        contours_info = _cv2.findContours(mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_NONE)
+        contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
+        if not contours:
+            return []
+        contour = None
+        anchor = anchor_points or []
+        if anchor:
+            ax, ay = float(anchor[0][0]), float(anchor[0][1])
+            anchored: list[object] = []
+            for c in contours:
+                try:
+                    inside = _cv2.pointPolygonTest(c, (ax, ay), False)
+                except Exception:
+                    inside = -1
+                if inside >= 0:
+                    anchored.append(c)
+            if anchored:
+                contour = max(anchored, key=_cv2.contourArea)
+        if contour is None:
+            contour = max(contours, key=_cv2.contourArea)
+        if contour is None or len(contour) < 3:
+            return []
+
+        points: list[tuple[float, float]] = []
+        for node in contour:
+            try:
+                x = float(node[0][0])
+                y = float(node[0][1])
+            except Exception:
+                continue
+            points.append((x, y))
+        if len(points) < 3:
+            return []
+        points = self._downsample_seg_points(points, max_points=1200)
+
+        if len(anchor) >= 3 and len(points) >= 3:
+            old_area = self._polygon_signed_area(anchor)
+            new_area = self._polygon_signed_area(points)
+            if old_area * new_area < 0:
+                points.reverse()
+            points = self._rotate_polygon_to_anchor(points, anchor[0])
+        return points
+
+    def _downsample_seg_points(self, points: list[tuple[float, float]], max_points: int = 1200) -> list[tuple[float, float]]:
+        if len(points) <= max_points:
+            return points
+        step = max(1, (len(points) + max_points - 1) // max_points)
+        reduced = points[::step]
+        if len(reduced) < 3:
+            return points[:3]
+        return reduced
+
+    def _polygon_signed_area(self, points: list[tuple[float, float]]) -> float:
+        if len(points) < 3:
+            return 0.0
+        total = 0.0
+        n = len(points)
+        for i in range(n):
+            x1, y1 = points[i]
+            x2, y2 = points[(i + 1) % n]
+            total += (float(x1) * float(y2)) - (float(x2) * float(y1))
+        return 0.5 * total
+
+    def _rotate_polygon_to_anchor(
+        self,
+        points: list[tuple[float, float]],
+        anchor: tuple[float, float],
+    ) -> list[tuple[float, float]]:
+        if not points:
+            return points
+        ax, ay = float(anchor[0]), float(anchor[1])
+        best_idx = 0
+        best_d2 = float("inf")
+        for idx, (x, y) in enumerate(points):
+            d2 = ((float(x) - ax) ** 2) + ((float(y) - ay) ** 2)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = idx
+        if best_idx == 0:
+            return points
+        return points[best_idx:] + points[:best_idx]
+
+    def _seg_edit_target_item(self) -> Optional[QGraphicsPathItem]:
+        if not self._is_seg_workflow():
+            return None
+        cid = self.class_selector.currentIndex() if hasattr(self, "class_selector") else -1
+        if cid < 0:
+            return None
+        preview = self.seg_preview_item
+        if (
+            preview is not None
+            and int(getattr(preview, "seg_class_id", -1)) == cid
+            and len(self.seg_preview_points) >= 3
+        ):
+            return preview
+        return self._class_seg_mask_item(cid)
+
+    def _seg_update_item_geometry(self, item: Optional[QGraphicsPathItem], points: list[tuple[float, float]]) -> bool:
+        if item is None:
+            return False
+        normalized = [(float(x), float(y)) for x, y in points]
+        path = self._polygon_path(normalized)
+        if path is None:
+            return False
+        item.seg_points = normalized
+        item.setPath(path)
+        label_item = getattr(item, "seg_label_item", None)
+        if label_item is not None:
+            bbox = path.boundingRect()
+            label_item.setPos(bbox.left() + 4.0, bbox.top() + 4.0)
+        return True
+
+    def _clear_seg_edit_handles(self):
+        self.seg_brush_active = False
+        self.seg_brush_mask = None
+        self.seg_brush_item = None
+        self.seg_brush_anchor_points = []
+
+    def _is_seg_edit_tool_brush(self) -> bool:
+        return True
+
+    def _refresh_seg_brush_size_badge(self):
+        if not hasattr(self, "seg_brush_size_label"):
+            return
+        radius = int(getattr(self, "seg_brush_radius", 8))
+        self.seg_brush_size_label.setText(f"Brush: {radius}px")
+        if self._is_seg_workflow():
+            self.seg_brush_size_label.setVisible(True)
+            fg = "#ecf5ff"
+            bg = "rgba(69, 101, 132, 190)"
+            border = "rgba(164, 195, 226, 180)"
+            self.seg_brush_size_label.setStyleSheet(
+                "font-size: 9pt; font-weight: 700; padding: 2px 9px; border-radius: 8px; "
+                f"color: {fg}; background-color: {bg}; border: 1px solid {border};"
+            )
+        else:
+            self.seg_brush_size_label.setVisible(False)
+
+    def _start_seg_brush(self, scene_pos: QPointF, add: bool) -> bool:
+        if not self._is_seg_workflow() or self.mode != "segedit":
+            return False
+        if not self._is_seg_edit_tool_brush():
+            return False
+        if _cv2 is None or _np is None:
+            QMessageBox.warning(
+                self,
+                "Brush edit unavailable",
+                "Brush-based mask editing requires OpenCV and NumPy in this environment.",
+            )
+            return False
+        item = self._seg_edit_target_item()
+        points = self._extract_seg_item_points(item)
+        if item is None or len(points) < 3:
+            self.update_status_bar("No segmentation mask available to brush-edit.")
+            return False
+        self._clear_seg_edit_handles()
+        self.seg_brush_mask = self._seg_mask_from_points(points)
+        self.seg_brush_item = item
+        self.seg_brush_anchor_points = [(float(x), float(y)) for x, y in points]
+        if self.seg_brush_mask is None:
+            return False
+        self.seg_brush_active = True
+        self._apply_seg_brush(scene_pos, add=add, prev_scene_pos=None)
+        return True
+
+    def _finish_seg_brush(self):
+        self.seg_brush_active = False
+        self.seg_brush_mask = None
+        self.seg_brush_item = None
+        self.seg_brush_anchor_points = []
+        self._clear_seg_edit_handles()
+        self._refresh_sam_controls()
+
+    def _apply_seg_brush(self, scene_pos: QPointF, add: bool, prev_scene_pos: Optional[QPointF] = None) -> bool:
+        if not self._is_seg_workflow() or self.mode != "segedit":
+            return False
+        if not self._is_seg_edit_tool_brush():
+            return False
+        if _cv2 is None or _np is None:
+            return False
+
+        item = self._seg_edit_target_item()
+        if item is None:
+            return False
+        if self.img_w <= 0 or self.img_h <= 0:
+            return False
+
+        points = self._extract_seg_item_points(item)
+        if len(points) < 3:
+            return False
+
+        # Keep a persistent raster mask through the brush stroke. This avoids
+        # repeated polygon->mask->polygon conversions that can drift vertices.
+        active_mask = getattr(self, "seg_brush_mask", None)
+        active_item = getattr(self, "seg_brush_item", None)
+        if active_mask is None or active_item is not item:
+            active_mask = self._seg_mask_from_points(points)
+            if active_mask is None:
+                return False
+            self.seg_brush_mask = active_mask
+            self.seg_brush_item = item
+            self.seg_brush_anchor_points = [(float(x), float(y)) for x, y in points]
+
+        mask = active_mask
+
+        x2, y2 = self._clamp_scene_xy(scene_pos.x(), scene_pos.y())
+        if prev_scene_pos is not None:
+            x1, y1 = self._clamp_scene_xy(prev_scene_pos.x(), prev_scene_pos.y())
+        else:
+            x1, y1 = x2, y2
+
+        radius = max(2, int(round(float(getattr(self, "seg_brush_radius", 8)))))
+        value = 255 if add else 0
+        thickness = max(2, radius * 2)
+        _cv2.circle(mask, (x2, y2), radius, value, thickness=-1)
+        if x1 != x2 or y1 != y2:
+            _cv2.line(mask, (x1, y1), (x2, y2), value, thickness=thickness)
+
+        if int(_cv2.countNonZero(mask)) == 0:
+            if item is self.seg_preview_item:
+                self._clear_seg_preview()
+            else:
+                cid = int(getattr(item, "seg_class_id", self.class_selector.currentIndex()))
+                self._clear_class_items(cid, drop_cache=True)
+            self.seg_brush_mask = None
+            self.seg_brush_item = None
+            self.seg_brush_anchor_points = []
+            self.update_status_bar("Brush erased mask.")
+            return True
+
+        anchor_points = getattr(self, "seg_brush_anchor_points", None) or points
+        new_points = self._seg_points_from_mask(mask, anchor_points=anchor_points)
+        if len(new_points) < 3:
+            return False
+
+        if not self._seg_update_item_geometry(item, new_points):
+            return False
+        if item is self.seg_preview_item:
+            self.seg_preview_points = [(float(x), float(y)) for x, y in new_points]
+        else:
+            cid = int(getattr(item, "seg_class_id", self.class_selector.currentIndex()))
+            self._cache_active_annotation(cid)
+        self._refresh_sam_controls()
+        return True
+
+    def _add_seg_mask_item(self, class_id: int, points: list[tuple[float, float]], preview: bool = False):
+        path = self._polygon_path(points)
+        if path is None:
+            return None
+        color = self._seg_class_color(class_id)
+        item = QGraphicsPathItem(path)
+        pen = QPen(color)
+        pen.setCosmetic(True)
+        pen.setWidth(2 if preview else 3)
+        if preview:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        item.setPen(pen)
+        fill_alpha = 60 if preview else 105
+        item.setBrush(QBrush(self._seg_class_color(class_id, alpha=fill_alpha)))
+        item.setZValue(4.5 if preview else 4.0)
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, not preview)
+        item.seg_class_id = int(class_id)
+        item.seg_points = [(float(x), float(y)) for x, y in points]
+        item.seg_preview = bool(preview)
+
+        label_text = self._seg_class_name(class_id)
+        if preview:
+            label_text += " (preview)"
+        label_item = QGraphicsSimpleTextItem(label_text, item)
+        label_item.setBrush(QBrush(color))
+        label_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        label_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        label_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        bbox = path.boundingRect()
+        label_item.setPos(bbox.left() + 4.0, bbox.top() + 4.0)
+        label_item.setZValue(0.2)
+        item.seg_label_item = label_item
+
+        self.scene.addItem(item)
+        self._track_scene_item(item)
+        return item
+
+    def _clear_seg_prompt_items(self):
+        for item in list(self.seg_prompt_items):
+            self._safe_remove_scene_item(item)
+            self._untrack_scene_item(item)
+        self.seg_prompt_items.clear()
+
+    def _clear_seg_preview(self):
+        self._clear_seg_edit_handles()
+        if self.seg_preview_item is not None:
+            self._safe_remove_scene_item(self.seg_preview_item)
+            self._untrack_scene_item(self.seg_preview_item)
+            self.seg_preview_item = None
+        self.seg_preview_points = []
+        self.seg_preview_score = 0.0
+        self._refresh_sam_controls()
+
+    def _clear_seg_prompt_state(self):
+        self.seg_prompt_points.clear()
+        self._clear_seg_prompt_items()
+        self._clear_seg_preview()
+        self._refresh_sam_controls()
+
+    def _refresh_sam_controls(self):
+        if not hasattr(self, "sam_helper_label"):
+            return
+        if not self._is_seg_workflow():
+            self.sam_helper_label.setText("")
+            return
+
+        total_prompts = len(self.seg_prompt_points)
+        pos_prompts = sum(1 for _, _, lb in self.seg_prompt_points if int(lb) == 1)
+        neg_prompts = total_prompts - pos_prompts
+        has_preview = len(self.seg_preview_points) >= 3
+        has_image = bool(self.images)
+        in_segment_mode = self.mode == "segment"
+        model_loaded = self.sam_model is not None
+
+        cid = self.class_selector.currentIndex() if hasattr(self, "class_selector") else -1
+        class_name = self._seg_class_name(cid) if cid >= 0 else "class"
+        has_mask = False
+        if cid >= 0:
+            entry = self.annotation_cache.get(cid, {})
+            has_mask = len(entry.get("segments", [])) >= 3 or (self._class_seg_mask_item(cid) is not None)
+        completed = sum(1 for idx in range(len(self.classes)) if self._class_is_complete(idx))
+        run_enabled = has_image and in_segment_mode and total_prompts > 0 and model_loaded
+        accept_enabled = has_preview
+        clear_enabled = has_preview or total_prompts > 0
+        load_enabled = SAM is not None and not model_loaded
+        if hasattr(self, "sam_load_btn"):
+            self.sam_load_btn.setEnabled(load_enabled)
+            self.sam_load_btn.setText("Load SAM" if load_enabled else ("SAM Ready" if model_loaded else "SAM N/A"))
+            self.sam_load_btn.setStyleSheet(
+                "background-color: rgba(84, 98, 112, 225); border-color: rgba(164, 180, 195, 165);"
+                if load_enabled else ""
+            )
+        self.sam_run_btn.setEnabled(run_enabled)
+        self.sam_accept_btn.setEnabled(accept_enabled)
+        self.sam_clear_btn.setEnabled(clear_enabled)
+        self.sam_run_btn.setStyleSheet(
+            "background-color: rgba(67, 104, 149, 230); border-color: rgba(150, 178, 207, 170);"
+            if (run_enabled and not has_preview) else ""
+        )
+        self.sam_accept_btn.setStyleSheet(
+            "background-color: rgba(62, 124, 92, 235); border-color: rgba(137, 201, 169, 180);"
+            if accept_enabled else ""
+        )
+        self.sam_clear_btn.setStyleSheet(
+            "background-color: rgba(108, 79, 79, 220); border-color: rgba(183, 147, 147, 165);"
+            if clear_enabled else ""
+        )
+        if not model_loaded:
+            self.sam_run_btn.setToolTip("Load SAM model first, then add prompts and run.")
+        elif not has_image:
+            self.sam_run_btn.setToolTip("No image loaded.")
+        elif not total_prompts:
+            self.sam_run_btn.setToolTip("Add prompt points first (left=positive, right=negative).")
+        else:
+            self.sam_run_btn.setToolTip("Run SAM using current positive/negative prompts.")
+
+        if self.mode == "segedit":
+            brush_px = int(getattr(self, "seg_brush_radius", 8))
+            tool_text = "Brush"
+            edit_text = f"left-drag add, right-drag erase (brush {brush_px}px, ,/. resize)."
+            if has_preview or has_mask:
+                action = f"Mask edit ({tool_text}): {edit_text}"
+            else:
+                action = "No mask yet. Run SAM and accept, or edit a current preview."
+        elif not model_loaded:
+            action = "Next: Load SAM, add prompts, then Run (G)."
+        elif not has_image:
+            action = "Open an image to segment."
+        elif not in_segment_mode:
+            action = "Press 2 for Segment mode. Left click = positive prompt, right click = negative prompt."
+        elif not total_prompts and not has_preview:
+            action = "Left click = positive prompt, right click = negative prompt."
+        elif total_prompts and not has_preview:
+            action = "Run SAM (G) to generate a preview mask."
+        else:
+            action = "Accept (Shift+Enter) to commit this mask."
+
+        mask_text = "saved" if has_mask else "none"
+        preview_text = "ready" if has_preview else "none"
+        model_text = "ready" if model_loaded else ("missing" if SAM is not None else "unavailable")
+        self.sam_helper_label.setText(
+            f"Class {class_name} | Done {completed}/{len(self.classes)} | Model {model_text} | Mask {mask_text}\n"
+            f"Prompts +{pos_prompts}/-{neg_prompts} | Preview {preview_text} | {action}"
+        )
+
+    def _load_sam_model_interactive(self):
+        if not self._is_seg_workflow():
+            self._switch_workflow(WORKFLOW_SEG)
+        self._ensure_sam_model_loaded()
+        self._refresh_sam_controls()
+
+    def _draw_seg_prompt_marker(self, x: float, y: float, positive: bool):
+        radius = 5.0
+        color = Qt.GlobalColor.green if positive else Qt.GlobalColor.red
+        marker = QGraphicsEllipseItem(x - radius, y - radius, radius * 2.0, radius * 2.0)
+        pen = QPen(color)
+        pen.setCosmetic(True)
+        pen.setWidth(2)
+        marker.setPen(pen)
+        marker.setBrush(QBrush(Qt.GlobalColor.transparent))
+        marker.setZValue(8.0)
+        marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.scene.addItem(marker)
+        self._track_scene_item(marker)
+        self.seg_prompt_items.append(marker)
+
+        if not positive:
+            cross_a = QGraphicsLineItem(x - radius + 1.0, y - radius + 1.0, x + radius - 1.0, y + radius - 1.0)
+            cross_b = QGraphicsLineItem(x - radius + 1.0, y + radius - 1.0, x + radius - 1.0, y - radius + 1.0)
+            for line in (cross_a, cross_b):
+                lp = QPen(color)
+                lp.setCosmetic(True)
+                lp.setWidth(2)
+                line.setPen(lp)
+                line.setZValue(8.1)
+                line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+                line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+                self.scene.addItem(line)
+                self._track_scene_item(line)
+                self.seg_prompt_items.append(line)
+
+    def _refresh_seg_prompt_markers(self):
+        self._clear_seg_prompt_items()
+        for x, y, label in self.seg_prompt_points:
+            self._draw_seg_prompt_marker(float(x), float(y), positive=bool(label))
+        self._refresh_sam_controls()
+
+    def _add_seg_prompt(self, scene_pos: QPointF, positive: bool = True):
+        if not self._is_seg_workflow() or self.mode != "segment":
+            return
+        if not self.images:
+            return
+        x = max(0.0, min(float(self.img_w - 1), float(scene_pos.x())))
+        y = max(0.0, min(float(self.img_h - 1), float(scene_pos.y())))
+        label = 1 if positive else 0
+        self.seg_prompt_points.append((x, y, label))
+        self._draw_seg_prompt_marker(x, y, positive=positive)
+        self.update_status_bar(
+            f"Added {'positive' if positive else 'negative'} prompt ({len(self.seg_prompt_points)} total)."
+        )
+        self._refresh_sam_controls()
+
+    def _sam3_model_candidates_in_project_root(self) -> list[str]:
+        root = os.path.abspath(getattr(self, "project_root", "") or "")
+        if not root or not os.path.isdir(root):
+            return []
+
+        exact: list[str] = []
+        prefix: list[str] = []
+        other: list[str] = []
+        try:
+            names = sorted(os.listdir(root))
+        except Exception:
+            names = []
+        for name in names:
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            lower = name.lower()
+            if not (lower.endswith(".pt") or lower.endswith(".pth")):
+                continue
+            if "sam3" not in lower:
+                continue
+            if lower == DEFAULT_SAM3_WEIGHTS.lower():
+                exact.append(path)
+            elif lower.startswith("sam3"):
+                prefix.append(path)
+            else:
+                other.append(path)
+        return exact + prefix + other
+
+    def _try_autoload_sam_model_from_project_root(self) -> tuple[bool, str]:
+        """Attempt non-interactive SAM autoload from project root.
+
+        Returns (loaded_now, model_path). loaded_now is True only when this call
+        actually loads a model instance.
+        """
+        if SAM is None:
+            return False, ""
+        if self.sam_model is not None:
+            return False, str(getattr(self, "sam_model_path", "") or "")
+
+        for path in self._sam3_model_candidates_in_project_root():
+            try:
+                self.sam_model = SAM(path)
+                self.sam_model_path = path
+                self._save_project_preferences()
+                return True, path
+            except Exception:
+                self.sam_model = None
+                continue
+        return False, ""
+
+    def _ensure_sam_model_loaded(self) -> bool:
+        if SAM is None:
+            QMessageBox.warning(
+                self,
+                "SAM unavailable",
+                "Ultralytics SAM support is not available in this environment.",
+            )
+            return False
+
+        if self.sam_model is not None:
+            return True
+
+        candidate_paths = []
+        if self.sam_model_path:
+            candidate_paths.append(self.sam_model_path)
+        candidate_paths.extend(self._sam3_model_candidates_in_project_root())
+        candidate_paths.extend(
+            [
+                os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS),
+                os.path.join(os.getcwd(), DEFAULT_SAM3_WEIGHTS),
+            ]
+        )
+
+        model_path = ""
+        seen = set()
+        for cand in candidate_paths:
+            norm = os.path.abspath(cand)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.isfile(norm):
+                model_path = norm
+                break
+
+        if not model_path:
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select SAM model file",
+                self.project_root,
+                "Model Files (*.pt *.pth)",
+            )
+            if not selected:
+                return False
+            model_path = selected
+
+        try:
+            self.sam_model = SAM(model_path)
+            self.sam_model_path = model_path
+            self._save_project_preferences()
+            self.update_status_bar(f"Loaded SAM model: {os.path.basename(model_path)}")
+            return True
+        except Exception as e:
+            self.sam_model = None
+            QMessageBox.warning(self, "SAM load error", f"Could not load SAM model:\n{e}")
+            return False
+
+    def _run_sam_segmentation(self):
+        if not self._is_seg_workflow():
+            return
+        if self.mode != "segment":
+            self.set_mode("segment")
+        if not self.images:
+            self.update_status_bar("No image loaded.")
+            return
+        if not self.seg_prompt_points:
+            QMessageBox.information(self, "No prompts", "Add at least one prompt point before running SAM.")
+            return
+        if not self._ensure_sam_model_loaded():
+            self._refresh_sam_controls()
+            return
+        self._refresh_sam_controls()
+
+        points = [[x, y] for x, y, _ in self.seg_prompt_points]
+        labels = [int(lb) for _, _, lb in self.seg_prompt_points]
+        img_source = self.current_image_path or os.path.join(self.active_image_dir, self.images[self.current_idx])
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            results = self.sam_model.predict(
+                source=img_source,
+                points=points,
+                labels=labels,
+                verbose=False,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "SAM inference error", f"SAM segmentation failed:\n{e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not results:
+            QMessageBox.information(self, "No masks", "SAM did not return any segmentation mask for these prompts.")
+            return
+
+        result = results[0]
+        masks = getattr(result, "masks", None)
+        if masks is None or len(masks) == 0:
+            QMessageBox.information(self, "No masks", "SAM did not return any segmentation mask for these prompts.")
+            return
+
+        best_idx = 0
+        best_score = 0.0
+        boxes = getattr(result, "boxes", None)
+        if boxes is not None and getattr(boxes, "conf", None) is not None and len(boxes.conf) > 0:
+            try:
+                conf_values = boxes.conf.cpu().tolist()
+                best_idx = max(range(len(conf_values)), key=lambda i: conf_values[i])
+                best_score = float(conf_values[best_idx])
+            except Exception:
+                best_idx = 0
+                best_score = 0.0
+
+        points_xy = []
+        try:
+            contours = masks.xy
+            if best_idx < len(contours):
+                points_xy = [(float(p[0]), float(p[1])) for p in contours[best_idx] if len(p) >= 2]
+        except Exception:
+            points_xy = []
+
+        if len(points_xy) < 3:
+            QMessageBox.information(self, "No polygon", "SAM returned a mask without a usable contour polygon.")
+            return
+
+        self._clear_seg_preview()
+        cid = self.class_selector.currentIndex()
+        self.seg_preview_item = self._add_seg_mask_item(cid, points_xy, preview=True)
+        self.seg_preview_points = points_xy
+        self.seg_preview_score = best_score
+        if self.seg_preview_item is None:
+            QMessageBox.information(self, "No polygon", "Unable to render SAM mask preview.")
+            return
+        self.update_status_bar("SAM mask preview ready. Click Accept Mask to commit.")
+        self._refresh_sam_controls()
+
+    def _accept_segmentation_preview(self):
+        if not self._is_seg_workflow():
+            return
+        if len(self.seg_preview_points) < 3:
+            QMessageBox.information(self, "No preview", "Run SAM first to create a segmentation mask preview.")
+            return
+
+        accepted_points = [(float(x), float(y)) for x, y in self.seg_preview_points]
+        accepted_score = float(self.seg_preview_score)
+        cid = self.class_selector.currentIndex()
+        self._clear_class_items(cid, drop_cache=False)
+        self.annotation_cache[cid] = {
+            "class_id": cid,
+            "segments": accepted_points,
+            "score": accepted_score,
+        }
+        self._restore_annotation_for_class(cid)
+        self._clear_seg_prompt_state()
+        self._update_item_editability()
+        if self.mode == "segedit":
+            self._clear_seg_edit_handles()
+        self._jump_to_next_pending_class()
+        self.update_status_bar("Segmentation mask accepted for current class.")
+        self._refresh_sam_controls()
+
     def _class_box_item(self, class_id: int) -> Optional[BoxItem]:
         for item in self.scene.items():
             if isinstance(item, BoxItem) and item.bbox.class_id == class_id:
@@ -1422,11 +2778,15 @@ class LabelingApp(QMainWindow):
         removed = False
         for item in list(self.scene.items()):
             if isinstance(item, BoxItem) and item.bbox.class_id == class_id:
-                self.scene.removeItem(item)
+                self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
                 removed = True
             elif isinstance(item, KeypointItem) and item.kp.class_id == class_id:
-                self.scene.removeItem(item)
+                self._safe_remove_scene_item(item)
+                self._untrack_scene_item(item)
+                removed = True
+            elif self._is_seg_mask_item(item) and int(getattr(item, "seg_class_id", -1)) == class_id:
+                self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
                 removed = True
         if drop_cache:
@@ -1435,19 +2795,28 @@ class LabelingApp(QMainWindow):
             self.bboxes.clear()
             self.kps.clear()
             self.current_kp_idx = 0
+            if self._is_seg_workflow():
+                self._clear_seg_prompt_state()
             if removed:
                 self._update_status()
 
     def _clear_all_annotation_items(self):
+        self._clear_seg_edit_handles()
         for item in list(self.scene.items()):
-            if isinstance(item, (BoxItem, KeypointItem)):
-                self.scene.removeItem(item)
+            if isinstance(item, (BoxItem, KeypointItem)) or self._is_seg_mask_item(item):
+                self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
         self.bboxes.clear()
         self.kps.clear()
         self.current_kp_idx = 0
+        self._clear_seg_prompt_state()
 
     def _sync_active_class_state(self):
+        if self._is_seg_workflow():
+            self.bboxes = []
+            self.kps = []
+            self.current_kp_idx = 0
+            return
         cid = self.class_selector.currentIndex()
         box_item = self._class_box_item(cid)
         self.bboxes = [box_item.bbox] if box_item else []
@@ -1467,11 +2836,18 @@ class LabelingApp(QMainWindow):
                 item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, editable)
                 item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, editable)
                 item.setOpacity(1.0 if editable else 0.4)
+            elif self._is_seg_mask_item(item):
+                editable = (int(getattr(item, "seg_class_id", -1)) == active_cid)
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, editable)
+                item.setOpacity(1.0 if editable else 0.35)
 
     def _class_is_complete(self, class_id: int) -> bool:
         entry = self.annotation_cache.get(class_id)
         if not entry:
             return False
+        if self._is_seg_workflow():
+            seg = entry.get("segments", [])
+            return len(seg) >= 3
         needed = len(self._kp_names_for_index(class_id))
         if needed == 0:
             return bool(entry.get("bbox"))
@@ -1566,12 +2942,16 @@ class LabelingApp(QMainWindow):
         # Backward-compatible alias used by some dialogs/tools.
         self.image_dir = self.image_dir_queue
         self.image_dir_archive = os.path.join(self.project_root, "images_all")
-        self.label_dir = label_dir or os.path.join(self.project_root, "labels_all")
+        self.pose_label_dir = label_dir or os.path.join(self.project_root, "labels_all")
+        self.seg_label_dir = os.path.join(self.project_root, "labels_seg_all")
         os.makedirs(self.image_dir_queue, exist_ok=True)
-        os.makedirs(self.label_dir, exist_ok=True)
+        os.makedirs(self.pose_label_dir, exist_ok=True)
+        os.makedirs(self.seg_label_dir, exist_ok=True)
         os.makedirs(self.image_dir_archive, exist_ok=True)
-        self.class_file = class_file or os.path.join(self.project_root, "classes.txt")
-        self.keypoint_file = keypoint_file or os.path.join(self.project_root, "keypoints.txt")
+        self.pose_class_file = class_file or os.path.join(self.project_root, "classes.txt")
+        self.pose_keypoint_file = keypoint_file or os.path.join(self.project_root, "keypoints.txt")
+        self.pose_class_keypoints_path = os.path.join(self.project_root, "class_keypoints.json")
+        self.seg_class_file = os.path.join(self.project_root, "classes_seg.txt")
         self.base_dir = self.project_root
 
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
@@ -1584,11 +2964,29 @@ class LabelingApp(QMainWindow):
         self._queue_current_idx = 0
         self._archive_current_idx = 0
 
-        # Ensure classes.txt and keypoints.txt exist (never prompt, always silent)
-        self.classes, self.kp_names, self._created_label_files = self._ensure_label_files(self.class_file, self.keypoint_file)
-        self.class_keypoints_path = os.path.join(self.project_root, "class_keypoints.json")
+        # Pose workflow resources
+        self.pose_classes, self.pose_kp_names, self._created_label_files = self._ensure_label_files(
+            self.pose_class_file, self.pose_keypoint_file
+        )
+        self.classes = self.pose_classes[:]
+        self.kp_names = self.pose_kp_names[:]
+        self.class_keypoints_path = self.pose_class_keypoints_path
         self.class_keypoints = self._load_class_keypoints()
         self._save_class_keypoints()
+        self.pose_class_keypoints = {name: self.class_keypoints.get(name, [])[:] for name in self.pose_classes}
+
+        # Segmentation workflow resources
+        self.seg_classes, self._created_seg_class_file = self._ensure_classes_file(
+            self.seg_class_file, DEFAULT_CLASS_NAMES
+        )
+
+        self.active_workflow = WORKFLOW_POSE
+        self.classes = self.pose_classes[:]
+        self.kp_names = self.pose_kp_names[:]
+        self.class_keypoints = {name: self.pose_class_keypoints.get(name, [])[:] for name in self.pose_classes}
+        self.label_dir = self.pose_label_dir
+        self.class_file = self.pose_class_file
+        self.keypoint_file = self.pose_keypoint_file
         self._schema_locked = self._detect_schema_locked()
         self._kp_index_lookup: dict[str, int] = {}
         self._refresh_kp_index_lookup()
@@ -1603,7 +3001,24 @@ class LabelingApp(QMainWindow):
         self._item_refs: list[QGraphicsItem] = []
         self.predict_model_path: Optional[str] = None
         self.predict_model: Optional[YOLO] = None
+        self.sam_model_path = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
+        self.sam_model: Optional[SAM] = None
+        self.seg_prompt_points: list[tuple[float, float, int]] = []
+        self.seg_prompt_items: list[QGraphicsItem] = []
+        self.seg_preview_item: Optional[QGraphicsPathItem] = None
+        self.seg_preview_points: list[tuple[float, float]] = []
+        self.seg_preview_score: float = 0.0
+        self.seg_brush_radius: int = 8
+        self.seg_brush_active: bool = False
+        self.seg_brush_mask: Optional[object] = None
+        self.seg_brush_item: Optional[QGraphicsPathItem] = None
+        self.seg_brush_anchor_points: list[tuple[float, float]] = []
+        self._seg_setup_prompted = False
         self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled' | 'archive'
+
+        self._load_project_preferences()
+        self._bind_workflow_state(self.active_workflow)
+        self._save_project_preferences()
 
         # keypoint display (screen-space)
         self.kp_pixel_radius = 4
@@ -1618,9 +3033,13 @@ class LabelingApp(QMainWindow):
         print(f"🧠 Inference device: {self._device}")
         # Build UI and load first image
         self._setup_ui()
+        self._update_workflow_ui_state()
         self.load_image()
         self._update_progress_label()
-        QTimer.singleShot(0, self._maybe_prompt_class_manager)
+        if self._is_seg_workflow():
+            QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
+        else:
+            QTimer.singleShot(0, self._maybe_prompt_class_manager)
     def closeEvent(self, event):
         super().closeEvent(event)
 
@@ -1733,6 +3152,31 @@ class LabelingApp(QMainWindow):
                 font-size: 9pt;
                 color: #c8d0d8;
             }
+            QLabel#brushSizeBadge {
+                font-size: 9pt;
+                font-weight: 700;
+                color: #dce8f4;
+                background-color: rgba(65, 76, 87, 170);
+                border: 1px solid rgba(130, 145, 160, 130);
+                border-radius: 8px;
+                padding: 2px 9px;
+                min-width: 84px;
+            }
+            QLabel#sectionLabel {
+                font-size: 8pt;
+                font-weight: 700;
+                color: #aebac8;
+                letter-spacing: 0.8px;
+            }
+            QLabel#samHelper {
+                font-size: 9pt;
+                color: #e3ebf3;
+                background-color: rgba(56, 64, 72, 150);
+                border: 1px solid rgba(120, 135, 149, 120);
+                border-radius: 8px;
+                padding: 5px 7px;
+                line-height: 1.15;
+            }
             QLabel#progressBadge {
                 font-weight: 700;
                 color: #f3f7fb;
@@ -1757,9 +3201,14 @@ class LabelingApp(QMainWindow):
                 background-color: rgba(42, 48, 53, 235);
             }
             QPushButton:disabled {
-                color: rgba(217, 225, 232, 110);
-                background-color: rgba(44, 49, 54, 180);
-                border-color: rgba(110, 121, 130, 90);
+                color: rgba(224, 232, 239, 155);
+                background-color: rgba(51, 58, 64, 196);
+                border-color: rgba(134, 147, 159, 125);
+            }
+            QPushButton#samAcceptButton:disabled {
+                color: rgba(229, 236, 241, 170);
+                background-color: rgba(54, 68, 62, 198);
+                border-color: rgba(135, 158, 147, 148);
             }
             QComboBox {
                 background-color: rgba(43, 49, 54, 218);
@@ -1783,6 +3232,56 @@ class LabelingApp(QMainWindow):
                 selection-background-color: rgba(94, 129, 161, 210);
                 selection-color: #ffffff;
             }
+            QComboBox#workflowSelector {
+                combobox-popup: 0;
+                font-size: 10pt;
+                font-weight: 600;
+                padding: 4px 12px;
+                min-height: 31px;
+            }
+            QComboBox#workflowSelector::drop-down {
+                width: 24px;
+            }
+            QComboBox#workflowSelector QAbstractItemView {
+                font-size: 10pt;
+                background-color: rgba(36, 42, 48, 246);
+                color: #edf4fc;
+                border: 1px solid rgba(129, 146, 162, 176);
+                border-radius: 9px;
+                outline: 0px;
+                padding: 4px;
+                selection-background-color: rgba(97, 136, 171, 230);
+                selection-color: #ffffff;
+            }
+            QComboBox#workflowSelector QAbstractItemView::item {
+                min-height: 30px;
+                padding: 4px 10px;
+            }
+            QComboBox#browseSelector {
+                combobox-popup: 0;
+                font-size: 10pt;
+                font-weight: 600;
+                padding: 4px 10px;
+                min-height: 31px;
+            }
+            QComboBox#browseSelector::drop-down {
+                width: 22px;
+            }
+            QComboBox#browseSelector QAbstractItemView {
+                font-size: 10pt;
+                background-color: rgba(36, 42, 48, 246);
+                color: #edf4fc;
+                border: 1px solid rgba(129, 146, 162, 176);
+                border-radius: 9px;
+                outline: 0px;
+                padding: 4px;
+                selection-background-color: rgba(97, 136, 171, 230);
+                selection-color: #ffffff;
+            }
+            QComboBox#browseSelector QAbstractItemView::item {
+                min-height: 28px;
+                padding: 4px 10px;
+            }
         """
 
         # Main layout: keep canvas clean and place controls as hot-corner overlays.
@@ -1804,6 +3303,25 @@ class LabelingApp(QMainWindow):
         self.class_selector.addItems(self.classes)
         self.class_selector.currentIndexChanged.connect(self._on_class_changed)
         self._active_class_id = self.class_selector.currentIndex()
+        self.workflow_selector = QComboBox()
+        self.workflow_selector.setObjectName("workflowSelector")
+        self.workflow_selector.addItem("Pose Workflow (BBox + Keypoints)", WORKFLOW_POSE)
+        self.workflow_selector.addItem("Segmentation Workflow (SAM)", WORKFLOW_SEG)
+        self.workflow_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.workflow_selector.setMinimumContentsLength(30)
+        self.workflow_selector.setMinimumWidth(286)
+        self.workflow_selector.setMinimumHeight(34)
+        self.workflow_selector.setMaxVisibleItems(6)
+        workflow_popup = QListView(self.workflow_selector)
+        workflow_popup.setUniformItemSizes(True)
+        workflow_popup.setSpacing(2)
+        workflow_popup.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        workflow_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.workflow_selector.setView(workflow_popup)
+        self.workflow_selector.setToolTip(
+            "Choose labeling workflow: Pose for boxes/keypoints, or Segmentation for SAM masks."
+        )
+        self.workflow_selector.currentIndexChanged.connect(self._on_workflow_changed)
 
         # -----------------------------
         # Top-left: navigation + labeling
@@ -1812,8 +3330,8 @@ class LabelingApp(QMainWindow):
         self.top_left_frame.setStyleSheet(panel_style)
         apply_panel_shadow(self.top_left_frame)
         top_left_layout = QVBoxLayout(self.top_left_frame)
-        top_left_layout.setContentsMargins(12, 11, 12, 11)
-        top_left_layout.setSpacing(8)
+        top_left_layout.setContentsMargins(10, 9, 10, 9)
+        top_left_layout.setSpacing(6)
 
         top_left_title = QLabel("Navigation & Labeling")
         top_left_title.setObjectName("panelTitle")
@@ -1822,11 +3340,20 @@ class LabelingApp(QMainWindow):
         filter_row = QHBoxLayout()
         filter_row.setSpacing(6)
         self.filter_combo = QComboBox()
+        self.filter_combo.setObjectName("browseSelector")
         self.filter_combo.addItems(["All", "Labeled", "Unlabeled", "Archive"])
         self.filter_combo.setToolTip("Which images to browse with Prev/Next")
         self.filter_combo.setMinimumContentsLength(10)
         self.filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.filter_combo.setMinimumWidth(132)
+        self.filter_combo.setMinimumHeight(34)
+        self.filter_combo.setMaxVisibleItems(8)
+        filter_popup = QListView(self.filter_combo)
+        filter_popup.setUniformItemSizes(True)
+        filter_popup.setSpacing(2)
+        filter_popup.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        filter_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.filter_combo.setView(filter_popup)
         self.filter_combo.currentTextChanged.connect(lambda t: self._set_nav_filter(t.lower()))
         browse_label = QLabel("Browse")
         browse_label.setObjectName("fieldLabel")
@@ -1834,6 +3361,14 @@ class LabelingApp(QMainWindow):
         filter_row.addWidget(self.filter_combo)
         filter_row.addStretch(1)
         top_left_layout.addLayout(filter_row)
+
+        workflow_row = QHBoxLayout()
+        workflow_row.setSpacing(6)
+        workflow_label = QLabel("Workflow")
+        workflow_label.setObjectName("fieldLabel")
+        workflow_row.addWidget(workflow_label)
+        workflow_row.addWidget(self.workflow_selector, 1)
+        top_left_layout.addLayout(workflow_row)
 
         nav_row = QHBoxLayout()
         nav_row.setSpacing(6)
@@ -1845,26 +3380,39 @@ class LabelingApp(QMainWindow):
         btn_next.clicked.connect(self.next_index)
         nav_row.addWidget(btn_next)
 
-        btn_complete = QPushButton('Complete')
-        btn_complete.setToolTip("Save and jump to next unlabeled image")
-        btn_complete.clicked.connect(self.complete_and_next_unlabeled)
-        nav_row.addWidget(btn_complete)
+        self.complete_btn = QPushButton('Complete')
+        self.complete_btn.setToolTip("Save and jump to next unlabeled image")
+        self.complete_btn.clicked.connect(self.complete_and_next_unlabeled)
+        nav_row.addWidget(self.complete_btn)
 
-        btn_skip = QPushButton('Skip')
-        btn_skip.setToolTip("Jump to next unlabeled image")
-        btn_skip.clicked.connect(self.skip_to_next_unlabeled)
-        nav_row.addWidget(btn_skip)
+        self.skip_btn = QPushButton('Skip')
+        self.skip_btn.setToolTip("Jump to next unlabeled image")
+        self.skip_btn.clicked.connect(self.skip_to_next_unlabeled)
+        nav_row.addWidget(self.skip_btn)
 
-        btn_save = QPushButton('Save')
-        btn_save.clicked.connect(self.save_labels)
-        nav_row.addWidget(btn_save)
+        self.save_btn = QPushButton('Save')
+        self.save_btn.clicked.connect(self.save_labels)
+        nav_row.addWidget(self.save_btn)
+        for btn in (btn_prev, btn_next, self.complete_btn, self.skip_btn, self.save_btn):
+            btn.setMinimumHeight(28)
         top_left_layout.addLayout(nav_row)
 
+        mode_section = QLabel("Mode")
+        mode_section.setObjectName("sectionLabel")
+        top_left_layout.addWidget(mode_section)
+
         mode_grid = QGridLayout()
-        mode_grid.setHorizontalSpacing(6)
-        mode_grid.setVerticalSpacing(6)
+        self.mode_grid = mode_grid
+        mode_grid.setHorizontalSpacing(5)
+        mode_grid.setVerticalSpacing(5)
         self.panzoom_btn = QPushButton('Pan/Zoom (1)')
         self.bbox_btn = QPushButton('BBox (2)')
+        self.segment_btn = QPushButton('Segment (2)')
+        self.segment_btn.setToolTip("Segmentation click prompts (left=positive, right=negative)")
+        self.seg_edit_btn = QPushButton('Edit Mask (E)')
+        self.seg_edit_btn.setToolTip(
+            "Manual mask edit mode using brush add/erase."
+        )
         self.keypoint_btn = QPushButton('Keypoint (3)')
         self.predict_btn = QPushButton('Predict (4)')
         for btn, mode_name in [(self.panzoom_btn, 'panzoom'),
@@ -1872,29 +3420,38 @@ class LabelingApp(QMainWindow):
                                (self.keypoint_btn, 'keypoint')]:
             btn.clicked.connect(lambda checked, m=mode_name: self.set_mode(m))
             btn.setMinimumWidth(116)
-            btn.setMinimumHeight(30)
+            btn.setMinimumHeight(28)
+        self.segment_btn.clicked.connect(lambda checked: self.set_mode('segment'))
+        self.seg_edit_btn.clicked.connect(lambda checked: self.set_mode('segedit'))
         self.predict_btn.clicked.connect(lambda checked: self.set_mode('predict'))
         self.panzoom_btn.setMinimumWidth(116)
         self.bbox_btn.setMinimumWidth(116)
+        self.segment_btn.setMinimumWidth(116)
+        self.seg_edit_btn.setMinimumWidth(116)
         self.keypoint_btn.setMinimumWidth(116)
         self.predict_btn.setMinimumWidth(116)
-        self.predict_btn.setMinimumHeight(30)
+        self.segment_btn.setMinimumHeight(28)
+        self.seg_edit_btn.setMinimumHeight(28)
+        self.predict_btn.setMinimumHeight(28)
         mode_grid.addWidget(self.panzoom_btn, 0, 0)
         mode_grid.addWidget(self.bbox_btn, 0, 1)
         mode_grid.addWidget(self.keypoint_btn, 1, 0)
         mode_grid.addWidget(self.predict_btn, 1, 1)
+        mode_grid.addWidget(self.segment_btn, 2, 0, 1, 2)
+        mode_grid.addWidget(self.seg_edit_btn, 3, 0, 1, 2)
         top_left_layout.addLayout(mode_grid)
+        self._reflow_mode_grid(is_pose=self._is_pose_workflow())
 
         class_row = QHBoxLayout()
         class_row.setSpacing(6)
-        class_label = QLabel("Class")
-        class_label.setObjectName("fieldLabel")
-        class_row.addWidget(class_label)
+        self.class_label_widget = QLabel("Class")
+        self.class_label_widget.setObjectName("fieldLabel")
+        class_row.addWidget(self.class_label_widget)
         class_row.addWidget(self.class_selector, 1)
-        manage_classes_btn = QPushButton("Classes…")
-        manage_classes_btn.setToolTip("Manage classes and per-class keypoints")
-        manage_classes_btn.clicked.connect(self.open_class_manager)
-        class_row.addWidget(manage_classes_btn)
+        self.manage_classes_btn = QPushButton("Classes…")
+        self.manage_classes_btn.setToolTip("Manage classes and per-class keypoints")
+        self.manage_classes_btn.clicked.connect(self.open_class_manager)
+        class_row.addWidget(self.manage_classes_btn)
         top_left_layout.addLayout(class_row)
 
         progress_row = QHBoxLayout()
@@ -1938,23 +3495,23 @@ class LabelingApp(QMainWindow):
         bottom_left_layout.addWidget(bottom_left_title)
         training_row = QHBoxLayout()
         training_row.setSpacing(6)
-        btn_normalize = QPushButton("Validate Labels")
-        btn_normalize.setToolTip("Rewrite labels_all files and ensure matching images exist in images_all")
-        btn_normalize.setMinimumHeight(30)
-        btn_normalize.clicked.connect(self.normalize_labels_all)
-        training_row.addWidget(btn_normalize)
+        self.normalize_btn = QPushButton("Validate Labels")
+        self.normalize_btn.setToolTip("Rewrite labels_all files and ensure matching images exist in images_all")
+        self.normalize_btn.setMinimumHeight(30)
+        self.normalize_btn.clicked.connect(self.normalize_labels_all)
+        training_row.addWidget(self.normalize_btn)
 
-        btn_export_dataset = QPushButton("Export Dataset")
-        btn_export_dataset.setToolTip("Split images_all/labels_all into train/val and regenerate dataset.yaml")
-        btn_export_dataset.setMinimumHeight(30)
-        btn_export_dataset.clicked.connect(self.export_dataset)
-        training_row.addWidget(btn_export_dataset)
+        self.export_dataset_btn = QPushButton("Export Dataset")
+        self.export_dataset_btn.setToolTip("Split images_all/labels_all into train/val and regenerate dataset.yaml")
+        self.export_dataset_btn.setMinimumHeight(30)
+        self.export_dataset_btn.clicked.connect(self.export_dataset)
+        training_row.addWidget(self.export_dataset_btn)
 
-        btn_train = QPushButton("Train Model")
-        btn_train.setToolTip("Launch a training run for a selected dataset")
-        btn_train.setMinimumHeight(30)
-        btn_train.clicked.connect(self.open_train_dialog)
-        training_row.addWidget(btn_train)
+        self.train_btn = QPushButton("Train Model")
+        self.train_btn.setToolTip("Launch a training run for a selected dataset")
+        self.train_btn.setMinimumHeight(30)
+        self.train_btn.clicked.connect(self.open_train_dialog)
+        training_row.addWidget(self.train_btn)
         bottom_left_layout.addLayout(training_row)
 
         # -----------------------------
@@ -1971,10 +3528,10 @@ class LabelingApp(QMainWindow):
         bottom_right_layout.addWidget(bottom_right_title)
         inference_row = QHBoxLayout()
         inference_row.setSpacing(6)
-        load_model_btn = QPushButton("Load Model")
-        load_model_btn.setMinimumHeight(30)
-        load_model_btn.clicked.connect(self.load_model)
-        inference_row.addWidget(load_model_btn)
+        self.load_model_btn = QPushButton("Load Model")
+        self.load_model_btn.setMinimumHeight(30)
+        self.load_model_btn.clicked.connect(self.load_model)
+        inference_row.addWidget(self.load_model_btn)
 
         self.template_apply_btn = QPushButton("Apply Tmpl")
         self.template_apply_btn.setToolTip("Apply the saved template for the selected class")
@@ -1995,12 +3552,73 @@ class LabelingApp(QMainWindow):
         inference_row.addWidget(self.inference_btn)
         bottom_right_layout.addLayout(inference_row)
 
+        # -----------------------------
+        # Bottom-left overlay: segmentation tools/help
+        # -----------------------------
+        self.seg_tools_frame = QFrame(self.view)
+        self.seg_tools_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.seg_tools_frame)
+        seg_tools_layout = QVBoxLayout(self.seg_tools_frame)
+        seg_tools_layout.setContentsMargins(10, 9, 10, 9)
+        seg_tools_layout.setSpacing(6)
+
+        seg_tools_title = QLabel("Segmentation Tools")
+        seg_tools_title.setObjectName("panelTitle")
+        seg_tools_layout.addWidget(seg_tools_title)
+
+        seg_brush_row = QHBoxLayout()
+        seg_brush_row.setSpacing(6)
+        seg_brush_label = QLabel("Brush")
+        seg_brush_label.setObjectName("fieldLabel")
+        seg_brush_row.addWidget(seg_brush_label)
+        self.seg_brush_size_label = QLabel("Brush: 8px")
+        self.seg_brush_size_label.setObjectName("brushSizeBadge")
+        seg_brush_row.addWidget(self.seg_brush_size_label)
+        seg_brush_row.addStretch(1)
+        seg_tools_layout.addLayout(seg_brush_row)
+
+        sam_row = QHBoxLayout()
+        sam_row.setSpacing(6)
+        self.sam_load_btn = QPushButton("Load SAM")
+        self.sam_load_btn.setToolTip("Load a SAM model file for segmentation prompts")
+        self.sam_load_btn.setMinimumHeight(28)
+        self.sam_load_btn.clicked.connect(self._load_sam_model_interactive)
+        sam_row.addWidget(self.sam_load_btn)
+
+        self.sam_run_btn = QPushButton("Run (G)")
+        self.sam_run_btn.setToolTip("Run SAM using current positive/negative prompts")
+        self.sam_run_btn.setMinimumHeight(28)
+        self.sam_run_btn.clicked.connect(self._run_sam_segmentation)
+        sam_row.addWidget(self.sam_run_btn)
+
+        self.sam_accept_btn = QPushButton("Accept")
+        self.sam_accept_btn.setObjectName("samAcceptButton")
+        self.sam_accept_btn.setToolTip("Commit the current SAM mask preview to this class")
+        self.sam_accept_btn.setMinimumHeight(28)
+        self.sam_accept_btn.clicked.connect(self._accept_segmentation_preview)
+        sam_row.addWidget(self.sam_accept_btn)
+
+        self.sam_clear_btn = QPushButton("Reset")
+        self.sam_clear_btn.setToolTip("Remove prompt points and the current SAM preview")
+        self.sam_clear_btn.setMinimumHeight(28)
+        self.sam_clear_btn.clicked.connect(self._clear_seg_prompt_state)
+        sam_row.addWidget(self.sam_clear_btn)
+        seg_tools_layout.addLayout(sam_row)
+
+        self.sam_helper_label = QLabel("")
+        self.sam_helper_label.setWordWrap(True)
+        self.sam_helper_label.setObjectName("samHelper")
+        seg_tools_layout.addWidget(self.sam_helper_label)
+        self._refresh_seg_brush_size_badge()
+        self.seg_tools_frame.hide()
+
         # reflect initial nav filter in the dropdown
         try:
             mapping = {"all": 0, "labeled": 1, "unlabeled": 2, "archive": 3}
             self.filter_combo.setCurrentIndex(mapping.get(self.nav_filter, 0))
         except Exception:
             pass
+        self.workflow_selector.setCurrentIndex(0 if self._is_pose_workflow() else 1)
 
         self._layout_hot_corners()
 
@@ -2092,20 +3710,43 @@ class LabelingApp(QMainWindow):
         if index < 0 or index >= len(self.classes):
             return
         prev = getattr(self, "_active_class_id", index)
-        if prev != index:
+        if prev != index and self._is_pose_workflow():
             self._cache_active_annotation(prev)
         self._active_class_id = index
-        if self.annotation_cache.get(index) and not self._class_box_item(index):
+        if self._is_seg_workflow():
+            self._clear_seg_prompt_state()
+            has_item = self._class_seg_mask_item(index) is not None
+        else:
+            has_item = self._class_box_item(index) is not None
+        if self.annotation_cache.get(index) and not has_item:
             self._restore_annotation_for_class(index)
         else:
             self._sync_active_class_state()
             self._update_item_editability()
             self._update_status()
+        self._clear_seg_edit_handles()
+        self._refresh_sam_controls()
 
     def _cache_active_annotation(self, class_id: Optional[int] = None) -> bool:
         if not self.images:
             return False
         cid = self.class_selector.currentIndex() if class_id is None else class_id
+
+        if self._is_seg_workflow():
+            seg_item = self._class_seg_mask_item(cid)
+            if seg_item is not None:
+                points = self._extract_seg_item_points(seg_item)
+                if len(points) >= 3:
+                    self.annotation_cache[cid] = {
+                        "class_id": cid,
+                        "segments": [(float(x), float(y)) for x, y in points],
+                    }
+                    return True
+                self.annotation_cache.pop(cid, None)
+                return False
+            entry = self.annotation_cache.get(cid, {})
+            return len(entry.get("segments", [])) >= 3
+
         bbox_item = self._class_box_item(cid)
         if bbox_item is None:
             self.annotation_cache.pop(cid, None)
@@ -2155,6 +3796,23 @@ class LabelingApp(QMainWindow):
                 self._sync_active_class_state()
                 self._update_item_editability()
             return
+
+        if self._is_seg_workflow():
+            seg_points_raw = entry.get("segments", [])
+            seg_points: list[tuple[float, float]] = []
+            for pair in seg_points_raw:
+                try:
+                    seg_points.append((float(pair[0]), float(pair[1])))
+                except Exception:
+                    continue
+            if len(seg_points) >= 3:
+                self._add_seg_mask_item(cid, seg_points, preview=False)
+            if cid == self.class_selector.currentIndex():
+                self._sync_active_class_state()
+                self._update_status()
+                self._update_item_editability()
+            return
+
         bbox_data = entry.get("bbox", {})
         bbox = BoundingBox(
             bbox_data.get("x", 0.0),
@@ -2187,6 +3845,8 @@ class LabelingApp(QMainWindow):
             self._update_item_editability()
 
     def _load_annotations_from_file(self, label_file: str) -> dict[int, dict]:
+        if self._is_seg_workflow():
+            return self._load_seg_annotations_from_file(label_file)
         cache: dict[int, dict] = {}
         extra_rows = 0
         try:
@@ -2209,6 +3869,21 @@ class LabelingApp(QMainWindow):
             )
         return cache
 
+    def _load_seg_annotations_from_file(self, label_file: str) -> dict[int, dict]:
+        cache: dict[int, dict] = {}
+        try:
+            with open(label_file, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    entry = self._parse_segmentation_line(line)
+                    if entry:
+                        cache[entry["class_id"]] = entry
+        except Exception:
+            pass
+        return cache
+
     def _parse_label_line(self, line: str) -> tuple[Optional[dict], bool]:
         class_lookup = [self._kp_names_for_index(i) for i in range(len(self.classes))]
         return parse_yolo_pose_label_line(
@@ -2220,7 +3895,57 @@ class LabelingApp(QMainWindow):
             img_h=self.img_h,
         )
 
+    def _parse_segmentation_line(self, line: str) -> Optional[dict]:
+        parts = line.split()
+        if len(parts) < 7:
+            return None
+        try:
+            cid = int(parts[0])
+        except Exception:
+            return None
+        if cid < 0 or cid >= len(self.classes):
+            return None
+        coord_tokens = parts[1:]
+        if len(coord_tokens) % 2 != 0:
+            coord_tokens = coord_tokens[:-1]
+        if len(coord_tokens) < 6:
+            return None
+
+        points: list[tuple[float, float]] = []
+        for idx in range(0, len(coord_tokens), 2):
+            try:
+                xn = float(coord_tokens[idx])
+                yn = float(coord_tokens[idx + 1])
+            except Exception:
+                return None
+            x = xn * max(1.0, float(self.img_w))
+            y = yn * max(1.0, float(self.img_h))
+            points.append((x, y))
+        if len(points) < 3:
+            return None
+        return {"class_id": cid, "segments": points}
+
+    def _segmentation_entry_to_line(self, entry: dict) -> str:
+        cid = int(entry.get("class_id", 0))
+        seg = entry.get("segments", [])
+        coords: list[str] = []
+        for pair in seg:
+            try:
+                x = float(pair[0])
+                y = float(pair[1])
+            except Exception:
+                continue
+            xn = x / max(1.0, float(self.img_w))
+            yn = y / max(1.0, float(self.img_h))
+            coords.append(f"{xn:.6f}")
+            coords.append(f"{yn:.6f}")
+        if len(coords) < 6:
+            return ""
+        return f"{cid} " + " ".join(coords)
+
     def _annotation_entry_to_line(self, entry: dict) -> str:
+        if self._is_seg_workflow():
+            return self._segmentation_entry_to_line(entry)
         cid = entry.get("class_id", 0)
         bbox = entry.get("bbox", {})
         x = bbox.get("x", 0.0); y = bbox.get("y", 0.0); w = bbox.get("w", 0.0); h = bbox.get("h", 0.0)
@@ -2301,22 +4026,40 @@ class LabelingApp(QMainWindow):
                 color = colors[idx % len(colors)]
                 pen = QPen(color); pen.setWidth(2); pen.setCosmetic(True)
                 painter.setPen(pen)
-                painter.setBrush(Qt.GlobalColor.transparent)
-                bbox = entry.get("bbox", {})
-                painter.drawRect(QRectF(bbox.get("x", 0.0), bbox.get("y", 0.0),
-                                        bbox.get("w", 0.0), bbox.get("h", 0.0)))
-                for kp in entry.get("keypoints", []):
-                    vis = int(kp.get("vis", 2))
-                    if vis == 0:
-                        painter.setBrush(QBrush(Qt.GlobalColor.transparent))
-                        painter.setPen(QPen(Qt.GlobalColor.lightGray))
-                    elif vis == 1:
-                        painter.setBrush(QBrush(color))
-                        pen = QPen(color); pen.setStyle(Qt.PenStyle.DashLine); painter.setPen(pen)
-                    else:
-                        painter.setBrush(QBrush(color))
-                        painter.setPen(QPen(color))
-                    painter.drawEllipse(QPointF(kp.get("x", 0.0), kp.get("y", 0.0)), 3, 3)
+                if self._is_seg_workflow():
+                    seg = entry.get("segments", [])
+                    if len(seg) < 3:
+                        continue
+                    path = self._polygon_path([(float(p[0]), float(p[1])) for p in seg])
+                    if path is None:
+                        continue
+                    fill = QColor(color)
+                    fill.setAlpha(85)
+                    painter.setBrush(QBrush(fill))
+                    painter.drawPath(path)
+                    painter.setBrush(Qt.GlobalColor.transparent)
+                    class_name = self._seg_class_name(cid)
+                    label_pt = path.boundingRect().topLeft() + QPointF(4.0, 14.0)
+                    painter.setPen(QPen(color))
+                    painter.drawText(label_pt, class_name)
+                else:
+                    painter.setBrush(Qt.GlobalColor.transparent)
+                    bbox = entry.get("bbox", {})
+                    painter.drawRect(QRectF(bbox.get("x", 0.0), bbox.get("y", 0.0),
+                                            bbox.get("w", 0.0), bbox.get("h", 0.0)))
+                    for kp in entry.get("keypoints", []):
+                        vis = int(kp.get("vis", 2))
+                        if vis == 0:
+                            painter.setBrush(QBrush(Qt.GlobalColor.transparent))
+                            painter.setPen(QPen(Qt.GlobalColor.lightGray))
+                        elif vis == 1:
+                            painter.setBrush(QBrush(color))
+                            pen = QPen(color); pen.setStyle(Qt.PenStyle.DashLine); painter.setPen(pen)
+                        else:
+                            painter.setBrush(QBrush(color))
+                            painter.setPen(QPen(color))
+                        painter.drawEllipse(QPointF(kp.get("x", 0.0), kp.get("y", 0.0)), 3, 3)
+                    painter.setPen(pen)
         finally:
             painter.end()
         try:
@@ -2410,7 +4153,7 @@ class LabelingApp(QMainWindow):
         else:
             pos = fi.index(self.current_idx)
             self.current_idx = fi[(pos - 1) % len(fi)]
-        self.mode = 'bbox'
+        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
         if self.nav_filter == 'archive':
             self._archive_current_idx = self.current_idx
@@ -2427,7 +4170,7 @@ class LabelingApp(QMainWindow):
         else:
             pos = fi.index(self.current_idx)
             self.current_idx = fi[(pos + 1) % len(fi)]
-        self.mode = 'bbox'
+        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
         if self.nav_filter == 'archive':
             self._archive_current_idx = self.current_idx
@@ -2435,6 +4178,43 @@ class LabelingApp(QMainWindow):
             self._queue_current_idx = self.current_idx
 
     def complete_and_next_unlabeled(self):
+        if self._is_seg_workflow():
+            if self.nav_filter == 'archive':
+                QMessageBox.information(
+                    self,
+                    "Archive View",
+                    "Switch to All/Labeled/Unlabeled to continue queue labeling.",
+                )
+                return
+            self._cache_active_annotation()
+            has_any_mask = any(len(entry.get("segments", [])) >= 3 for entry in self.annotation_cache.values())
+            if not has_any_mask:
+                QMessageBox.information(
+                    self,
+                    "Incomplete",
+                    "Add and accept at least one segmentation mask before completing this frame.",
+                )
+                return
+            if self.seg_preview_points:
+                QMessageBox.information(
+                    self,
+                    "Pending preview",
+                    "Accept the current SAM preview mask before completing this frame.",
+                )
+                return
+            self.save_labels()
+            base = os.path.splitext(self.images[self.current_idx])[0]
+            if not os.path.exists(os.path.join(self.label_dir, f"{base}.txt")):
+                return
+            next_idx = self._find_next_unlabeled(self.current_idx)
+            if next_idx == self.current_idx:
+                popup = CongratsPopup(); popup.exec()
+                return
+            self.current_idx = next_idx
+            self._queue_current_idx = self.current_idx
+            self.mode = 'segment'
+            self.load_image()
+            return
         if self.nav_filter == 'archive':
             QMessageBox.information(self, "Archive View",
                                     "Switch to All/Labeled/Unlabeled to continue queue labeling.")
@@ -2450,7 +4230,7 @@ class LabelingApp(QMainWindow):
             return
         self.current_idx = next_idx
         self._queue_current_idx = self.current_idx
-        self.mode = 'bbox'
+        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
 
     def skip_to_next_unlabeled(self):
@@ -2464,7 +4244,7 @@ class LabelingApp(QMainWindow):
             return
         self.current_idx = next_idx
         self._queue_current_idx = self.current_idx
-        self.mode = 'bbox'
+        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
 
     # ---------- Prediction ----------
@@ -2587,6 +4367,9 @@ class LabelingApp(QMainWindow):
             "speed_preprocess_ms",
             "speed_inference_ms",
             "speed_postprocess_ms",
+            "mask_area_px",
+            "mask_area_norm",
+            "mask_vertices",
         ] + kp_columns
 
         rows_written = 0
@@ -2704,6 +4487,9 @@ class LabelingApp(QMainWindow):
                             "speed_preprocess_ms": speed.get("preprocess"),
                             "speed_inference_ms": speed.get("inference"),
                             "speed_postprocess_ms": speed.get("postprocess"),
+                            "mask_area_px": "",
+                            "mask_area_norm": "",
+                            "mask_vertices": "",
                         }
                         for col in kp_columns:
                             row[col] = ""
@@ -2737,6 +4523,18 @@ class LabelingApp(QMainWindow):
                                 kp_abs = []
                                 kp_norm = []
 
+                        mask_data = None
+                        mask_segments = []
+                        if hasattr(result, "masks") and result.masks is not None:
+                            try:
+                                mask_data = result.masks.data
+                            except Exception:
+                                mask_data = None
+                            try:
+                                mask_segments = result.masks.xy
+                            except Exception:
+                                mask_segments = []
+
                         for det_idx in range(detections):
                             x1, y1, x2, y2 = xyxy[det_idx]
                             cx, cy, w, h = xywh[det_idx]
@@ -2750,6 +4548,24 @@ class LabelingApp(QMainWindow):
 
                             kp_values = kp_abs[det_idx] if det_idx < len(kp_abs) else []
                             kp_norm_values = kp_norm[det_idx] if det_idx < len(kp_norm) else []
+
+                            mask_area_px = ""
+                            mask_area_norm = ""
+                            mask_vertices = ""
+                            if mask_data is not None and det_idx < len(mask_data):
+                                try:
+                                    mask_tensor = mask_data[det_idx]
+                                    mask_area_px = float(mask_tensor.float().sum().item())
+                                    denom = float(img_w * img_h) if img_w and img_h else 0.0
+                                    mask_area_norm = (mask_area_px / denom) if denom > 0 else ""
+                                except Exception:
+                                    mask_area_px = ""
+                                    mask_area_norm = ""
+                            if det_idx < len(mask_segments):
+                                try:
+                                    mask_vertices = int(len(mask_segments[det_idx]))
+                                except Exception:
+                                    mask_vertices = ""
 
                             row = {
                                 "video_path": video_path,
@@ -2780,6 +4596,9 @@ class LabelingApp(QMainWindow):
                                 "speed_preprocess_ms": speed.get("preprocess"),
                                 "speed_inference_ms": speed.get("inference"),
                                 "speed_postprocess_ms": speed.get("postprocess"),
+                                "mask_area_px": mask_area_px,
+                                "mask_area_norm": mask_area_norm,
+                                "mask_vertices": mask_vertices,
                             }
 
                             for idx_kp, kp_name in enumerate(self.kp_names):
@@ -2893,6 +4712,13 @@ class LabelingApp(QMainWindow):
         QMessageBox.information(self, "Inference Complete", message)
 
     def set_mode(self, mode: str):
+        if self._is_seg_workflow() and mode in {"bbox", "keypoint", "predict"}:
+            self.update_status_bar("Segmentation workflow uses Segment Prompt (2) and Edit Mask (E) modes.")
+            return
+        if self._is_pose_workflow() and mode in {"segment", "segedit"}:
+            self.update_status_bar("Segment Prompt/Edit Mask modes are only available in Segmentation workflow.")
+            return
+
         if mode == 'predict':
             if not self.predict_model:
                 QMessageBox.information(self, "No Model", "Please click 'Load Model' first.")
@@ -2905,6 +4731,10 @@ class LabelingApp(QMainWindow):
                 return
             self.run_prediction_on_current_image()
             return
+
+        if mode != "segedit":
+            self.seg_brush_active = False
+            self._clear_seg_edit_handles()
 
         self.mode = mode
         self._update_status()
@@ -2925,6 +4755,17 @@ class LabelingApp(QMainWindow):
             self.view.setCursor(Qt.CursorShape.CrossCursor)
             if hasattr(self.view, 'draw_crosshairs_at'):
                 self.view.draw_crosshairs_at(QCursor.pos())
+        elif self.mode == 'segment':
+            self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.view.setCursor(Qt.CursorShape.CrossCursor)
+            if hasattr(self.view, 'draw_crosshairs_at'):
+                self.view.draw_crosshairs_at(QCursor.pos())
+        elif self.mode == 'segedit':
+            self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.view.setCursor(Qt.CursorShape.ArrowCursor)
+            self._clear_seg_edit_handles()
+        if hasattr(self.view, "refresh_seg_brush_cursor"):
+            self.view.refresh_seg_brush_cursor()
 
     def run_prediction_on_current_image(self):
         if not self.predict_model or not self.images:
@@ -3139,13 +4980,16 @@ class LabelingApp(QMainWindow):
         # modes & core actions
         mapping = {
             '1': lambda: self.set_mode('panzoom'),
-            '2': lambda: self.set_mode('bbox'),
+            '2': lambda: self.set_mode('segment' if self._is_seg_workflow() else 'bbox'),
+            'E': lambda: self.set_mode('segedit'),
             '3': lambda: self.set_mode('keypoint'),
             '4': lambda: self.set_mode('predict'),
             'S': self.save_labels,
             'Z': self.undo,
             'V': self.toggle_selected_visibility,
             'R': self._reset_zoom,  # <-- refresh zoom label too
+            'G': self._run_sam_segmentation,
+            'X': self._clear_seg_prompt_state,
             'A': self.apply_template_for_current_class,
             'C': lambda: self._cycle_class(+1),
             Qt.Key.Key_Delete: self.delete_selected,
@@ -3165,6 +5009,8 @@ class LabelingApp(QMainWindow):
         QShortcut(QKeySequence(']'), self).activated.connect(lambda: self._bump_kp_font(+1))
         QShortcut(QKeySequence('['), self).activated.connect(lambda: self._bump_kp_font(-1))
         QShortcut(QKeySequence('L'), self).activated.connect(self._toggle_kp_labels)
+        QShortcut(QKeySequence(','), self).activated.connect(lambda: self._adjust_seg_brush_radius(-2))
+        QShortcut(QKeySequence('.'), self).activated.connect(lambda: self._adjust_seg_brush_radius(+2))
 
         # Invisible keypoints
         QShortcut(QKeySequence('0'), self).activated.connect(self.mark_current_kp_invisible)
@@ -3175,6 +5021,7 @@ class LabelingApp(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Enter"), self).activated.connect(self.complete_and_next_unlabeled)
         QShortcut(QKeySequence('K'), self).activated.connect(self.skip_to_next_unlabeled)
         QShortcut(QKeySequence('Meta+Return'), self).activated.connect(self.complete_and_next_unlabeled)  # optional: macOS
+        QShortcut(QKeySequence("Shift+Return"), self).activated.connect(self._accept_segmentation_preview)
 
     def keyPressEvent(self, event):
         # Space = temporary pan
@@ -3237,6 +5084,17 @@ class LabelingApp(QMainWindow):
             if isinstance(it, KeypointItem):
                 it.text_item.setVisible(new_vis)
         self.update_status_bar("Keypoint labels " + ("shown" if new_vis else "hidden"))
+
+    def _adjust_seg_brush_radius(self, delta: int):
+        radius = int(getattr(self, "seg_brush_radius", 8))
+        radius = max(2, min(96, radius + int(delta)))
+        self.seg_brush_radius = radius
+        self._refresh_seg_brush_size_badge()
+        if hasattr(self, "view") and hasattr(self.view, "refresh_seg_brush_cursor"):
+            self.view.refresh_seg_brush_cursor()
+        if self._is_seg_workflow() and self.mode == "segedit":
+            self._refresh_sam_controls()
+            self.update_status_bar(f"Mask brush radius: {radius}px")
 
     def _apply_class_manager_results(self, classes: list[str], keypoints: list[str], kp_map: dict[str, list[str]]) -> bool:
         if not classes or not keypoints:
@@ -3308,6 +5166,9 @@ class LabelingApp(QMainWindow):
         return True
 
     def open_class_manager(self):
+        if self._is_seg_workflow():
+            self._open_seg_class_manager()
+            return
         dlg = ClassManagerDialog(
             self.classes,
             self.class_keypoints,
@@ -3321,11 +5182,62 @@ class LabelingApp(QMainWindow):
         if self._apply_class_manager_results(classes, keypoints, kp_map):
             self.update_status_bar("Classes and keypoints updated.")
 
+    def _open_seg_class_manager(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Segmentation Classes",
+            "Enter one segmentation class per line:",
+            "\n".join(self.seg_classes),
+        )
+        if not ok:
+            return
+        classes_clean = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not classes_clean:
+            QMessageBox.warning(self, "No classes", "Add at least one segmentation class.")
+            return
+        dupes = find_duplicate_names(classes_clean)
+        if dupes:
+            QMessageBox.warning(
+                self,
+                "Duplicate classes",
+                "Segmentation class names must be unique.\n\nDuplicates: " + ", ".join(dupes),
+            )
+            return
+        if self._schema_is_locked():
+            existing_classes = self.seg_classes[:]
+            if len(classes_clean) < len(existing_classes):
+                QMessageBox.warning(
+                    self,
+                    "Schema Locked",
+                    "Cannot remove segmentation classes after labeled data exists.\n\n"
+                    "Labeled data already exists for this segmentation project.",
+                )
+                return
+            if classes_clean[:len(existing_classes)] != existing_classes:
+                QMessageBox.warning(
+                    self,
+                    "Schema Locked",
+                    "Existing segmentation class names/order are locked.\n"
+                    "Only append new classes at the end.\n\n"
+                    "Labeled data already exists for this segmentation project.",
+                )
+                return
+        self.seg_classes = classes_clean[:]
+        self._write_list_file(self.seg_class_file, self.seg_classes)
+        self.classes = self.seg_classes[:]
+        self._refresh_class_selector_for_workflow()
+        self.annotation_cache.clear()
+        self.load_image()
+        self.update_status_bar("Segmentation classes updated.")
+
     def _template_path_for_class(self, class_name: str) -> str:
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", class_name)
         return os.path.join(self.template_dir, f"{safe}.json")
 
     def save_template_for_current_class(self):
+        if self._is_seg_workflow():
+            self.update_status_bar("Templates are only available in Pose workflow.")
+            return
         if not self._cache_active_annotation():
             QMessageBox.warning(self, "Template error", "Complete the current class annotation before saving a template.")
             return
@@ -3364,6 +5276,9 @@ class LabelingApp(QMainWindow):
             QMessageBox.warning(self, "Template error", f"Failed to save template:\n{e}")
 
     def apply_template_for_current_class(self):
+        if self._is_seg_workflow():
+            self.update_status_bar("Templates are only available in Pose workflow.")
+            return
         if not self.images:
             QMessageBox.warning(self, "Template error", "Load an image before applying templates.")
             return
@@ -3445,6 +5360,9 @@ class LabelingApp(QMainWindow):
     def load_image(self):
         if hasattr(self.view, '_remove_crosshairs'):
             self.view._remove_crosshairs()
+        if hasattr(self.view, "_reset_seg_brush_cursor"):
+            self.view._reset_seg_brush_cursor()
+        self._clear_seg_edit_handles()
 
         self.scene.clear()
         self._item_refs.clear()
@@ -3466,9 +5384,26 @@ class LabelingApp(QMainWindow):
         self.bboxes.clear()
         self.kps.clear()
         self.current_kp_idx = 0
-
         base = os.path.splitext(self.images[self.current_idx])[0]
         label_file = os.path.join(self.label_dir, f"{base}.txt")
+
+        if self._is_seg_workflow():
+            self.annotation_cache = {}
+            if os.path.exists(label_file):
+                self.annotation_cache = self._load_seg_annotations_from_file(label_file)
+            for cid in range(len(self.classes)):
+                if cid in self.annotation_cache:
+                    self._restore_annotation_for_class(cid)
+            self._clear_seg_prompt_state()
+            self._sync_active_class_state()
+            self._update_item_editability()
+            self._update_status()
+            self._clear_seg_edit_handles()
+            if hasattr(self.view, "refresh_seg_brush_cursor"):
+                self.view.refresh_seg_brush_cursor()
+            scene_center = self.scene.sceneRect().center()
+            self.view.centerOn(scene_center)
+            return
 
         self.annotation_cache = {}
         if os.path.exists(label_file):
@@ -3480,6 +5415,8 @@ class LabelingApp(QMainWindow):
         self._update_item_editability()
 
         self._update_status()
+        if hasattr(self.view, "refresh_seg_brush_cursor"):
+            self.view.refresh_seg_brush_cursor()
         scene_center = self.scene.sceneRect().center()
         self.view.centerOn(scene_center)
 
@@ -3532,7 +5469,7 @@ class LabelingApp(QMainWindow):
         drop_cache = False
         for item in list(self.scene.selectedItems()):
             if isinstance(item, BoxItem) and item.bbox.class_id == cid:
-                self.scene.removeItem(item)
+                self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
                 self.bboxes.clear()
                 self.kps.clear()
@@ -3541,8 +5478,13 @@ class LabelingApp(QMainWindow):
             elif isinstance(item, KeypointItem) and item.kp.class_id == cid:
                 if item.kp in self.kps:
                     self.kps.remove(item.kp)
-                self.scene.removeItem(item)
+                self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
+                changed = True
+            elif self._is_seg_mask_item(item) and int(getattr(item, "seg_class_id", -1)) == cid:
+                self._safe_remove_scene_item(item)
+                self._untrack_scene_item(item)
+                drop_cache = True
                 changed = True
         names = self._active_kp_names()
         self.current_kp_idx = min(self.current_kp_idx, len(names), len(self.kps))
@@ -3554,11 +5496,30 @@ class LabelingApp(QMainWindow):
 
     def undo(self):
         cid = self.class_selector.currentIndex()
+        if self._is_seg_workflow() and self.mode == "segment":
+            if self.seg_preview_points:
+                self._clear_seg_preview()
+                self.update_status_bar("Cleared segmentation preview.")
+                return
+            if self.seg_prompt_points:
+                self.seg_prompt_points.pop()
+                self._refresh_seg_prompt_markers()
+                self.update_status_bar("Removed last segmentation prompt.")
+                return
+            seg_item = self._class_seg_mask_item(cid)
+            if seg_item is not None:
+                self._safe_remove_scene_item(seg_item)
+                self._untrack_scene_item(seg_item)
+                self.annotation_cache.pop(cid, None)
+                self.update_status_bar("Removed segmentation mask for current class.")
+                self._update_item_editability()
+                self._refresh_sam_controls()
+                return
         if self.mode == 'keypoint' and self.kps:
             kp = self.kps.pop()
             for it in list(self.scene.items()):
                 if isinstance(it, KeypointItem) and it.kp is kp and it.kp.class_id == cid:
-                    self.scene.removeItem(it)
+                    self._safe_remove_scene_item(it)
                     self._untrack_scene_item(it)
                     break
             self.current_kp_idx = max(0, self.current_kp_idx - 1)
@@ -3567,12 +5528,12 @@ class LabelingApp(QMainWindow):
             bb = self.bboxes.pop()
             for it in list(self.scene.items()):
                 if isinstance(it, BoxItem) and it.bbox is bb and it.bbox.class_id == cid:
-                    self.scene.removeItem(it)
+                    self._safe_remove_scene_item(it)
                     self._untrack_scene_item(it)
                     break
             for it in list(self.scene.items()):
                 if isinstance(it, KeypointItem) and it.kp.class_id == cid:
-                    self.scene.removeItem(it)
+                    self._safe_remove_scene_item(it)
                     self._untrack_scene_item(it)
             self.kps.clear()
             self.current_kp_idx = 0
@@ -3584,6 +5545,8 @@ class LabelingApp(QMainWindow):
         self._cache_active_annotation()
         if not self.classes:
             return False
+        if self._is_seg_workflow():
+            return any(len(entry.get("segments", [])) >= 3 for entry in self.annotation_cache.values())
         for cid in range(len(self.classes)):
             entry = self.annotation_cache.get(cid)
             if not entry:
@@ -3594,8 +5557,14 @@ class LabelingApp(QMainWindow):
         return True
 
     def _update_status(self):
-        buttons = {'panzoom': self.panzoom_btn, 'bbox': self.bbox_btn,
-                   'keypoint': self.keypoint_btn, 'predict': self.predict_btn}
+        buttons = {
+            'panzoom': self.panzoom_btn,
+            'bbox': self.bbox_btn,
+            'segment': self.segment_btn,
+            'segedit': self.seg_edit_btn,
+            'keypoint': self.keypoint_btn,
+            'predict': self.predict_btn,
+        }
         for mode_name, button in buttons.items():
             if self.mode == mode_name:
                 button.setStyleSheet("background-color: #505357; font-weight: bold;")
@@ -3621,6 +5590,7 @@ class LabelingApp(QMainWindow):
         else:
             self.legend_frame.hide()
             self.zoom_frame.hide()
+        self._refresh_sam_controls()
 
     def toggle_selected_visibility(self):
         for item in self.scene.selectedItems():
@@ -3664,29 +5634,36 @@ class LabelingApp(QMainWindow):
         vw = self.view.viewport().width()
         vh = self.view.viewport().height()
 
-        # --- compute a content-based preferred width ---
-        fm = self.legend_label.fontMetrics()
-        ch = fm.horizontalAdvance('M')  # approx width of one character
-        # Aim for ~26 characters per line (+ padding), wrap the rest
-        preferred = int(ch * 30 + 24)
-
-        # Clamp between sensible bounds and a fraction of viewport
-        w = max(250, min(preferred, int(vw * 0.36), 400))
-
-        # Keep visibility overlays above the bottom-left tool panel.
+        # Keep overlays above the bottom-left tool panel.
         bottom_offset = 10
         if hasattr(self, "bottom_left_frame") and self.bottom_left_frame.isVisible():
             bottom_offset += self.bottom_left_frame.sizeHint().height() + 8
 
-        # Apply width and position lower-left (above bottom-left controls)
-        self.legend_frame.setFixedWidth(w)
-        h = self.legend_frame.sizeHint().height()
-        self.legend_frame.move(10, vh - h - bottom_offset)
+        x = 10
+        cursor_y = vh - bottom_offset
 
-        # If you also show the zoom HUD, keep it in the same corner
+        # Segmentation tools box (seg workflow).
+        if hasattr(self, "seg_tools_frame") and self.seg_tools_frame.isVisible():
+            self.seg_tools_frame.adjustSize()
+            sh = self.seg_tools_frame.sizeHint().height()
+            self.seg_tools_frame.move(x, cursor_y - sh)
+            cursor_y -= sh + 8
+
+        # Keypoint legend (pose workflow / keypoint mode).
+        if hasattr(self, "legend_frame") and self.legend_frame.isVisible():
+            fm = self.legend_label.fontMetrics()
+            ch = fm.horizontalAdvance('M')  # approx width of one character
+            preferred = int(ch * 30 + 24)
+            w = max(250, min(preferred, int(vw * 0.36), 400))
+            self.legend_frame.setFixedWidth(w)
+            lh = self.legend_frame.sizeHint().height()
+            self.legend_frame.move(x, cursor_y - lh)
+            cursor_y -= lh + 8
+
+        # Keep zoom HUD stacked above whichever lower-left overlays are visible.
         if hasattr(self, "zoom_frame") and self.zoom_frame.isVisible():
             zh = self.zoom_frame.sizeHint().height()
-            self.zoom_frame.move(10, vh - zh - bottom_offset)
+            self.zoom_frame.move(x, cursor_y - zh)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3739,15 +5716,25 @@ class LabelingApp(QMainWindow):
         if not self.images:
             return
 
-        if not self._cache_active_annotation():
+        if self._is_seg_workflow() and self.seg_preview_points:
+            QMessageBox.information(
+                self,
+                "Pending preview",
+                "Accept the current SAM preview mask before saving.",
+            )
+            return
+
+        if self._is_pose_workflow() and not self._cache_active_annotation():
             QMessageBox.warning(self, "Save Error", "Place one bounding box and all keypoints for the selected class before saving.")
             return
+        if self._is_seg_workflow():
+            self._cache_active_annotation()
 
         base = os.path.splitext(self.images[self.current_idx])[0]
 
-        project_root = os.path.dirname(self.label_dir)
+        project_root = self.project_root
         images_all_dir = os.path.join(project_root, "images_all")
-        labels_all_dir = os.path.join(project_root, "labels_all")
+        labels_all_dir = self.label_dir
         annotations_dir = os.path.join(project_root, "annotations")
         os.makedirs(images_all_dir, exist_ok=True)
         os.makedirs(labels_all_dir, exist_ok=True)
@@ -3763,7 +5750,8 @@ class LabelingApp(QMainWindow):
             if not entry:
                 continue
             line = self._annotation_entry_to_line(entry)
-            lines.append(line)
+            if line:
+                lines.append(line)
 
         if not lines:
             QMessageBox.warning(self, "No annotations", "Nothing to save for this image.")
@@ -3834,7 +5822,8 @@ class LabelingApp(QMainWindow):
     # ---------- Video ----------
     def export_dataset(self):
         """Split images_all/labels_all into train/val sets and regenerate dataset.yaml."""
-        project_root = os.path.dirname(self.label_dir) if self.label_dir else self.base_dir
+        seg_mode = self._is_seg_workflow()
+        project_root = self.project_root
         images_all_dir = self.image_dir_archive
         labels_all_dir = self.label_dir
 
@@ -3866,18 +5855,24 @@ class LabelingApp(QMainWindow):
         if not ok:
             return
 
-        dataset_choice, ok_choice = QInputDialog.getItem(
-            self,
-            "Dataset Type",
-            "Choose dataset format:",
-            ["Pose (keypoints)", "Detection (bbox only)"],
-            0,
-            False
-        )
-        if not ok_choice:
-            return
-        pose_mode = dataset_choice.startswith("Pose")
-        base_datasets_dir = os.path.join(project_root, "datasets", "pose" if pose_mode else "detect")
+        pose_mode = False
+        if not seg_mode:
+            dataset_choice, ok_choice = QInputDialog.getItem(
+                self,
+                "Dataset Type",
+                "Choose dataset format:",
+                ["Pose (keypoints)", "Detection (bbox only)"],
+                0,
+                False
+            )
+            if not ok_choice:
+                return
+            pose_mode = dataset_choice.startswith("Pose")
+
+        if seg_mode:
+            base_datasets_dir = os.path.join(project_root, "datasets", "segment")
+        else:
+            base_datasets_dir = os.path.join(project_root, "datasets", "pose" if pose_mode else "detect")
         os.makedirs(base_datasets_dir, exist_ok=True)
 
         images_train_dir = os.path.join(base_datasets_dir, "images", "train")
@@ -3956,6 +5951,11 @@ class LabelingApp(QMainWindow):
                                 shutil.copy2(label_src, label_dst)
                             except Exception as e:
                                 missing_labels.append(f"{base_name}.txt: copy failed ({e})")
+                        elif seg_mode:
+                            try:
+                                shutil.copy2(label_src, label_dst)
+                            except Exception as e:
+                                missing_labels.append(f"{base_name}.txt: copy failed ({e})")
                         else:
                             try:
                                 det_lines: list[str] = []
@@ -4007,6 +6007,22 @@ class LabelingApp(QMainWindow):
                 QMessageBox.warning(self, "dataset.yaml error",
                                     f"Failed to create dataset.yaml:\n{e}")
                 return
+        elif seg_mode:
+            seg_yaml = {
+                "path": base_datasets_dir,
+                "train": "images/train",
+                "val": "images/val",
+                "task": "segment",
+                "nc": len(self.classes),
+                "names": self.classes,
+            }
+            try:
+                with open(dataset_yaml_path, "w", encoding="utf-8") as yf:
+                    yaml.safe_dump(seg_yaml, yf, sort_keys=False)
+            except Exception as e:
+                QMessageBox.warning(self, "dataset.yaml error",
+                                    f"Failed to write segmentation dataset.yaml:\n{e}")
+                return
         else:
             detect_yaml = {
                 "path": base_datasets_dir,
@@ -4025,7 +6041,7 @@ class LabelingApp(QMainWindow):
 
         summary = (f"Train images: {len(train_images)}\n"
                    f"Val images: {len(val_images)}\n"
-                   f"Format: {'Pose (keypoints)' if pose_mode else 'Detection (bbox)'}\n"
+                   f"Format: {'Segmentation (mask)' if seg_mode else ('Pose (keypoints)' if pose_mode else 'Detection (bbox)')}\n"
                    f"dataset.yaml written to: {dataset_yaml_path}")
         if missing_labels:
             summary += ("\n\nWarnings:\n" +
@@ -4043,7 +6059,173 @@ class LabelingApp(QMainWindow):
 
         label_files = [f for f in os.listdir(labels_dir) if f.lower().endswith(".txt")]
         if not label_files:
-            QMessageBox.information(self, "No labels", "labels_all does not contain any .txt files.")
+            folder_name = os.path.basename(labels_dir.rstrip(os.sep)) or labels_dir
+            QMessageBox.information(self, "No labels", f"{folder_name} does not contain any .txt files.")
+            return
+
+        if self._is_seg_workflow():
+            exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
+            prog = QProgressDialog("Validating segmentation labels…", "Cancel", 0, len(label_files), self)
+            prog.setWindowTitle("Validate Segmentation Labels")
+            prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            prog.setMinimumDuration(0)
+            prog.setValue(0)
+
+            normalized = 0
+            untouched = 0
+            copied_images = 0
+            warnings: list[str] = []
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            canceled = False
+            try:
+                for idx, fname in enumerate(sorted(label_files), start=1):
+                    if prog.wasCanceled():
+                        canceled = True
+                        break
+
+                    stem = os.path.splitext(fname)[0]
+                    label_path = os.path.join(labels_dir, fname)
+                    try:
+                        with open(label_path, "r", encoding="utf-8") as lf:
+                            lines = [ln.strip() for ln in lf if ln.strip()]
+                    except Exception as e:
+                        warnings.append(f"{fname}: read error ({e})")
+                        prog.setValue(idx)
+                        QApplication.processEvents()
+                        continue
+
+                    if not lines:
+                        warnings.append(f"{fname}: empty file")
+                        prog.setValue(idx)
+                        QApplication.processEvents()
+                        continue
+
+                    normalized_lines: list[str] = []
+                    had_error = False
+                    for line_no, raw_line in enumerate(lines, start=1):
+                        parts = raw_line.split()
+                        if len(parts) < 7:
+                            warnings.append(f"{fname}: line {line_no} has <7 values")
+                            had_error = True
+                            continue
+                        try:
+                            cid = int(round(float(parts[0])))
+                        except Exception:
+                            warnings.append(f"{fname}: line {line_no} invalid class id")
+                            had_error = True
+                            continue
+
+                        coord_tokens = parts[1:]
+                        if len(coord_tokens) % 2 != 0:
+                            coord_tokens = coord_tokens[:-1]
+                            had_error = True
+                        if len(coord_tokens) < 6:
+                            warnings.append(f"{fname}: line {line_no} has <3 polygon points")
+                            had_error = True
+                            continue
+
+                        coords: list[str] = []
+                        parse_failed = False
+                        for cidx in range(0, len(coord_tokens), 2):
+                            try:
+                                xn = float(coord_tokens[cidx])
+                                yn = float(coord_tokens[cidx + 1])
+                            except Exception:
+                                parse_failed = True
+                                break
+                            if xn < 0.0 or xn > 1.0 or yn < 0.0 or yn > 1.0:
+                                had_error = True
+                            xn = max(0.0, min(1.0, xn))
+                            yn = max(0.0, min(1.0, yn))
+                            coords.append(f"{xn:.6f}")
+                            coords.append(f"{yn:.6f}")
+                        if parse_failed or len(coords) < 6:
+                            warnings.append(f"{fname}: line {line_no} parse error")
+                            had_error = True
+                            continue
+                        normalized_lines.append(f"{cid} " + " ".join(coords))
+
+                    if not normalized_lines:
+                        prog.setValue(idx)
+                        QApplication.processEvents()
+                        continue
+
+                    reconstructed = "\n".join(normalized_lines) + "\n"
+                    new_line_count = len(normalized_lines)
+                    line_changed = had_error or (new_line_count != len(lines)) or any(
+                        nl.strip() != ol for nl, ol in zip(normalized_lines, lines[:new_line_count])
+                    ) or (len(lines) != new_line_count)
+
+                    if line_changed:
+                        try:
+                            with open(label_path, "w", encoding="utf-8") as lf:
+                                lf.write(reconstructed)
+                        except Exception as e:
+                            warnings.append(f"{fname}: write error ({e})")
+                            prog.setValue(idx)
+                            QApplication.processEvents()
+                            continue
+                        normalized += 1
+                    else:
+                        untouched += 1
+
+                    image_found = False
+                    for ext in exts:
+                        candidate = os.path.join(images_all_dir, stem + ext)
+                        if os.path.exists(candidate):
+                            image_found = True
+                            break
+                    if not image_found:
+                        for ext in exts:
+                            src = os.path.join(images_to_label_dir, stem + ext)
+                            if os.path.exists(src):
+                                dst = os.path.join(images_all_dir, os.path.basename(src))
+                                try:
+                                    os.makedirs(images_all_dir, exist_ok=True)
+                                    shutil.copy2(src, dst)
+                                    copied_images += 1
+                                    image_found = True
+                                except Exception as e:
+                                    warnings.append(f"{stem}{ext}: copy failed ({e})")
+                                break
+                    if not image_found:
+                        warnings.append(f"{fname}: no matching image found in images_all or images_to_label")
+
+                    prog.setValue(idx)
+                    prog.setLabelText(f"Normalizing {fname}")
+                    QApplication.processEvents()
+            finally:
+                QApplication.restoreOverrideCursor()
+                prog.close()
+
+            if canceled:
+                QMessageBox.information(
+                    self,
+                    "Normalization canceled",
+                    "Operation canceled. Some files may have been processed already.",
+                )
+                return
+
+            if normalized == 0 and copied_images == 0 and not warnings:
+                summary = "All segmentation label files already normalized. No changes made."
+            else:
+                parts: list[str] = []
+                if normalized:
+                    parts.append(f"Normalized {normalized} segmentation label file(s).")
+                if untouched and normalized:
+                    parts.append(f"{untouched} file(s) were already normalized.")
+                elif untouched and not normalized:
+                    parts.append(f"{untouched} file(s) already normalized.")
+                parts.append(f"Copied {copied_images} missing image(s) into images_all.")
+                summary = "\n".join(parts)
+            if warnings:
+                summary += "\n\nWarnings:\n" + "\n".join(warnings[:10])
+                if len(warnings) > 10:
+                    summary += f"\n…{len(warnings) - 10} more"
+
+            QMessageBox.information(self, "Normalization complete", summary)
+            self.update_status_bar("Segmentation label normalization complete.")
             return
 
         kp_count = len(self.kp_names)
@@ -4208,8 +6390,14 @@ class LabelingApp(QMainWindow):
         self.update_status_bar("Label normalization complete.")
 
     def open_train_dialog(self):
-        default_dataset = resolve_default_training_dataset_path(self.project_root)
-        dlg = TrainDialog(self, default_dataset=default_dataset)
+        if self._is_seg_workflow():
+            default_dataset = os.path.join(self.project_root, "datasets", "segment")
+            if not os.path.isdir(default_dataset):
+                default_dataset = os.path.join(self.project_root, "datasets")
+            dlg = TrainDialog(self, default_dataset=default_dataset, default_task="segment")
+        else:
+            default_dataset = resolve_default_training_dataset_path(self.project_root)
+            dlg = TrainDialog(self, default_dataset=default_dataset, default_task=None)
         dlg.exec()
 
     def open_video_reviewer(self):
@@ -4224,6 +6412,7 @@ class LabelingApp(QMainWindow):
             self.kp_names,
             self.classes,
             class_keypoints=self.class_keypoints,
+            workflow=self.active_workflow,
         )
         dlg.exec()
 
@@ -4232,7 +6421,7 @@ class VideoReviewDialog(QDialog):
     Modal tool that:
       1) Loads a video
       2) Runs YOLO predict synchronously over a chosen frame range (with a modal QProgressDialog)
-      3) Lets you scrub a timeline and see bbox+keypoint overlays and confidence
+      3) Lets you scrub a timeline and see prediction overlays and confidence
     """
     def __init__(
         self,
@@ -4242,9 +6431,12 @@ class VideoReviewDialog(QDialog):
         kp_names: list[str],
         classes: list[str],
         class_keypoints: Optional[dict[str, list[str]]] = None,
+        workflow: str = WORKFLOW_POSE,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Video Review")
+        self.workflow = WORKFLOW_SEG if str(workflow).lower() == WORKFLOW_SEG else WORKFLOW_POSE
+        workflow_title = "Segmentation" if self.workflow == WORKFLOW_SEG else "Pose"
+        self.setWindowTitle(f"Video Review ({workflow_title})")
         self.resize(980, 700)
 
         self.model = model            # may be None until user loads
@@ -4263,9 +6455,13 @@ class VideoReviewDialog(QDialog):
         self.cur: int = 0
         self.preds: dict[int, dict] = {}
         self._last_frame_bgr = None  # holds the current raw frame for export
+        self._seg_task_warned = False
 
         # build all widgets/layouts
         self._build_ui()
+
+    def _is_seg_workflow(self) -> bool:
+        return self.workflow == WORKFLOW_SEG
 
     def _build_ui(self):
         # --- UI ---
@@ -4326,6 +6522,10 @@ class VideoReviewDialog(QDialog):
         controls_row_1.addStretch(1)
         self.btn_predict = QPushButton("Predict Range")
         self.btn_predict.setEnabled(False)
+        if self._is_seg_workflow():
+            self.btn_predict.setToolTip("Run segmentation predictions over the selected frame range.")
+        else:
+            self.btn_predict.setToolTip("Run pose predictions over the selected frame range.")
         self.btn_predict.clicked.connect(self._predict_sync)
         controls_row_1.addWidget(self.btn_predict)
         top.addLayout(controls_row_1)
@@ -4350,8 +6550,9 @@ class VideoReviewDialog(QDialog):
         self.spin_iou.setMaximumWidth(90)
         controls_row_2.addWidget(self.spin_iou)
 
-        # keypoint visibility threshold (map kp conf → visible/occluded)
-        controls_row_2.addWidget(QLabel("kp≥"))
+        # keypoint visibility threshold (pose workflow only)
+        self.lbl_kpvis = QLabel("kp≥")
+        controls_row_2.addWidget(self.lbl_kpvis)
         self.spin_kpvis = QDoubleSpinBox()
         self.spin_kpvis.setRange(0.0, 1.0)
         self.spin_kpvis.setSingleStep(0.05)
@@ -4359,6 +6560,9 @@ class VideoReviewDialog(QDialog):
         self.spin_kpvis.setValue(0.50)  # >= → visible (red); < → occluded (yellow)
         self.spin_kpvis.setMaximumWidth(90)
         controls_row_2.addWidget(self.spin_kpvis)
+        show_kp_controls = not self._is_seg_workflow()
+        self.lbl_kpvis.setVisible(show_kp_controls)
+        self.spin_kpvis.setVisible(show_kp_controls)
         controls_row_2.addStretch(1)
         top.addLayout(controls_row_2)
 
@@ -4527,6 +6731,9 @@ class VideoReviewDialog(QDialog):
             mp_saved = meta.get("model_path")
             if mp_saved and self.model_path and (mp_saved != self.model_path):
                 return False
+            saved_workflow = str(meta.get("workflow", WORKFLOW_POSE)).strip().lower()
+            if saved_workflow != self.workflow:
+                return False
 
             preds = data.get("preds", {})
             self.preds = {int(k): v for k, v in preds.items()}
@@ -4618,6 +6825,16 @@ class VideoReviewDialog(QDialog):
         if self.model is None:
             QMessageBox.information(self, "No model", "Click 'Load Model' in the main window first.")
             return
+        if self._is_seg_workflow() and not self._seg_task_warned:
+            model_task = str(getattr(self.model, "task", "") or "").strip().lower()
+            if model_task and model_task != "segment":
+                QMessageBox.information(
+                    self,
+                    "Model Task Warning",
+                    f"Loaded model task is '{model_task}'. Segmentation review works best with a segment model.\n"
+                    "Continuing; masks may be unavailable for this model.",
+                )
+                self._seg_task_warned = True
 
         start = int(self.spin_start.value())
         end = int(self.spin_end.value())
@@ -4627,7 +6844,7 @@ class VideoReviewDialog(QDialog):
         requested_batch = int(self.spin_batch.value()) if hasattr(self, "spin_batch") else 1
         effective_batch = effective_prediction_batch(requested_batch, self.device)
         imgsz = 640
-        kpvis = float(self.spin_kpvis.value()) if hasattr(self, "spin_kpvis") else 0.5
+        kpvis = float(self.spin_kpvis.value()) if (hasattr(self, "spin_kpvis") and not self._is_seg_workflow()) else None
         batch_kwargs = {} if requested_batch <= 0 else {"batch": requested_batch}
 
         if end < start:
@@ -4677,7 +6894,7 @@ class VideoReviewDialog(QDialog):
                         )
                         results_list = list(results_list)
                         for fi, res in zip(frame_indices, results_list):
-                            pred = self._extract_top(res)
+                            pred = self._extract_prediction(res)
                             self.preds[fi] = pred
                     except Exception as e:
                         # if batch fails, mark each frame in the batch as failed
@@ -4706,6 +6923,7 @@ class VideoReviewDialog(QDialog):
                 meta = {
                     "video": self._video_signature(),
                     "model_path": self.model_path,
+                    "workflow": self.workflow,
                     "imgsz": imgsz,
                     "conf": conf,
                     "iou": iou,
@@ -4728,24 +6946,84 @@ class VideoReviewDialog(QDialog):
                 self.btn_send_high.setEnabled(True)
             self._seek(start, show_only=False)
 
+    def _extract_prediction(self, results) -> dict:
+        if self._is_seg_workflow():
+            return self._extract_top_seg(results)
+        return self._extract_top_pose(results)
+
     @staticmethod
-    def _extract_top(results) -> dict:
-        """Pick highest-conf detection; keep kp 'v' as confidence float (0..1)."""
-        out = {"ok": False, "conf": 0.0, "cls": 0, "xyxy": None, "kps": []}
+    def _extract_top_pose(results) -> dict:
+        """Pick highest-conf detection and include keypoint confidence."""
+        out = {"ok": False, "conf": 0.0, "cls": 0, "xyxy": None, "kps": [], "segments": []}
         try:
             if results.boxes is None or len(results.boxes) == 0:
                 return out
             import numpy as _np
-            confs = results.boxes.conf.cpu().numpy() if results.boxes.conf is not None else _np.zeros((len(results.boxes),), dtype=_np.float32)
+
+            confs = (
+                results.boxes.conf.cpu().numpy()
+                if results.boxes.conf is not None
+                else _np.zeros((len(results.boxes),), dtype=_np.float32)
+            )
             i = int(confs.argmax())
             out["conf"] = float(confs[i])
             out["cls"] = int(results.boxes.cls.cpu().numpy()[i]) if results.boxes.cls is not None else 0
             out["xyxy"] = [float(v) for v in results.boxes.xyxy.cpu().numpy()[i].tolist()]
-            # keep keypoint confidence as float
             if hasattr(results, "keypoints") and results.keypoints is not None:
                 kps = results.keypoints.data.cpu().numpy()  # (N, K, 3)
                 if kps.shape[0] > i:
                     out["kps"] = [[float(x), float(y), float(v)] for (x, y, v) in kps[i]]
+            out["ok"] = True
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _extract_top_seg(results) -> dict:
+        """Pick highest-conf detection and include its segmentation contour when available."""
+        out = {"ok": False, "conf": 0.0, "cls": 0, "xyxy": None, "kps": [], "segments": []}
+        try:
+            if results.boxes is None or len(results.boxes) == 0:
+                return out
+            import numpy as _np
+
+            confs = (
+                results.boxes.conf.cpu().numpy()
+                if results.boxes.conf is not None
+                else _np.zeros((len(results.boxes),), dtype=_np.float32)
+            )
+            i = int(confs.argmax())
+            out["conf"] = float(confs[i])
+            out["cls"] = int(results.boxes.cls.cpu().numpy()[i]) if results.boxes.cls is not None else 0
+            out["xyxy"] = [float(v) for v in results.boxes.xyxy.cpu().numpy()[i].tolist()]
+
+            masks = getattr(results, "masks", None)
+            if masks is not None:
+                polys = getattr(masks, "xy", None)
+                if polys is not None and len(polys) > i:
+                    poly = polys[i]
+                    points: list[list[float]] = []
+                    for node in poly:
+                        if len(node) < 2:
+                            continue
+                        points.append([float(node[0]), float(node[1])])
+                    if len(points) >= 3:
+                        out["segments"] = points
+
+                if not out["segments"] and _cv2 is not None:
+                    data = getattr(masks, "data", None)
+                    if data is not None and len(data) > i:
+                        mask_arr = data[i].cpu().numpy()
+                        if getattr(mask_arr, "ndim", 0) == 3:
+                            mask_arr = mask_arr[0]
+                        mask_u8 = (_np.asarray(mask_arr) > 0.5).astype(_np.uint8) * 255
+                        contours_info = _cv2.findContours(mask_u8, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_NONE)
+                        contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
+                        if contours:
+                            contour = max(contours, key=_cv2.contourArea)
+                            points = [[float(pt[0][0]), float(pt[0][1])] for pt in contour if len(pt[0]) >= 2]
+                            if len(points) >= 3:
+                                out["segments"] = points
             out["ok"] = True
         except Exception:
             pass
@@ -5117,8 +7395,15 @@ class VideoReviewDialog(QDialog):
     def _draw_overlay_for(self, frame_idx: int):
         # clear old
         for it in getattr(self, "_overlay_items", []):
-            try: self.scene.removeItem(it)
-            except Exception: pass
+            try:
+                owner_scene = it.scene()
+            except Exception:
+                owner_scene = None
+            if owner_scene is not None:
+                try:
+                    owner_scene.removeItem(it)
+                except Exception:
+                    pass
         self._overlay_items = []
 
         p = self.preds.get(frame_idx)
@@ -5127,6 +7412,65 @@ class VideoReviewDialog(QDialog):
 
         cls_id = int(p.get("cls", 0))
         class_name = self.classes[cls_id] if 0 <= cls_id < len(self.classes) else str(cls_id)
+        if self._is_seg_workflow():
+            seg_points_raw = p.get("segments", []) or []
+            seg_points: list[tuple[float, float]] = []
+            for pair in seg_points_raw:
+                try:
+                    x = float(pair[0])
+                    y = float(pair[1])
+                    seg_points.append((x, y))
+                except Exception:
+                    continue
+
+            color = QColor.fromHsv(int((cls_id * 47) % 360), 210, 245, 255)
+            label_x = 6.0
+            label_y = 6.0
+
+            if len(seg_points) >= 3:
+                path = QPainterPath()
+                path.moveTo(seg_points[0][0], seg_points[0][1])
+                for x, y in seg_points[1:]:
+                    path.lineTo(x, y)
+                path.closeSubpath()
+
+                seg_item = QGraphicsPathItem(path)
+                seg_pen = QPen(color)
+                seg_pen.setWidth(3)
+                seg_pen.setCosmetic(True)
+                seg_item.setPen(seg_pen)
+                seg_item.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 72)))
+                seg_item.setZValue(5)
+                self.scene.addItem(seg_item)
+                self._overlay_items.append(seg_item)
+
+                bbox = path.boundingRect()
+                label_x = bbox.left() + 3.0
+                label_y = bbox.top() + 3.0
+            elif p.get("xyxy"):
+                x1, y1, x2, y2 = p["xyxy"]
+                rect_item = QGraphicsRectItem(x1, y1, x2 - x1, y2 - y1)
+                rect_pen = QPen(color)
+                rect_pen.setWidth(3)
+                rect_pen.setCosmetic(True)
+                rect_pen.setStyle(Qt.PenStyle.DashLine)
+                rect_item.setPen(rect_pen)
+                rect_item.setBrush(QBrush(Qt.GlobalColor.transparent))
+                rect_item.setZValue(5)
+                self.scene.addItem(rect_item)
+                self._overlay_items.append(rect_item)
+                label_x = x1 + 2.0
+                label_y = y1 + 2.0
+
+            label_item = QGraphicsSimpleTextItem(f"{class_name} {p.get('conf', 0.0):.2f}")
+            label_item.setFont(_ui_font(24))
+            label_item.setBrush(QBrush(color))
+            label_item.setPos(label_x, label_y)
+            label_item.setZValue(6)
+            self.scene.addItem(label_item)
+            self._overlay_items.append(label_item)
+            return
+
         class_kp_names = self.class_keypoints.get(class_name, self.kp_names)
 
         # ---- Bounding box (blue, thicker) ----
@@ -5206,12 +7550,13 @@ class TrainDialog(QDialog):
         "YOLOv26x (xlarge)": "yolo26x.yaml",
     }
 
-    def __init__(self, parent, default_dataset: str):
+    def __init__(self, parent, default_dataset: str, default_task: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("Train Model")
         self.resize(520, 360)
 
         self.default_dataset = default_dataset
+        self.default_task = (default_task or "").strip().lower() or None
         self.app_base_dir = os.path.abspath(getattr(parent, "app_base_dir", os.path.dirname(os.path.abspath(__file__))))
         self.project_root = os.path.abspath(getattr(parent, "project_root", self.app_base_dir))
         self.project_runs_dir = os.path.join(self.project_root, "runs")
@@ -5329,7 +7674,14 @@ class TrainDialog(QDialog):
             "Auto (from dataset)",
             "Detection",
             "Pose",
+            "Segmentation",
         ])
+        if self.default_task == "segment":
+            self.task_combo.setCurrentText("Segmentation")
+        elif self.default_task == "pose":
+            self.task_combo.setCurrentText("Pose")
+        elif self.default_task == "detect":
+            self.task_combo.setCurrentText("Detection")
         form.addRow("Training task:", self.task_combo)
 
         # Hyperparameters
@@ -5560,15 +7912,27 @@ class TrainDialog(QDialog):
     def _resolve_model_config(self, base_cfg: str, task_value: Optional[str]) -> tuple[str, Optional[str]]:
         cfg = base_cfg
         notice = None
-        if task_value == "pose" and "-pose" not in cfg.lower():
-            if cfg.lower().endswith(".yaml"):
-                cfg = cfg[:-5] + "-pose.yaml"
-            else:
-                cfg = cfg + "-pose.yaml"
-            notice = "Pose task detected → switched to pose variant of the model config."
-        elif task_value == "detect" and "-pose" in cfg.lower():
-            cfg = cfg.replace("-pose", "")
-            notice = "Detection task selected → using detection variant of the model config."
+        if not task_value:
+            return cfg, notice
+
+        has_yaml_ext = cfg.lower().endswith(".yaml")
+        stem = cfg[:-5] if has_yaml_ext else cfg
+        stem_clean = re.sub(r"-(pose|seg)$", "", stem, flags=re.IGNORECASE)
+
+        if task_value == "pose":
+            target = f"{stem_clean}-pose"
+            cfg = f"{target}.yaml" if has_yaml_ext else target
+            if cfg != base_cfg:
+                notice = "Pose task detected → switched to pose variant of the model config."
+        elif task_value == "segment":
+            target = f"{stem_clean}-seg"
+            cfg = f"{target}.yaml" if has_yaml_ext else target
+            if cfg != base_cfg:
+                notice = "Segmentation task detected → switched to segmentation variant of the model config."
+        elif task_value == "detect":
+            cfg = f"{stem_clean}.yaml" if has_yaml_ext else stem_clean
+            if cfg != base_cfg:
+                notice = "Detection task selected → using detection variant of the model config."
         return cfg, notice
 
     def _infer_task_from_yaml(self, yaml_path: str) -> Optional[str]:
@@ -5578,6 +7942,9 @@ class TrainDialog(QDialog):
         except Exception:
             return None
         if isinstance(data, dict):
+            task_raw = str(data.get("task", "")).strip().lower()
+            if task_raw in {"segment", "seg"}:
+                return "segment"
             if "kpt_shape" in data or "kp_names" in data:
                 return "pose"
         return "detect"
@@ -5671,9 +8038,16 @@ class TrainDialog(QDialog):
             task_value = None
         elif task_selection.startswith("Auto"):
             inferred_task = self._infer_task_from_yaml(resolved) if resolved else None
-            task_value = inferred_task if inferred_task in {"pose", "detect"} else None
+            if inferred_task in {"pose", "detect", "segment"}:
+                task_value = inferred_task
+            elif self.default_task in {"pose", "detect", "segment"}:
+                task_value = self.default_task
+            else:
+                task_value = None
         elif task_selection.startswith("Detection"):
             task_value = "detect"
+        elif task_selection.startswith("Segmentation"):
+            task_value = "segment"
         else:
             task_value = "pose"
 
@@ -5729,7 +8103,7 @@ class TrainDialog(QDialog):
         else:
             batch_param = -1 if batch <= 0 else int(batch)
 
-            task_folder = task_value if task_value in ("pose", "detect") else ("pose" if use_dino else "auto")
+            task_folder = task_value if task_value in ("pose", "detect", "segment") else ("pose" if use_dino else "auto")
             project_dir = os.path.join(self.project_runs_dir, "train", task_folder)
             try:
                 os.makedirs(project_dir, exist_ok=True)
@@ -5824,18 +8198,22 @@ if __name__ == '__main__':
     y = (screen_geometry.height() - splash_pix.height()) // 2
     splash.move(x, y)
     font_path = os.path.join(app_base, 'fonts', 'FiraSans-Regular.ttf')
-
+    system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
+    preferred_family = system_family
     if os.path.exists(font_path):
         font_id = QFontDatabase.addApplicationFont(font_path)
-        print("✅ Fira Sans font loaded successfully." if font_id != -1 else "⚠️ Failed to load Fira Sans font.")
-
-    system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
+        if font_id != -1:
+            loaded_families = QFontDatabase.applicationFontFamilies(font_id)
+            if loaded_families:
+                preferred_family = loaded_families[0]
+        else:
+            print("⚠️ Failed to load bundled Fira Sans font; using system font.")
 
     dark_stylesheet = f"""
     QWidget {{
         background-color: #2b2b2b;
         color: #e0e0e0;
-        font-family: 'Fira Sans', '{system_family}', 'Arial', 'Helvetica';
+        font-family: '{preferred_family}', '{system_family}', 'Arial', 'Helvetica';
         font-size: 11pt;
     }}
     QPushButton {{

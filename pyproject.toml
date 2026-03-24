@@ -1,6 +1,6 @@
 [project]
 name = "SqueakPoseStudio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tools for small-animal pose estimation, tracking, and behavioral analysis. Built for reproducibility, rapid prototyping, and seamless integration into research pipelines."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,6 +20,7 @@ dependencies = [
     "oneeurofilter>=0.2.1",
     "pandas>=2.3.3",
     "pyqt6>=6.10.2",
+    "pyqt6-sip>=13.11.1",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
     "timm>=1.0.24",

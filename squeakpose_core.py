@@ -38,14 +38,15 @@ def resolve_default_training_dataset_path(project_root: str) -> str:
 
     Preference order:
     1. `datasets/pose` if it contains `dataset.yaml`
-    2. `datasets/detect` if it contains `dataset.yaml`
-    3. `datasets` if it contains `dataset.yaml`
+    2. `datasets/segment` if it contains `dataset.yaml`
+    3. `datasets/detect` if it contains `dataset.yaml`
     4. fallback to `datasets` under the project root
     """
     root = os.path.abspath(project_root or os.getcwd())
     datasets_root = os.path.join(root, "datasets")
     candidates = (
         os.path.join(datasets_root, "pose"),
+        os.path.join(datasets_root, "segment"),
         os.path.join(datasets_root, "detect"),
         datasets_root,
     )

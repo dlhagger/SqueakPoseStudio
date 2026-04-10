@@ -3,10 +3,25 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
+_OPTIONAL_STUDIO_IMPORT_MODULES = {"PyQt6", "cv2", "numpy", "torch", "ultralytics", "yaml"}
+
+
+def _is_optional_studio_import_error(exc: Exception) -> bool:
+    if isinstance(exc, ModuleNotFoundError):
+        name = (getattr(exc, "name", "") or "").split(".", 1)[0]
+        return name in _OPTIONAL_STUDIO_IMPORT_MODULES
+    if isinstance(exc, ImportError):
+        msg = str(exc)
+        return any(mod in msg for mod in _OPTIONAL_STUDIO_IMPORT_MODULES)
+    return False
+
+
 try:
     from squeakpose_studio import VideoReviewDialog, WORKFLOW_POSE, WORKFLOW_SEG
     _STUDIO_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - environment-dependent import gate
+    if not _is_optional_studio_import_error(exc):
+        raise
     VideoReviewDialog = None
     WORKFLOW_POSE = "pose"
     WORKFLOW_SEG = "segmentation"

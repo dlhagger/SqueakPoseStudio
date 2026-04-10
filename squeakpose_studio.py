@@ -23,6 +23,7 @@ from PyQt6.QtCore import (
 )
 from squeakpose_core import (
     InferenceCsvWriter,
+    build_segmentation_inference_rows,
     effective_prediction_batch,
     find_duplicate_names,
     parse_yolo_pose_label_line,
@@ -403,6 +404,11 @@ try:
     import numpy as _np
 except Exception:
     _np = None
+
+try:
+    import pandas as _pd
+except Exception:
+    _pd = None
 
 # Ultralytics YOLO
 
@@ -1625,11 +1631,11 @@ class LabelingApp(QMainWindow):
         else:
             self.mode_grid.addWidget(self.panzoom_btn, 0, 0)
             self.mode_grid.addWidget(self.segment_btn, 0, 1)
-            self.mode_grid.addWidget(self.seg_edit_btn, 1, 0, 1, 2)
+            self.mode_grid.addWidget(self.seg_edit_btn, 1, 0)
+            self.mode_grid.addWidget(self.predict_btn, 1, 1)
             # Hidden in seg workflow, but keep deterministic positions.
             self.mode_grid.addWidget(self.bbox_btn, 2, 0)
             self.mode_grid.addWidget(self.keypoint_btn, 2, 1)
-            self.mode_grid.addWidget(self.predict_btn, 3, 0, 1, 2)
 
     def _update_workflow_ui_state(self):
         is_pose = self._is_pose_workflow()
@@ -1640,7 +1646,7 @@ class LabelingApp(QMainWindow):
         self.bbox_btn.setEnabled(is_pose)
         self.segment_btn.setEnabled(not is_pose)
         self.keypoint_btn.setEnabled(is_pose)
-        self.predict_btn.setEnabled(is_pose)
+        self.predict_btn.setEnabled(True)
         self.seg_edit_btn.setEnabled(not is_pose)
         self.sam_load_btn.setEnabled(not is_pose)
         self.sam_run_btn.setEnabled(not is_pose)
@@ -1665,7 +1671,12 @@ class LabelingApp(QMainWindow):
         if hasattr(self, "keypoint_btn"):
             self.keypoint_btn.setVisible(is_pose)
         if hasattr(self, "predict_btn"):
-            self.predict_btn.setVisible(is_pose)
+            self.predict_btn.setVisible(True)
+            self.predict_btn.setToolTip(
+                "Run YOLO pose prediction on the current image"
+                if is_pose else
+                "Run YOLO segmentation prediction on the current image"
+            )
         if hasattr(self, "segment_btn"):
             self.segment_btn.setVisible(not is_pose)
         if hasattr(self, "seg_edit_btn"):
@@ -4269,6 +4280,9 @@ class LabelingApp(QMainWindow):
         if _cv2 is None:
             QMessageBox.warning(self, "OpenCV missing", "Install OpenCV:\n\n  pip install opencv-python")
             return
+        if self._is_seg_workflow() and _pd is None:
+            QMessageBox.warning(self, "Pandas missing", "Install pandas to export segmentation inference pickle files.")
+            return
         if not self.predict_model:
             QMessageBox.information(self, "No Model", "Load a model before running inference.")
             return
@@ -4318,6 +4332,16 @@ class LabelingApp(QMainWindow):
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         base_name = os.path.splitext(os.path.basename(video_path))[0]
+        if self._is_seg_workflow():
+            self._run_segmentation_video_inference(
+                video_path=video_path,
+                output_root=output_root,
+                base_name=base_name,
+                timestamp=timestamp,
+                total_frames=total_frames,
+            )
+            return
+
         csv_name = f"{base_name}_{timestamp}.csv"
         csv_path = os.path.join(output_root, csv_name)
 
@@ -4711,9 +4735,169 @@ class LabelingApp(QMainWindow):
             message = "Inference canceled early.\n" + message
         QMessageBox.information(self, "Inference Complete", message)
 
+    def _segmentation_rows_from_result(self, result, frame_idx: int) -> list[dict[str, object]]:
+        if result.boxes is None or len(result.boxes) == 0:
+            return []
+
+        try:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else []
+            class_ids = (
+                result.boxes.cls.cpu().numpy().astype(int)
+                if result.boxes.cls is not None else
+                [0] * len(boxes)
+            )
+        except Exception:
+            return []
+
+        mask_polygons = []
+        mask_data = None
+        if getattr(result, "masks", None) is not None:
+            try:
+                mask_polygons = result.masks.xy
+            except Exception:
+                mask_polygons = []
+            try:
+                mask_data = result.masks.data.cpu().numpy()
+            except Exception:
+                mask_data = None
+        if not mask_polygons:
+            mask_polygons = [None] * len(boxes)
+
+        detections: list[dict[str, object]] = []
+        for det_idx, box in enumerate(boxes):
+            cls_id = int(class_ids[det_idx]) if det_idx < len(class_ids) else 0
+            poly = mask_polygons[det_idx] if det_idx < len(mask_polygons) else None
+            polygon = poly.tolist() if poly is not None and hasattr(poly, "tolist") else poly
+            binary_mask = None
+            if mask_data is not None and det_idx < len(mask_data):
+                binary_mask = (_np.asarray(mask_data[det_idx]) > 0.5).astype(_np.uint8) if _np is not None else None
+            detections.append(
+                {
+                    "det": det_idx,
+                    "class_id": cls_id,
+                    "class_name": (result.names.get(cls_id, "") if hasattr(result, "names") and result.names else ""),
+                    "conf": float(confs[det_idx]) if det_idx < len(confs) else 0.0,
+                    "box": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+                    "mask_polygon": polygon,
+                    "binary_mask": binary_mask,
+                }
+            )
+        return build_segmentation_inference_rows(
+            frame_index=frame_idx,
+            detections=detections,
+            class_names=getattr(result, "names", None) or self.classes,
+        )
+
+    def _run_segmentation_video_inference(
+        self,
+        *,
+        video_path: str,
+        output_root: str,
+        base_name: str,
+        timestamp: str,
+        total_frames: int,
+    ) -> None:
+        pkl_name = f"{base_name}_{timestamp}_segmentation_df.pkl"
+        pkl_path = os.path.join(output_root, pkl_name)
+        rows: list[dict[str, object]] = []
+        processed_frames = 0
+        canceled = False
+        had_error = False
+        error_message = ""
+
+        prog = QProgressDialog(
+            "Running segmentation inference…",
+            "Cancel",
+            0,
+            0 if total_frames <= 0 else total_frames,
+            self,
+        )
+        prog.setWindowTitle("Segmentation Video Inference")
+        prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        prog.setMinimumDuration(0)
+        if total_frames <= 0:
+            prog.setRange(0, 0)
+
+        was_busy = getattr(self, "_predict_busy", False)
+        self._predict_busy = True
+        if hasattr(self, "predict_btn"):
+            self.predict_btn.setEnabled(False)
+        if hasattr(self, "inference_btn"):
+            self.inference_btn.setEnabled(False)
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            try:
+                results_iter = self.predict_model.predict(
+                    video_path,
+                    stream=True,
+                    imgsz=640,
+                    conf=0.25,
+                    iou=0.5,
+                    device=self._device,
+                    verbose=False,
+                )
+            except Exception as e:
+                had_error = True
+                error_message = str(e)
+                results_iter = []
+
+            for frame_idx, result in enumerate(results_iter):
+                if prog.wasCanceled():
+                    canceled = True
+                    break
+                rows.extend(self._segmentation_rows_from_result(result, frame_idx))
+                processed_frames = frame_idx + 1
+                if total_frames > 0:
+                    prog.setValue(min(processed_frames, total_frames))
+                    prog.setLabelText(f"Inferencing frame {processed_frames}/{total_frames}")
+                else:
+                    prog.setLabelText(f"Inferencing frame {processed_frames}")
+                QApplication.processEvents()
+        except Exception as e:
+            had_error = True
+            error_message = str(e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            prog.close()
+            self._predict_busy = was_busy
+            if hasattr(self, "predict_btn"):
+                self.predict_btn.setEnabled(True)
+            if hasattr(self, "inference_btn"):
+                self.inference_btn.setEnabled(True)
+
+        if had_error:
+            QMessageBox.critical(
+                self,
+                "Inference Error",
+                f"An error occurred during segmentation inference:\n{error_message}",
+            )
+            return
+
+        if canceled and not rows:
+            QMessageBox.information(
+                self,
+                "Inference Canceled",
+                "Segmentation inference canceled before any results were generated.",
+            )
+            return
+
+        try:
+            df = _pd.DataFrame(rows)
+            df.to_pickle(pkl_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Write Error", f"Failed to write segmentation pickle:\n{pkl_path}\n\n{e}")
+            return
+
+        message = f"Saved {len(rows)} segmentation row(s) to:\n{pkl_path}"
+        if canceled:
+            message = "Inference canceled early.\n" + message
+        QMessageBox.information(self, "Inference Complete", message)
+
     def set_mode(self, mode: str):
-        if self._is_seg_workflow() and mode in {"bbox", "keypoint", "predict"}:
-            self.update_status_bar("Segmentation workflow uses Segment Prompt (2) and Edit Mask (E) modes.")
+        if self._is_seg_workflow() and mode in {"bbox", "keypoint"}:
+            self.update_status_bar("Segmentation workflow uses Segment Prompt (2), Edit Mask (E), and Predict (4) modes.")
             return
         if self._is_pose_workflow() and mode in {"segment", "segedit"}:
             self.update_status_bar("Segment Prompt/Edit Mask modes are only available in Segmentation workflow.")
@@ -4810,6 +4994,39 @@ class LabelingApp(QMainWindow):
                 self.predict_btn.setEnabled(True)
 
 
+    def _seg_points_from_prediction(self, results, det_idx: int) -> list[tuple[float, float]]:
+        masks = getattr(results, "masks", None)
+        if masks is None:
+            return []
+
+        polys = getattr(masks, "xy", None)
+        if polys is not None and det_idx < len(polys):
+            points: list[tuple[float, float]] = []
+            for node in polys[det_idx]:
+                try:
+                    if len(node) < 2:
+                        continue
+                    points.append((float(node[0]), float(node[1])))
+                except Exception:
+                    continue
+            if len(points) >= 3:
+                return points
+
+        if _cv2 is None or _np is None:
+            return []
+
+        data = getattr(masks, "data", None)
+        if data is None or det_idx >= len(data):
+            return []
+        try:
+            mask_arr = data[det_idx].cpu().numpy()
+        except Exception:
+            return []
+        if getattr(mask_arr, "ndim", 0) == 3:
+            mask_arr = mask_arr[0]
+        mask_u8 = (_np.asarray(mask_arr) > 0.5).astype(_np.uint8) * 255
+        return self._seg_points_from_mask(mask_u8)
+
     def _apply_prediction(self, results):
         try:
             self._cache_active_annotation()
@@ -4853,6 +5070,42 @@ class LabelingApp(QMainWindow):
             kp_data = None
             if hasattr(results, "keypoints") and results.keypoints is not None:
                 kp_data = results.keypoints.data.cpu().numpy().tolist()
+
+            if self._is_seg_workflow():
+                applied_count = 0
+                missing_mask_count = 0
+                for cid, det_idx in best_by_class.items():
+                    seg_points = self._seg_points_from_prediction(results, det_idx)
+                    if len(seg_points) < 3:
+                        missing_mask_count += 1
+                        continue
+                    self._clear_class_items(cid, drop_cache=False)
+                    self.annotation_cache[cid] = {
+                        "class_id": cid,
+                        "segments": [(float(x), float(y)) for x, y in seg_points],
+                        "score": float(conf_list[det_idx]) if det_idx < len(conf_list) else 0.0,
+                    }
+                    self._restore_annotation_for_class(cid)
+                    applied_count += 1
+
+                if applied_count > 0:
+                    self._clear_seg_prompt_state()
+                    self._clear_seg_preview()
+                    self._update_item_editability()
+                    self._update_status()
+                    self._jump_to_next_pending_class()
+                    status_msg = "Segmentation prediction applied."
+                    if missing_mask_count:
+                        status_msg += f" Skipped {missing_mask_count} detection(s) without usable masks."
+                    self.update_status_bar(status_msg)
+                else:
+                    self.update_status_bar("Prediction returned no usable segmentation masks.")
+                    QMessageBox.information(
+                        self,
+                        "No segmentation masks",
+                        "The loaded model did not return any usable segmentation masks for this image.",
+                    )
+                return
 
             for cid, det_idx in best_by_class.items():
                 xyxy = xyxy_list[det_idx]
@@ -6807,11 +7060,11 @@ class VideoReviewDialog(QDialog):
             if hasattr(self, "btn_send_high"):
                 self.btn_send_high.setEnabled(bool(self.preds))
             cached_keys = sorted(self.preds.keys())
-            self._seek(cached_keys[0] if cached_keys else 0, show_only=False)
+            self._seek(cached_keys[0] if cached_keys else 0, show_only=False, fit_view=True)
         else:
             # Timeline scrubbing should work even without predictions.
             self.slider.setEnabled(True)
-            self._seek(0, show_only=True)
+            self._seek(0, show_only=True, fit_view=True)
 
         # Reset pan/zoom whenever a new video is opened
         if hasattr(self, "view") and hasattr(self.view, "reset_view"):
@@ -7047,7 +7300,7 @@ class VideoReviewDialog(QDialog):
     def _on_slider(self, idx: int):
         self._seek(int(idx), show_only=False)
 
-    def _seek(self, frame_idx: int, show_only: bool):
+    def _seek(self, frame_idx: int, show_only: bool, fit_view: bool = False):
         if self.cap is None:
             return
         self.cur = frame_idx
@@ -7063,7 +7316,8 @@ class VideoReviewDialog(QDialog):
         self.scene.clear()
         self.scene.setSceneRect(0, 0, pix.width(), pix.height())
         self.scene.addPixmap(pix)
-        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if fit_view:
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
         if not show_only:
             self._draw_overlay_for(frame_idx)

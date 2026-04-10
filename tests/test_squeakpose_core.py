@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 
 from squeakpose_core import (
     InferenceCsvWriter,
+    build_segmentation_inference_rows,
     effective_prediction_batch,
     find_duplicate_names,
     parse_yolo_pose_label_line,
@@ -77,6 +78,32 @@ class CoreHelpersTests(unittest.TestCase):
         stream.write_row({"frame_index": 1, "confidence": 0.9})
         self.assertEqual(stream.rows_written, 2)
         self.assertEqual(len(fake.rows), 2)
+
+    def test_build_segmentation_inference_rows_formats_pickle_schema(self):
+        rows = build_segmentation_inference_rows(
+            frame_index=7,
+            detections=[
+                {
+                    "class_id": 1,
+                    "conf": 0.91,
+                    "box": [1, 2, 30, 40],
+                    "mask_polygon": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+                    "binary_mask": [[1, 0], [0, 1]],
+                }
+            ],
+            class_names={1: "mouse"},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["frame"], 7)
+        self.assertEqual(rows[0]["det"], 0)
+        self.assertEqual(rows[0]["class_id"], 1)
+        self.assertEqual(rows[0]["class_name"], "mouse")
+        self.assertAlmostEqual(rows[0]["conf"], 0.91, places=5)
+        self.assertEqual(rows[0]["x1"], 1.0)
+        self.assertEqual(rows[0]["y2"], 40.0)
+        self.assertEqual(rows[0]["mask_polygon"][2], [1.0, 1.0])
+        self.assertEqual(rows[0]["binary_mask"], [[1, 0], [0, 1]])
 
     def test_resolve_default_training_dataset_path_prefers_pose_then_segment_then_detect(self):
         with TemporaryDirectory() as tmp:

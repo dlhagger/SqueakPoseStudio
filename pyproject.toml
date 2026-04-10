@@ -19,6 +19,7 @@ dependencies = [
     "lightly-train>=0.14.0",
     "oneeurofilter>=0.2.1",
     "pandas>=2.3.3",
+    "pyyaml>=6.0.2",
     "pyqt6>=6.10.2",
     "pyqt6-sip>=13.11.1",
     "scikit-learn>=1.7.2",

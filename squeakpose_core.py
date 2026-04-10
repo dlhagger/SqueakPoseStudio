@@ -68,6 +68,43 @@ class InferenceCsvWriter:
         self.rows_written += 1
 
 
+def build_segmentation_inference_rows(
+    *,
+    frame_index: int,
+    detections: list[dict[str, Any]],
+    class_names: Any = None,
+) -> list[dict[str, Any]]:
+    """Build pickle-ready segmentation inference rows for one frame."""
+    rows: list[dict[str, Any]] = []
+    for det_idx, det in enumerate(detections):
+        cls_id = int(det.get("class_id", 0))
+        class_name = det.get("class_name")
+        if not class_name:
+            if isinstance(class_names, dict):
+                class_name = class_names.get(cls_id, "")
+            elif isinstance(class_names, list) and 0 <= cls_id < len(class_names):
+                class_name = class_names[cls_id]
+            else:
+                class_name = ""
+        box = det.get("box") or [0.0, 0.0, 0.0, 0.0]
+        rows.append(
+            {
+                "frame": int(frame_index),
+                "det": int(det.get("det", det_idx)),
+                "class_id": cls_id,
+                "class_name": str(class_name or ""),
+                "conf": float(det.get("conf", 0.0)),
+                "x1": float(box[0]),
+                "y1": float(box[1]),
+                "x2": float(box[2]),
+                "y2": float(box[3]),
+                "mask_polygon": det.get("mask_polygon"),
+                "binary_mask": det.get("binary_mask"),
+            }
+        )
+    return rows
+
+
 def parse_yolo_pose_label_line(
     line: str,
     *,

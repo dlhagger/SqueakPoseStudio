@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, shutil, json, random, yaml, re, shlex, platform, csv, datetime
+import sys, os, shutil, json, random, yaml, re, shlex, platform, datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -11,23 +11,50 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QLabel, QSplashScreen, QMessageBox,
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
-    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QListWidget, QListView
+    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QListView
 )
 from PyQt6.QtGui import (
     QPixmap, QPen, QBrush, QKeySequence, QFont, QPainter, QShortcut,
     QFontDatabase, QIcon, QCursor, QPainterPath, QPainterPathStroker,
-    QFontInfo, QColor
+    QFontInfo, QColor, QTextCursor
 )
 from PyQt6.QtCore import (
     Qt, QRectF, QPointF, QTimer, QPoint, QProcess, QLibraryInfo
 )
 from squeakpose_core import (
-    InferenceCsvWriter,
-    build_segmentation_inference_rows,
+    atomic_write_text,
     effective_prediction_batch,
     find_duplicate_names,
-    parse_yolo_pose_label_line,
     resolve_default_training_dataset_path,
+)
+from dataset_ops import (
+    DATASET_DETECT,
+    DATASET_POSE,
+    DATASET_SEGMENT,
+    backup_label_dir,
+    dataset_dirs_have_files,
+    dataset_export_paths,
+    export_dataset_files,
+    format_dataset_export_summary,
+    format_label_normalization_summary,
+    list_image_files,
+    list_label_files,
+    normalize_label_directory,
+    remove_dataset_split_dirs,
+    split_train_val_images,
+    write_dataset_yaml_for_mode,
+)
+from label_io import (
+    load_pose_annotations_from_file,
+    load_segmentation_annotations_from_file,
+    parse_pose_label_line,
+    parse_segmentation_label_line,
+    pose_annotation_to_line,
+    segmentation_annotation_to_line,
+)
+from inference_ops import (
+    probe_video_metadata,
+    segmentation_rows_from_result,
 )
 
 DEFAULT_CLASS_NAMES = ["mouse"]
@@ -84,9 +111,7 @@ def _ensure_project_structure(project_root: str) -> dict[str, str]:
 
     if not os.path.exists(paths["classes_seg_file"]):
         try:
-            with open(paths["classes_seg_file"], "w", encoding="utf-8") as f:
-                for name in DEFAULT_CLASS_NAMES:
-                    f.write(name + "\n")
+            atomic_write_text(paths["classes_seg_file"], "".join(f"{name}\n" for name in DEFAULT_CLASS_NAMES))
         except Exception:
             pass
 
@@ -97,8 +122,7 @@ def _ensure_project_structure(project_root: str) -> dict[str, str]:
             "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         }
         try:
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            atomic_write_text(meta_path, json.dumps(payload, indent=2))
         except Exception:
             pass
     return paths
@@ -121,8 +145,7 @@ def _load_last_project() -> Optional[str]:
 def _save_last_project(project_root: str):
     payload = {"last_project": os.path.abspath(project_root)}
     try:
-        with open(LAST_PROJECT_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        atomic_write_text(LAST_PROJECT_STATE_FILE, json.dumps(payload, indent=2))
     except Exception:
         pass
 
@@ -405,14 +428,6 @@ try:
 except Exception:
     _np = None
 
-try:
-    import pandas as _pd
-except Exception:
-    _pd = None
-
-# Ultralytics YOLO
-
-from ultralytics import YOLO
 try:
     from ultralytics import SAM
 except Exception:
@@ -1400,9 +1415,7 @@ class LabelingApp(QMainWindow):
         if not classes:
             classes = defaults[:] or DEFAULT_CLASS_NAMES[:]
             try:
-                with open(class_file, "w", encoding="utf-8") as f:
-                    for name in classes:
-                        f.write(name + "\n")
+                atomic_write_text(class_file, "".join(f"{name}\n" for name in classes))
                 created_any = True
             except Exception:
                 pass
@@ -1441,8 +1454,7 @@ class LabelingApp(QMainWindow):
             else:
                 payload[str(key)] = value
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            atomic_write_text(path, json.dumps(payload, indent=2))
         except Exception:
             pass
 
@@ -1785,9 +1797,7 @@ class LabelingApp(QMainWindow):
         # Helper to write a list to file
         def _write_lines(path: str, items: list[str]):
             try:
-                with open(path, "w", encoding="utf-8") as f:
-                    for s in items:
-                        f.write(s + "\n")
+                atomic_write_text(path, "".join(f"{s}\n" for s in items))
             except Exception:
                 pass
 
@@ -1809,7 +1819,8 @@ class LabelingApp(QMainWindow):
         # Read current values.
         def _read_nonempty_lines(path: str) -> list[str]:
             try:
-                lines = [l.strip() for l in open(path, "r", encoding="utf-8") if l.strip()]
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [l.strip() for l in f if l.strip()]
                 if not lines:
                     return []
                 return lines
@@ -1860,8 +1871,7 @@ class LabelingApp(QMainWindow):
 
     def _save_class_keypoints(self):
         try:
-            with open(self.class_keypoints_path, "w", encoding="utf-8") as f:
-                json.dump(self.class_keypoints, f, indent=2)
+            atomic_write_text(self.class_keypoints_path, json.dumps(self.class_keypoints, indent=2))
         except Exception as e:
             QMessageBox.warning(self, "Save error", f"Could not write class keypoints file:\n{e}")
 
@@ -2011,11 +2021,12 @@ class LabelingApp(QMainWindow):
 
     def _write_list_file(self, path: str, items: list[str]):
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                for item in items:
-                    f.write(item + "\n")
+            atomic_write_text(path, "".join(f"{item}\n" for item in items))
         except Exception as e:
             QMessageBox.warning(self, "File write error", f"Could not write {path}:\n{e}")
+
+    def _backup_label_dir(self, labels_dir: str) -> str:
+        return backup_label_dir(labels_dir)
 
     def _track_scene_item(self, item: QGraphicsItem):
         if item not in self._item_refs:
@@ -3011,7 +3022,6 @@ class LabelingApp(QMainWindow):
         self.current_kp_idx = 0
         self._item_refs: list[QGraphicsItem] = []
         self.predict_model_path: Optional[str] = None
-        self.predict_model: Optional[YOLO] = None
         self.sam_model_path = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
         self.sam_model: Optional[SAM] = None
         self.seg_prompt_points: list[tuple[float, float, int]] = []
@@ -3039,6 +3049,22 @@ class LabelingApp(QMainWindow):
         self._log_path = os.path.join(self.project_root, "logs", "squeakpose_debug.log")
         os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
         self._predict_busy = False
+        self._inference_process: Optional[QProcess] = None
+        self._inference_progress: Optional[QProgressDialog] = None
+        self._inference_stdout_buffer = ""
+        self._inference_stderr = ""
+        self._inference_result_event: Optional[dict] = None
+        self._inference_config_path: Optional[str] = None
+        self._inference_csv_path: Optional[str] = None
+        self._inference_mode: str = WORKFLOW_POSE
+        self._inference_cancel_requested = False
+        self._prediction_process: Optional[QProcess] = None
+        self._prediction_stdout_buffer = ""
+        self._prediction_stderr = ""
+        self._prediction_result_event: Optional[dict] = None
+        self._prediction_config_path: Optional[str] = None
+        self._prediction_image_path: Optional[str] = None
+        self._prediction_cancel_requested = False
         # Auto-select device once at startup
         self._device = _auto_device()
         print(f"🧠 Inference device: {self._device}")
@@ -3052,6 +3078,10 @@ class LabelingApp(QMainWindow):
         else:
             QTimer.singleShot(0, self._maybe_prompt_class_manager)
     def closeEvent(self, event):
+        if self._inference_process is not None and self._inference_process.state() != QProcess.ProcessState.NotRunning:
+            self._cancel_inference_process()
+        if self._prediction_process is not None and self._prediction_process.state() != QProcess.ProcessState.NotRunning:
+            self._cancel_prediction_process()
         super().closeEvent(event)
 
     def _setup_menu(self):
@@ -3858,21 +3888,15 @@ class LabelingApp(QMainWindow):
     def _load_annotations_from_file(self, label_file: str) -> dict[int, dict]:
         if self._is_seg_workflow():
             return self._load_seg_annotations_from_file(label_file)
-        cache: dict[int, dict] = {}
-        extra_rows = 0
-        try:
-            with open(label_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    ln = line.strip()
-                    if not ln:
-                        continue
-                    entry, had_extra = self._parse_label_line(ln)
-                    if had_extra:
-                        extra_rows += 1
-                    if entry:
-                        cache[entry["class_id"]] = entry
-        except Exception:
-            pass
+        class_lookup = [self._kp_names_for_index(i) for i in range(len(self.classes))]
+        cache, extra_rows = load_pose_annotations_from_file(
+            label_file,
+            classes_count=len(self.classes),
+            canonical_names=self.kp_names,
+            class_keypoint_lookup=class_lookup,
+            img_w=self.img_w,
+            img_h=self.img_h,
+        )
         if extra_rows > 0:
             print(
                 f"⚠️ Ignored extra keypoint values in {extra_rows} row(s) while reading {label_file}",
@@ -3881,23 +3905,16 @@ class LabelingApp(QMainWindow):
         return cache
 
     def _load_seg_annotations_from_file(self, label_file: str) -> dict[int, dict]:
-        cache: dict[int, dict] = {}
-        try:
-            with open(label_file, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    entry = self._parse_segmentation_line(line)
-                    if entry:
-                        cache[entry["class_id"]] = entry
-        except Exception:
-            pass
-        return cache
+        return load_segmentation_annotations_from_file(
+            label_file,
+            classes_count=len(self.classes),
+            img_w=self.img_w,
+            img_h=self.img_h,
+        )
 
     def _parse_label_line(self, line: str) -> tuple[Optional[dict], bool]:
         class_lookup = [self._kp_names_for_index(i) for i in range(len(self.classes))]
-        return parse_yolo_pose_label_line(
+        return parse_pose_label_line(
             line,
             classes_count=len(self.classes),
             canonical_names=self.kp_names,
@@ -3907,83 +3924,20 @@ class LabelingApp(QMainWindow):
         )
 
     def _parse_segmentation_line(self, line: str) -> Optional[dict]:
-        parts = line.split()
-        if len(parts) < 7:
-            return None
-        try:
-            cid = int(parts[0])
-        except Exception:
-            return None
-        if cid < 0 or cid >= len(self.classes):
-            return None
-        coord_tokens = parts[1:]
-        if len(coord_tokens) % 2 != 0:
-            coord_tokens = coord_tokens[:-1]
-        if len(coord_tokens) < 6:
-            return None
-
-        points: list[tuple[float, float]] = []
-        for idx in range(0, len(coord_tokens), 2):
-            try:
-                xn = float(coord_tokens[idx])
-                yn = float(coord_tokens[idx + 1])
-            except Exception:
-                return None
-            x = xn * max(1.0, float(self.img_w))
-            y = yn * max(1.0, float(self.img_h))
-            points.append((x, y))
-        if len(points) < 3:
-            return None
-        return {"class_id": cid, "segments": points}
+        return parse_segmentation_label_line(
+            line,
+            classes_count=len(self.classes),
+            img_w=self.img_w,
+            img_h=self.img_h,
+        )
 
     def _segmentation_entry_to_line(self, entry: dict) -> str:
-        cid = int(entry.get("class_id", 0))
-        seg = entry.get("segments", [])
-        coords: list[str] = []
-        for pair in seg:
-            try:
-                x = float(pair[0])
-                y = float(pair[1])
-            except Exception:
-                continue
-            xn = x / max(1.0, float(self.img_w))
-            yn = y / max(1.0, float(self.img_h))
-            coords.append(f"{xn:.6f}")
-            coords.append(f"{yn:.6f}")
-        if len(coords) < 6:
-            return ""
-        return f"{cid} " + " ".join(coords)
+        return segmentation_annotation_to_line(entry, img_w=self.img_w, img_h=self.img_h)
 
     def _annotation_entry_to_line(self, entry: dict) -> str:
         if self._is_seg_workflow():
             return self._segmentation_entry_to_line(entry)
-        cid = entry.get("class_id", 0)
-        bbox = entry.get("bbox", {})
-        x = bbox.get("x", 0.0); y = bbox.get("y", 0.0); w = bbox.get("w", 0.0); h = bbox.get("h", 0.0)
-        xc = (x + w / 2.0) / max(1.0, float(self.img_w))
-        yc = (y + h / 2.0) / max(1.0, float(self.img_h))
-        w_norm = w / max(1.0, float(self.img_w))
-        h_norm = h / max(1.0, float(self.img_h))
-        line = f"{cid} {xc:.6f} {yc:.6f} {w_norm:.6f} {h_norm:.6f}"
-        kp_entries = entry.get("keypoints", [])
-        kp_lookup = {}
-        for kp in kp_entries:
-            canon_idx = int(kp.get("canon_idx", -1))
-            if canon_idx >= 0:
-                kp_lookup[canon_idx] = kp
-        for idx in range(len(self.kp_names)):
-            kp = kp_lookup.get(idx)
-            if not kp:
-                line += " 0.000000 0.000000 0"
-                continue
-            vis = int(kp.get("vis", 2))
-            if vis == 0:
-                line += " 0.000000 0.000000 0"
-            else:
-                xn = kp.get("x", 0.0) / max(1.0, float(self.img_w))
-                yn = kp.get("y", 0.0) / max(1.0, float(self.img_h))
-                line += f" {xn:.6f} {yn:.6f} {vis}"
-        return line
+        return pose_annotation_to_line(entry, kp_names=self.kp_names, img_w=self.img_w, img_h=self.img_h)
 
     def _render_overlay_from_cache(self, out_path: str):
         if self.img_w <= 0 or self.img_h <= 0:
@@ -4267,12 +4221,11 @@ class LabelingApp(QMainWindow):
         if not model_file:
             return
         try:
-            self.predict_model = YOLO(model_file)
             self.predict_model_path = model_file
             # Re-detect device in case hardware/availability changed
             self._device = _auto_device()
             print(f"🧠 Inference device: {self._device}")
-            QMessageBox.information(self, "Model Loaded", f"Loaded model:\n{os.path.basename(model_file)}")
+            QMessageBox.information(self, "Model Selected", f"Selected model:\n{os.path.basename(model_file)}")
         except Exception as e:
             QMessageBox.warning(self, "Model Load Error", f"Could not load model:\n{e}")
 
@@ -4280,11 +4233,11 @@ class LabelingApp(QMainWindow):
         if _cv2 is None:
             QMessageBox.warning(self, "OpenCV missing", "Install OpenCV:\n\n  pip install opencv-python")
             return
-        if self._is_seg_workflow() and _pd is None:
-            QMessageBox.warning(self, "Pandas missing", "Install pandas to export segmentation inference pickle files.")
-            return
-        if not self.predict_model:
+        if not getattr(self, "predict_model_path", None):
             QMessageBox.information(self, "No Model", "Load a model before running inference.")
+            return
+        if self._inference_process is not None and self._inference_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Inference Running", "An inference process is already running.")
             return
 
         video_path, _ = QFileDialog.getOpenFileName(
@@ -4296,19 +4249,10 @@ class LabelingApp(QMainWindow):
         if not video_path:
             return
 
-        # Gather basic video metadata for progress/time stamps
-        total_frames = 0
-        fps = 0.0
-        try:
-            cap_meta = _cv2.VideoCapture(video_path)
-            if cap_meta is not None and cap_meta.isOpened():
-                total_frames = int(cap_meta.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
-                fps = float(cap_meta.get(_cv2.CAP_PROP_FPS) or 0.0)
-            if cap_meta is not None:
-                cap_meta.release()
-        except Exception:
-            total_frames = 0
-            fps = 0.0
+        metadata = probe_video_metadata(video_path, _cv2)
+        if not metadata.opened:
+            QMessageBox.warning(self, "Video Error", f"Unable to open video:\n{video_path}")
+            return
 
         device_name = str(getattr(self, "_device", "cpu")).lower()
         default_batch = 16 if device_name in {"cuda", "mps"} else 4
@@ -4332,380 +4276,238 @@ class LabelingApp(QMainWindow):
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-        if self._is_seg_workflow():
-            self._run_segmentation_video_inference(
-                video_path=video_path,
-                output_root=output_root,
-                base_name=base_name,
-                timestamp=timestamp,
-                total_frames=total_frames,
-            )
-            return
-
-        csv_name = f"{base_name}_{timestamp}.csv"
+        workflow = WORKFLOW_SEG if self._is_seg_workflow() else WORKFLOW_POSE
+        suffix = "_segmentation.csv" if workflow == WORKFLOW_SEG else ".csv"
+        csv_name = f"{base_name}_{timestamp}{suffix}"
         csv_path = os.path.join(output_root, csv_name)
+        self._start_inference_process(
+            workflow=workflow,
+            video_path=video_path,
+            csv_path=csv_path,
+            batch_size=batch_size,
+            total_frames=metadata.total_frames,
+            fps=metadata.fps,
+        )
 
-        # Pre-compute CSV schema (frame/detection metrics + keypoints)
-        def _kp_key(name: str, idx: int) -> str:
-            safe = re.sub(r"[^0-9a-zA-Z_]+", "_", (name or f"kp{idx}").strip().lower())
-            safe = safe.strip("_") or f"kp{idx}"
-            return safe
-
-        kp_columns = []
-        for idx, kp_name in enumerate(self.kp_names):
-            key = _kp_key(kp_name, idx)
-            kp_columns.extend([
-                f"kp_{key}_x",
-                f"kp_{key}_y",
-                f"kp_{key}_conf",
-                f"kp_{key}_x_norm",
-                f"kp_{key}_y_norm",
-            ])
-
-        fieldnames = [
-            "video_path",
-            "model_path",
-            "frame_index",
-            "time_seconds",
-            "detections_in_frame",
-            "detection_index",
-            "track_id",
-            "class_id",
-            "class_name",
-            "confidence",
-            "bbox_x1",
-            "bbox_y1",
-            "bbox_x2",
-            "bbox_y2",
-            "bbox_width",
-            "bbox_height",
-            "bbox_area",
-            "bbox_center_x",
-            "bbox_center_y",
-            "bbox_center_x_norm",
-            "bbox_center_y_norm",
-            "bbox_width_norm",
-            "bbox_height_norm",
-            "image_width",
-            "image_height",
-            "speed_preprocess_ms",
-            "speed_inference_ms",
-            "speed_postprocess_ms",
-            "mask_area_px",
-            "mask_area_norm",
-            "mask_vertices",
-        ] + kp_columns
-
-        rows_written = 0
-        canceled = False
-        had_error = False
-        error_message = ""
-        model_path = getattr(self, "predict_model_path", "")
-        csv_handle = None
-        csv_streamer: Optional[InferenceCsvWriter] = None
-
+    def _start_inference_process(
+        self,
+        *,
+        workflow: str,
+        video_path: str,
+        csv_path: str,
+        batch_size: int,
+        total_frames: int,
+        fps: float,
+    ) -> None:
+        output_root = os.path.dirname(csv_path)
+        config = {
+            "mode": workflow,
+            "model_path": self.predict_model_path,
+            "video_path": video_path,
+            "csv_path": csv_path,
+            "classes": self.classes,
+            "kp_names": self.kp_names,
+            "device": self._device,
+            "batch_size": int(batch_size),
+            "total_frames": int(total_frames),
+            "fps": float(fps),
+        }
+        config_path = os.path.join(output_root, f".{os.path.splitext(os.path.basename(csv_path))[0]}_config.json")
         try:
-            csv_handle = open(csv_path, "w", newline="", encoding="utf-8")
-            csv_writer = csv.DictWriter(csv_handle, fieldnames=fieldnames)
-            csv_writer.writeheader()
-            csv_streamer = InferenceCsvWriter(csv_writer)
+            atomic_write_text(config_path, json.dumps(config, indent=2))
         except Exception as e:
-            QMessageBox.warning(self, "Write Error", f"Failed to initialize CSV:\n{csv_path}\n\n{e}")
+            QMessageBox.warning(self, "Output Error", f"Could not write inference config:\n{config_path}\n\n{e}")
             return
 
-        prog = QProgressDialog("Running inference…", "Cancel", 0, 0 if total_frames <= 0 else total_frames, self)
-        prog.setWindowTitle("Video Inference")
+        title = "Segmentation Video Inference" if workflow == WORKFLOW_SEG else "Video Inference"
+        label = "Running segmentation inference…" if workflow == WORKFLOW_SEG else "Running inference…"
+        prog = QProgressDialog(label, "Cancel", 0, 0 if total_frames <= 0 else total_frames, self)
+        prog.setWindowTitle(title)
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         prog.setMinimumDuration(0)
         if total_frames <= 0:
             prog.setRange(0, 0)  # busy indicator for unknown length
 
-        # Avoid concurrent predictions
         was_busy = getattr(self, "_predict_busy", False)
+        self._inference_previous_busy = was_busy
         self._predict_busy = True
         if hasattr(self, "predict_btn"):
             self.predict_btn.setEnabled(False)
         if hasattr(self, "inference_btn"):
             self.inference_btn.setEnabled(False)
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", "inference_worker", "--config", config_path])
+        process.setWorkingDirectory(os.path.dirname(os.path.abspath(__file__)))
+        process.readyReadStandardOutput.connect(self._read_inference_process_stdout)
+        process.readyReadStandardError.connect(self._read_inference_process_stderr)
+        process.finished.connect(self._finish_inference_process)
+        process.errorOccurred.connect(self._handle_inference_process_error)
+        prog.canceled.connect(self._cancel_inference_process)
+
+        self._inference_process = process
+        self._inference_progress = prog
+        self._inference_stdout_buffer = ""
+        self._inference_stderr = ""
+        self._inference_result_event = None
+        self._inference_config_path = config_path
+        self._inference_csv_path = csv_path
+        self._inference_mode = workflow
+        self._inference_cancel_requested = False
+
+        prog.show()
+        process.start()
+        if not process.waitForStarted(1000):
+            self._inference_stderr = process.errorString()
+            self._finish_inference_process(1, QProcess.ExitStatus.CrashExit)
+            return
+
+    def _read_inference_process_stdout(self) -> None:
+        process = self._inference_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not text:
+            return
+        self._inference_stdout_buffer += text
+        lines = self._inference_stdout_buffer.splitlines(keepends=True)
+        self._inference_stdout_buffer = ""
+        for line in lines:
+            if line.endswith("\n") or line.endswith("\r"):
+                self._handle_inference_event_line(line.strip())
+            else:
+                self._inference_stdout_buffer = line
+
+    def _read_inference_process_stderr(self) -> None:
+        process = self._inference_process
+        if process is None:
+            return
+        self._inference_stderr += bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+
+    def _handle_inference_event_line(self, line: str) -> None:
+        if not line:
+            return
         try:
-            cap = _cv2.VideoCapture(video_path)
-            if cap is None or not cap.isOpened():
-                QMessageBox.warning(self, "Video Error", f"Unable to open video:\n{video_path}")
-                return
+            event = json.loads(line)
+        except Exception:
+            self._inference_stderr += line + "\n"
+            return
 
-            frames: list = []
-            frame_indices: list[int] = []
-            processed_frames = 0
+        event_type = event.get("event")
+        if event_type == "progress":
+            progress = self._inference_progress
+            if progress is not None:
+                processed = int(event.get("processed_frames") or 0)
+                total = int(event.get("total_frames") or 0)
+                if total > 0:
+                    progress.setValue(min(processed, total))
+                progress.setLabelText(str(event.get("message") or f"Inferencing frame {processed}"))
+            QApplication.processEvents()
+        elif event_type == "result":
+            self._inference_result_event = event
+        elif event_type == "error":
+            self._inference_result_event = {
+                "event": "result",
+                "csv_path": self._inference_csv_path or "",
+                "rows_written": 0,
+                "processed_frames": 0,
+                "canceled": False,
+                "had_error": True,
+                "error_message": str(event.get("error_message") or "Inference worker error"),
+                "mode": self._inference_mode,
+            }
+        elif event_type == "started":
+            progress = self._inference_progress
+            if progress is not None:
+                progress.setLabelText("Loading model in inference process…")
 
-            def process_batch() -> bool:
-                nonlocal frames, frame_indices, canceled, processed_frames, had_error, error_message, rows_written
-                if not frames:
-                    return True
+    def _cancel_inference_process(self) -> None:
+        process = self._inference_process
+        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._inference_cancel_requested = True
+        progress = self._inference_progress
+        if progress is not None:
+            progress.setLabelText("Canceling inference process…")
+        process.terminate()
+        QTimer.singleShot(5000, self._kill_inference_process_if_running)
 
-                batch_frames = frames[:]
-                batch_indices = frame_indices[:]
-                frames.clear()
-                frame_indices.clear()
+    def _kill_inference_process_if_running(self) -> None:
+        process = self._inference_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            process.kill()
 
-                try:
-                    predict_args = dict(
-                        source=batch_frames,
-                        imgsz=640,
-                        conf=0.25,
-                        iou=0.5,
-                        device=self._device,
-                        verbose=False,
-                    )
-                    if batch_size > 0:
-                        predict_args["batch"] = batch_size
-                    results_list = list(self.predict_model.predict(**predict_args))
-                except Exception as e:
-                    had_error = True
-                    error_message = str(e)
-                    return False
+    def _handle_inference_process_error(self, _error) -> None:
+        process = self._inference_process
+        if process is not None:
+            self._inference_stderr += process.errorString() + "\n"
 
-                for fi, result in zip(batch_indices, results_list):
-                    if prog.wasCanceled():
-                        canceled = True
-                        break
+    def _finish_inference_process(self, exit_code: int, exit_status) -> None:
+        if self._inference_stdout_buffer.strip():
+            self._handle_inference_event_line(self._inference_stdout_buffer.strip())
+            self._inference_stdout_buffer = ""
 
-                    img_h, img_w = 0, 0
-                    if hasattr(result, "orig_shape") and result.orig_shape:
-                        img_h, img_w = int(result.orig_shape[0]), int(result.orig_shape[1])
-                    elif hasattr(result, "orig_img") and getattr(result, "orig_img") is not None:
-                        img_h, img_w = result.orig_img.shape[:2]
+        progress = self._inference_progress
+        if progress is not None:
+            progress.close()
 
-                    detections = int(len(result.boxes) if result.boxes is not None else 0)
-                    speed = getattr(result, "speed", {}) or {}
-                    time_seconds = (fi / fps) if fps > 0 else ""
+        if hasattr(self, "_inference_previous_busy"):
+            self._predict_busy = self._inference_previous_busy
+        else:
+            self._predict_busy = False
+        if hasattr(self, "predict_btn"):
+            self.predict_btn.setEnabled(True)
+        if hasattr(self, "inference_btn"):
+            self.inference_btn.setEnabled(True)
 
-                    if detections == 0:
-                        row = {
-                            "video_path": video_path,
-                            "model_path": model_path,
-                            "frame_index": fi,
-                            "time_seconds": time_seconds,
-                            "detections_in_frame": 0,
-                            "detection_index": -1,
-                            "track_id": "",
-                            "class_id": "",
-                            "class_name": "",
-                            "confidence": "",
-                            "bbox_x1": "",
-                            "bbox_y1": "",
-                            "bbox_x2": "",
-                            "bbox_y2": "",
-                            "bbox_width": "",
-                            "bbox_height": "",
-                            "bbox_area": "",
-                            "bbox_center_x": "",
-                            "bbox_center_y": "",
-                            "bbox_center_x_norm": "",
-                            "bbox_center_y_norm": "",
-                            "bbox_width_norm": "",
-                            "bbox_height_norm": "",
-                            "image_width": img_w,
-                            "image_height": img_h,
-                            "speed_preprocess_ms": speed.get("preprocess"),
-                            "speed_inference_ms": speed.get("inference"),
-                            "speed_postprocess_ms": speed.get("postprocess"),
-                            "mask_area_px": "",
-                            "mask_area_norm": "",
-                            "mask_vertices": "",
-                        }
-                        for col in kp_columns:
-                            row[col] = ""
-                        if csv_streamer is None:
-                            had_error = True
-                            error_message = "CSV writer was not initialized."
-                            return False
-                        csv_streamer.write_row(row)
-                        rows_written = csv_streamer.rows_written
-                    else:
-                        xyxy = result.boxes.xyxy.cpu().tolist()
-                        xywh = result.boxes.xywh.cpu().tolist()
-                        confs = result.boxes.conf.cpu().tolist() if result.boxes.conf is not None else [None] * detections
-                        cls_list = result.boxes.cls.cpu().tolist() if result.boxes.cls is not None else [0] * detections
-                        ids_raw = getattr(result.boxes, "id", None)
-                        if ids_raw is not None:
-                            try:
-                                ids_list = ids_raw.cpu().tolist()
-                            except Exception:
-                                ids_list = [None] * detections
-                        else:
-                            ids_list = [None] * detections
+        event = self._inference_result_event
+        csv_path = self._inference_csv_path or ""
+        config_path = self._inference_config_path
+        mode = self._inference_mode
+        cancel_requested = self._inference_cancel_requested
+        stderr_text = self._inference_stderr.strip()
 
-                        kp_abs = []
-                        kp_norm = []
-                        if hasattr(result, "keypoints") and result.keypoints is not None:
-                            try:
-                                kp_abs = result.keypoints.data.cpu().tolist()
-                                kp_norm = result.keypoints.xyn.cpu().tolist() if hasattr(result.keypoints, "xyn") else []
-                            except Exception:
-                                kp_abs = []
-                                kp_norm = []
-
-                        mask_data = None
-                        mask_segments = []
-                        if hasattr(result, "masks") and result.masks is not None:
-                            try:
-                                mask_data = result.masks.data
-                            except Exception:
-                                mask_data = None
-                            try:
-                                mask_segments = result.masks.xy
-                            except Exception:
-                                mask_segments = []
-
-                        for det_idx in range(detections):
-                            x1, y1, x2, y2 = xyxy[det_idx]
-                            cx, cy, w, h = xywh[det_idx]
-                            area = w * h
-                            cls_id = int(cls_list[det_idx]) if det_idx < len(cls_list) else 0
-                            class_name = ""
-                            if hasattr(result, "names") and result.names:
-                                class_name = result.names.get(cls_id, "")
-                            if not class_name and 0 <= cls_id < len(self.classes):
-                                class_name = self.classes[cls_id]
-
-                            kp_values = kp_abs[det_idx] if det_idx < len(kp_abs) else []
-                            kp_norm_values = kp_norm[det_idx] if det_idx < len(kp_norm) else []
-
-                            mask_area_px = ""
-                            mask_area_norm = ""
-                            mask_vertices = ""
-                            if mask_data is not None and det_idx < len(mask_data):
-                                try:
-                                    mask_tensor = mask_data[det_idx]
-                                    mask_area_px = float(mask_tensor.float().sum().item())
-                                    denom = float(img_w * img_h) if img_w and img_h else 0.0
-                                    mask_area_norm = (mask_area_px / denom) if denom > 0 else ""
-                                except Exception:
-                                    mask_area_px = ""
-                                    mask_area_norm = ""
-                            if det_idx < len(mask_segments):
-                                try:
-                                    mask_vertices = int(len(mask_segments[det_idx]))
-                                except Exception:
-                                    mask_vertices = ""
-
-                            row = {
-                                "video_path": video_path,
-                                "model_path": model_path,
-                                "frame_index": fi,
-                                "time_seconds": time_seconds,
-                                "detections_in_frame": detections,
-                                "detection_index": det_idx,
-                                "track_id": ids_list[det_idx] if det_idx < len(ids_list) else "",
-                                "class_id": cls_id,
-                                "class_name": class_name,
-                                "confidence": confs[det_idx] if det_idx < len(confs) else "",
-                                "bbox_x1": x1,
-                                "bbox_y1": y1,
-                                "bbox_x2": x2,
-                                "bbox_y2": y2,
-                                "bbox_width": w,
-                                "bbox_height": h,
-                                "bbox_area": area,
-                                "bbox_center_x": cx,
-                                "bbox_center_y": cy,
-                                "bbox_center_x_norm": (cx / img_w) if img_w else "",
-                                "bbox_center_y_norm": (cy / img_h) if img_h else "",
-                                "bbox_width_norm": (w / img_w) if img_w else "",
-                                "bbox_height_norm": (h / img_h) if img_h else "",
-                                "image_width": img_w,
-                                "image_height": img_h,
-                                "speed_preprocess_ms": speed.get("preprocess"),
-                                "speed_inference_ms": speed.get("inference"),
-                                "speed_postprocess_ms": speed.get("postprocess"),
-                                "mask_area_px": mask_area_px,
-                                "mask_area_norm": mask_area_norm,
-                                "mask_vertices": mask_vertices,
-                            }
-
-                            for idx_kp, kp_name in enumerate(self.kp_names):
-                                key = _kp_key(kp_name, idx_kp)
-                                abs_val = kp_values[idx_kp] if idx_kp < len(kp_values) else [None, None, None]
-                                norm_val = kp_norm_values[idx_kp] if idx_kp < len(kp_norm_values) else [None, None]
-                                row[f"kp_{key}_x"] = abs_val[0] if abs_val and abs_val[0] is not None else ""
-                                row[f"kp_{key}_y"] = abs_val[1] if abs_val and abs_val[1] is not None else ""
-                                row[f"kp_{key}_conf"] = abs_val[2] if abs_val and len(abs_val) > 2 else ""
-                                row[f"kp_{key}_x_norm"] = norm_val[0] if norm_val and norm_val[0] is not None else ""
-                                row[f"kp_{key}_y_norm"] = norm_val[1] if norm_val and norm_val[1] is not None else ""
-
-                            if csv_streamer is None:
-                                had_error = True
-                                error_message = "CSV writer was not initialized."
-                                return False
-                            csv_streamer.write_row(row)
-                            rows_written = csv_streamer.rows_written
-
-                    processed_frames += 1
-                    if total_frames > 0:
-                        prog.setValue(min(processed_frames, total_frames))
-                        prog.setLabelText(f"Inferencing frame {processed_frames}/{total_frames}")
-                    else:
-                        prog.setLabelText(f"Inferencing frame {processed_frames}")
-                    QApplication.processEvents()
-
-                    if canceled:
-                        break
-
-                return not canceled and not had_error
-
-            frame_idx = 0
+        if config_path:
             try:
-                while not canceled and not had_error:
-                    if prog.wasCanceled():
-                        canceled = True
-                        break
+                if os.path.exists(config_path):
+                    os.remove(config_path)
+            except Exception:
+                pass
 
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
+        self._inference_process = None
+        self._inference_progress = None
+        self._inference_config_path = None
+        self._inference_csv_path = None
+        self._inference_result_event = None
+        self._inference_stdout_buffer = ""
+        self._inference_stderr = ""
+        self._inference_cancel_requested = False
 
-                    frames.append(frame)
-                    frame_indices.append(frame_idx)
-                    frame_idx += 1
+        if cancel_requested and event is None:
+            QMessageBox.information(
+                self,
+                "Inference Canceled",
+                f"Inference process was canceled.\n\nPartial CSV may remain at:\n{csv_path}",
+            )
+            return
 
-                    if len(frames) >= batch_size:
-                        if not process_batch():
-                            break
+        if event is None:
+            detail = stderr_text or f"Process exited with code {exit_code}."
+            QMessageBox.critical(self, "Inference Error", f"Inference process failed:\n{detail}")
+            return
 
-                if not canceled and not had_error and frames:
-                    process_batch()
-            finally:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-        except Exception as e:
-            had_error = True
-            error_message = str(e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            prog.close()
-            if csv_handle is not None:
-                try:
-                    csv_handle.flush()
-                except Exception:
-                    pass
-                try:
-                    csv_handle.close()
-                except Exception:
-                    pass
-            self._predict_busy = was_busy
-            if hasattr(self, "predict_btn"):
-                self.predict_btn.setEnabled(True)
-            if hasattr(self, "inference_btn"):
-                self.inference_btn.setEnabled(True)
+        rows_written = int(event.get("rows_written") or 0)
+        had_error = bool(event.get("had_error"))
+        canceled = bool(event.get("canceled"))
+        error_message = str(event.get("error_message") or stderr_text or "Unknown inference error")
+        csv_path = str(event.get("csv_path") or csv_path)
+        label = "segmentation row(s)" if mode == WORKFLOW_SEG else "row(s)"
 
-        if had_error:
+        if had_error or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
             if rows_written == 0:
                 try:
-                    if os.path.exists(csv_path):
+                    if csv_path and os.path.exists(csv_path):
                         os.remove(csv_path)
                 except Exception:
                     pass
@@ -4716,184 +4518,42 @@ class LabelingApp(QMainWindow):
                     "Inference Error",
                     "An error occurred during inference.\n\n"
                     f"{error_message}\n\n"
-                    f"Partial CSV saved ({rows_written} row(s)):\n{csv_path}"
+                    f"Partial CSV saved ({rows_written} {label}):\n{csv_path}",
                 )
+            return
+
+        if canceled and rows_written == 0:
+            try:
+                if csv_path and os.path.exists(csv_path):
+                    os.remove(csv_path)
+            except Exception:
+                pass
+            QMessageBox.information(self, "Inference Canceled", "Inference canceled before any results were generated.")
             return
 
         if rows_written == 0:
-            if canceled:
-                try:
-                    if os.path.exists(csv_path):
-                        os.remove(csv_path)
-                except Exception:
-                    pass
-                QMessageBox.information(self, "Inference Canceled", "Inference canceled before any results were generated.")
+            QMessageBox.information(self, "Inference Complete", "Inference completed without writing result rows.")
             return
 
-        message = f"Saved {rows_written} row(s) to:\n{csv_path}"
+        message = f"Saved {rows_written} {label} to:\n{csv_path}"
         if canceled:
             message = "Inference canceled early.\n" + message
         QMessageBox.information(self, "Inference Complete", message)
 
-    def _segmentation_rows_from_result(self, result, frame_idx: int) -> list[dict[str, object]]:
-        if result.boxes is None or len(result.boxes) == 0:
-            return []
-
-        try:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else []
-            class_ids = (
-                result.boxes.cls.cpu().numpy().astype(int)
-                if result.boxes.cls is not None else
-                [0] * len(boxes)
-            )
-        except Exception:
-            return []
-
-        mask_polygons = []
-        mask_data = None
-        if getattr(result, "masks", None) is not None:
-            try:
-                mask_polygons = result.masks.xy
-            except Exception:
-                mask_polygons = []
-            try:
-                mask_data = result.masks.data.cpu().numpy()
-            except Exception:
-                mask_data = None
-        if not mask_polygons:
-            mask_polygons = [None] * len(boxes)
-
-        detections: list[dict[str, object]] = []
-        for det_idx, box in enumerate(boxes):
-            cls_id = int(class_ids[det_idx]) if det_idx < len(class_ids) else 0
-            poly = mask_polygons[det_idx] if det_idx < len(mask_polygons) else None
-            polygon = poly.tolist() if poly is not None and hasattr(poly, "tolist") else poly
-            binary_mask = None
-            if mask_data is not None and det_idx < len(mask_data):
-                binary_mask = (_np.asarray(mask_data[det_idx]) > 0.5).astype(_np.uint8) if _np is not None else None
-            detections.append(
-                {
-                    "det": det_idx,
-                    "class_id": cls_id,
-                    "class_name": (result.names.get(cls_id, "") if hasattr(result, "names") and result.names else ""),
-                    "conf": float(confs[det_idx]) if det_idx < len(confs) else 0.0,
-                    "box": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
-                    "mask_polygon": polygon,
-                    "binary_mask": binary_mask,
-                }
-            )
-        return build_segmentation_inference_rows(
-            frame_index=frame_idx,
-            detections=detections,
-            class_names=getattr(result, "names", None) or self.classes,
-        )
-
-    def _run_segmentation_video_inference(
+    def _segmentation_rows_from_result(
         self,
+        result,
+        frame_idx: int,
         *,
-        video_path: str,
-        output_root: str,
-        base_name: str,
-        timestamp: str,
-        total_frames: int,
-    ) -> None:
-        pkl_name = f"{base_name}_{timestamp}_segmentation_df.pkl"
-        pkl_path = os.path.join(output_root, pkl_name)
-        rows: list[dict[str, object]] = []
-        processed_frames = 0
-        canceled = False
-        had_error = False
-        error_message = ""
-
-        prog = QProgressDialog(
-            "Running segmentation inference…",
-            "Cancel",
-            0,
-            0 if total_frames <= 0 else total_frames,
-            self,
+        include_binary_mask: bool = True,
+    ) -> list[dict[str, object]]:
+        return segmentation_rows_from_result(
+            result,
+            frame_idx,
+            classes=self.classes,
+            include_binary_mask=include_binary_mask,
+            numpy_module=_np,
         )
-        prog.setWindowTitle("Segmentation Video Inference")
-        prog.setWindowModality(Qt.WindowModality.ApplicationModal)
-        prog.setMinimumDuration(0)
-        if total_frames <= 0:
-            prog.setRange(0, 0)
-
-        was_busy = getattr(self, "_predict_busy", False)
-        self._predict_busy = True
-        if hasattr(self, "predict_btn"):
-            self.predict_btn.setEnabled(False)
-        if hasattr(self, "inference_btn"):
-            self.inference_btn.setEnabled(False)
-
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            try:
-                results_iter = self.predict_model.predict(
-                    video_path,
-                    stream=True,
-                    imgsz=640,
-                    conf=0.25,
-                    iou=0.5,
-                    device=self._device,
-                    verbose=False,
-                )
-            except Exception as e:
-                had_error = True
-                error_message = str(e)
-                results_iter = []
-
-            for frame_idx, result in enumerate(results_iter):
-                if prog.wasCanceled():
-                    canceled = True
-                    break
-                rows.extend(self._segmentation_rows_from_result(result, frame_idx))
-                processed_frames = frame_idx + 1
-                if total_frames > 0:
-                    prog.setValue(min(processed_frames, total_frames))
-                    prog.setLabelText(f"Inferencing frame {processed_frames}/{total_frames}")
-                else:
-                    prog.setLabelText(f"Inferencing frame {processed_frames}")
-                QApplication.processEvents()
-        except Exception as e:
-            had_error = True
-            error_message = str(e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            prog.close()
-            self._predict_busy = was_busy
-            if hasattr(self, "predict_btn"):
-                self.predict_btn.setEnabled(True)
-            if hasattr(self, "inference_btn"):
-                self.inference_btn.setEnabled(True)
-
-        if had_error:
-            QMessageBox.critical(
-                self,
-                "Inference Error",
-                f"An error occurred during segmentation inference:\n{error_message}",
-            )
-            return
-
-        if canceled and not rows:
-            QMessageBox.information(
-                self,
-                "Inference Canceled",
-                "Segmentation inference canceled before any results were generated.",
-            )
-            return
-
-        try:
-            df = _pd.DataFrame(rows)
-            df.to_pickle(pkl_path)
-        except Exception as e:
-            QMessageBox.critical(self, "Write Error", f"Failed to write segmentation pickle:\n{pkl_path}\n\n{e}")
-            return
-
-        message = f"Saved {len(rows)} segmentation row(s) to:\n{pkl_path}"
-        if canceled:
-            message = "Inference canceled early.\n" + message
-        QMessageBox.information(self, "Inference Complete", message)
 
     def set_mode(self, mode: str):
         if self._is_seg_workflow() and mode in {"bbox", "keypoint"}:
@@ -4904,7 +4564,7 @@ class LabelingApp(QMainWindow):
             return
 
         if mode == 'predict':
-            if not self.predict_model:
+            if not self.predict_model_path:
                 QMessageBox.information(self, "No Model", "Please click 'Load Model' first.")
                 return
             if not self.images:
@@ -4952,7 +4612,7 @@ class LabelingApp(QMainWindow):
             self.view.refresh_seg_brush_cursor()
 
     def run_prediction_on_current_image(self):
-        if not self.predict_model or not self.images:
+        if not self.predict_model_path or not self.images:
             return
         img_path = os.path.join(self.active_image_dir, self.images[self.current_idx])
 
@@ -4960,130 +4620,214 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("Prediction already running...")
             return
 
+        if self._prediction_process is not None and self._prediction_process.state() != QProcess.ProcessState.NotRunning:
+            self.update_status_bar("Prediction already running...")
+            return
+
+        config = {
+            "model_path": self.predict_model_path,
+            "image_path": img_path,
+            "workflow": self.active_workflow,
+            "device": self._device,
+        }
+        try:
+            os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
+            config_path = os.path.join(os.path.dirname(self._log_path), ".single_image_predict_config.json")
+            atomic_write_text(config_path, json.dumps(config, indent=2))
+        except Exception as e:
+            QMessageBox.warning(self, "Prediction Error", f"Could not write prediction config:\n{e}")
+            return
+
         self._predict_busy = True
         if hasattr(self, 'predict_btn'):
             self.predict_btn.setEnabled(False)
         self.update_status_bar("Running prediction...")
 
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", "predict_worker", "--config", config_path])
+        process.setWorkingDirectory(os.path.dirname(os.path.abspath(__file__)))
+        process.readyReadStandardOutput.connect(self._read_prediction_process_stdout)
+        process.readyReadStandardError.connect(self._read_prediction_process_stderr)
+        process.finished.connect(self._finish_prediction_process)
+        process.errorOccurred.connect(self._handle_prediction_process_error)
+
+        self._prediction_process = process
+        self._prediction_stdout_buffer = ""
+        self._prediction_stderr = ""
+        self._prediction_result_event = None
+        self._prediction_config_path = config_path
+        self._prediction_image_path = img_path
+        self._prediction_cancel_requested = False
+        process.start()
+        if not process.waitForStarted(1000):
+            self._prediction_stderr = process.errorString()
+            self._finish_prediction_process(1, QProcess.ExitStatus.CrashExit)
+            return
+
+    def _read_prediction_process_stdout(self) -> None:
+        process = self._prediction_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not text:
+            return
+        self._prediction_stdout_buffer += text
+        lines = self._prediction_stdout_buffer.splitlines(keepends=True)
+        self._prediction_stdout_buffer = ""
+        for line in lines:
+            if line.endswith("\n") or line.endswith("\r"):
+                self._handle_prediction_event_line(line.strip())
+            else:
+                self._prediction_stdout_buffer = line
+
+    def _read_prediction_process_stderr(self) -> None:
+        process = self._prediction_process
+        if process is None:
+            return
+        self._prediction_stderr += bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+
+    def _handle_prediction_event_line(self, line: str) -> None:
+        if not line:
+            return
         try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            results_list = self.predict_model.predict(
-                source=img_path,
-                imgsz=640,
-                conf=0.25,
-                iou=0.5,
-                device=self._device,
-                verbose=False
-            )
-            results = results_list[0]
-            self._apply_prediction(results)
-        except Exception as e:
-            import traceback, datetime
-            tb = traceback.format_exc()
+            event = json.loads(line)
+        except Exception:
+            self._prediction_stderr += line + "\n"
+            return
+        if event.get("event") == "result":
+            self._prediction_result_event = event
+        elif event.get("event") == "error":
+            self._prediction_result_event = {
+                "event": "result",
+                "canceled": False,
+                "had_error": True,
+                "error_message": str(event.get("error_message") or "Prediction worker error"),
+                "prediction": None,
+            }
+        elif event.get("event") == "started":
+            self.update_status_bar("Prediction worker started...")
+
+    def _cancel_prediction_process(self) -> None:
+        process = self._prediction_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            self._prediction_cancel_requested = True
+            process.terminate()
+            QTimer.singleShot(3000, self._kill_prediction_process_if_running)
+
+    def _kill_prediction_process_if_running(self) -> None:
+        process = self._prediction_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            process.kill()
+
+    def _handle_prediction_process_error(self, _error) -> None:
+        process = self._prediction_process
+        if process is not None:
+            self._prediction_stderr += process.errorString() + "\n"
+
+    def _finish_prediction_process(self, exit_code: int, exit_status) -> None:
+        if self._prediction_stdout_buffer.strip():
+            self._handle_prediction_event_line(self._prediction_stdout_buffer.strip())
+            self._prediction_stdout_buffer = ""
+
+        config_path = self._prediction_config_path
+        if config_path:
             try:
-                with open(self._log_path, 'a', encoding='utf-8') as lf:
-                    lf.write(f"\n[{datetime.datetime.now().isoformat()}] Sync prediction error on {img_path}\n{tb}\n")
+                if os.path.exists(config_path):
+                    os.remove(config_path)
             except Exception:
                 pass
-            self._on_predict_error(str(e))
-        finally:
-            QApplication.restoreOverrideCursor()
-            # ensure reset on ALL paths
-            self._predict_busy = False
-            if hasattr(self, 'predict_btn'):
-                self.predict_btn.setEnabled(True)
 
+        event = self._prediction_result_event
+        stderr_text = self._prediction_stderr.strip()
+        cancel_requested = self._prediction_cancel_requested
+        self._prediction_process = None
+        self._prediction_config_path = None
+        self._prediction_image_path = None
+        self._prediction_result_event = None
+        self._prediction_stdout_buffer = ""
+        self._prediction_stderr = ""
+        self._prediction_cancel_requested = False
+        self._predict_busy = False
+        if hasattr(self, 'predict_btn'):
+            self.predict_btn.setEnabled(True)
 
-    def _seg_points_from_prediction(self, results, det_idx: int) -> list[tuple[float, float]]:
-        masks = getattr(results, "masks", None)
-        if masks is None:
-            return []
+        if cancel_requested and event is None:
+            self.update_status_bar("Prediction canceled.")
+            return
+        if event is None:
+            self._on_predict_error(stderr_text or f"Process exited with code {exit_code}.")
+            return
+        if bool(event.get("canceled")):
+            self.update_status_bar("Prediction canceled.")
+            return
+        if bool(event.get("had_error")) or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
+            self._on_predict_error(str(event.get("error_message") or stderr_text or "Unknown prediction error"))
+            return
+        prediction = event.get("prediction")
+        if not isinstance(prediction, dict):
+            self._on_predict_error("Prediction worker returned no prediction payload.")
+            return
+        self._apply_prediction_payload(prediction)
 
-        polys = getattr(masks, "xy", None)
-        if polys is not None and det_idx < len(polys):
-            points: list[tuple[float, float]] = []
-            for node in polys[det_idx]:
-                try:
-                    if len(node) < 2:
-                        continue
-                    points.append((float(node[0]), float(node[1])))
-                except Exception:
-                    continue
-            if len(points) >= 3:
-                return points
-
-        if _cv2 is None or _np is None:
-            return []
-
-        data = getattr(masks, "data", None)
-        if data is None or det_idx >= len(data):
-            return []
-        try:
-            mask_arr = data[det_idx].cpu().numpy()
-        except Exception:
-            return []
-        if getattr(mask_arr, "ndim", 0) == 3:
-            mask_arr = mask_arr[0]
-        mask_u8 = (_np.asarray(mask_arr) > 0.5).astype(_np.uint8) * 255
-        return self._seg_points_from_mask(mask_u8)
-
-    def _apply_prediction(self, results):
+    def _apply_prediction_payload(self, prediction: dict):
         try:
             self._cache_active_annotation()
 
-            # Re-enable predict button / clear busy state
-            self._predict_busy = False
-            if hasattr(self, 'predict_btn'):
-                self.predict_btn.setEnabled(True)
-
             active_cid = self.class_selector.currentIndex()
-            best_by_class: dict[int, int] = {}
-            xyxy_list: list[list[float]] = []
-            conf_list: list[float] = []
-            cls_list: list[int] = []
-            if results.boxes is not None and len(results.boxes) > 0:
-                xyxy_list = results.boxes.xyxy.cpu().tolist()
-                conf_list = (
-                    results.boxes.conf.cpu().tolist()
-                    if getattr(results.boxes, "conf", None) is not None
-                    else [0.0] * len(xyxy_list)
-                )
-                cls_source = (
-                    results.boxes.cls.cpu().tolist()
-                    if getattr(results.boxes, "cls", None) is not None
-                    else [active_cid] * len(xyxy_list)
-                )
-                cls_list = [int(c) for c in cls_source]
-                for det_idx, (xyxy, conf, cid) in enumerate(zip(xyxy_list, conf_list, cls_list)):
-                    if cid < 0 or cid >= len(self.classes):
-                        continue
-                    prev_idx = best_by_class.get(cid)
-                    if prev_idx is None or conf >= conf_list[prev_idx]:
-                        best_by_class[cid] = det_idx
-                if not best_by_class and xyxy_list:
-                    # fallback: use highest confidence detection for current class
-                    best_idx = max(range(len(xyxy_list)), key=lambda i: conf_list[i])
-                    best_by_class[active_cid] = best_idx
-            else:
+            raw_detections = prediction.get("detections") or []
+            if not isinstance(raw_detections, list) or not raw_detections:
                 self.update_status_bar("Prediction returned no detections.")
+                return
 
-            kp_data = None
-            if hasattr(results, "keypoints") and results.keypoints is not None:
-                kp_data = results.keypoints.data.cpu().numpy().tolist()
+            detections = [det for det in raw_detections if isinstance(det, dict)]
+            if not detections:
+                self.update_status_bar("Prediction returned no usable detections.")
+                return
+
+            best_by_class: dict[int, int] = {}
+            conf_list: list[float] = []
+            for det_idx, det in enumerate(detections):
+                try:
+                    conf = float(det.get("confidence", 0.0) or 0.0)
+                except Exception:
+                    conf = 0.0
+                conf_list.append(conf)
+                try:
+                    cid = int(det.get("class_id", active_cid))
+                except Exception:
+                    cid = active_cid
+                if cid < 0 or cid >= len(self.classes):
+                    continue
+                prev_idx = best_by_class.get(cid)
+                if prev_idx is None or conf >= conf_list[prev_idx]:
+                    best_by_class[cid] = det_idx
+
+            if not best_by_class:
+                best_idx = max(range(len(detections)), key=lambda i: conf_list[i])
+                best_by_class[active_cid] = best_idx
 
             if self._is_seg_workflow():
                 applied_count = 0
                 missing_mask_count = 0
                 for cid, det_idx in best_by_class.items():
-                    seg_points = self._seg_points_from_prediction(results, det_idx)
+                    det = detections[det_idx]
+                    seg_points: list[tuple[float, float]] = []
+                    for raw_pair in det.get("segments") or []:
+                        try:
+                            if len(raw_pair) < 2:
+                                continue
+                            seg_points.append((float(raw_pair[0]), float(raw_pair[1])))
+                        except Exception:
+                            continue
                     if len(seg_points) < 3:
                         missing_mask_count += 1
                         continue
                     self._clear_class_items(cid, drop_cache=False)
                     self.annotation_cache[cid] = {
                         "class_id": cid,
-                        "segments": [(float(x), float(y)) for x, y in seg_points],
-                        "score": float(conf_list[det_idx]) if det_idx < len(conf_list) else 0.0,
+                        "segments": seg_points,
+                        "score": conf_list[det_idx] if det_idx < len(conf_list) else 0.0,
                     }
                     self._restore_annotation_for_class(cid)
                     applied_count += 1
@@ -5107,10 +4851,18 @@ class LabelingApp(QMainWindow):
                     )
                 return
 
+            applied_count = 0
             for cid, det_idx in best_by_class.items():
-                xyxy = xyxy_list[det_idx]
-                x1, y1, x2, y2 = xyxy
+                det = detections[det_idx]
+                xyxy = det.get("xyxy") or []
+                try:
+                    x1, y1, x2, y2 = [float(v) for v in xyxy[:4]]
+                except Exception:
+                    continue
                 w, h = x2 - x1, y2 - y1
+                if w <= 0 or h <= 0:
+                    continue
+
                 bb = BoundingBox(x1, y1, w, h, cid)
                 self._clear_class_items(cid, drop_cache=True)
                 item = BoxItem(bb, self.classes[cid] if cid < len(self.classes) else str(cid))
@@ -5119,32 +4871,36 @@ class LabelingApp(QMainWindow):
 
                 kp_objs: list[Keypoint] = []
                 class_kp_names = self._kp_names_for_index(cid)
-                if kp_data and det_idx < len(kp_data):
-                    inst = kp_data[det_idx]
-                    for idx_pt, raw_kp in enumerate(inst):
-                        # Standard Ultralytics pose prediction format: (x, y, conf).
+                for idx_pt, raw_kp in enumerate(det.get("keypoints") or []):
+                    try:
                         if len(raw_kp) < 3:
                             continue
-                        x, y, kp_conf = raw_kp[0], raw_kp[1], raw_kp[2]
-                        if idx_pt >= len(self.kp_names):
-                            break
-                        canonical_name = self.kp_names[idx_pt]
-                        if canonical_name not in class_kp_names:
-                            continue
-                        kp_obj = Keypoint(x, y, cid, canonical_name)
-                        kp_item = KeypointItem(kp_obj, self.kp_pixel_radius, self.kp_font_px)
-                        # Keep prediction confidence available for future use, but
-                        # do not infer visibility flags from it.
-                        setattr(kp_item, "pred_conf", kp_conf)
-                        kp_item.update_appearance()
-                        self.scene.addItem(kp_item)
-                        self._track_scene_item(kp_item)
-                        kp_objs.append(kp_obj)
+                        x, y, kp_conf = float(raw_kp[0]), float(raw_kp[1]), float(raw_kp[2])
+                    except Exception:
+                        continue
+                    if idx_pt >= len(self.kp_names):
+                        break
+                    canonical_name = self.kp_names[idx_pt]
+                    if canonical_name not in class_kp_names:
+                        continue
+                    kp_obj = Keypoint(x, y, cid, canonical_name)
+                    kp_item = KeypointItem(kp_obj, self.kp_pixel_radius, self.kp_font_px)
+                    setattr(kp_item, "pred_conf", kp_conf)
+                    kp_item.update_appearance()
+                    self.scene.addItem(kp_item)
+                    self._track_scene_item(kp_item)
+                    kp_objs.append(kp_obj)
+
                 if cid == active_cid:
                     self.bboxes = [bb]
                     self.kps = kp_objs[:]
                     self.current_kp_idx = min(len(class_kp_names), len(self.kps))
                 self._cache_active_annotation(cid)
+                applied_count += 1
+
+            if applied_count == 0:
+                self.update_status_bar("Prediction returned no usable boxes.")
+                return
 
             self._update_item_editability()
             self._maybe_autoadvance()
@@ -5155,11 +4911,10 @@ class LabelingApp(QMainWindow):
             tb = traceback.format_exc()
             try:
                 with open(self._log_path, 'a', encoding='utf-8') as lf:
-                    lf.write(f"\n[{datetime.datetime.now().isoformat()}] Apply-prediction error on {self.images[self.current_idx] if self.images else 'N/A'}\n{tb}\n")
+                    lf.write(f"\n[{datetime.datetime.now().isoformat()}] Apply-prediction payload error on {self.images[self.current_idx] if self.images else 'N/A'}\n{tb}\n")
             except Exception:
                 pass
-            self._on_predict_error(tb)
-            return
+            self._on_predict_error(str(e) or tb)
 
     def _on_predict_error(self, error_text: str):
         # Reset busy state and re-enable button
@@ -5522,8 +5277,7 @@ class LabelingApp(QMainWindow):
             })
         path = self._template_path_for_class(self.classes[cid])
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            atomic_write_text(path, json.dumps(data, indent=2))
             QMessageBox.information(self, "Template saved", f"Template saved to {path}.")
         except Exception as e:
             QMessageBox.warning(self, "Template error", f"Failed to save template:\n{e}")
@@ -6010,8 +5764,11 @@ class LabelingApp(QMainWindow):
             QMessageBox.warning(self, "No annotations", "Nothing to save for this image.")
             return
 
-        with open(label_out_path, 'w', encoding='utf-8') as f:
-            f.write("\n".join(lines) + "\n")
+        try:
+            atomic_write_text(label_out_path, "\n".join(lines) + "\n")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Could not write label file:\n{label_out_path}\n\n{e}")
+            return
         print(f"✅ Saved label to {label_out_path}")
         self._schema_locked = True
 
@@ -6089,8 +5846,7 @@ class LabelingApp(QMainWindow):
                                     f"Expected {labels_all_dir} to exist.")
             return
 
-        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-        images = [f for f in os.listdir(images_all_dir) if f.lower().endswith(exts)]
+        images = list_image_files(images_all_dir)
         if not images:
             QMessageBox.information(self, "Nothing to export",
                                     "images_all does not contain any images.")
@@ -6123,19 +5879,14 @@ class LabelingApp(QMainWindow):
             pose_mode = dataset_choice.startswith("Pose")
 
         if seg_mode:
-            base_datasets_dir = os.path.join(project_root, "datasets", "segment")
+            dataset_mode = DATASET_SEGMENT
         else:
-            base_datasets_dir = os.path.join(project_root, "datasets", "pose" if pose_mode else "detect")
-        os.makedirs(base_datasets_dir, exist_ok=True)
+            dataset_mode = DATASET_POSE if pose_mode else DATASET_DETECT
 
-        images_train_dir = os.path.join(base_datasets_dir, "images", "train")
-        images_val_dir = os.path.join(base_datasets_dir, "images", "val")
-        labels_train_dir = os.path.join(base_datasets_dir, "labels", "train")
-        labels_val_dir = os.path.join(base_datasets_dir, "labels", "val")
+        paths = dataset_export_paths(project_root, dataset_mode)
+        os.makedirs(paths.base_dir, exist_ok=True)
 
-        dataset_dirs = [images_train_dir, images_val_dir, labels_train_dir, labels_val_dir]
-        existing = any(os.path.isdir(d) and os.listdir(d) for d in dataset_dirs)
-        if existing:
+        if dataset_dirs_have_files(paths):
             confirm = QMessageBox.question(
                 self,
                 "Overwrite dataset?",
@@ -6145,29 +5896,10 @@ class LabelingApp(QMainWindow):
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
-            for d in dataset_dirs:
-                if os.path.isdir(d):
-                    try:
-                        shutil.rmtree(d, ignore_errors=True)
-                    except Exception:
-                        pass
+            remove_dataset_split_dirs(paths)
 
         random.shuffle(images)
-        train_count = int(len(images) * ratio)
-        if train_count <= 0 and len(images) > 0:
-            train_count = 1
-        if train_count >= len(images) and len(images) > 1:
-            train_count = len(images) - 1
-        train_images = images[:train_count]
-        val_images = images[train_count:]
-
-        targets = [
-            (train_images, images_train_dir, labels_train_dir),
-            (val_images, images_val_dir, labels_val_dir),
-        ]
-        for _, img_dir, lbl_dir in targets:
-            os.makedirs(img_dir, exist_ok=True)
-            os.makedirs(lbl_dir, exist_ok=True)
+        train_images, val_images = split_train_val_images(images, ratio)
 
         total = len(train_images) + len(val_images)
         prog = QProgressDialog("Copying dataset…", "Cancel", 0, total, self)
@@ -6176,133 +5908,45 @@ class LabelingApp(QMainWindow):
         prog.setMinimumDuration(0)
         prog.setValue(0)
 
-        missing_labels: list[str] = []
-        copied = 0
-        canceled = False
+        def _progress(processed: int, img_file: str):
+            prog.setValue(processed)
+            prog.setLabelText(f"Copying {img_file}")
+            QApplication.processEvents()
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            for group, img_dir, lbl_dir in targets:
-                for img_file in group:
-                    if prog.wasCanceled():
-                        canceled = True
-                        break
-                    src_img = os.path.join(images_all_dir, img_file)
-                    dst_img = os.path.join(img_dir, img_file)
-                    try:
-                        shutil.copy2(src_img, dst_img)
-                    except Exception as e:
-                        missing_labels.append(f"{img_file}: copy image failed ({e})")
-                        continue
-
-                    base_name = os.path.splitext(img_file)[0]
-                    label_src = os.path.join(labels_all_dir, f"{base_name}.txt")
-                    label_dst = os.path.join(lbl_dir, f"{base_name}.txt")
-                    if os.path.exists(label_src):
-                        if pose_mode:
-                            try:
-                                shutil.copy2(label_src, label_dst)
-                            except Exception as e:
-                                missing_labels.append(f"{base_name}.txt: copy failed ({e})")
-                        elif seg_mode:
-                            try:
-                                shutil.copy2(label_src, label_dst)
-                            except Exception as e:
-                                missing_labels.append(f"{base_name}.txt: copy failed ({e})")
-                        else:
-                            try:
-                                det_lines: list[str] = []
-                                with open(label_src, "r", encoding="utf-8") as lf:
-                                    for raw in lf:
-                                        parts = raw.strip().split()
-                                        if not parts:
-                                            continue
-                                        if len(parts) < 5:
-                                            missing_labels.append(f"{base_name}.txt: insufficient columns for detection")
-                                            continue
-                                        det_lines.append(" ".join(parts[:5]))
-                                if det_lines:
-                                    with open(label_dst, "w", encoding="utf-8") as out:
-                                        out.write("\n".join(det_lines) + "\n")
-                                else:
-                                    missing_labels.append(f"{base_name}.txt: no usable bbox rows")
-                            except Exception as e:
-                                missing_labels.append(f"{base_name}.txt: convert failed ({e})")
-                    else:
-                        missing_labels.append(f"{base_name}.txt: missing")
-
-                    copied += 1
-                    prog.setValue(copied)
-                    prog.setLabelText(f"Copying {img_file}")
-                    QApplication.processEvents()
-                if canceled:
-                    break
+            export_result = export_dataset_files(
+                images_all_dir=images_all_dir,
+                labels_all_dir=labels_all_dir,
+                paths=paths,
+                train_images=train_images,
+                val_images=val_images,
+                mode=dataset_mode,
+                progress_callback=_progress,
+                cancel_requested=prog.wasCanceled,
+            )
         finally:
             QApplication.restoreOverrideCursor()
             prog.close()
 
-        if canceled:
+        if export_result.canceled:
             QMessageBox.information(self, "Export canceled",
                                     "Dataset export was canceled. Partially copied files may remain.")
             return
 
-        dataset_yaml_path = os.path.join(base_datasets_dir, "dataset.yaml")
-        if pose_mode:
-            try:
-                from dataset_builder import create_dataset_yaml
-            except Exception as e:
-                QMessageBox.warning(self, "dataset_builder import error",
-                                    f"Could not import dataset_builder.create_dataset_yaml:\n{e}")
-                return
-            try:
-                create_dataset_yaml(base_datasets_dir, self.classes, self.kp_names)
-            except Exception as e:
-                QMessageBox.warning(self, "dataset.yaml error",
-                                    f"Failed to create dataset.yaml:\n{e}")
-                return
-        elif seg_mode:
-            seg_yaml = {
-                "path": base_datasets_dir,
-                "train": "images/train",
-                "val": "images/val",
-                "task": "segment",
-                "nc": len(self.classes),
-                "names": self.classes,
-            }
-            try:
-                with open(dataset_yaml_path, "w", encoding="utf-8") as yf:
-                    yaml.safe_dump(seg_yaml, yf, sort_keys=False)
-            except Exception as e:
-                QMessageBox.warning(self, "dataset.yaml error",
-                                    f"Failed to write segmentation dataset.yaml:\n{e}")
-                return
-        else:
-            detect_yaml = {
-                "path": base_datasets_dir,
-                "train": "images/train",
-                "val": "images/val",
-                "nc": len(self.classes),
-                "names": self.classes,
-            }
-            try:
-                with open(dataset_yaml_path, "w", encoding="utf-8") as yf:
-                    yaml.safe_dump(detect_yaml, yf, sort_keys=False)
-            except Exception as e:
-                QMessageBox.warning(self, "dataset.yaml error",
-                                    f"Failed to write detection dataset.yaml:\n{e}")
-                return
+        try:
+            export_result.dataset_yaml_path = write_dataset_yaml_for_mode(
+                paths.base_dir,
+                dataset_mode,
+                self.classes,
+                self.kp_names,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "dataset.yaml error",
+                                f"Failed to create dataset.yaml:\n{e}")
+            return
 
-        summary = (f"Train images: {len(train_images)}\n"
-                   f"Val images: {len(val_images)}\n"
-                   f"Format: {'Segmentation (mask)' if seg_mode else ('Pose (keypoints)' if pose_mode else 'Detection (bbox)')}\n"
-                   f"dataset.yaml written to: {dataset_yaml_path}")
-        if missing_labels:
-            summary += ("\n\nWarnings:\n" +
-                        "\n".join(missing_labels[:10]))
-            if len(missing_labels) > 10:
-                summary += f"\n…{len(missing_labels) - 10} more"
-
-        QMessageBox.information(self, "Dataset exported", summary)
+        QMessageBox.information(self, "Dataset exported", format_dataset_export_summary(export_result))
         self.update_status_bar("Dataset export complete.")
 
     def normalize_labels_all(self):
@@ -6310,337 +5954,53 @@ class LabelingApp(QMainWindow):
         images_all_dir = self.image_dir_archive
         images_to_label_dir = self.image_dir_queue
 
-        label_files = [f for f in os.listdir(labels_dir) if f.lower().endswith(".txt")]
+        label_files = list_label_files(labels_dir)
         if not label_files:
             folder_name = os.path.basename(labels_dir.rstrip(os.sep)) or labels_dir
             QMessageBox.information(self, "No labels", f"{folder_name} does not contain any .txt files.")
             return
 
-        if self._is_seg_workflow():
-            exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-            prog = QProgressDialog("Validating segmentation labels…", "Cancel", 0, len(label_files), self)
-            prog.setWindowTitle("Validate Segmentation Labels")
-            prog.setWindowModality(Qt.WindowModality.ApplicationModal)
-            prog.setMinimumDuration(0)
-            prog.setValue(0)
+        seg_mode = self._is_seg_workflow()
+        dataset_mode = DATASET_SEGMENT if seg_mode else DATASET_POSE
+        progress_label = "Validating segmentation labels…" if seg_mode else "Validating labels…"
+        window_title = "Validate Segmentation Labels" if seg_mode else "Validate Labels"
 
-            normalized = 0
-            untouched = 0
-            copied_images = 0
-            warnings: list[str] = []
-
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            canceled = False
-            try:
-                for idx, fname in enumerate(sorted(label_files), start=1):
-                    if prog.wasCanceled():
-                        canceled = True
-                        break
-
-                    stem = os.path.splitext(fname)[0]
-                    label_path = os.path.join(labels_dir, fname)
-                    try:
-                        with open(label_path, "r", encoding="utf-8") as lf:
-                            lines = [ln.strip() for ln in lf if ln.strip()]
-                    except Exception as e:
-                        warnings.append(f"{fname}: read error ({e})")
-                        prog.setValue(idx)
-                        QApplication.processEvents()
-                        continue
-
-                    if not lines:
-                        warnings.append(f"{fname}: empty file")
-                        prog.setValue(idx)
-                        QApplication.processEvents()
-                        continue
-
-                    normalized_lines: list[str] = []
-                    had_error = False
-                    for line_no, raw_line in enumerate(lines, start=1):
-                        parts = raw_line.split()
-                        if len(parts) < 7:
-                            warnings.append(f"{fname}: line {line_no} has <7 values")
-                            had_error = True
-                            continue
-                        try:
-                            cid = int(round(float(parts[0])))
-                        except Exception:
-                            warnings.append(f"{fname}: line {line_no} invalid class id")
-                            had_error = True
-                            continue
-
-                        coord_tokens = parts[1:]
-                        if len(coord_tokens) % 2 != 0:
-                            coord_tokens = coord_tokens[:-1]
-                            had_error = True
-                        if len(coord_tokens) < 6:
-                            warnings.append(f"{fname}: line {line_no} has <3 polygon points")
-                            had_error = True
-                            continue
-
-                        coords: list[str] = []
-                        parse_failed = False
-                        for cidx in range(0, len(coord_tokens), 2):
-                            try:
-                                xn = float(coord_tokens[cidx])
-                                yn = float(coord_tokens[cidx + 1])
-                            except Exception:
-                                parse_failed = True
-                                break
-                            if xn < 0.0 or xn > 1.0 or yn < 0.0 or yn > 1.0:
-                                had_error = True
-                            xn = max(0.0, min(1.0, xn))
-                            yn = max(0.0, min(1.0, yn))
-                            coords.append(f"{xn:.6f}")
-                            coords.append(f"{yn:.6f}")
-                        if parse_failed or len(coords) < 6:
-                            warnings.append(f"{fname}: line {line_no} parse error")
-                            had_error = True
-                            continue
-                        normalized_lines.append(f"{cid} " + " ".join(coords))
-
-                    if not normalized_lines:
-                        prog.setValue(idx)
-                        QApplication.processEvents()
-                        continue
-
-                    reconstructed = "\n".join(normalized_lines) + "\n"
-                    new_line_count = len(normalized_lines)
-                    line_changed = had_error or (new_line_count != len(lines)) or any(
-                        nl.strip() != ol for nl, ol in zip(normalized_lines, lines[:new_line_count])
-                    ) or (len(lines) != new_line_count)
-
-                    if line_changed:
-                        try:
-                            with open(label_path, "w", encoding="utf-8") as lf:
-                                lf.write(reconstructed)
-                        except Exception as e:
-                            warnings.append(f"{fname}: write error ({e})")
-                            prog.setValue(idx)
-                            QApplication.processEvents()
-                            continue
-                        normalized += 1
-                    else:
-                        untouched += 1
-
-                    image_found = False
-                    for ext in exts:
-                        candidate = os.path.join(images_all_dir, stem + ext)
-                        if os.path.exists(candidate):
-                            image_found = True
-                            break
-                    if not image_found:
-                        for ext in exts:
-                            src = os.path.join(images_to_label_dir, stem + ext)
-                            if os.path.exists(src):
-                                dst = os.path.join(images_all_dir, os.path.basename(src))
-                                try:
-                                    os.makedirs(images_all_dir, exist_ok=True)
-                                    shutil.copy2(src, dst)
-                                    copied_images += 1
-                                    image_found = True
-                                except Exception as e:
-                                    warnings.append(f"{stem}{ext}: copy failed ({e})")
-                                break
-                    if not image_found:
-                        warnings.append(f"{fname}: no matching image found in images_all or images_to_label")
-
-                    prog.setValue(idx)
-                    prog.setLabelText(f"Normalizing {fname}")
-                    QApplication.processEvents()
-            finally:
-                QApplication.restoreOverrideCursor()
-                prog.close()
-
-            if canceled:
-                QMessageBox.information(
-                    self,
-                    "Normalization canceled",
-                    "Operation canceled. Some files may have been processed already.",
-                )
-                return
-
-            if normalized == 0 and copied_images == 0 and not warnings:
-                summary = "All segmentation label files already normalized. No changes made."
-            else:
-                parts: list[str] = []
-                if normalized:
-                    parts.append(f"Normalized {normalized} segmentation label file(s).")
-                if untouched and normalized:
-                    parts.append(f"{untouched} file(s) were already normalized.")
-                elif untouched and not normalized:
-                    parts.append(f"{untouched} file(s) already normalized.")
-                parts.append(f"Copied {copied_images} missing image(s) into images_all.")
-                summary = "\n".join(parts)
-            if warnings:
-                summary += "\n\nWarnings:\n" + "\n".join(warnings[:10])
-                if len(warnings) > 10:
-                    summary += f"\n…{len(warnings) - 10} more"
-
-            QMessageBox.information(self, "Normalization complete", summary)
-            self.update_status_bar("Segmentation label normalization complete.")
-            return
-
-        kp_count = len(self.kp_names)
-        expected_kp_values = kp_count * 3
-        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-
-        prog = QProgressDialog("Validating labels…", "Cancel", 0, len(label_files), self)
-        prog.setWindowTitle("Validate Labels")
+        prog = QProgressDialog(progress_label, "Cancel", 0, len(label_files), self)
+        prog.setWindowTitle(window_title)
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         prog.setMinimumDuration(0)
         prog.setValue(0)
 
-        normalized = 0
-        untouched = 0
-        copied_images = 0
-        warnings: list[str] = []
+        def _progress(idx: int, fname: str):
+            prog.setValue(idx)
+            prog.setLabelText(f"Normalizing {fname}")
+            QApplication.processEvents()
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        canceled = False
         try:
-            for idx, fname in enumerate(sorted(label_files), start=1):
-                if prog.wasCanceled():
-                    canceled = True
-                    break
-
-                stem = os.path.splitext(fname)[0]
-                label_path = os.path.join(labels_dir, fname)
-                try:
-                    with open(label_path, "r", encoding="utf-8") as lf:
-                        lines = [ln.strip() for ln in lf if ln.strip()]
-                except Exception as e:
-                    warnings.append(f"{fname}: read error ({e})")
-                    prog.setValue(idx)
-                    QApplication.processEvents()
-                    continue
-
-                if not lines:
-                    warnings.append(f"{fname}: empty file")
-                    prog.setValue(idx)
-                    QApplication.processEvents()
-                    continue
-
-                normalized_lines: list[str] = []
-                had_error = False
-                for line_no, raw_line in enumerate(lines, start=1):
-                    parts = raw_line.split()
-                    if len(parts) < 5:
-                        warnings.append(f"{fname}: line {line_no} has <5 values")
-                        had_error = True
-                        continue
-                    try:
-                        cid = int(round(float(parts[0])))
-                        bbox_vals = [float(parts[i]) for i in range(1, 5)]
-                    except Exception as e:
-                        warnings.append(f"{fname}: line {line_no} parse error ({e})")
-                        had_error = True
-                        continue
-
-                    kp_vals_raw = parts[5:]
-                    normalized_kp: list[tuple[float, float, int]] = []
-                    for i in range(expected_kp_values // 3):
-                        base_idx = i * 3
-                        if base_idx + 2 < len(kp_vals_raw):
-                            try:
-                                xn = float(kp_vals_raw[base_idx])
-                                yn = float(kp_vals_raw[base_idx + 1])
-                                vis = int(round(float(kp_vals_raw[base_idx + 2])))
-                            except Exception:
-                                xn = 0.0
-                                yn = 0.0
-                                vis = 0
-                        else:
-                            xn = 0.0
-                            yn = 0.0
-                            vis = 0
-                        vis = max(0, min(2, vis))
-                        normalized_kp.append((xn, yn, vis))
-
-                    line_out = f"{cid} {bbox_vals[0]:.6f} {bbox_vals[1]:.6f} {bbox_vals[2]:.6f} {bbox_vals[3]:.6f}"
-                    for xn, yn, vis in normalized_kp:
-                        line_out += f" {xn:.6f} {yn:.6f} {vis}"
-                    normalized_lines.append(line_out)
-
-                if not normalized_lines:
-                    prog.setValue(idx)
-                    QApplication.processEvents()
-                    continue
-
-                reconstructed = "\n".join(normalized_lines) + "\n"
-                new_line_count = len(normalized_lines)
-                line_changed = had_error or (new_line_count != len(lines)) or any(
-                    nl.strip() != ol for nl, ol in zip(normalized_lines, lines[:new_line_count])
-                ) or (len(lines) != new_line_count)
-
-                if line_changed:
-                    try:
-                        with open(label_path, "w", encoding="utf-8") as lf:
-                            lf.write(reconstructed)
-                    except Exception as e:
-                        warnings.append(f"{fname}: write error ({e})")
-                        prog.setValue(idx)
-                        QApplication.processEvents()
-                        continue
-                    normalized += 1
-                else:
-                    untouched += 1
-
-                image_found = False
-                for ext in exts:
-                    candidate = os.path.join(images_all_dir, stem + ext)
-                    if os.path.exists(candidate):
-                        image_found = True
-                        break
-
-                if not image_found:
-                    for ext in exts:
-                        src = os.path.join(images_to_label_dir, stem + ext)
-                        if os.path.exists(src):
-                            dst = os.path.join(images_all_dir, os.path.basename(src))
-                            try:
-                                os.makedirs(images_all_dir, exist_ok=True)
-                                shutil.copy2(src, dst)
-                                copied_images += 1
-                                image_found = True
-                            except Exception as e:
-                                warnings.append(f"{stem}{ext}: copy failed ({e})")
-                            break
-
-                if not image_found:
-                    warnings.append(f"{fname}: no matching image found in images_all or images_to_label")
-
-                prog.setValue(idx)
-                prog.setLabelText(f"Normalizing {fname}")
-                QApplication.processEvents()
+            result = normalize_label_directory(
+                labels_dir=labels_dir,
+                images_all_dir=images_all_dir,
+                images_to_label_dir=images_to_label_dir,
+                mode=dataset_mode,
+                class_count=len(self.classes),
+                keypoint_count=len(self.kp_names),
+                label_files=label_files,
+                progress_callback=_progress,
+                cancel_requested=prog.wasCanceled,
+            )
         finally:
             QApplication.restoreOverrideCursor()
             prog.close()
 
-        if canceled:
+        if result.canceled:
             QMessageBox.information(self, "Normalization canceled",
                                     "Operation canceled. Some files may have been processed already.")
             return
 
-        if normalized == 0 and copied_images == 0 and not warnings:
-            summary = "All label files already normalized. No changes made."
-        else:
-            parts: list[str] = []
-            if normalized:
-                parts.append(f"Normalized {normalized} label file(s).")
-            if untouched and normalized:
-                parts.append(f"{untouched} file(s) were already normalized.")
-            elif untouched and not normalized:
-                parts.append(f"{untouched} file(s) already normalized.")
-            parts.append(f"Copied {copied_images} missing image(s) into images_all.")
-            summary = "\n".join(parts)
-        if warnings:
-            summary += "\n\nWarnings:\n" + "\n".join(warnings[:10])
-            if len(warnings) > 10:
-                summary += f"\n…{len(warnings) - 10} more"
-
-        QMessageBox.information(self, "Normalization complete", summary)
-        self.update_status_bar("Label normalization complete.")
+        QMessageBox.information(self, "Normalization complete", format_label_normalization_summary(result))
+        status = "Segmentation label normalization complete." if seg_mode else "Label normalization complete."
+        self.update_status_bar(status)
 
     def open_train_dialog(self):
         if self._is_seg_workflow():
@@ -6660,7 +6020,6 @@ class LabelingApp(QMainWindow):
         # It’s okay if no model is loaded yet; dialog will warn before predicting
         dlg = VideoReviewDialog(
             self,
-            self.predict_model,
             self._device,
             self.kp_names,
             self.classes,
@@ -6673,13 +6032,12 @@ class VideoReviewDialog(QDialog):
     """
     Modal tool that:
       1) Loads a video
-      2) Runs YOLO predict synchronously over a chosen frame range (with a modal QProgressDialog)
+      2) Runs YOLO predict over a chosen frame range in a child process
       3) Lets you scrub a timeline and see prediction overlays and confidence
     """
     def __init__(
         self,
         parent,
-        model,
         device: str,
         kp_names: list[str],
         classes: list[str],
@@ -6692,7 +6050,6 @@ class VideoReviewDialog(QDialog):
         self.setWindowTitle(f"Video Review ({workflow_title})")
         self.resize(980, 700)
 
-        self.model = model            # may be None until user loads
         self.device = device
         self.kp_names = kp_names
         self.classes = classes
@@ -6708,7 +6065,14 @@ class VideoReviewDialog(QDialog):
         self.cur: int = 0
         self.preds: dict[int, dict] = {}
         self._last_frame_bgr = None  # holds the current raw frame for export
-        self._seg_task_warned = False
+        self._review_process: Optional[QProcess] = None
+        self._review_progress: Optional[QProgressDialog] = None
+        self._review_stdout_buffer = ""
+        self._review_stderr = ""
+        self._review_result_event: Optional[dict] = None
+        self._review_config_path: Optional[str] = None
+        self._review_cancel_requested = False
+        self._review_run_meta: Optional[dict] = None
 
         # build all widgets/layouts
         self._build_ui()
@@ -6779,7 +6143,7 @@ class VideoReviewDialog(QDialog):
             self.btn_predict.setToolTip("Run segmentation predictions over the selected frame range.")
         else:
             self.btn_predict.setToolTip("Run pose predictions over the selected frame range.")
-        self.btn_predict.clicked.connect(self._predict_sync)
+        self.btn_predict.clicked.connect(self._start_range_prediction)
         controls_row_1.addWidget(self.btn_predict)
         top.addLayout(controls_row_1)
 
@@ -6838,28 +6202,24 @@ class VideoReviewDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
 
-        # NEW: bottom-right export button
         self.btn_send = QPushButton("Send Frame")
         self.btn_send.setToolTip("Save current frame to the labeler's images_to_label folder")
         self.btn_send.setEnabled(False)
         self.btn_send.clicked.connect(self._export_current_frame_to_images)
         buttons.addButton(self.btn_send, QDialogButtonBox.ButtonRole.ActionRole)
 
-        # NEW: export N lowest-confidence frames
         self.btn_send_low = QPushButton("Send Low…")
         self.btn_send_low.setToolTip("Export N lowest-confidence predicted frames to the labeler")
         self.btn_send_low.setEnabled(False)
         self.btn_send_low.clicked.connect(self._export_low_confidence_frames)
         buttons.addButton(self.btn_send_low, QDialogButtonBox.ButtonRole.ActionRole)
 
-        # NEW: export N highest-confidence frames
         self.btn_send_high = QPushButton("Send High…")
         self.btn_send_high.setToolTip("Export N highest-confidence predicted frames to the labeler")
         self.btn_send_high.setEnabled(False)
         self.btn_send_high.clicked.connect(self._export_high_confidence_frames)
         buttons.addButton(self.btn_send_high, QDialogButtonBox.ButtonRole.ActionRole)
 
-        # NEW: export N random frames (no predictions required)
         self.btn_send_random = QPushButton("Send Random…")
         self.btn_send_random.setToolTip("Export N random frames to the labeler for fresh labeling")
         self.btn_send_random.setEnabled(False)
@@ -7003,8 +6363,7 @@ class VideoReviewDialog(QDialog):
             "preds": {str(k): v for k, v in self.preds.items()},
         }
         try:
-            with open(fp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
+            atomic_write_text(fp, json.dumps(data))
         except Exception:
             pass
 
@@ -7070,24 +6429,17 @@ class VideoReviewDialog(QDialog):
         if hasattr(self, "view") and hasattr(self.view, "reset_view"):
             self.view.reset_view()
 
-    # ---------- prediction (sync, modal progress) ----------
-    def _predict_sync(self):
+    # ---------- prediction ----------
+    def _start_range_prediction(self):
         if self.cap is None or not self.path:
             QMessageBox.information(self, "No video", "Load a video first.")
             return
-        if self.model is None:
+        if not self.model_path:
             QMessageBox.information(self, "No model", "Click 'Load Model' in the main window first.")
             return
-        if self._is_seg_workflow() and not self._seg_task_warned:
-            model_task = str(getattr(self.model, "task", "") or "").strip().lower()
-            if model_task and model_task != "segment":
-                QMessageBox.information(
-                    self,
-                    "Model Task Warning",
-                    f"Loaded model task is '{model_task}'. Segmentation review works best with a segment model.\n"
-                    "Continuing; masks may be unavailable for this model.",
-                )
-                self._seg_task_warned = True
+        if self._review_process is not None and self._review_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Prediction running", "Video prediction is already running.")
+            return
 
         start = int(self.spin_start.value())
         end = int(self.spin_end.value())
@@ -7098,98 +6450,228 @@ class VideoReviewDialog(QDialog):
         effective_batch = effective_prediction_batch(requested_batch, self.device)
         imgsz = 640
         kpvis = float(self.spin_kpvis.value()) if (hasattr(self, "spin_kpvis") and not self._is_seg_workflow()) else None
-        batch_kwargs = {} if requested_batch <= 0 else {"batch": requested_batch}
 
         if end < start:
             QMessageBox.warning(self, "Range Error", "End must be ≥ Start.")
             return
 
-        # modal progress dialog
         steps = max(1, ((end - start) // stride) + 1)
         prog = QProgressDialog("Running prediction…", "Cancel", 0, steps, self)
         prog.setWindowTitle("Predicting")
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         prog.setMinimumDuration(0)
         prog.setValue(0)
+        prog.canceled.connect(self._cancel_review_prediction_process)
 
-        # Set initial position once
-        self.cap.set(_cv2.CAP_PROP_POS_FRAMES, start)
-        idx = start
-        done = 0
-        self.preds.clear()
+        meta = {
+            "video": self._video_signature(),
+            "model_path": self.model_path,
+            "workflow": self.workflow,
+            "imgsz": imgsz,
+            "conf": conf,
+            "iou": iou,
+            "kpvis": kpvis,
+            "start": start,
+            "end": end,
+            "stride": stride,
+            "total": self.total,
+            "fps": self.fps,
+            "classes": self.classes,
+            "kp_names": self.kp_names,
+        }
+        config = {
+            "model_path": self.model_path,
+            "video_path": self.path,
+            "workflow": self.workflow,
+            "device": self.device,
+            "start": start,
+            "end": end,
+            "stride": stride,
+            "imgsz": imgsz,
+            "conf": conf,
+            "iou": iou,
+            "batch": requested_batch,
+            "effective_batch": effective_batch,
+        }
 
-        frames: list = []
-        frame_indices: list[int] = []
-
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        parent = self.parent()
+        parent_log_path = getattr(parent, "_log_path", "") if parent is not None else ""
+        config_dir = os.path.dirname(parent_log_path) if parent_log_path else os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
         try:
-            while idx <= end:
-                if prog.wasCanceled():
-                    break
-                ok, frame = self.cap.read()
-                if not ok or frame is None:
-                    break
-
-                frames.append(frame)
-                frame_indices.append(idx)
-
-                # If we filled a batch or reached the end, run prediction on the batch
-                if len(frames) >= effective_batch or (idx + stride) > end:
-                    try:
-                        results_list = self.model.predict(
-                            source=frames,
-                            imgsz=imgsz,
-                            conf=conf,
-                            iou=iou,
-                            device=self.device,
-                            verbose=False,
-                            **batch_kwargs,
-                        )
-                        results_list = list(results_list)
-                        for fi, res in zip(frame_indices, results_list):
-                            pred = self._extract_prediction(res)
-                            self.preds[fi] = pred
-                    except Exception as e:
-                        # if batch fails, mark each frame in the batch as failed
-                        for fi in frame_indices:
-                            self.preds[fi] = {"ok": False, "error": str(e)}
-
-                    done += len(frames)
-                    prog.setValue(min(done, steps))
-                    prog.setLabelText(f"Predicting frames {frame_indices[0]}–{frame_indices[-1]}")
-                    QApplication.processEvents()
-
-                    # reset batch accumulators
-                    frames = []
-                    frame_indices = []
-
-                idx += stride
-                if idx <= end:
-                    self.cap.set(_cv2.CAP_PROP_POS_FRAMES, idx)
-        finally:
-            QApplication.restoreOverrideCursor()
+            os.makedirs(config_dir, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            config_path = os.path.join(config_dir, f".video_review_predict_{stamp}.json")
+            atomic_write_text(config_path, json.dumps(config, indent=2))
+        except Exception as e:
             prog.close()
+            QMessageBox.warning(self, "Prediction Error", f"Could not write video prediction config:\n{e}")
+            return
 
-        # persist cache and enable review
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", "video_review_worker", "--config", config_path])
+        process.setWorkingDirectory(os.path.dirname(os.path.abspath(__file__)))
+        process.readyReadStandardOutput.connect(self._read_review_prediction_stdout)
+        process.readyReadStandardError.connect(self._read_review_prediction_stderr)
+        process.finished.connect(self._finish_review_prediction_process)
+        process.errorOccurred.connect(self._handle_review_prediction_error)
+
+        self._review_process = process
+        self._review_progress = prog
+        self._review_stdout_buffer = ""
+        self._review_stderr = ""
+        self._review_result_event = None
+        self._review_config_path = config_path
+        self._review_cancel_requested = False
+        self._review_run_meta = meta
+        self.preds.clear()
+        self.btn_predict.setEnabled(False)
+        if hasattr(self, "btn_send_low"):
+            self.btn_send_low.setEnabled(False)
+        if hasattr(self, "btn_send_high"):
+            self.btn_send_high.setEnabled(False)
+
+        prog.show()
+        process.start()
+        if not process.waitForStarted(1000):
+            self._review_stderr = process.errorString()
+            self._finish_review_prediction_process(1, QProcess.ExitStatus.CrashExit)
+            return
+
+    def _read_review_prediction_stdout(self):
+        process = self._review_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not text:
+            return
+        self._review_stdout_buffer += text
+        lines = self._review_stdout_buffer.splitlines(keepends=True)
+        self._review_stdout_buffer = ""
+        for line in lines:
+            if line.endswith("\n") or line.endswith("\r"):
+                self._handle_review_prediction_event_line(line.strip())
+            else:
+                self._review_stdout_buffer = line
+
+    def _read_review_prediction_stderr(self):
+        process = self._review_process
+        if process is None:
+            return
+        self._review_stderr += bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+
+    def _handle_review_prediction_event_line(self, line: str):
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except Exception:
+            self._review_stderr += line + "\n"
+            return
+
+        event_type = event.get("event")
+        if event_type == "started":
+            progress = self._review_progress
+            if progress is not None:
+                progress.setLabelText("Loading model in video prediction process…")
+        elif event_type == "progress":
+            progress = self._review_progress
+            if progress is not None:
+                processed = int(event.get("processed") or 0)
+                total = int(event.get("total") or progress.maximum())
+                progress.setMaximum(max(1, total))
+                progress.setValue(min(processed, max(1, total)))
+                progress.setLabelText(str(event.get("message") or f"Predicting {processed}/{total}"))
+            QApplication.processEvents()
+        elif event_type == "result":
+            self._review_result_event = event
+        elif event_type == "error":
+            self._review_result_event = {
+                "event": "result",
+                "canceled": False,
+                "had_error": True,
+                "error_message": str(event.get("error_message") or "Video prediction worker error"),
+                "preds": {},
+            }
+
+    def _cancel_review_prediction_process(self):
+        process = self._review_process
+        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._review_cancel_requested = True
+        progress = self._review_progress
+        if progress is not None:
+            progress.setLabelText("Canceling prediction process…")
+        process.terminate()
+        QTimer.singleShot(5000, self._kill_review_prediction_if_running)
+
+    def _kill_review_prediction_if_running(self):
+        process = self._review_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            process.kill()
+
+    def _handle_review_prediction_error(self, _error):
+        process = self._review_process
+        if process is not None:
+            self._review_stderr += process.errorString() + "\n"
+
+    def _finish_review_prediction_process(self, exit_code: int, exit_status):
+        if self._review_stdout_buffer.strip():
+            self._handle_review_prediction_event_line(self._review_stdout_buffer.strip())
+            self._review_stdout_buffer = ""
+
+        progress = self._review_progress
+        if progress is not None:
+            progress.close()
+
+        config_path = self._review_config_path
+        if config_path:
+            try:
+                if os.path.exists(config_path):
+                    os.remove(config_path)
+            except Exception:
+                pass
+
+        event = self._review_result_event
+        stderr_text = self._review_stderr.strip()
+        cancel_requested = self._review_cancel_requested
+        run_meta = self._review_run_meta or {}
+
+        self._review_process = None
+        self._review_progress = None
+        self._review_config_path = None
+        self._review_result_event = None
+        self._review_stdout_buffer = ""
+        self._review_stderr = ""
+        self._review_cancel_requested = False
+        self._review_run_meta = None
+        self.btn_predict.setEnabled(self.cap is not None)
+
+        if cancel_requested and event is None:
+            QMessageBox.information(self, "Prediction canceled", "Video prediction was canceled.")
+            return
+
+        if event is None:
+            detail = stderr_text or f"Process exited with code {exit_code}."
+            QMessageBox.critical(self, "Prediction Error", f"Video prediction failed:\n{detail}")
+            return
+
+        raw_preds = event.get("preds") or {}
+        self.preds = {}
+        if isinstance(raw_preds, dict):
+            for key, value in raw_preds.items():
+                try:
+                    self.preds[int(key)] = value if isinstance(value, dict) else {"ok": False}
+                except Exception:
+                    continue
+
+        had_error = bool(event.get("had_error")) or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0
+        canceled = bool(event.get("canceled")) or cancel_requested
+        error_message = str(event.get("error_message") or stderr_text or "Unknown video prediction error")
+
         if self.preds:
             try:
-                meta = {
-                    "video": self._video_signature(),
-                    "model_path": self.model_path,
-                    "workflow": self.workflow,
-                    "imgsz": imgsz,
-                    "conf": conf,
-                    "iou": iou,
-                    "kpvis": kpvis,
-                    "start": start,
-                    "end": end,
-                    "stride": stride,
-                    "total": self.total,
-                    "fps": self.fps,
-                    "classes": self.classes,
-                    "kp_names": self.kp_names,
-                }
-                self._save_cache(meta)
+                self._save_cache(run_meta)
             except Exception:
                 pass
             self.slider.setEnabled(True)
@@ -7197,90 +6679,29 @@ class VideoReviewDialog(QDialog):
                 self.btn_send_low.setEnabled(True)
             if hasattr(self, "btn_send_high"):
                 self.btn_send_high.setEnabled(True)
-            self._seek(start, show_only=False)
+            first_idx = min(self.preds.keys())
+            self._seek(first_idx, show_only=False)
 
-    def _extract_prediction(self, results) -> dict:
-        if self._is_seg_workflow():
-            return self._extract_top_seg(results)
-        return self._extract_top_pose(results)
+        if had_error:
+            if self.preds:
+                QMessageBox.warning(
+                    self,
+                    "Prediction Error",
+                    f"Video prediction stopped with an error, but partial predictions were kept:\n{error_message}",
+                )
+            else:
+                QMessageBox.critical(self, "Prediction Error", f"Video prediction failed:\n{error_message}")
+            return
 
-    @staticmethod
-    def _extract_top_pose(results) -> dict:
-        """Pick highest-conf detection and include keypoint confidence."""
-        out = {"ok": False, "conf": 0.0, "cls": 0, "xyxy": None, "kps": [], "segments": []}
-        try:
-            if results.boxes is None or len(results.boxes) == 0:
-                return out
-            import numpy as _np
+        if canceled:
+            if self.preds:
+                QMessageBox.information(self, "Prediction canceled", "Video prediction was canceled; partial predictions were kept.")
+            else:
+                QMessageBox.information(self, "Prediction canceled", "Video prediction was canceled before results were generated.")
+            return
 
-            confs = (
-                results.boxes.conf.cpu().numpy()
-                if results.boxes.conf is not None
-                else _np.zeros((len(results.boxes),), dtype=_np.float32)
-            )
-            i = int(confs.argmax())
-            out["conf"] = float(confs[i])
-            out["cls"] = int(results.boxes.cls.cpu().numpy()[i]) if results.boxes.cls is not None else 0
-            out["xyxy"] = [float(v) for v in results.boxes.xyxy.cpu().numpy()[i].tolist()]
-            if hasattr(results, "keypoints") and results.keypoints is not None:
-                kps = results.keypoints.data.cpu().numpy()  # (N, K, 3)
-                if kps.shape[0] > i:
-                    out["kps"] = [[float(x), float(y), float(v)] for (x, y, v) in kps[i]]
-            out["ok"] = True
-        except Exception:
-            pass
-        return out
-
-    @staticmethod
-    def _extract_top_seg(results) -> dict:
-        """Pick highest-conf detection and include its segmentation contour when available."""
-        out = {"ok": False, "conf": 0.0, "cls": 0, "xyxy": None, "kps": [], "segments": []}
-        try:
-            if results.boxes is None or len(results.boxes) == 0:
-                return out
-            import numpy as _np
-
-            confs = (
-                results.boxes.conf.cpu().numpy()
-                if results.boxes.conf is not None
-                else _np.zeros((len(results.boxes),), dtype=_np.float32)
-            )
-            i = int(confs.argmax())
-            out["conf"] = float(confs[i])
-            out["cls"] = int(results.boxes.cls.cpu().numpy()[i]) if results.boxes.cls is not None else 0
-            out["xyxy"] = [float(v) for v in results.boxes.xyxy.cpu().numpy()[i].tolist()]
-
-            masks = getattr(results, "masks", None)
-            if masks is not None:
-                polys = getattr(masks, "xy", None)
-                if polys is not None and len(polys) > i:
-                    poly = polys[i]
-                    points: list[list[float]] = []
-                    for node in poly:
-                        if len(node) < 2:
-                            continue
-                        points.append([float(node[0]), float(node[1])])
-                    if len(points) >= 3:
-                        out["segments"] = points
-
-                if not out["segments"] and _cv2 is not None:
-                    data = getattr(masks, "data", None)
-                    if data is not None and len(data) > i:
-                        mask_arr = data[i].cpu().numpy()
-                        if getattr(mask_arr, "ndim", 0) == 3:
-                            mask_arr = mask_arr[0]
-                        mask_u8 = (_np.asarray(mask_arr) > 0.5).astype(_np.uint8) * 255
-                        contours_info = _cv2.findContours(mask_u8, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_NONE)
-                        contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
-                        if contours:
-                            contour = max(contours, key=_cv2.contourArea)
-                            points = [[float(pt[0][0]), float(pt[0][1])] for pt in contour if len(pt[0]) >= 2]
-                            if len(points) >= 3:
-                                out["segments"] = points
-            out["ok"] = True
-        except Exception:
-            pass
-        return out
+        if not self.preds:
+            QMessageBox.information(self, "No predictions", "Video prediction completed without generating predictions.")
 
     # ---------- timeline / overlay ----------
     def _step(self, delta: int):
@@ -7785,6 +7206,10 @@ class VideoReviewDialog(QDialog):
         return QPixmap.fromImage(qimg)
 
     def reject(self):
+        if self._review_process is not None and self._review_process.state() != QProcess.ProcessState.NotRunning:
+            self._cancel_review_prediction_process()
+            QMessageBox.information(self, "Prediction running", "Canceling video prediction. Close the reviewer after it stops.")
+            return
         # cleanup
         try:
             if self.cap is not None:
@@ -7794,7 +7219,9 @@ class VideoReviewDialog(QDialog):
         super().reject()
 
 class TrainDialog(QDialog):
-    """Dialog scaffold for future YOLO training integration."""
+    """Dialog for launching YOLO training in a child process."""
+
+    ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
     MODEL_OPTIONS = {
         "YOLOv26n (nano)": "yolo26n.yaml",
@@ -7807,7 +7234,8 @@ class TrainDialog(QDialog):
     def __init__(self, parent, default_dataset: str, default_task: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("Train Model")
-        self.resize(520, 360)
+        self.resize(1100, 720)
+        self.setMinimumSize(760, 520)
 
         self.default_dataset = default_dataset
         self.default_task = (default_task or "").strip().lower() or None
@@ -7836,9 +7264,40 @@ class TrainDialog(QDialog):
         self.resume_manual_path: Optional[str] = None
         self.device = _auto_device()
         self.training_running = False
+        self.train_process: Optional[QProcess] = None
+        self.train_stdout_buffer = ""
+        self.train_stderr_buffer = ""
+        self.train_result_event: Optional[dict] = None
+        self.train_config_path: Optional[str] = None
+        self.train_cancel_requested = False
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        settings_panel = QFrame()
+        settings_panel.setObjectName("TrainSettingsPanel")
+        settings_layout = QVBoxLayout(settings_panel)
+        settings_layout.setContentsMargins(12, 12, 12, 10)
+        settings_layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        title = QLabel("Training Setup")
+        title.setObjectName("TrainPanelTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.train_status_label = QLabel("Idle")
+        self.train_status_label.setObjectName("TrainStatusLabel")
+        header.addWidget(self.train_status_label)
+        settings_layout.addLayout(header)
+
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(7)
 
         # Dataset selector
         ds_row = QHBoxLayout()
@@ -7954,12 +7413,32 @@ class TrainDialog(QDialog):
         self.batch_hint.setStyleSheet("color: #bbbbbb; font-size: 9pt;")
         form.addRow("", self.batch_hint)
 
-        layout.addLayout(form)
+        settings_layout.addLayout(form)
+        layout.addWidget(settings_panel, 0)
 
-        self.log_view = QTextEdit()
+        output_panel = QFrame()
+        output_panel.setObjectName("TrainOutputPanel")
+        output_layout = QVBoxLayout(output_panel)
+        output_layout.setContentsMargins(10, 10, 10, 10)
+        output_layout.setSpacing(8)
+        output_header = QHBoxLayout()
+        output_title = QLabel("Training Output")
+        output_title.setObjectName("TrainPanelTitle")
+        output_header.addWidget(output_title)
+        output_header.addStretch(1)
+        output_layout.addLayout(output_header)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("TrainLogView")
         self.log_view.setReadOnly(True)
-        self.log_view.setPlaceholderText("Training output will appear here once the integration is complete.")
-        layout.addWidget(self.log_view, 1)
+        self.log_view.setPlaceholderText("Training output will appear here.")
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.log_view.setMaximumBlockCount(12000)
+        terminal_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        terminal_font.setPointSize(11)
+        self.log_view.setFont(terminal_font)
+        output_layout.addWidget(self.log_view, 1)
+        layout.addWidget(output_panel, 1)
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         button_box.rejected.connect(self.reject)
@@ -7968,7 +7447,47 @@ class TrainDialog(QDialog):
         self.run_btn.clicked.connect(self._start_training)
         button_box.addButton(self.run_btn, QDialogButtonBox.ButtonRole.ActionRole)
 
+        self.cancel_train_btn = QPushButton("Cancel Training")
+        self.cancel_train_btn.clicked.connect(self._cancel_training_process)
+        self.cancel_train_btn.setEnabled(False)
+        button_box.addButton(self.cancel_train_btn, QDialogButtonBox.ButtonRole.ActionRole)
+
         layout.addWidget(button_box)
+
+        self.setStyleSheet(
+            self.styleSheet()
+            + """
+            QFrame#TrainSettingsPanel, QFrame#TrainOutputPanel {
+                background-color: #24272a;
+                border: 1px solid #3e4449;
+                border-radius: 8px;
+            }
+            QLabel#TrainPanelTitle {
+                background: transparent;
+                border: none;
+                color: #f0f3f5;
+                font-size: 12pt;
+                font-weight: 700;
+                padding: 0;
+            }
+            QLabel#TrainStatusLabel {
+                background-color: #343a40;
+                border: 1px solid #515a61;
+                border-radius: 10px;
+                color: #dce3e8;
+                font-size: 9pt;
+                padding: 3px 10px;
+            }
+            QPlainTextEdit#TrainLogView {
+                background-color: #0e1113;
+                color: #d8dee4;
+                border: 1px solid #2f363d;
+                border-radius: 6px;
+                padding: 8px;
+                selection-background-color: #315f8f;
+            }
+            """
+        )
 
         self._update_source_controls()
         self._configure_batch_controls()
@@ -8158,10 +7677,52 @@ class TrainDialog(QDialog):
             self.batch_spin.setEnabled(True)
             self.batch_hint.setText("CPU detected → adjust batch size as needed (lower values use less memory).")
 
+    def _set_training_status(self, text: str, tone: str = "idle"):
+        self.train_status_label.setText(text)
+        colors = {
+            "idle": ("#343a40", "#515a61", "#dce3e8"),
+            "running": ("#214f63", "#3f879c", "#dff8ff"),
+            "complete": ("#214f3a", "#3d8b61", "#e4fff1"),
+            "failed": ("#5a2528", "#94434a", "#ffe4e8"),
+            "canceled": ("#5a4a25", "#93763c", "#fff5d8"),
+        }
+        bg, border, fg = colors.get(tone, colors["idle"])
+        self.train_status_label.setStyleSheet(
+            f"background-color: {bg}; border: 1px solid {border}; border-radius: 10px; "
+            f"color: {fg}; font-size: 9pt; padding: 3px 10px;"
+        )
+
+    def _clean_training_output(self, text: str) -> str:
+        cleaned = self.ANSI_ESCAPE_RE.sub("", text)
+        cleaned = cleaned.replace("\x08", "")
+        return cleaned.replace("\r", "\n").replace("\x1b", "")
+
+    def _write_training_terminal_output(self, text: str):
+        cleaned = self._clean_training_output(text)
+        if cleaned:
+            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+            self.log_view.insertPlainText(cleaned)
+            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+            self.log_view.ensureCursorVisible()
+        QApplication.processEvents()
+
+    def _flush_training_terminal_output(self):
+        self.log_view.ensureCursorVisible()
+
     def _log(self, message: str):
-        self.log_view.append(message)
+        cleaned = self._clean_training_output(str(message))
+        if not cleaned:
+            return
+        self.log_view.appendPlainText(cleaned.rstrip())
         self.log_view.ensureCursorVisible()
         QApplication.processEvents()
+
+    def closeEvent(self, event):
+        if self.training_running:
+            QMessageBox.information(self, "Training running", "Cancel training before closing this dialog.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _resolve_model_config(self, base_cfg: str, task_value: Optional[str]) -> tuple[str, Optional[str]]:
         cfg = base_cfg
@@ -8311,17 +7872,12 @@ class TrainDialog(QDialog):
             else (resume_path if (use_checkpoint_continue or use_exact_resume) else base_model_cfg)
         )
         cfg_notice = None
+        self.log_view.clear()
+        self._set_training_status("Preparing", "running")
         if not (use_dino or use_checkpoint_continue or use_exact_resume):
             model_cfg, cfg_notice = self._resolve_model_config(base_model_cfg, task_value)
             if cfg_notice:
                 self._log(cfg_notice)
-
-        try:
-            from ultralytics import YOLO
-        except Exception as e:
-            QMessageBox.warning(self, "ultralytics missing",
-                                f"Could not import ultralytics.YOLO:\n{e}\n\nInstall with:\n  pip install ultralytics")
-            return
 
         if use_dino:
             self._log(f"Starting training from DINO export: {model_cfg}")
@@ -8346,7 +7902,7 @@ class TrainDialog(QDialog):
             self._log(f"- batch size: {batch_display}")
         if task_value:
             self._log(f"- task: {task_value}")
-        self._log("Running ultralyticsYOLO.train() — progress will stream to the active terminal.")
+        self._log("Running training in a child process.")
         self._log("")
 
         if use_exact_resume:
@@ -8384,38 +7940,199 @@ class TrainDialog(QDialog):
             if task_value:
                 params["task"] = task_value
 
-        QApplication.processEvents()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.run_btn.setEnabled(False)
-        self.training_running = True
+        self._start_training_process(model_cfg=model_cfg, params=params)
 
-        try:
-            model = YOLO(model_cfg)
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            self.run_btn.setEnabled(True)
-            self.training_running = False
-            self._log(f"Failed to load model config '{model_cfg}': {e}")
-            QMessageBox.critical(self, "Model load error",
-                                 f"Could not create YOLO model from {model_cfg}.\n\nDetails:\n{e}")
+    def _start_training_process(self, *, model_cfg: str, params: dict):
+        if self.train_process is not None and self.train_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Training running", "A training session is already in progress.")
             return
 
+        config = {
+            "model_cfg": model_cfg,
+            "params": params,
+        }
+        run_root = os.path.join(self.project_runs_dir, "train")
         try:
-            results = model.train(**params)
-            save_dir = getattr(results, "save_dir", None)
-            if save_dir:
-                self._log(f"Training complete. Artifacts saved to: {save_dir}")
-            else:
-                self._log("Training complete.")
-            QMessageBox.information(self, "Training complete",
-                                    "YOLO training finished. Review the terminal/logs for metrics.")
+            os.makedirs(run_root, exist_ok=True)
         except Exception as e:
-            self._log(f"Training failed: {e}")
-            QMessageBox.critical(self, "Training error", f"Training failed:\n{e}")
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.run_btn.setEnabled(True)
-            self.training_running = False
+            QMessageBox.warning(self, "Training setup error", f"Could not create training run directory:\n{e}")
+            return
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        config_path = os.path.join(run_root, f".train_config_{timestamp}.json")
+        try:
+            atomic_write_text(config_path, json.dumps(config, indent=2))
+        except Exception as e:
+            QMessageBox.warning(self, "Training setup error", f"Could not write training config:\n{config_path}\n\n{e}")
+            return
+
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", "train_worker", "--config", config_path])
+        process.setWorkingDirectory(self.app_base_dir)
+        process.readyReadStandardOutput.connect(self._read_training_process_stdout)
+        process.readyReadStandardError.connect(self._read_training_process_stderr)
+        process.finished.connect(self._finish_training_process)
+        process.errorOccurred.connect(self._handle_training_process_error)
+
+        self.train_process = process
+        self.train_stdout_buffer = ""
+        self.train_stderr_buffer = ""
+        self.train_result_event = None
+        self.train_config_path = config_path
+        self.train_cancel_requested = False
+        self.training_running = True
+        self.run_btn.setEnabled(False)
+        self.cancel_train_btn.setEnabled(True)
+        self._set_training_status("Launching", "running")
+
+        self._log("Launching training worker process...")
+        process.start()
+        if not process.waitForStarted(1000):
+            self.train_stderr_buffer = process.errorString()
+            self._finish_training_process(1, QProcess.ExitStatus.CrashExit)
+            return
+
+    def _read_training_process_stdout(self):
+        process = self.train_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not text:
+            return
+        self.train_stdout_buffer += text
+        lines = self.train_stdout_buffer.splitlines(keepends=True)
+        self.train_stdout_buffer = ""
+        for line in lines:
+            if line.endswith("\n") or line.endswith("\r"):
+                self._handle_training_event_line(line.strip())
+            else:
+                self.train_stdout_buffer = line
+
+    def _read_training_process_stderr(self):
+        process = self.train_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+        if not text:
+            return
+        self.train_stderr_buffer += text
+        self._write_training_terminal_output(text)
+
+    def _handle_training_event_line(self, line: str):
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except Exception:
+            self._log(line)
+            return
+        event_type = event.get("event")
+        if event_type == "started":
+            self._log(f"Training worker loaded config: {event.get('model_cfg', '')}")
+            self._set_training_status("Loading", "running")
+        elif event_type == "training":
+            self._log(str(event.get("message") or "Training started"))
+            self._set_training_status("Running", "running")
+        elif event_type == "result":
+            self.train_result_event = event
+        elif event_type == "error":
+            self.train_result_event = {
+                "event": "result",
+                "canceled": False,
+                "had_error": True,
+                "error_message": str(event.get("error_message") or "Training worker error"),
+                "save_dir": "",
+            }
+
+    def _cancel_training_process(self):
+        process = self.train_process
+        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self.train_cancel_requested = True
+        self._set_training_status("Canceling", "canceled")
+        self._log("Cancel requested. Stopping training worker process...")
+        process.terminate()
+        QTimer.singleShot(5000, self._kill_training_process_if_running)
+
+    def _kill_training_process_if_running(self):
+        process = self.train_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            self._log("Training worker did not stop after terminate; killing process.")
+            process.kill()
+
+    def _handle_training_process_error(self, _error):
+        process = self.train_process
+        if process is not None:
+            self.train_stderr_buffer += process.errorString() + "\n"
+
+    def _finish_training_process(self, exit_code: int, exit_status):
+        self._flush_training_terminal_output()
+        if self.train_stdout_buffer.strip():
+            self._handle_training_event_line(self.train_stdout_buffer.strip())
+            self.train_stdout_buffer = ""
+
+        config_path = self.train_config_path
+        if config_path:
+            try:
+                if os.path.exists(config_path):
+                    os.remove(config_path)
+            except Exception:
+                pass
+
+        event = self.train_result_event
+        stderr_text = self.train_stderr_buffer.strip()
+        cancel_requested = self.train_cancel_requested
+
+        self.training_running = False
+        self.run_btn.setEnabled(True)
+        self.cancel_train_btn.setEnabled(False)
+        self.train_process = None
+        self.train_config_path = None
+        self.train_result_event = None
+        self.train_stdout_buffer = ""
+        self.train_stderr_buffer = ""
+        self.train_cancel_requested = False
+
+        if cancel_requested and event is None:
+            self._set_training_status("Canceled", "canceled")
+            self._log("Training canceled.")
+            QMessageBox.information(self, "Training canceled", "Training worker process was canceled.")
+            return
+
+        if event is None:
+            detail = stderr_text or f"Process exited with code {exit_code}."
+            self._set_training_status("Failed", "failed")
+            self._log(f"Training worker failed: {detail}")
+            QMessageBox.critical(self, "Training error", f"Training worker failed:\n{detail}")
+            return
+
+        had_error = bool(event.get("had_error"))
+        canceled = bool(event.get("canceled")) or cancel_requested
+        save_dir = str(event.get("save_dir") or "")
+        error_message = str(event.get("error_message") or stderr_text or "Unknown training error")
+
+        if canceled and not had_error:
+            self._set_training_status("Canceled", "canceled")
+            self._log("Training canceled.")
+            QMessageBox.information(self, "Training canceled", "Training was canceled.")
+            return
+
+        if had_error or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
+            self._set_training_status("Failed", "failed")
+            self._log(f"Training failed: {error_message}")
+            QMessageBox.critical(self, "Training error", f"Training failed:\n{error_message}")
+            return
+
+        self._set_training_status("Complete", "complete")
+        if save_dir:
+            self._log(f"Training complete. Artifacts saved to: {save_dir}")
+        else:
+            self._log("Training complete.")
+        QMessageBox.information(
+            self,
+            "Training complete",
+            "YOLO training finished. Review the logs for metrics.",
+        )
 
 # =========================
 # Entrypoint

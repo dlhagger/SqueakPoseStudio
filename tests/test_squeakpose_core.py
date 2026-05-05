@@ -4,9 +4,12 @@ from tempfile import TemporaryDirectory
 
 from squeakpose_core import (
     InferenceCsvWriter,
+    atomic_write_text,
     build_segmentation_inference_rows,
     effective_prediction_batch,
     find_duplicate_names,
+    normalize_pose_label_lines,
+    normalize_segmentation_label_lines,
     parse_yolo_pose_label_line,
     resolve_default_training_dataset_path,
 )
@@ -79,7 +82,71 @@ class CoreHelpersTests(unittest.TestCase):
         self.assertEqual(stream.rows_written, 2)
         self.assertEqual(len(fake.rows), 2)
 
-    def test_build_segmentation_inference_rows_formats_pickle_schema(self):
+    def test_atomic_write_text_replaces_existing_file(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "labels.txt"
+            path.write_text("old\n", encoding="utf-8")
+
+            atomic_write_text(str(path), "new\n")
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+            self.assertEqual([item.name for item in Path(tmp).iterdir()], ["labels.txt"])
+
+    def test_normalize_pose_label_lines_clamps_pads_and_drops_invalid_rows(self):
+        normalized, warnings, changed = normalize_pose_label_lines(
+            [
+                "0 1.2 -0.1 2.0 0.2 1.5 -0.5 3 0.4 0.6 2 0.9 0.9 2",
+                "9 0.5 0.5 0.2 0.2 0.1 0.1 2",
+                "0 0.5 0.5 -0.2 0.2 0.1 0.1 2",
+            ],
+            class_count=1,
+            keypoint_count=2,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            normalized,
+            [
+                "0 1.000000 0.000000 1.000000 0.200000 "
+                "1.000000 0.000000 2 0.400000 0.600000 2"
+            ],
+        )
+        self.assertTrue(any("extra keypoint" in warning for warning in warnings))
+        self.assertTrue(any("parse error" in warning for warning in warnings))
+        self.assertTrue(any("non-positive bbox" in warning for warning in warnings))
+
+    def test_normalize_pose_label_lines_pads_missing_keypoints(self):
+        normalized, warnings, changed = normalize_pose_label_lines(
+            ["0 0.5 0.5 0.2 0.2 0.1 0.1 2"],
+            class_count=1,
+            keypoint_count=2,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            normalized,
+            ["0 0.500000 0.500000 0.200000 0.200000 0.100000 0.100000 2 0.000000 0.000000 0"],
+        )
+        self.assertTrue(any("missing keypoint" in warning for warning in warnings))
+
+    def test_normalize_segmentation_label_lines_clamps_and_drops_invalid_rows(self):
+        normalized, warnings, changed = normalize_segmentation_label_lines(
+            [
+                "0 1.2 -0.1 0.5 0.5 0.1 1.1 99",
+                "2 0.1 0.1 0.2 0.2 0.3 0.3",
+            ],
+            class_count=1,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            normalized,
+            ["0 1.000000 0.000000 0.500000 0.500000 0.100000 1.000000"],
+        )
+        self.assertTrue(any("odd coordinate count" in warning for warning in warnings))
+        self.assertTrue(any("invalid class id" in warning for warning in warnings))
+
+    def test_build_segmentation_inference_rows_formats_detection_schema(self):
         rows = build_segmentation_inference_rows(
             frame_index=7,
             detections=[
@@ -104,6 +171,39 @@ class CoreHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["y2"], 40.0)
         self.assertEqual(rows[0]["mask_polygon"][2], [1.0, 1.0])
         self.assertEqual(rows[0]["binary_mask"], [[1, 0], [0, 1]])
+
+    def test_build_segmentation_inference_rows_emits_no_detection_row(self):
+        rows = build_segmentation_inference_rows(
+            frame_index=8,
+            detections=[],
+            class_names={0: "mouse"},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["frame"], 8)
+        self.assertEqual(rows[0]["det"], -1)
+        self.assertEqual(rows[0]["class_id"], "")
+        self.assertEqual(rows[0]["class_name"], "")
+        self.assertEqual(rows[0]["conf"], "")
+        self.assertIsNone(rows[0]["mask_polygon"])
+        self.assertIsNone(rows[0]["binary_mask"])
+
+    def test_build_segmentation_inference_rows_can_omit_binary_masks(self):
+        rows = build_segmentation_inference_rows(
+            frame_index=9,
+            detections=[
+                {
+                    "class_id": 0,
+                    "conf": 0.8,
+                    "box": [1, 2, 3, 4],
+                    "binary_mask": [[1, 1], [0, 0]],
+                }
+            ],
+            include_binary_mask=False,
+        )
+
+        self.assertEqual(rows[0]["frame"], 9)
+        self.assertIsNone(rows[0]["binary_mask"])
 
     def test_resolve_default_training_dataset_path_prefers_pose_then_segment_then_detect(self):
         with TemporaryDirectory() as tmp:

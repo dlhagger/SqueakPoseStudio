@@ -11,9 +11,17 @@ Overview
   - **Segmentation Workflow (SAM)**: place positive/negative prompts, run SAM mask proposal, accept, and refine masks with brush add/erase.
 - SAM integration: supports auto-discovery of `sam3*.pt` / `sam3*.pth` files in the project root and remembers your last SAM path in project metadata.
 - Dataset management: keeps originals in `images_all`, pose labels in `labels_all`, seg labels in `labels_seg_all`, and annotated overlays in `annotations`.
-- Training launcher: choose task (pose, segmentation, or detection), dataset, epochs, batch size/device, and trigger `ultralytics.YOLO.train()` without leaving the UI.
+- Training launcher: choose task (pose, segmentation, or detection), dataset, epochs, batch size/device, and run Ultralytics training in a child process with terminal-style output in the UI.
 - Video reviewer supports both workflows: pose overlays (bbox + keypoints) and segmentation overlays (mask polygons), with frame export back to `images_to_label`.
+- Process-backed prediction/inference: model-heavy single-image prediction, Video Reviewer range prediction, video CSV inference, and training run outside the GUI process so the app stays responsive and worker RAM is released when jobs exit.
 - Programmatic helper: `dataset_builder.py` generates YOLO pose `dataset.yaml` files with sensible flip indices based on keypoint names.
+
+Release highlights (May 2026)
+-----------------------------
+- Moved training, video inference, single-image prediction, and Video Reviewer range prediction to `QProcess` workers.
+- Added terminal-style training output inside the Train Model dialog.
+- Added explicit no-detection inference rows and streamed video inference CSV writes to reduce memory use.
+- Refactored label, dataset, prediction, inference, and training helpers into Qt-free modules with unit coverage.
 
 Release highlights (March 2026)
 -------------------------------
@@ -31,6 +39,9 @@ Repository layout
 -----------------
 - `squeakpose_studio.py`: main PyQt6 application (project launcher, labeling, SAM seg tools, exporting, training, inference).
 - `dataset_builder.py`: helper to emit YOLO pose `dataset.yaml` files.
+- `label_io.py`, `dataset_ops.py`: Qt-free label parsing, dataset export, and normalization helpers.
+- `prediction_ops.py`, `inference_ops.py`: Qt-free prediction serialization and video inference helpers.
+- `predict_worker.py`, `video_review_worker.py`, `inference_worker.py`, `train_worker.py`: child-process entry points used by the GUI for model-heavy work.
 - `images_to_label/`: drop raw frames to annotate (created on first run).
 - `images_all/`, `labels_all/`, `labels_seg_all/`, `annotations/`: accumulated originals, pose labels, seg labels, and rendered overlays (auto-managed on Save).
 - `datasets/`: created when exporting train/val splits.
@@ -122,15 +133,17 @@ Dataset export & training
 - **Export Dataset**:
   - Pose workflow exports from `labels_all` to `datasets/pose` (or `datasets/detect` for bbox-only cases).
   - Seg workflow exports from `labels_seg_all` to `datasets/segment`.
-- **Train Model**: Pick task/dataset/model/device/epochs/batch size and launch Ultralytics training. Outputs land in `runs/`.
+- **Train Model**: Pick task/dataset/model/device/epochs/batch size and launch Ultralytics training in a worker process. Outputs stream into the dialog and artifacts land in `runs/`.
 
 Video inference
 ---------------
-- Load a trained model via **Load Model**.
+- Select a trained model path via **Load Model**. The GUI keeps the path; worker processes load the model only when they need it.
 - **Video Reviewer** adapts to active workflow:
   - Pose: bbox + keypoint overlays.
   - Segmentation: mask polygon overlays (bbox fallback when mask is unavailable).
-- **Inference** prompts for a video, batch size, and runs YOLO on batches. Results are saved as CSV to the active project's `inference outputs/` folder.
+- **Video Reviewer → Predict Range** runs in a child process, caches predictions next to the reviewed video, and keeps the timeline/export tools responsive.
+- **Inference** prompts for a video, batch size, and runs YOLO on batches in a child process. Results are streamed to CSV in the active project's `inference outputs/` folder.
+- CSV inference outputs include explicit no-detection rows for frames with no detections.
 
 Programmatic helper
 -------------------

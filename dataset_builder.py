@@ -7,6 +7,8 @@ import os
 import re
 from typing import Iterable
 
+from squeakpose_core import atomic_write_text
+
 _SIDE_SPLIT_RE = re.compile(r"[\s\-_]+")
 _LEFT_TOKENS = {"left", "l"}
 _RIGHT_TOKENS = {"right", "r"}
@@ -164,8 +166,7 @@ def create_dataset_yaml(
     }
 
     out_path = os.path.join(base_dir, "dataset.yaml")
-    with open(out_path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(dataset, fh, sort_keys=False)
+    atomic_write_text(out_path, yaml.safe_dump(dataset, sort_keys=False))
 
     if verbose:
         print(_flip_index_summary(kp_list, flip_idx))

@@ -20,7 +20,6 @@ dependencies = [
     "oneeurofilter>=0.2.1",
     "pandas>=2.3.3",
     "pyyaml>=6.0.2",
-    "pyqt6>=6.10.2",
     "pyqt6-sip>=13.11.1",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
@@ -30,19 +29,20 @@ dependencies = [
     "tqdm>=4.67.1",
     "ultralytics>=8.3.233",
     "umap-learn>=0.5.11",
+    "pyqt6>=6.11.0",
 ]
 
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'win32'" },
 ]
 
 torchvision = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'win32'" },
 ]
 
 clip = { git = "https://github.com/ultralytics/CLIP/"}
@@ -53,6 +53,6 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true

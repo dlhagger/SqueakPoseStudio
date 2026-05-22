@@ -11,6 +11,7 @@ from dataset_ops import (
     DATASET_SEGMENT,
     dataset_export_paths,
     export_dataset_files,
+    format_dataset_export_summary,
     normalize_label_directory,
     split_train_val_images,
     write_dataset_yaml_for_mode,
@@ -68,6 +69,23 @@ class DatasetOpsTests(unittest.TestCase):
             data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
             self.assertEqual(data["names"], ["mouse"])
             self.assertNotIn("task", data)
+
+    def test_dataset_export_summary_includes_split_seed(self):
+        with TemporaryDirectory() as tmp:
+            paths = dataset_export_paths(tmp, DATASET_POSE)
+            result = export_dataset_files(
+                images_all_dir=os.path.join(tmp, "missing-images"),
+                labels_all_dir=os.path.join(tmp, "missing-labels"),
+                paths=paths,
+                train_images=[],
+                val_images=[],
+                mode=DATASET_POSE,
+            )
+            result.split_seed = 42
+
+            summary = format_dataset_export_summary(result)
+
+        self.assertIn("Split seed: 42", summary)
 
     def test_write_segmentation_dataset_yaml_sets_task(self):
         with TemporaryDirectory() as tmp:

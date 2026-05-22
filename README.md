@@ -42,13 +42,8 @@ Repository layout
 - `label_io.py`, `dataset_ops.py`: Qt-free label parsing, dataset export, and normalization helpers.
 - `prediction_ops.py`, `inference_ops.py`: Qt-free prediction serialization and video inference helpers.
 - `predict_worker.py`, `video_review_worker.py`, `inference_worker.py`, `train_worker.py`: child-process entry points used by the GUI for model-heavy work.
-- `images_to_label/`: drop raw frames to annotate (created on first run).
-- `images_all/`, `labels_all/`, `labels_seg_all/`, `annotations/`: accumulated originals, pose labels, seg labels, and rendered overlays (auto-managed on Save).
-- `datasets/`: created when exporting train/val splits.
-- `runs/`: default Ultralytics training outputs.
-- `classes.txt`, `keypoints.txt`: pose class and keypoint lists.
-- `classes_seg.txt`: segmentation class list.
-- `squeakpose_project.json`: project metadata (workflow + model/path state).
+- `example_datasets/`: bundled sample image/label data.
+- Project data such as `images_to_label/`, `labels_all/`, `datasets/`, `runs/`, and `squeakpose_project.json` lives inside the project folder selected at launch, not in the repository root.
 - `fonts/`: optional UI font (Fira Sans).
 - `torch_ultralytics_checks.py`: quick check that PyTorch + MPS is working on Apple Silicon.
 
@@ -66,10 +61,10 @@ pip install -e .
 ```
    If using `uv`, the PyTorch indexes in `pyproject.toml` are preconfigured.
 
-2) Ensure `classes.txt` and `keypoints.txt` exist in the project root. On first launch the app will create defaults (`mouse` class; 6 keypoints).
+2) Launch the app and choose **Create Project** or **Open Project**. New projects get default class/keypoint files (`mouse`; 6 keypoints) and project metadata automatically.
 
 3) If you will use segmentation, provide your own SAM weights file:
-- Place `sam3.pt` in the project root (recommended), or
+- Place `sam3.pt` in the selected project folder (recommended), or
 - Load any `sam3*.pt` / `sam3*.pth` manually from the UI.
 - SAM weights are not bundled with this repository.
 
@@ -101,6 +96,7 @@ Per-project structure (auto-created)
 - `runs/`
 - `inference outputs/`
 - `templates/`
+- `logs/`
 - `classes.txt`
 - `keypoints.txt`
 - `classes_seg.txt`
@@ -126,13 +122,14 @@ Segmentation workflow (SAM):
 - **Save** writes segmentation labels to `labels_seg_all/<image>.txt`, copies source image to `images_all/`, and renders overlay to `annotations/`.
 
 For both workflows:
-- Browse with filters (`All`, `Labeled`, `Unlabeled`, `Archive`) and use **Complete → Next Unlabeled** to advance.
+- Browse the labeling queue with filters (`All`, `Labeled`, `Unlabeled`) and use **Complete → Next Unlabeled** to advance.
 
 Dataset export & training
 -------------------------
 - **Export Dataset**:
   - Pose workflow exports from `labels_all` to `datasets/pose` (or `datasets/detect` for bbox-only cases).
   - Seg workflow exports from `labels_seg_all` to `datasets/segment`.
+  - Dataset splits are shuffled with a user-provided seed so the same files, ratio, and seed reproduce the same train/val split.
 - **Train Model**: Pick task/dataset/model/device/epochs/batch size and launch Ultralytics training in a worker process. Outputs stream into the dialog and artifacts land in `runs/`.
 
 Video inference
@@ -163,6 +160,6 @@ Troubleshooting
 ---------------
 - Device selection is automatic (CUDA → MPS → CPU). Run `python torch_ultralytics_checks.py` to verify.
 - If OpenCV is missing, install `opencv-python` to enable video inference.
-- For missing class/keypoint files, create or edit `classes.txt` and `keypoints.txt` at the project root.
+- For missing class/keypoint files, create or edit `classes.txt` and `keypoints.txt` inside the selected project folder.
 - Segmentation requires your own SAM weights (`sam3.pt` or compatible `sam3*.pt` / `sam3*.pth`). These are not included in this repo.
-- Place `sam3.pt` at project root for auto-load, or load manually from the Segmentation tools panel.
+- Place `sam3.pt` in the selected project folder for auto-load, or load manually from the Segmentation tools panel.

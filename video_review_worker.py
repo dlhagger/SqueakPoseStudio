@@ -105,6 +105,7 @@ def run_video_review_worker(
 
     total_steps = max(1, ((end - start) // stride) + 1)
     preds: dict[int, dict[str, Any]] = {}
+    prediction_errors: list[str] = []
     processed = 0
     event_writer({"event": "started", "video_path": video_path, "total": total_steps})
 
@@ -142,7 +143,9 @@ def run_video_review_worker(
                     results = list(results_list or [])
                     for pos, fi in enumerate(frame_indices):
                         if pos >= len(results):
-                            preds[fi] = {"ok": False, "error": "Prediction returned fewer results than frames."}
+                            err = "Prediction returned fewer results than frames."
+                            preds[fi] = {"ok": False, "error": err}
+                            prediction_errors.append(f"frame {fi}: {err}")
                             continue
                         payload = serialize_prediction_result(
                             results[pos],
@@ -152,8 +155,10 @@ def run_video_review_worker(
                         )
                         preds[fi] = top_prediction_from_payload(payload, workflow=workflow)
                 except Exception as exc:
+                    error_text = str(exc)
                     for fi in frame_indices:
-                        preds[fi] = {"ok": False, "error": str(exc)}
+                        preds[fi] = {"ok": False, "error": error_text}
+                    prediction_errors.append(f"frames {frame_indices[0]}-{frame_indices[-1]}: {error_text}")
 
                 processed += len(frame_indices)
                 event_writer(
@@ -171,16 +176,20 @@ def run_video_review_worker(
             if idx <= end:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
 
+        had_error = bool(prediction_errors) and not _CANCEL_REQUESTED
+        error_message = "; ".join(prediction_errors[:3])
+        if len(prediction_errors) > 3:
+            error_message += f"; ...{len(prediction_errors) - 3} more"
         event_writer(
             {
                 "event": "result",
                 "canceled": bool(_CANCEL_REQUESTED),
-                "had_error": False,
-                "error_message": "",
+                "had_error": had_error,
+                "error_message": error_message,
                 "preds": {str(k): v for k, v in preds.items()},
             }
         )
-        return 0
+        return 1 if had_error else 0
     except Exception as exc:
         event_writer(
             {

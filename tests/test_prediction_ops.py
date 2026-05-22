@@ -77,6 +77,11 @@ class _VideoReviewModel:
         return out
 
 
+class _FailingVideoReviewModel:
+    def predict(self, **kwargs):
+        raise RuntimeError("predict boom")
+
+
 class _FakeCapture:
     def __init__(self, frames):
         self.frames = list(frames)
@@ -246,6 +251,35 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertEqual(sorted(result["preds"].keys()), ["0", "2"])
         self.assertEqual(result["preds"]["2"]["cls"], 1)
         self.assertAlmostEqual(result["preds"]["2"]["conf"], 0.85)
+
+    def test_video_review_worker_reports_batch_prediction_errors(self):
+        cv2 = _FakeCv2(["frame0", "frame1"])
+        events = []
+
+        exit_code = run_video_review_worker(
+            {
+                "model_path": "model.pt",
+                "video_path": "video.mp4",
+                "workflow": "pose",
+                "device": "cpu",
+                "start": 0,
+                "end": 1,
+                "stride": 1,
+                "batch": 2,
+                "effective_batch": 2,
+            },
+            model_factory=lambda _path: _FailingVideoReviewModel(),
+            cv2_module=cv2,
+            event_writer=events.append,
+        )
+
+        self.assertEqual(exit_code, 1)
+        result = events[-1]
+        self.assertEqual(result["event"], "result")
+        self.assertTrue(result["had_error"])
+        self.assertIn("predict boom", result["error_message"])
+        self.assertEqual(result["preds"]["0"]["ok"], False)
+        self.assertEqual(result["preds"]["1"]["ok"], False)
 
 
 if __name__ == "__main__":

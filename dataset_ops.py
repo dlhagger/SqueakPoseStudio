@@ -49,6 +49,7 @@ class DatasetExportResult:
     train_images: list[str]
     val_images: list[str]
     dataset_yaml_path: str
+    split_seed: Optional[int] = None
     warnings: list[str] = field(default_factory=list)
     processed: int = 0
     canceled: bool = False
@@ -246,6 +247,8 @@ def format_dataset_export_summary(result: DatasetExportResult) -> str:
         f"Format: {label_format}\n"
         f"dataset.yaml written to: {result.dataset_yaml_path}"
     )
+    if result.split_seed is not None:
+        summary += f"\nSplit seed: {result.split_seed}"
     if result.warnings:
         summary += "\n\nWarnings:\n" + "\n".join(result.warnings[:10])
         if len(result.warnings) > 10:

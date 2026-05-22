@@ -66,6 +66,16 @@ WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
 
 
+def _qt_app_instance():
+    return QApplication.instance()
+
+
+def _retain_main_window(window) -> None:
+    app = _qt_app_instance()
+    if app is not None:
+        app._squeakpose_main_window = window
+
+
 def _project_paths(project_root: str) -> dict[str, str]:
     root = os.path.abspath(project_root)
     return {
@@ -1531,6 +1541,8 @@ class LabelingApp(QMainWindow):
             self.classes = self.pose_classes[:]
             self.kp_names = self.pose_kp_names[:]
             self.class_keypoints = {name: self.pose_class_keypoints.get(name, [])[:] for name in self.classes}
+            if self._sync_canonical_keypoints_from_class_map():
+                self.pose_kp_names = self.kp_names[:]
             self._schema_locked = self._detect_schema_locked()
         else:
             self.active_workflow = WORKFLOW_SEG
@@ -1550,12 +1562,21 @@ class LabelingApp(QMainWindow):
         self.class_selector.blockSignals(True)
         self.class_selector.clear()
         self.class_selector.addItems(self.classes)
+        self._fit_class_selector_to_items()
         if current in self.classes:
             self.class_selector.setCurrentIndex(self.classes.index(current))
         elif self.classes:
             self.class_selector.setCurrentIndex(0)
         self.class_selector.blockSignals(False)
         self._active_class_id = self.class_selector.currentIndex()
+
+    def _fit_class_selector_to_items(self):
+        if not hasattr(self, "class_selector"):
+            return
+        longest = 14
+        for class_name in self.classes:
+            longest = max(longest, min(len(str(class_name)), 36))
+        self.class_selector.setMinimumContentsLength(longest)
 
     def _ensure_workflow_selector_items(self):
         if not hasattr(self, "workflow_selector"):
@@ -1670,6 +1691,8 @@ class LabelingApp(QMainWindow):
         self.normalize_btn.setEnabled(True)
         self.export_dataset_btn.setEnabled(True)
         self.train_btn.setEnabled(True)
+        if hasattr(self, "delete_image_btn"):
+            self.delete_image_btn.setEnabled(True)
         self.load_model_btn.setEnabled(True)
 
         self.manage_classes_btn.setToolTip(
@@ -1869,6 +1892,39 @@ class LabelingApp(QMainWindow):
                 data[name] = default_kp[:]
         return data
 
+    def _sync_canonical_keypoints_from_class_map(self) -> bool:
+        """Ensure keypoints.txt covers every per-class keypoint name."""
+        class_map = getattr(self, "class_keypoints", {}) or {}
+        if not class_map:
+            return False
+
+        canonical: list[str] = []
+        seen: set[str] = set()
+        for raw in getattr(self, "kp_names", []) or []:
+            name = str(raw).strip()
+            if name and name not in seen:
+                canonical.append(name)
+                seen.add(name)
+
+        classes = getattr(self, "classes", []) or list(class_map.keys())
+        for class_name in classes:
+            for raw in class_map.get(class_name, []) or []:
+                name = str(raw).strip()
+                if name and name not in seen:
+                    canonical.append(name)
+                    seen.add(name)
+
+        if canonical == (getattr(self, "kp_names", []) or []):
+            return False
+
+        self.kp_names = canonical
+        if hasattr(self, "_refresh_kp_index_lookup"):
+            self._refresh_kp_index_lookup()
+        keypoint_file = getattr(self, "keypoint_file", "") or getattr(self, "pose_keypoint_file", "")
+        if keypoint_file:
+            self._write_list_file(keypoint_file, self.kp_names)
+        return True
+
     def _save_class_keypoints(self):
         try:
             atomic_write_text(self.class_keypoints_path, json.dumps(self.class_keypoints, indent=2))
@@ -1903,15 +1959,18 @@ class LabelingApp(QMainWindow):
         self._write_list_file(self.keypoint_file, self.kp_names)
         return self._kp_index_lookup[name]
 
-    def _count_labeled_frames(self) -> tuple[int, int]:
-        total = len(self.images_queue)
+    def _count_labeled_images(self, images: list[str], label_dir: str) -> tuple[int, int]:
+        total = len(images)
         labeled = 0
-        for img in self.images_queue:
+        for img in images:
             base = os.path.splitext(img)[0]
-            label_file = os.path.join(self.label_dir, f"{base}.txt")
+            label_file = os.path.join(label_dir, f"{base}.txt")
             if os.path.exists(label_file):
                 labeled += 1
         return labeled, total
+
+    def _count_labeled_frames(self) -> tuple[int, int]:
+        return self._count_labeled_images(self.images_queue, self.label_dir)
 
     def _detect_schema_locked(self) -> bool:
         """Schema is considered locked once any non-empty label file exists."""
@@ -1969,9 +2028,8 @@ class LabelingApp(QMainWindow):
     def _update_progress_label(self):
         if not hasattr(self, "progress_label"):
             return
-        labeled, total = self._count_labeled_frames()
-        remaining = max(0, total - labeled)
-        self.progress_label.setText(f"Labeled: {labeled} | Remaining: {remaining}")
+        queue_labeled, queue_total = self._count_labeled_frames()
+        self.progress_label.setText(f"Queue: {queue_labeled}/{queue_total} labeled")
 
     def _maybe_prompt_class_manager(self):
         if getattr(self, "_prompted_class_manager", False):
@@ -2915,17 +2973,11 @@ class LabelingApp(QMainWindow):
             self.class_selector.setCurrentIndex(new_idx)
 
     def refresh_image_list(self):
-        """Reload queue/archive file lists (used after exporting a frame from video)."""
+        """Reload queue file list (used after exporting a frame from video)."""
         self._refresh_queue_images()
-        self._refresh_archive_images()
-        if self.nav_filter != 'archive':
-            self.images = self.images_queue[:]
-            if self.current_idx >= len(self.images):
-                self.current_idx = max(0, len(self.images) - 1)
-        else:
-            self.images = self.images_archive[:]
-            if self.current_idx >= len(self.images):
-                self.current_idx = max(0, len(self.images) - 1)
+        self.images = self.images_queue[:]
+        if self.current_idx >= len(self.images):
+            self.current_idx = max(0, len(self.images) - 1)
         self._update_progress_label()
 
     def _refresh_queue_images(self):
@@ -2937,14 +2989,6 @@ class LabelingApp(QMainWindow):
         except Exception:
             self.images_queue = []
 
-    def _refresh_archive_images(self):
-        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-        try:
-            self.images_archive = sorted(
-                f for f in os.listdir(self.image_dir_archive) if f.lower().endswith(exts)
-            )
-        except Exception:
-            self.images_archive = []
     def __init__(
         self,
         image_dir: Optional[str],
@@ -2963,13 +3007,13 @@ class LabelingApp(QMainWindow):
         self.image_dir_queue = image_dir or os.path.join(self.project_root, "images_to_label")
         # Backward-compatible alias used by some dialogs/tools.
         self.image_dir = self.image_dir_queue
-        self.image_dir_archive = os.path.join(self.project_root, "images_all")
+        self.image_dir_all = os.path.join(self.project_root, "images_all")
         self.pose_label_dir = label_dir or os.path.join(self.project_root, "labels_all")
         self.seg_label_dir = os.path.join(self.project_root, "labels_seg_all")
         os.makedirs(self.image_dir_queue, exist_ok=True)
         os.makedirs(self.pose_label_dir, exist_ok=True)
         os.makedirs(self.seg_label_dir, exist_ok=True)
-        os.makedirs(self.image_dir_archive, exist_ok=True)
+        os.makedirs(self.image_dir_all, exist_ok=True)
         self.pose_class_file = class_file or os.path.join(self.project_root, "classes.txt")
         self.pose_keypoint_file = keypoint_file or os.path.join(self.project_root, "keypoints.txt")
         self.pose_class_keypoints_path = os.path.join(self.project_root, "class_keypoints.json")
@@ -2978,13 +3022,11 @@ class LabelingApp(QMainWindow):
 
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
         self.images_queue = sorted(f for f in os.listdir(self.image_dir_queue) if f.lower().endswith(exts))
-        self.images_archive = sorted(f for f in os.listdir(self.image_dir_archive) if f.lower().endswith(exts))
         self.images = self.images_queue[:]
         self.active_image_dir = self.image_dir_queue
         self.current_image_path = ""
         self.current_idx = 0
         self._queue_current_idx = 0
-        self._archive_current_idx = 0
 
         # Pose workflow resources
         self.pose_classes, self.pose_kp_names, self._created_label_files = self._ensure_label_files(
@@ -2994,6 +3036,8 @@ class LabelingApp(QMainWindow):
         self.kp_names = self.pose_kp_names[:]
         self.class_keypoints_path = self.pose_class_keypoints_path
         self.class_keypoints = self._load_class_keypoints()
+        if self._sync_canonical_keypoints_from_class_map():
+            self.pose_kp_names = self.kp_names[:]
         self._save_class_keypoints()
         self.pose_class_keypoints = {name: self.class_keypoints.get(name, [])[:] for name in self.pose_classes}
 
@@ -3035,7 +3079,7 @@ class LabelingApp(QMainWindow):
         self.seg_brush_item: Optional[QGraphicsPathItem] = None
         self.seg_brush_anchor_points: list[tuple[float, float]] = []
         self._seg_setup_prompted = False
-        self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled' | 'archive'
+        self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled'
 
         self._load_project_preferences()
         self._bind_workflow_state(self.active_workflow)
@@ -3128,6 +3172,7 @@ class LabelingApp(QMainWindow):
             project_root=paths["root"],
             force_initial_setup=force_initial_setup,
         )
+        _retain_main_window(new_window)
         new_window.setWindowTitle(_project_window_title(paths["root"]))
         new_window.setGeometry(self.geometry())
         new_window.show()
@@ -3323,6 +3368,31 @@ class LabelingApp(QMainWindow):
                 min-height: 28px;
                 padding: 4px 10px;
             }
+            QComboBox#classSelector {
+                combobox-popup: 0;
+                font-size: 10pt;
+                font-weight: 600;
+                padding: 4px 10px;
+                min-height: 31px;
+            }
+            QComboBox#classSelector::drop-down {
+                width: 22px;
+            }
+            QComboBox#classSelector QAbstractItemView {
+                font-size: 10pt;
+                background-color: rgba(36, 42, 48, 246);
+                color: #edf4fc;
+                border: 1px solid rgba(129, 146, 162, 176);
+                border-radius: 9px;
+                outline: 0px;
+                padding: 4px;
+                selection-background-color: rgba(97, 136, 171, 230);
+                selection-color: #ffffff;
+            }
+            QComboBox#classSelector QAbstractItemView::item {
+                min-height: 28px;
+                padding: 4px 10px;
+            }
         """
 
         # Main layout: keep canvas clean and place controls as hot-corner overlays.
@@ -3341,7 +3411,21 @@ class LabelingApp(QMainWindow):
 
         # Shared widgets/state
         self.class_selector = QComboBox()
+        self.class_selector.setObjectName("classSelector")
         self.class_selector.addItems(self.classes)
+        self.class_selector.setToolTip("Choose the active class to label")
+        self.class_selector.setMinimumContentsLength(14)
+        self.class_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.class_selector.setMinimumWidth(156)
+        self.class_selector.setMinimumHeight(34)
+        self.class_selector.setMaxVisibleItems(8)
+        class_popup = QListView(self.class_selector)
+        class_popup.setUniformItemSizes(True)
+        class_popup.setSpacing(2)
+        class_popup.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        class_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.class_selector.setView(class_popup)
+        self._fit_class_selector_to_items()
         self.class_selector.currentIndexChanged.connect(self._on_class_changed)
         self._active_class_id = self.class_selector.currentIndex()
         self.workflow_selector = QComboBox()
@@ -3382,7 +3466,7 @@ class LabelingApp(QMainWindow):
         filter_row.setSpacing(6)
         self.filter_combo = QComboBox()
         self.filter_combo.setObjectName("browseSelector")
-        self.filter_combo.addItems(["All", "Labeled", "Unlabeled", "Archive"])
+        self.filter_combo.addItems(["All", "Labeled", "Unlabeled"])
         self.filter_combo.setToolTip("Which images to browse with Prev/Next")
         self.filter_combo.setMinimumContentsLength(10)
         self.filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -3437,6 +3521,16 @@ class LabelingApp(QMainWindow):
         for btn in (btn_prev, btn_next, self.complete_btn, self.skip_btn, self.save_btn):
             btn.setMinimumHeight(28)
         top_left_layout.addLayout(nav_row)
+
+        delete_row = QHBoxLayout()
+        delete_row.setSpacing(6)
+        self.delete_image_btn = QPushButton("Delete Image")
+        self.delete_image_btn.setToolTip("Delete the current image after confirmation")
+        self.delete_image_btn.setMinimumHeight(28)
+        self.delete_image_btn.clicked.connect(self.delete_current_image)
+        delete_row.addWidget(self.delete_image_btn)
+        delete_row.addStretch(1)
+        top_left_layout.addLayout(delete_row)
 
         mode_section = QLabel("Mode")
         mode_section.setObjectName("sectionLabel")
@@ -3553,6 +3647,7 @@ class LabelingApp(QMainWindow):
         self.train_btn.setMinimumHeight(30)
         self.train_btn.clicked.connect(self.open_train_dialog)
         training_row.addWidget(self.train_btn)
+
         bottom_left_layout.addLayout(training_row)
 
         # -----------------------------
@@ -3655,7 +3750,7 @@ class LabelingApp(QMainWindow):
 
         # reflect initial nav filter in the dropdown
         try:
-            mapping = {"all": 0, "labeled": 1, "unlabeled": 2, "archive": 3}
+            mapping = {"all": 0, "labeled": 1, "unlabeled": 2}
             self.filter_combo.setCurrentIndex(mapping.get(self.nav_filter, 0))
         except Exception:
             pass
@@ -3955,7 +4050,7 @@ class LabelingApp(QMainWindow):
             for cand in (
                 os.path.join(self.active_image_dir, file_name),
                 os.path.join(self.image_dir_queue, file_name),
-                os.path.join(self.image_dir_archive, file_name),
+                os.path.join(self.image_dir_all, file_name),
             ):
                 if not os.path.exists(cand):
                     continue
@@ -4058,8 +4153,6 @@ class LabelingApp(QMainWindow):
     def _filtered_indices(self) -> list[int]:
         if not self.images:
             return []
-        if self.nav_filter == 'archive':
-            return list(range(len(self.images)))
         if self.nav_filter == 'all':
             return list(range(len(self.images)))
         elif self.nav_filter == 'labeled':
@@ -4068,26 +4161,8 @@ class LabelingApp(QMainWindow):
             return [i for i in range(len(self.images)) if not self._is_labeled_index(i)]
 
     def _set_nav_filter(self, mode: str):
-        if mode not in ('all', 'labeled', 'unlabeled', 'archive'):
+        if mode not in ('all', 'labeled', 'unlabeled'):
             return
-        if mode == 'archive':
-            if self.nav_filter != 'archive':
-                self._queue_current_idx = self.current_idx
-            self.nav_filter = 'archive'
-            self.images = self.images_archive[:]
-            self.active_image_dir = self.image_dir_archive
-            if not self.images:
-                self.update_status_bar("No archived images available.")
-                return
-            self.current_idx = min(self._archive_current_idx, len(self.images) - 1)
-            self._archive_current_idx = self.current_idx
-            self.update_status_bar(f"Browsing: archive ({self.current_idx + 1}/{len(self.images)})")
-            self.load_image()
-            return
-
-        # switching back to queue-based views
-        if self.nav_filter == 'archive':
-            self._archive_current_idx = self.current_idx
         self.nav_filter = mode
         self.images = self.images_queue[:]
         self.active_image_dir = self.image_dir_queue
@@ -4120,10 +4195,7 @@ class LabelingApp(QMainWindow):
             self.current_idx = fi[(pos - 1) % len(fi)]
         self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
-        if self.nav_filter == 'archive':
-            self._archive_current_idx = self.current_idx
-        else:
-            self._queue_current_idx = self.current_idx
+        self._queue_current_idx = self.current_idx
 
     def next_index(self):
         fi = self._filtered_indices()
@@ -4137,20 +4209,10 @@ class LabelingApp(QMainWindow):
             self.current_idx = fi[(pos + 1) % len(fi)]
         self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
-        if self.nav_filter == 'archive':
-            self._archive_current_idx = self.current_idx
-        else:
-            self._queue_current_idx = self.current_idx
+        self._queue_current_idx = self.current_idx
 
     def complete_and_next_unlabeled(self):
         if self._is_seg_workflow():
-            if self.nav_filter == 'archive':
-                QMessageBox.information(
-                    self,
-                    "Archive View",
-                    "Switch to All/Labeled/Unlabeled to continue queue labeling.",
-                )
-                return
             self._cache_active_annotation()
             has_any_mask = any(len(entry.get("segments", [])) >= 3 for entry in self.annotation_cache.values())
             if not has_any_mask:
@@ -4180,10 +4242,6 @@ class LabelingApp(QMainWindow):
             self.mode = 'segment'
             self.load_image()
             return
-        if self.nav_filter == 'archive':
-            QMessageBox.information(self, "Archive View",
-                                    "Switch to All/Labeled/Unlabeled to continue queue labeling.")
-            return
         if not self._is_fully_labeled():
             QMessageBox.information(self, "Incomplete",
                                     "Place one bounding box and all keypoints to complete this frame.")
@@ -4199,10 +4257,6 @@ class LabelingApp(QMainWindow):
         self.load_image()
 
     def skip_to_next_unlabeled(self):
-        if self.nav_filter == 'archive':
-            QMessageBox.information(self, "Archive View",
-                                    "Switch to All/Labeled/Unlabeled to skip within the queue.")
-            return
         next_idx = self._find_next_unlabeled(self.current_idx)
         if next_idx == self.current_idx:
             popup = CongratsPopup(); popup.exec()
@@ -4211,6 +4265,135 @@ class LabelingApp(QMainWindow):
         self._queue_current_idx = self.current_idx
         self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
         self.load_image()
+
+    def _image_delete_paths(self, image_name: str) -> list[str]:
+        file_name = os.path.basename(image_name)
+        if not file_name:
+            return []
+        base = os.path.splitext(file_name)[0]
+        label_name = f"{base}.txt"
+        paths: list[str] = []
+        for directory, target_name in (
+            (getattr(self, "active_image_dir", ""), file_name),
+            (getattr(self, "image_dir_queue", ""), file_name),
+            (getattr(self, "image_dir_all", ""), file_name),
+            (getattr(self, "pose_label_dir", ""), label_name),
+            (getattr(self, "seg_label_dir", ""), label_name),
+            (os.path.join(self.project_root, "annotations"), f"{base}_annotated.png"),
+        ):
+            if directory:
+                paths.append(os.path.join(directory, target_name))
+
+        for mode in (DATASET_POSE, DATASET_SEGMENT, DATASET_DETECT):
+            dataset_paths = dataset_export_paths(self.project_root, mode)
+            paths.extend(
+                [
+                    os.path.join(dataset_paths.images_train_dir, file_name),
+                    os.path.join(dataset_paths.images_val_dir, file_name),
+                    os.path.join(dataset_paths.labels_train_dir, label_name),
+                    os.path.join(dataset_paths.labels_val_dir, label_name),
+                ]
+            )
+
+        unique_paths: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            norm = os.path.abspath(path)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            unique_paths.append(path)
+        return unique_paths
+
+    def _delete_image_files(self, image_name: str) -> tuple[list[str], list[str]]:
+        removed: list[str] = []
+        errors: list[str] = []
+        for path in self._image_delete_paths(image_name):
+            if not os.path.exists(path):
+                continue
+            if os.path.isdir(path):
+                errors.append(f"{path}: expected a file but found a directory")
+                continue
+            try:
+                os.remove(path)
+                removed.append(path)
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+        return removed, errors
+
+    def _clear_loaded_image_state(self):
+        self.current_image_path = ""
+        self.annotation_cache.clear()
+        self.bboxes.clear()
+        self.kps.clear()
+        self.current_kp_idx = 0
+        self.scene.clear()
+        self._item_refs.clear()
+
+    def _reload_after_current_image_delete(self):
+        self._queue_current_idx = self.current_idx
+
+        self._refresh_queue_images()
+        self._update_progress_label()
+
+        self.images = self.images_queue[:]
+        self.active_image_dir = self.image_dir_queue
+        if self._queue_current_idx >= len(self.images):
+            self._queue_current_idx = max(0, len(self.images) - 1)
+        self.current_idx = self._queue_current_idx
+
+        fi = self._filtered_indices()
+        if fi and self.current_idx not in fi:
+            self.current_idx = fi[0]
+            self._queue_current_idx = self.current_idx
+        if self.images and fi:
+            self.load_image()
+        else:
+            self._clear_loaded_image_state()
+            if not self.images:
+                self.update_status_bar("No images available in the current batch.")
+            else:
+                self.update_status_bar(f"No images match filter: {self.nav_filter}.")
+
+    def delete_current_image(self):
+        if not self.images:
+            QMessageBox.information(self, "No image", "No current image is loaded.")
+            return
+
+        file_name = os.path.basename(self.images[self.current_idx])
+        existing_paths = [p for p in self._image_delete_paths(file_name) if os.path.exists(p)]
+        if not existing_paths:
+            QMessageBox.information(
+                self,
+                "Image Not Found",
+                f"'{file_name}' was not found in the current project.",
+            )
+            return
+
+        decision = QMessageBox.question(
+            self,
+            "Delete Image",
+            f"Are you sure you want to delete '{file_name}'?\n\n"
+            "This permanently removes the current image from the project browser. "
+            "If matching labels, annotated previews, or generated dataset train/val "
+            "copies exist, those are removed too.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+
+        removed, errors = self._delete_image_files(file_name)
+        self._reload_after_current_image_delete()
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Delete Error",
+                "Some files could not be deleted:\n\n" + "\n".join(errors[:8]),
+            )
+        elif removed:
+            self.update_status_bar(f"Deleted '{file_name}'.")
 
     # ---------- Prediction ----------
 
@@ -5164,6 +5347,7 @@ class LabelingApp(QMainWindow):
         self.class_selector.blockSignals(True)
         self.class_selector.clear()
         self.class_selector.addItems(self.classes)
+        self._fit_class_selector_to_items()
         if current_name in self.classes:
             self.class_selector.setCurrentIndex(self.classes.index(current_name))
         else:
@@ -5783,7 +5967,7 @@ class LabelingApp(QMainWindow):
         src_candidates.extend([
             os.path.join(self.active_image_dir, file_name),
             os.path.join(self.image_dir_queue, file_name),
-            os.path.join(self.image_dir_archive, file_name),
+            os.path.join(self.image_dir_all, file_name),
         ])
 
         src_path = ""
@@ -5821,20 +6005,15 @@ class LabelingApp(QMainWindow):
             except Exception:
                 pass
 
-        # Update the labeled frame counter immediately after saving
+        # Update the labeled frame counter immediately after saving.
         self._update_progress_label()
-        self._refresh_archive_images()
-        if self.nav_filter == 'archive':
-            self.images = self.images_archive[:]
-            if self.current_idx >= len(self.images):
-                self.current_idx = max(0, len(self.images) - 1)
 
     # ---------- Video ----------
     def export_dataset(self):
         """Split images_all/labels_all into train/val sets and regenerate dataset.yaml."""
         seg_mode = self._is_seg_workflow()
         project_root = self.project_root
-        images_all_dir = self.image_dir_archive
+        images_all_dir = self.image_dir_all
         labels_all_dir = self.label_dir
 
         if not os.path.isdir(images_all_dir):
@@ -5862,6 +6041,17 @@ class LabelingApp(QMainWindow):
             2
         )
         if not ok:
+            return
+
+        split_seed, ok_seed = QInputDialog.getInt(
+            self,
+            "Split Seed",
+            "Shuffle seed (same files and seed recreate the same split):",
+            0,
+            0,
+            2147483647,
+        )
+        if not ok_seed:
             return
 
         pose_mode = False
@@ -5898,7 +6088,8 @@ class LabelingApp(QMainWindow):
                 return
             remove_dataset_split_dirs(paths)
 
-        random.shuffle(images)
+        images = sorted(images)
+        random.Random(split_seed).shuffle(images)
         train_images, val_images = split_train_val_images(images, ratio)
 
         total = len(train_images) + len(val_images)
@@ -5925,6 +6116,7 @@ class LabelingApp(QMainWindow):
                 progress_callback=_progress,
                 cancel_requested=prog.wasCanceled,
             )
+            export_result.split_seed = split_seed
         finally:
             QApplication.restoreOverrideCursor()
             prog.close()
@@ -5951,7 +6143,7 @@ class LabelingApp(QMainWindow):
 
     def normalize_labels_all(self):
         labels_dir = self.label_dir
-        images_all_dir = self.image_dir_archive
+        images_all_dir = self.image_dir_all
         images_to_label_dir = self.image_dir_queue
 
         label_files = list_label_files(labels_dir)
@@ -8217,6 +8409,7 @@ if __name__ == '__main__':
             project_root=project_paths["root"],
             force_initial_setup=force_initial_setup,
         )
+        _retain_main_window(window)
         window.setWindowTitle(_project_window_title(project_paths["root"]))
         splash.finish(window)
         window.show()

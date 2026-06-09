@@ -1,165 +1,346 @@
-SqueakPose Studio
-=================
+# SqueakPose Studio
 
-Desktop labeling, training, and inference toolkit for small-animal (mouse) annotation. Built with PyQt6 and Ultralytics YOLO to streamline the full loop: annotate frames (pose and segmentation), export YOLO-format datasets, train models, and run video inference with per-frame CSV outputs.
+SqueakPose Studio is a desktop application for small-animal image annotation,
+YOLO dataset creation, model training, prediction review, and video inference.
+It supports pose labels (bounding boxes and keypoints) and SAM-assisted
+segmentation labels from the same project-based interface.
 
-Overview
---------
-- Project-based workflow: launch into **Open Project / Create Project**, keep all assets per-project, and restore project metadata (including last active workflow).
-- Dual labeling workflows from one UI:
-  - **Pose Workflow (BBox + Keypoints)**: draw one box, place ordered keypoints, set visibility states, and save YOLO pose labels.
-  - **Segmentation Workflow (SAM)**: place positive/negative prompts, run SAM mask proposal, accept, and refine masks with brush add/erase.
-- SAM integration: supports auto-discovery of `sam3*.pt` / `sam3*.pth` files in the project root and remembers your last SAM path in project metadata.
-- Dataset management: keeps originals in `images_all`, pose labels in `labels_all`, seg labels in `labels_seg_all`, and annotated overlays in `annotations`.
-- Training launcher: choose task (pose, segmentation, or detection), dataset, epochs, batch size/device, and run Ultralytics training in a child process with terminal-style output in the UI.
-- Video reviewer supports both workflows: pose overlays (bbox + keypoints) and segmentation overlays (mask polygons), with frame export back to `images_to_label`.
-- Process-backed prediction/inference: model-heavy single-image prediction, Video Reviewer range prediction, video CSV inference, and training run outside the GUI process so the app stays responsive and worker RAM is released when jobs exit.
-- Programmatic helper: `dataset_builder.py` generates YOLO pose `dataset.yaml` files with sensible flip indices based on keypoint names.
+The application is built with PyQt6, PyTorch, and Ultralytics YOLO. Model-heavy
+operations run in child processes so training, prediction, and inference do not
+block the main interface.
 
-Release highlights (May 2026)
------------------------------
-- Moved training, video inference, single-image prediction, and Video Reviewer range prediction to `QProcess` workers.
-- Added terminal-style training output inside the Train Model dialog.
-- Added explicit no-detection inference rows and streamed video inference CSV writes to reduce memory use.
-- Refactored label, dataset, prediction, inference, and training helpers into Qt-free modules with unit coverage.
+## Features
 
-Release highlights (March 2026)
--------------------------------
-- Added project launcher and project-scoped metadata/state management.
-- Added segmentation workflow with SAM prompting, mask acceptance, and brush-based mask editing.
-- Simplified segmentation UI to match pose UX patterns and cleaned dropdown readability.
-- Added segmentation parity in Video Reviewer.
-- Added automation tests for new studio workflow-aware logic.
+- Project launcher with **Create Project** and **Open Project** workflows.
+- Pose annotation with per-class bounding boxes, ordered keypoints, templates,
+  visibility states, and model-assisted predictions.
+- Segmentation annotation with positive and negative SAM prompts, mask previews,
+  and add/erase brush editing.
+- YOLO pose, detection, and segmentation dataset export with reproducible
+  train/validation splits.
+- YOLOv26 training for detection, pose, and segmentation.
+- Support for standard YOLO models, existing checkpoints, exact run resume, and
+  optional DINO-distilled backbones.
+- Single-image prediction and a video reviewer for finding and exporting useful
+  frames back into the labeling queue.
+- Batched video inference with per-frame CSV output.
+- Qt-free helper modules with unit tests for label, dataset, prediction,
+  inference, and training logic.
 
-Demo
----------------
-- For a video walkthrough, see: [https://www.youtube.com/watch?v=aeKuTOTbb8c](https://youtu.be/aeKuTOTbb8c?si=wo0ss4DYnGRMW2T6)
+## Requirements
 
-Repository layout
------------------
-- `squeakpose_studio.py`: main PyQt6 application (project launcher, labeling, SAM seg tools, exporting, training, inference).
-- `dataset_builder.py`: helper to emit YOLO pose `dataset.yaml` files.
-- `label_io.py`, `dataset_ops.py`: Qt-free label parsing, dataset export, and normalization helpers.
-- `prediction_ops.py`, `inference_ops.py`: Qt-free prediction serialization and video inference helpers.
-- `predict_worker.py`, `video_review_worker.py`, `inference_worker.py`, `train_worker.py`: child-process entry points used by the GUI for model-heavy work.
-- `example_datasets/`: bundled sample image/label data.
-- Project data such as `images_to_label/`, `labels_all/`, `datasets/`, `runs/`, and `squeakpose_project.json` lives inside the project folder selected at launch, not in the repository root.
-- `fonts/`: optional UI font (Fira Sans).
-- `torch_ultralytics_checks.py`: quick check that PyTorch + MPS is working on Apple Silicon.
+- [uv](https://docs.astral.sh/uv/)
+- Python 3.12 or newer
+- A desktop environment supported by PyQt6
+- Optional CUDA or Apple Silicon acceleration
+- Optional SAM-compatible weights for the segmentation workflow
 
-Requirements
-------------
-- Python >= 3.12 (3.12 Dev on Linux)
-- PyQt6, torch, torchvision, ultralytics (declared in `pyproject.toml`)
-- Optional: Apple Silicon / CUDA for faster training and inference (device auto-selected in app)
+PyTorch package sources are configured in `pyproject.toml`: macOS uses the
+PyTorch CPU index, while Linux and Windows use the configured CUDA index. The
+application selects CUDA, MPS, or CPU at runtime according to availability.
 
-Setup
------
-1) Create a virtualenv and install:
+## Install and Run
+
+From the repository root, create the environment and install the locked
+dependencies:
+
+```bash
+uv sync
 ```
-pip install -e .
+
+Launch the application:
+
+```bash
+uv run python squeakpose_studio.py
 ```
-   If using `uv`, the PyTorch indexes in `pyproject.toml` are preconfigured.
 
-2) Launch the app and choose **Create Project** or **Open Project**. New projects get default class/keypoint files (`mouse`; 6 keypoints) and project metadata automatically.
+This is a dependency-only uv project; the repository itself is run directly and
+is not installed as a Python package.
 
-3) If you will use segmentation, provide your own SAM weights file:
-- Place `sam3.pt` in the selected project folder (recommended), or
-- Load any `sam3*.pt` / `sam3*.pth` manually from the UI.
-- SAM weights are not bundled with this repository.
+## Projects
 
-Running the app
----------------
+At startup, choose **Create Project** or **Open Project**. By default, the
+launcher starts in:
+
+```text
+~/Documents/SqueakPose Studio Projects
 ```
-uv run squeakpose_studio.py
+
+A project stores its own images, labels, datasets, training runs, templates,
+inference outputs, and UI state. The active labeling workflow and the most
+recent SAM weights path are restored from project metadata.
+
+New projects receive a default `mouse` pose class with six keypoints. Classes
+and keypoints can be changed through the application before labeling begins.
+
+### Project Structure
+
+The application creates the following entries inside each project:
+
+```text
+project/
+├── images_to_label/       # labeling queue
+├── images_all/            # images that have been saved or validated
+├── labels_all/            # YOLO pose labels
+├── labels_seg_all/        # YOLO segmentation labels
+├── annotations/           # rendered annotation previews
+├── datasets/              # exported YOLO datasets
+├── runs/                  # training output
+├── templates/             # pose annotation templates
+├── inference outputs/     # video inference CSV files
+├── logs/
+├── classes.txt
+├── keypoints.txt
+├── class_keypoints.json
+├── classes_seg.txt
+└── squeakpose_project.json
 ```
-On launch, you will be prompted to select a **project folder**. The app stores labeling, datasets, training runs, templates, and inference outputs inside that selected project.
-- Startup now opens a launcher screen with **Open Project** and **Create Project**.
-- Choosing **Create Project** immediately launches class/keypoint setup for the new project.
-- By default, the launcher starts in your Documents projects folder (`Documents/SqueakPose Studio Projects`).
-- In-app project commands are available under **File → Open Project…** and **File → Close Project**.
-- Workflow selector supports **Pose** and **Segmentation (SAM)** and restores last-used workflow per project.
-- Main controls are organized as hot-corner panels:
-  - top-left: navigation + labeling
-  - top-right: video tools
-  - bottom-left: dataset + training
-  - bottom-right: model + inference
 
-Per-project structure (auto-created)
-------------------------------------
-- `images_to_label/`
-- `images_all/`
-- `labels_all/`
-- `labels_seg_all/`
-- `annotations/`
-- `datasets/`
-- `runs/`
-- `inference outputs/`
-- `templates/`
-- `logs/`
-- `classes.txt`
-- `keypoints.txt`
-- `classes_seg.txt`
-- `class_keypoints.json`
-- `squeakpose_project.json`
+Use **File > Open Project...** to switch projects or **File > Close Project**
+to return to the launcher.
 
-Labeling workflow
------------------
-1) Add images to `images_to_label/`.
-2) Select workflow from the **Workflow** dropdown in the top-left panel.
+## Labeling
 
-Pose workflow:
-- Modes/shortcuts: pan/zoom (1), bbox (2), keypoint (3), predict (4).
-- Draw one box for the active class, place class-specific keypoints in order, set visibility states.
-- **Save** writes pose labels to `labels_all/<image>.txt`, copies source image to `images_all/`, and renders overlay to `annotations/`.
+Add source images to the project's `images_to_label/` directory, then select
+**Pose** or **Segmentation (SAM)** from the workflow selector.
 
-Segmentation workflow (SAM):
-- On first switch, you are prompted to define segmentation classes (stored in `classes_seg.txt`).
-- Modes/shortcuts: pan (1), segment prompt (2), edit mask brush (E).
-- Prompt semantics: left-click positive, right-click negative.
-- Run SAM (`G`) to generate preview, then **Accept** to commit per-class mask.
-- Brush editing: left-drag add, right-drag erase, `,`/`.` to resize brush.
-- **Save** writes segmentation labels to `labels_seg_all/<image>.txt`, copies source image to `images_all/`, and renders overlay to `annotations/`.
+Image filenames must have unique stems, including across extensions and letter
+case. For example, `frame.jpg`, `frame.png`, and `Frame.jpg` cannot coexist in
+one labeling queue because each would map to the same YOLO label name. The
+application excludes conflicting files until they are renamed.
 
-For both workflows:
-- Browse the labeling queue with filters (`All`, `Labeled`, `Unlabeled`) and use **Complete → Next Unlabeled** to advance.
+The main window is organized into four control areas:
 
-Dataset export & training
--------------------------
-- **Export Dataset**:
-  - Pose workflow exports from `labels_all` to `datasets/pose` (or `datasets/detect` for bbox-only cases).
-  - Seg workflow exports from `labels_seg_all` to `datasets/segment`.
-  - Dataset splits are shuffled with a user-provided seed so the same files, ratio, and seed reproduce the same train/val split.
-- **Train Model**: Pick task/dataset/model/device/epochs/batch size and launch Ultralytics training in a worker process. Outputs stream into the dialog and artifacts land in `runs/`.
+- Top left: image navigation and labeling controls
+- Top right: video review
+- Bottom left: dataset validation, export, and training
+- Bottom right: model loading, prediction, and inference
 
-Video inference
----------------
-- Select a trained model path via **Load Model**. The GUI keeps the path; worker processes load the model only when they need it.
-- **Video Reviewer** adapts to active workflow:
-  - Pose: bbox + keypoint overlays.
-  - Segmentation: mask polygon overlays (bbox fallback when mask is unavailable).
-- **Video Reviewer → Predict Range** runs in a child process, caches predictions next to the reviewed video, and keeps the timeline/export tools responsive.
-- **Inference** prompts for a video, batch size, and runs YOLO on batches in a child process. Results are streamed to CSV in the active project's `inference outputs/` folder.
-- CSV inference outputs include explicit no-detection rows for frames with no detections.
+The image browser can show all, labeled, or unlabeled images. Saving an image
+writes its active-workflow labels, copies the image into `images_all/`, and
+renders an overlay into `annotations/`. These outputs are staged and committed
+together, so a failed save does not replace an existing annotation.
 
-Programmatic helper
--------------------
-Generate a YOLO pose `dataset.yaml` from Python:
-```python
-from dataset_builder import create_dataset_yaml
+### Pose Workflow
 
-create_dataset_yaml(
-    base_dir="datasets/pose",          # folder containing images/train, images/val, labels/train, labels/val
-    class_names=["mouse"],
-    kp_names=["nose", "head", "left_ear", "right_ear", "back", "tail_base"],
-)
+For each active class:
+
+1. Draw one bounding box.
+2. Place the class's keypoints in their configured order.
+3. Set keypoint visibility when a point is occluded or not visible.
+4. Save the completed annotation.
+
+Pose labels use the YOLO pose format and are written to
+`labels_all/<image-stem>.txt`. Visibility values are:
+
+- `2`: visible
+- `1`: labeled but occluded
+- `0`: not visible
+
+Pose templates can be saved and applied per class. Once the project contains
+labels, the existing class/keypoint schema is protected from removal, renaming,
+or reordering because those changes would invalidate saved rows. New entries
+can still be added.
+
+### Segmentation Workflow
+
+Segmentation classes are stored in `classes_seg.txt`. SAM weights are not
+included in this repository.
+
+To use segmentation:
+
+1. Put a compatible `sam3*.pt` or `sam3*.pth` file in the project root, or
+   select one from the segmentation controls.
+2. Use left-click prompts for foreground and right-click prompts for
+   background.
+3. Run SAM to generate a preview.
+4. Accept the preview, then optionally refine it with the mask brush.
+5. Save the completed masks.
+
+The application automatically looks for SAM weights in the project root and
+prioritizes `sam3.pt`. Accepted polygons are written in YOLO segmentation
+format to `labels_seg_all/<image-stem>.txt`.
+
+In mask edit mode, left-drag adds to a mask and right-drag erases from it.
+
+### Main Shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `1` | Pan/zoom mode |
+| `2` | Bounding-box mode or segmentation prompt mode |
+| `3` | Keypoint mode |
+| `4` | Model prediction mode |
+| `S` | Save |
+| `Z` | Undo |
+| `P` / `N` | Previous / next image |
+| `K` | Skip to next unlabeled image |
+| `Ctrl+Enter` / `Cmd+Enter` | Complete and open next unlabeled image |
+| `Delete` / `Backspace` | Delete selected annotation |
+| `Escape` | Cancel the current draw or SAM prompts |
+| `Space` | Temporarily pan |
+| `V` | Toggle selected keypoint visibility |
+| `0` | Mark the next keypoint invisible |
+| `A` | Apply the active pose template |
+| `C` | Select the next class |
+| `G` | Run SAM |
+| `Shift+Enter` | Accept the SAM preview |
+| `E` | Edit the accepted segmentation mask |
+| `,` / `.` | Decrease / increase segmentation brush size |
+| `R` | Reset zoom |
+
+## Dataset Validation and Export
+
+Use **Validate Labels** before export to normalize the active workflow's label
+files. Validation:
+
+- creates a backup before the first rewrite;
+- clamps normalized coordinates;
+- pads missing pose keypoints as invisible;
+- removes invalid rows;
+- moves empty or completely unusable label files into a timestamped quarantine
+  directory beside the active label directory; and
+- ensures labeled images are available in `images_all/` when a matching queue
+  image exists.
+
+Use **Export Dataset** to choose a training ratio and deterministic shuffle
+seed. Only images with usable labels for the selected workflow and format are
+included; images without matching labels are skipped and reported in the export
+summary. Pose and segmentation rows are normalized again while the staged
+dataset is built, so exported files match the current class/keypoint schema.
+Exports are written under:
+
+```text
+datasets/pose/
+datasets/detect/
+datasets/segment/
 ```
-Flip indices are inferred automatically when keypoint names contain “left”/“right”.
 
-Troubleshooting
----------------
-- Device selection is automatic (CUDA → MPS → CPU). Run `python torch_ultralytics_checks.py` to verify.
-- If OpenCV is missing, install `opencv-python` to enable video inference.
-- For missing class/keypoint files, create or edit `classes.txt` and `keypoints.txt` inside the selected project folder.
-- Segmentation requires your own SAM weights (`sam3.pt` or compatible `sam3*.pt` / `sam3*.pth`). These are not included in this repo.
-- Place `sam3.pt` in the selected project folder for auto-load, or load manually from the Segmentation tools panel.
+The pose workflow can export either full pose labels or bounding-box-only
+detection labels. The segmentation workflow exports polygon labels. Each
+dataset contains YOLO `images/train`, `images/val`, `labels/train`,
+`labels/val`, and `dataset.yaml` entries.
+
+Pose dataset YAML files include class names, keypoint names, keypoint shape, and
+flip indices inferred from `left` and `right` keypoint names.
+
+Exports are built in a temporary directory first. Replacing an existing dataset
+only occurs after all image/label copies and `dataset.yaml` generation succeed.
+Canceling or failing an export leaves the previous dataset unchanged.
+
+Use **Project Health** to inspect image counts, usable labels, orphan labels,
+ambiguous stems, likely numbered image copies, worker config files, and stale
+transaction artifacts. Its cleanup prompt removes only transaction staging
+paths; it does not delete images, labels, or worker configs.
+
+## Training
+
+Open **Train Model** after exporting a dataset. The training dialog supports:
+
+- automatic, detection, pose, or segmentation task selection;
+- YOLOv26 `n`, `s`, `m`, `l`, and `x` model sizes;
+- standard YOLO initialization;
+- DINO distillation exports;
+- fine-tuning from an existing YOLO checkpoint; and
+- exact resume from a run containing `weights/last.pt`.
+
+Training runs in a child process and streams output into the dialog. Results are
+stored under the active project's `runs/train/<task>/` directory.
+The dialog blocks dataset/task mismatches before launch, and each worker checks
+the loaded model's Ultralytics task before prediction, review, inference, or
+training begins.
+
+Device selection prefers CUDA, then MPS, then CPU. CUDA uses automatic batch
+sizing in the UI; MPS requires a positive manual batch size.
+
+The optional DINO workflow is documented separately in
+[`dino_distillation/README.md`](dino_distillation/README.md).
+
+## Prediction and Video Review
+
+Use **Load Model** to select a `.pt`, `.yaml`, or `.onnx` model.
+
+Single-image prediction applies the best prediction for each class to the
+current image. Pose predictions populate boxes and keypoints; segmentation
+predictions populate boxes and masks.
+
+The **Video Reviewer** supports `.mp4`, `.mov`, `.avi`, and `.mkv` files. It
+can:
+
+- predict a selected frame range with configurable stride, batch size, and
+  confidence thresholds;
+- cache predictions beside the video in `<video-name>.sqp_preds.json`;
+- display prediction overlays on the timeline; and
+- export the current, random, low-confidence, or high-confidence frames into
+  the active project's labeling queue.
+
+Exported frame names include a short identifier derived from the source video
+path, preventing same-named videos from being mistaken for one another.
+
+Video Reviewer shortcuts include:
+
+| Shortcut | Action |
+| --- | --- |
+| `Left` / `Right` | Previous / next frame |
+| `E` | Export current frame |
+| `Shift+E` | Export lowest-confidence frames |
+| `Shift+H` | Export highest-confidence frames |
+| `Shift+R` | Export random frames |
+| `+` / `-` | Zoom in / out |
+| `R` | Reset zoom |
+
+## Video Inference
+
+Video inference processes the selected video in batches and writes a CSV into
+the project's `inference outputs/` directory.
+
+Pose output includes frame/time metadata, class and confidence, bounding boxes,
+tracking IDs when available, speed values, and absolute/normalized keypoint
+coordinates with confidence. Segmentation output includes detection metadata,
+boxes, and mask polygons. Frames without detections receive an explicit
+no-detection row.
+
+Closing a window with an active worker terminates the child process before the
+window exits and removes its temporary config file. Canceled inference keeps
+already-written CSV rows and reports the output as partial.
+
+## Repository Layout
+
+```text
+squeakpose_studio.py       Main PyQt6 application
+squeakpose_core.py         Qt-free project and workflow logic
+label_io.py                Label parsing and normalization
+dataset_builder.py         YOLO pose dataset YAML generation
+dataset_ops.py             Dataset validation and export helpers
+prediction_ops.py          Prediction serialization helpers
+inference_ops.py           Video inference row generation
+predict_worker.py          Single-image prediction process
+video_review_worker.py     Video review prediction process
+inference_worker.py        Video inference process
+train_worker.py            Ultralytics training process
+tests/                     Unit test suite
+example_datasets/          Example pose images, labels, and overlays
+analysis_toolset/          Example inference analysis notebook
+dino_distillation/         Optional DINO distillation workflow
+```
+
+## Development Checks
+
+Run the unit tests:
+
+```bash
+uv run python -m unittest -q
+```
+
+Run the PyTorch and Ultralytics environment check:
+
+```bash
+uv run python torch_ultralytics_checks.py
+```
+
+The environment check reports the selected PyTorch device and verifies that the
+core model stack imports successfully.
+
+## License
+
+See [`LICENSE`](LICENSE).

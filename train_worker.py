@@ -9,6 +9,8 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
+from squeakpose_core import model_task_mismatch_message
+
 _CANCEL_REQUESTED = False
 
 
@@ -33,6 +35,9 @@ def run_training_worker(
     event_writer: Callable[[dict[str, Any]], None] = _stdout_event_writer,
 ) -> int:
     """Run one YOLO training job and emit JSON-compatible event payloads."""
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = False
+
     model_cfg = str(config.get("model_cfg") or "")
     params = dict(config.get("params") or {})
     if not model_cfg:
@@ -54,6 +59,15 @@ def run_training_worker(
             model = model_factory(model_cfg)
     except Exception as exc:
         _emit_event(event_writer, {"event": "error", "error_message": f"Could not load model config '{model_cfg}': {exc}"})
+        return 1
+
+    task_error = model_task_mismatch_message(
+        getattr(model, "task", None),
+        params.get("task"),
+        subject="Training model",
+    )
+    if task_error:
+        _emit_event(event_writer, {"event": "error", "error_message": task_error})
         return 1
 
     if _CANCEL_REQUESTED:

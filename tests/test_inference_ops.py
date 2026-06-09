@@ -206,6 +206,63 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(rows[1]["kp_nose_x"], "3")
             self.assertEqual(progress[-1], (2, 2, "Inferencing frame 2/2"))
 
+    def test_run_pose_video_inference_rejects_short_result_batch(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pose.csv")
+            cv2 = _FakeCv2(["frame0", "frame1"])
+            model = _PoseModel([_Result(boxes=_Boxes())])
+
+            result = run_pose_video_inference(
+                model=model,
+                cv2_module=cv2,
+                video_path="video.mp4",
+                csv_path=csv_path,
+                model_path="model.pt",
+                classes=["mouse"],
+                kp_names=["nose"],
+                device="cpu",
+                batch_size=2,
+                total_frames=2,
+                fps=10.0,
+            )
+
+            self.assertTrue(result.had_error)
+            self.assertEqual(result.processed_frames, 0)
+            self.assertIn("1 results for 2 input frames", result.error_message)
+
+    def test_pose_inference_cancellation_preserves_completed_rows(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pose.csv")
+            cv2 = _FakeCv2(["frame0", "frame1"])
+            model = _PoseModel(
+                [
+                    _Result(boxes=_Boxes()),
+                    _Result(boxes=_Boxes()),
+                ]
+            )
+            cancel_checks = iter([False, False, False, True])
+
+            result = run_pose_video_inference(
+                model=model,
+                cv2_module=cv2,
+                video_path="video.mp4",
+                csv_path=csv_path,
+                model_path="model.pt",
+                classes=["mouse"],
+                kp_names=["nose"],
+                device="cpu",
+                batch_size=2,
+                total_frames=2,
+                fps=10.0,
+                cancel_requested=lambda: next(cancel_checks, True),
+            )
+
+            self.assertTrue(result.canceled)
+            self.assertFalse(result.had_error)
+            self.assertEqual(result.processed_frames, 1)
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                self.assertEqual(len(list(csv.DictReader(fh))), 1)
+
     def test_run_segmentation_video_inference_writes_json_polygons_without_binary_masks(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "seg.csv")
@@ -238,6 +295,33 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(rows[0]["class_name"], "mouse")
             self.assertEqual(rows[0]["binary_mask"], "")
             self.assertEqual(rows[0]["mask_polygon"], "[[1, 2], [11, 2], [11, 12]]")
+
+    def test_segmentation_inference_cancellation_preserves_completed_rows(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "seg.csv")
+            model = _SegModel(
+                [
+                    _Result(boxes=_Boxes()),
+                    _Result(boxes=_Boxes()),
+                ]
+            )
+            cancel_checks = iter([False, True])
+
+            result = run_segmentation_video_inference(
+                model=model,
+                video_path="video.mp4",
+                csv_path=csv_path,
+                classes=["mouse"],
+                device="cpu",
+                total_frames=2,
+                cancel_requested=lambda: next(cancel_checks, True),
+            )
+
+            self.assertTrue(result.canceled)
+            self.assertFalse(result.had_error)
+            self.assertEqual(result.processed_frames, 1)
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                self.assertEqual(len(list(csv.DictReader(fh))), 1)
 
     def test_inference_worker_runs_pose_config_and_emits_events(self):
         with TemporaryDirectory() as tmp:
@@ -290,6 +374,27 @@ class InferenceOpsTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(events[0]["event"], "error")
         self.assertIn("model_path", events[0]["error_message"])
+
+    def test_inference_worker_rejects_model_task_mismatch(self):
+        events = []
+        model = _SegModel([])
+        model.task = "segment"
+
+        exit_code = run_inference_worker(
+            {
+                "mode": "pose",
+                "model_path": "model.pt",
+                "video_path": "video.mp4",
+                "csv_path": "out.csv",
+            },
+            model_factory=lambda _path: model,
+            cv2_module=_FakeCv2([]),
+            event_writer=events.append,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertIn("task mismatch", events[-1]["error_message"])
 
 
 if __name__ == "__main__":

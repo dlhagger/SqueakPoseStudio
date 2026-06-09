@@ -72,6 +72,25 @@ class TrainWorkerTests(unittest.TestCase):
         self.assertTrue(events[-1]["had_error"])
         self.assertEqual(events[-1]["error_message"], "boom")
 
+    def test_training_worker_rejects_checkpoint_task_mismatch(self):
+        model = _TrainModel()
+        model.task = "detect"
+        events = []
+
+        exit_code = run_training_worker(
+            {
+                "model_cfg": "checkpoint.pt",
+                "params": {"data": "dataset.yaml", "task": "pose"},
+            },
+            model_factory=lambda _cfg: model,
+            event_writer=events.append,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual([event["event"] for event in events], ["started", "error"])
+        self.assertIn("task mismatch", events[-1]["error_message"])
+        self.assertEqual(model.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

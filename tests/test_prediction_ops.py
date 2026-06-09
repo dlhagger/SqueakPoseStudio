@@ -212,6 +212,25 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertEqual(events[0]["event"], "error")
         self.assertIn("image_path", events[0]["error_message"])
 
+    def test_predict_worker_rejects_model_task_mismatch(self):
+        model = _PredictModel([])
+        model.task = "detect"
+        events = []
+
+        exit_code = run_predict_worker(
+            {
+                "model_path": "model.pt",
+                "image_path": "image.png",
+                "workflow": "segmentation",
+            },
+            model_factory=lambda _path: model,
+            event_writer=events.append,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertIn("task mismatch", events[-1]["error_message"])
+
     def test_video_review_worker_predicts_strided_frames_and_emits_cache_shape(self):
         model = _VideoReviewModel(
             [
@@ -280,6 +299,30 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertIn("predict boom", result["error_message"])
         self.assertEqual(result["preds"]["0"]["ok"], False)
         self.assertEqual(result["preds"]["1"]["ok"], False)
+
+    def test_video_review_worker_rejects_model_task_mismatch(self):
+        model = _VideoReviewModel([])
+        model.task = "pose"
+        cv2 = _FakeCv2(["frame0"])
+        events = []
+
+        exit_code = run_video_review_worker(
+            {
+                "model_path": "model.pt",
+                "video_path": "video.mp4",
+                "workflow": "segmentation",
+                "start": 0,
+                "end": 0,
+            },
+            model_factory=lambda _path: model,
+            cv2_module=cv2,
+            event_writer=events.append,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertIn("task mismatch", events[-1]["error_message"])
+        self.assertTrue(cv2.capture.released)
 
 
 if __name__ == "__main__":

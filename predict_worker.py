@@ -10,6 +10,7 @@ import sys
 from typing import Any, Callable, Optional
 
 from prediction_ops import serialize_prediction_result
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -69,6 +70,14 @@ def run_predict_worker(
     try:
         with contextlib.redirect_stdout(sys.stderr):
             model = model_factory(model_path)
+            task_error = model_task_mismatch_message(
+                getattr(model, "task", None),
+                workflow,
+                subject="Prediction model",
+            )
+            if task_error:
+                event_writer({"event": "error", "error_message": task_error})
+                return 1
             results_list = model.predict(
                 source=image_path,
                 imgsz=640,

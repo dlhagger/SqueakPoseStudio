@@ -88,6 +88,27 @@ class StudioVideoReviewTests(unittest.TestCase):
 
         self.assertIs(fake_app._squeakpose_main_window, marker)
 
+    def test_corrupt_project_metadata_is_preserved_before_recovery(self):
+        with TemporaryDirectory() as tmp:
+            meta_path = os.path.join(tmp, "squeakpose_project.json")
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                fh.write("{not valid json")
+            app = LabelingApp.__new__(LabelingApp)
+            app.project_root = tmp
+            app._project_meta_recovery = None
+
+            payload = LabelingApp._read_project_meta(app)
+
+            self.assertEqual(payload, {})
+            self.assertFalse(os.path.exists(meta_path))
+            backups = [
+                name
+                for name in os.listdir(tmp)
+                if name.startswith("squeakpose_project.corrupt-")
+            ]
+            self.assertEqual(len(backups), 1)
+            self.assertIsNotNone(app._project_meta_recovery)
+
     def test_sync_canonical_keypoints_appends_class_map_names(self):
         with TemporaryDirectory() as tmp:
             keypoint_file = os.path.join(tmp, "keypoints.txt")
@@ -233,6 +254,175 @@ class StudioVideoReviewTests(unittest.TestCase):
             for path in paths:
                 self.assertFalse(os.path.exists(path), path)
             self.assertEqual(set(removed), set(paths))
+
+    def test_delete_image_blocks_when_another_extension_shares_the_stem(self):
+        with TemporaryDirectory() as tmp:
+            queue = os.path.join(tmp, "images_to_label")
+            images_all = os.path.join(tmp, "images_all")
+            os.makedirs(queue)
+            os.makedirs(images_all)
+            with open(os.path.join(queue, "frame001.jpg"), "wb") as fh:
+                fh.write(b"queue")
+            with open(os.path.join(images_all, "frame001.png"), "wb") as fh:
+                fh.write(b"stored")
+
+            class DeleteDummy:
+                images = ["frame001.jpg"]
+                current_idx = 0
+                image_dir_queue = queue
+                image_dir_all = images_all
+
+            app = DeleteDummy()
+            with (
+                patch("squeakpose_studio.QMessageBox.warning") as warning,
+                patch("squeakpose_studio.QMessageBox.question") as question,
+            ):
+                LabelingApp.delete_current_image(app)
+
+            warning.assert_called_once()
+            question.assert_not_called()
+            self.assertTrue(os.path.exists(os.path.join(queue, "frame001.jpg")))
+            self.assertTrue(os.path.exists(os.path.join(images_all, "frame001.png")))
+
+    def test_save_labels_keeps_existing_files_when_transaction_fails(self):
+        with TemporaryDirectory() as tmp:
+            queue = os.path.join(tmp, "images_to_label")
+            images_all = os.path.join(tmp, "images_all")
+            labels = os.path.join(tmp, "labels_all")
+            annotations = os.path.join(tmp, "annotations")
+            for directory in (queue, images_all, labels, annotations):
+                os.makedirs(directory)
+
+            source_path = os.path.join(queue, "frame001.jpg")
+            image_path = os.path.join(images_all, "frame001.jpg")
+            label_path = os.path.join(labels, "frame001.txt")
+            overlay_path = os.path.join(annotations, "frame001_annotated.png")
+            with open(source_path, "wb") as fh:
+                fh.write(b"new-image")
+            with open(image_path, "wb") as fh:
+                fh.write(b"old-image")
+            with open(label_path, "w", encoding="utf-8") as fh:
+                fh.write("old-label\n")
+            with open(overlay_path, "wb") as fh:
+                fh.write(b"old-overlay")
+
+            class SaveDummy:
+                def _is_seg_workflow(self):
+                    return False
+
+                def _is_pose_workflow(self):
+                    return True
+
+                def _cache_active_annotation(self):
+                    return True
+
+                def _annotation_entry_to_line(self, _entry):
+                    return "0 0.5 0.5 0.2 0.2"
+
+                def _render_overlay_from_cache(self, path):
+                    with open(path, "wb") as fh:
+                        fh.write(b"new-overlay")
+                    return True
+
+                def _update_progress_label(self):
+                    raise AssertionError("failed save must not update progress")
+
+            app = SaveDummy()
+            app.images = ["frame001.jpg"]
+            app.current_idx = 0
+            app.project_root = tmp
+            app.label_dir = labels
+            app.classes = ["mouse"]
+            app.annotation_cache = {0: {"class_id": 0}}
+            app.current_image_path = source_path
+            app.active_image_dir = queue
+            app.image_dir_queue = queue
+            app.image_dir_all = images_all
+
+            with (
+                patch("squeakpose_studio.commit_staged_paths", side_effect=OSError("injected failure")),
+                patch("squeakpose_studio.QMessageBox.warning"),
+            ):
+                saved = LabelingApp.save_labels(app)
+
+            self.assertFalse(saved)
+            with open(image_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"old-image")
+            with open(label_path, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "old-label\n")
+            with open(overlay_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"old-overlay")
+
+    def test_complete_does_not_advance_after_failed_save(self):
+        class CompleteDummy:
+            images = ["frame001.jpg", "frame002.jpg"]
+            current_idx = 0
+
+            def _is_seg_workflow(self):
+                return False
+
+            def _is_fully_labeled(self):
+                return True
+
+            def save_labels(self):
+                return False
+
+            def _find_next_unlabeled(self, _start):
+                raise AssertionError("failed save must not search for the next image")
+
+        app = CompleteDummy()
+        LabelingApp.complete_and_next_unlabeled(app)
+        self.assertEqual(app.current_idx, 0)
+
+    def test_schema_state_is_unchanged_when_transaction_fails(self):
+        with TemporaryDirectory() as tmp:
+            class SchemaDummy:
+                def _schema_is_locked(self):
+                    return False
+
+            app = SchemaDummy()
+            app.classes = ["mouse"]
+            app.kp_names = ["nose"]
+            app.class_keypoints = {"mouse": ["nose"]}
+            app.class_file = os.path.join(tmp, "classes.txt")
+            app.keypoint_file = os.path.join(tmp, "keypoints.txt")
+            app.class_keypoints_path = os.path.join(tmp, "class_keypoints.json")
+
+            with (
+                patch("squeakpose_studio.atomic_write_text_files", side_effect=OSError("disk full")),
+                patch("squeakpose_studio.QMessageBox.warning"),
+            ):
+                changed = LabelingApp._apply_class_manager_results(
+                    app,
+                    ["mouse", "rat"],
+                    ["nose", "tail"],
+                    {"mouse": ["nose"], "rat": ["tail"]},
+                )
+
+            self.assertFalse(changed)
+            self.assertEqual(app.classes, ["mouse"])
+            self.assertEqual(app.kp_names, ["nose"])
+            self.assertEqual(app.class_keypoints, {"mouse": ["nose"]})
+
+    def test_video_export_dedupe_is_scoped_to_source_id(self):
+        with TemporaryDirectory() as tmp:
+            for name in (
+                "session_sourcea_f000003.png",
+                "session_sourceb_f000007.png",
+            ):
+                with open(os.path.join(tmp, name), "wb") as fh:
+                    fh.write(b"frame")
+
+            class ReviewDummy:
+                base = "session"
+                video_source_id = "sourcea"
+
+                def _labeler_image_dir(self):
+                    return tmp
+
+            indices = VideoReviewDialog._existing_export_indices(ReviewDummy())
+
+            self.assertEqual(indices, {3})
 
     def test_progress_label_shows_queue_count(self):
         with TemporaryDirectory() as tmp:

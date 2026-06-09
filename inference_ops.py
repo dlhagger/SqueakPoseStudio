@@ -494,6 +494,13 @@ def run_pose_video_inference(
                 result.had_error = True
                 result.error_message = str(exc)
                 return False
+            if len(results_list) != len(batch_indices):
+                result.had_error = True
+                result.error_message = (
+                    "Prediction returned "
+                    f"{len(results_list)} results for {len(batch_indices)} input frames."
+                )
+                return False
 
             try:
                 for fi, inference_result in zip(batch_indices, results_list):
@@ -611,6 +618,10 @@ def run_segmentation_video_inference(
                 classes=classes,
                 include_binary_mask=False,
             )
+            if not rows:
+                raise RuntimeError(
+                    f"Could not serialize segmentation result for frame {frame_idx}."
+                )
             for row in rows:
                 csv_row = dict(row)
                 polygon = csv_row.get("mask_polygon")

@@ -49,6 +49,28 @@ class DatasetBuilderTests(unittest.TestCase):
                     verbose=False,
                 )
 
+    def test_create_dataset_yaml_can_reference_final_path_from_staging_directory(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for rel in (
+                ("images", "train"),
+                ("images", "val"),
+                ("labels", "train"),
+                ("labels", "val"),
+            ):
+                (base.joinpath(*rel)).mkdir(parents=True, exist_ok=True)
+
+            out_path = create_dataset_yaml(
+                base_dir=str(base),
+                class_names=["mouse"],
+                kp_names=["nose"],
+                verbose=False,
+                dataset_path="/final/project/datasets/pose",
+            )
+
+            data = yaml.safe_load(Path(out_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["path"], "/final/project/datasets/pose")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,17 +1,27 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from squeakpose_core import (
+    CURRENT_PROJECT_SCHEMA_VERSION,
     InferenceCsvWriter,
+    atomic_write_text_files,
     atomic_write_text,
     build_segmentation_inference_rows,
+    commit_staged_paths,
     effective_prediction_batch,
+    filter_image_stem_collisions,
     find_duplicate_names,
+    infer_dataset_task,
+    migrate_project_metadata,
+    model_task_mismatch_message,
     normalize_pose_label_lines,
     normalize_segmentation_label_lines,
+    normalize_yolo_task,
     parse_yolo_pose_label_line,
     resolve_default_training_dataset_path,
+    stable_path_id,
 )
 
 
@@ -24,6 +34,41 @@ class _FakeWriter:
 
 
 class CoreHelpersTests(unittest.TestCase):
+    def test_task_helpers_normalize_and_detect_mismatch(self):
+        self.assertEqual(normalize_yolo_task("segmentation"), "segment")
+        self.assertEqual(normalize_yolo_task("keypoints"), "pose")
+        self.assertEqual(infer_dataset_task({"task": "seg", "train": "images/train"}), "segment")
+        self.assertEqual(infer_dataset_task({"kpt_shape": [6, 3]}), "pose")
+        self.assertEqual(infer_dataset_task({"train": "images/train"}), "detect")
+        self.assertIsNone(model_task_mismatch_message("pose", "keypoints"))
+        self.assertIn("requires 'segment'", model_task_mismatch_message("detect", "segment"))
+
+    def test_project_metadata_migration_preserves_unknown_fields(self):
+        migrated, changed = migrate_project_metadata(
+            {
+                "schema_version": 1,
+                "workflow": "seg",
+                "sam_path": "models/sam.pt",
+                "custom": {"keep": True},
+            },
+            created_at="2026-06-09T12:00:00",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(migrated["schema_version"], CURRENT_PROJECT_SCHEMA_VERSION)
+        self.assertEqual(migrated["active_workflow"], "segmentation")
+        self.assertEqual(migrated["sam_model_path"], "models/sam.pt")
+        self.assertEqual(migrated["custom"], {"keep": True})
+        self.assertEqual(migrated["created_at"], "2026-06-09T12:00:00")
+
+    def test_project_metadata_does_not_downgrade_newer_schema(self):
+        payload = {"schema_version": CURRENT_PROJECT_SCHEMA_VERSION + 1, "future": True}
+
+        migrated, changed = migrate_project_metadata(payload)
+
+        self.assertFalse(changed)
+        self.assertEqual(migrated, payload)
+
     def test_find_duplicate_names_preserves_first_seen_order(self):
         dupes = find_duplicate_names(["nose", "tail", "nose", "ear", "tail", "tail"])
         self.assertEqual(dupes, ["nose", "tail"])
@@ -92,6 +137,90 @@ class CoreHelpersTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
             self.assertEqual([item.name for item in Path(tmp).iterdir()], ["labels.txt"])
 
+    def test_filter_image_stem_collisions_blocks_case_and_extension_variants(self):
+        accepted, collisions = filter_image_stem_collisions(
+            ["frame.jpg", "frame.png", "Mouse.JPG", "mouse.jpeg", "unique.webp"]
+        )
+
+        self.assertEqual(accepted, ["unique.webp"])
+        self.assertEqual(collisions["frame"], ["frame.jpg", "frame.png"])
+        self.assertEqual(collisions["mouse"], ["mouse.jpeg", "Mouse.JPG"])
+
+    def test_stable_path_id_distinguishes_same_named_files_in_different_folders(self):
+        first = stable_path_id("/tmp/session-a/video.mp4")
+        second = stable_path_id("/tmp/session-b/video.mp4")
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, stable_path_id("/tmp/session-a/video.mp4"))
+
+    def test_atomic_write_text_files_rolls_back_all_targets_on_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            classes = root / "classes.txt"
+            keypoints = root / "keypoints.txt"
+            classes.write_text("old-class\n", encoding="utf-8")
+            keypoints.write_text("old-keypoint\n", encoding="utf-8")
+            real_replace = __import__("os").replace
+
+            def fail_second_staged_install(src, dst):
+                if Path(dst) == keypoints and ".tmp" in Path(src).name:
+                    raise OSError("injected install failure")
+                return real_replace(src, dst)
+
+            with patch("squeakpose_core.os.replace", side_effect=fail_second_staged_install):
+                with self.assertRaises(OSError):
+                    atomic_write_text_files(
+                        {
+                            str(classes): "new-class\n",
+                            str(keypoints): "new-keypoint\n",
+                        }
+                    )
+
+            self.assertEqual(classes.read_text(encoding="utf-8"), "old-class\n")
+            self.assertEqual(keypoints.read_text(encoding="utf-8"), "old-keypoint\n")
+            self.assertFalse(any(".backup-" in item.name or ".tmp" in item.name for item in root.iterdir()))
+
+    def test_commit_staged_paths_restores_directories_when_final_install_fails(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_images = root / "images"
+            old_labels = root / "labels"
+            old_yaml = root / "dataset.yaml"
+            old_images.mkdir()
+            old_labels.mkdir()
+            (old_images / "old.jpg").write_text("old-image", encoding="utf-8")
+            (old_labels / "old.txt").write_text("old-label", encoding="utf-8")
+            old_yaml.write_text("old-yaml", encoding="utf-8")
+
+            staged_images = root / "staged-images"
+            staged_labels = root / "staged-labels"
+            staged_yaml = root / "staged.yaml"
+            staged_images.mkdir()
+            staged_labels.mkdir()
+            (staged_images / "new.jpg").write_text("new-image", encoding="utf-8")
+            (staged_labels / "new.txt").write_text("new-label", encoding="utf-8")
+            staged_yaml.write_text("new-yaml", encoding="utf-8")
+            real_replace = __import__("os").replace
+
+            def fail_yaml_install(src, dst):
+                if Path(src) == staged_yaml and Path(dst) == old_yaml:
+                    raise OSError("injected yaml install failure")
+                return real_replace(src, dst)
+
+            with patch("squeakpose_core.os.replace", side_effect=fail_yaml_install):
+                with self.assertRaises(OSError):
+                    commit_staged_paths(
+                        [
+                            (str(staged_images), str(old_images)),
+                            (str(staged_labels), str(old_labels)),
+                            (str(staged_yaml), str(old_yaml)),
+                        ]
+                    )
+
+            self.assertEqual((old_images / "old.jpg").read_text(encoding="utf-8"), "old-image")
+            self.assertEqual((old_labels / "old.txt").read_text(encoding="utf-8"), "old-label")
+            self.assertEqual(old_yaml.read_text(encoding="utf-8"), "old-yaml")
+
     def test_normalize_pose_label_lines_clamps_pads_and_drops_invalid_rows(self):
         normalized, warnings, changed = normalize_pose_label_lines(
             [
@@ -145,6 +274,20 @@ class CoreHelpersTests(unittest.TestCase):
         )
         self.assertTrue(any("odd coordinate count" in warning for warning in warnings))
         self.assertTrue(any("invalid class id" in warning for warning in warnings))
+
+    def test_normalize_segmentation_label_lines_drops_zero_area_polygons(self):
+        normalized, warnings, changed = normalize_segmentation_label_lines(
+            [
+                "0 0.1 0.1 0.2 0.2 0.3 0.3",
+                "0 0.5 0.5 0.5 0.5 0.5 0.5",
+            ],
+            class_count=1,
+        )
+
+        self.assertEqual(normalized, [])
+        self.assertTrue(changed)
+        self.assertTrue(any("zero-area" in warning for warning in warnings))
+        self.assertTrue(any("<3 unique" in warning for warning in warnings))
 
     def test_build_segmentation_inference_rows_formats_detection_schema(self):
         rows = build_segmentation_inference_rows(

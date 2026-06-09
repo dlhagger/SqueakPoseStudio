@@ -127,6 +127,8 @@ def create_dataset_yaml(
     class_names: Iterable[str],
     kp_names: Iterable[str],
     verbose: bool = True,
+    *,
+    dataset_path: str | None = None,
 ) -> str:
     """Create a YOLO pose dataset.yaml file in `base_dir`.
 
@@ -153,10 +155,10 @@ def create_dataset_yaml(
     try:
         import yaml
     except ImportError as exc:
-        raise ImportError("PyYAML is required to write dataset.yaml. Install with `pip install pyyaml`.") from exc
+        raise ImportError("PyYAML is required to write dataset.yaml.") from exc
 
     dataset = {
-        "path": base_dir,
+        "path": dataset_path or base_dir,
         "train": "images/train",
         "val": "images/val",
         "names": cls_list,

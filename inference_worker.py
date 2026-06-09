@@ -12,6 +12,7 @@ from inference_ops import (
     run_pose_video_inference,
     run_segmentation_video_inference,
 )
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -42,6 +43,9 @@ def run_inference_worker(
     event_writer: Callable[[dict[str, Any]], None] = _stdout_event_writer,
 ) -> int:
     """Run one inference job and emit JSON-compatible event payloads."""
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = False
+
     mode = str(config.get("mode", "pose")).lower()
     model_path = str(config.get("model_path") or "")
     video_path = str(config.get("video_path") or "")
@@ -83,6 +87,15 @@ def run_inference_worker(
         model = model_factory(model_path)
     except Exception as exc:
         _emit_event(event_writer, {"event": "error", "error_message": f"Could not load model: {exc}"})
+        return 1
+
+    task_error = model_task_mismatch_message(
+        getattr(model, "task", None),
+        mode,
+        subject="Inference model",
+    )
+    if task_error:
+        _emit_event(event_writer, {"event": "error", "error_message": task_error})
         return 1
 
     def progress(processed_frames: int, total: int, message: str) -> None:

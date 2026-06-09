@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, shutil, json, random, yaml, re, shlex, platform, datetime
+import sys, os, shutil, json, random, yaml, re, shlex, platform, datetime, tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -22,25 +22,41 @@ from PyQt6.QtCore import (
     Qt, QRectF, QPointF, QTimer, QPoint, QProcess, QLibraryInfo
 )
 from squeakpose_core import (
+    CURRENT_PROJECT_SCHEMA_VERSION,
+    atomic_write_text_files,
     atomic_write_text,
+    commit_staged_paths,
     effective_prediction_batch,
+    filter_image_stem_collisions,
     find_duplicate_names,
+    infer_dataset_task,
+    migrate_project_metadata,
+    remove_path,
     resolve_default_training_dataset_path,
+    stable_path_id,
+    stage_copy_file,
+    stage_text_file,
+    staging_path_for,
 )
 from dataset_ops import (
     DATASET_DETECT,
     DATASET_POSE,
     DATASET_SEGMENT,
     backup_label_dir,
+    cleanup_project_temporary_paths,
     dataset_dirs_have_files,
     dataset_export_paths,
+    dataset_export_paths_from_base,
     export_dataset_files,
     format_dataset_export_summary,
     format_label_normalization_summary,
+    format_project_health_summary,
+    label_file_has_usable_rows,
     list_image_files,
     list_label_files,
     normalize_label_directory,
-    remove_dataset_split_dirs,
+    partition_images_by_usable_labels,
+    scan_project_health,
     split_train_val_images,
     write_dataset_yaml_for_mode,
 )
@@ -64,6 +80,37 @@ PROJECT_META_FILE = "squeakpose_project.json"
 LAST_PROJECT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".squeakpose_studio_last_project.json")
 WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
+
+
+def _remove_file_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        if os.path.isfile(path) or os.path.islink(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def _shutdown_qprocess(
+    process: Optional[QProcess],
+    *,
+    terminate_timeout_ms: int = 2000,
+    kill_timeout_ms: int = 1000,
+) -> bool:
+    """Synchronously stop a child process before its owning window closes."""
+    if process is None or process.state() == QProcess.ProcessState.NotRunning:
+        return True
+    try:
+        process.blockSignals(True)
+    except Exception:
+        pass
+    process.terminate()
+    if process.waitForFinished(terminate_timeout_ms):
+        return True
+    process.kill()
+    process.waitForFinished(kill_timeout_ms)
+    return process.state() == QProcess.ProcessState.NotRunning
 
 
 def _qt_app_instance():
@@ -128,7 +175,7 @@ def _ensure_project_structure(project_root: str) -> dict[str, str]:
     meta_path = os.path.join(paths["root"], PROJECT_META_FILE)
     if not os.path.exists(meta_path):
         payload = {
-            "schema_version": 1,
+            "schema_version": CURRENT_PROJECT_SCHEMA_VERSION,
             "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         }
         try:
@@ -1442,11 +1489,38 @@ class LabelingApp(QMainWindow):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {}
+            if not isinstance(data, dict):
+                raise ValueError("project metadata must contain a JSON object")
+        except Exception as exc:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = os.path.join(
+                os.path.dirname(path),
+                f"squeakpose_project.corrupt-{timestamp}.json",
+            )
+            suffix = 1
+            while os.path.exists(backup_path):
+                backup_path = os.path.join(
+                    os.path.dirname(path),
+                    f"squeakpose_project.corrupt-{timestamp}-{suffix}.json",
+                )
+                suffix += 1
+            try:
+                os.replace(path, backup_path)
+                self._project_meta_recovery = (backup_path, str(exc))
+            except Exception:
+                self._project_meta_recovery = ("", str(exc))
+            return {}
+
+        migrated, changed = migrate_project_metadata(
+            data,
+            created_at=datetime.datetime.now().isoformat(timespec="seconds"),
+        )
+        if changed:
+            try:
+                atomic_write_text(path, json.dumps(migrated, indent=2))
+            except Exception:
+                pass
+        return migrated
 
     def _write_project_meta(self, updates: dict):
         if not isinstance(updates, dict):
@@ -1455,7 +1529,7 @@ class LabelingApp(QMainWindow):
         payload = self._read_project_meta()
         if not payload:
             payload = {
-                "schema_version": 1,
+                "schema_version": CURRENT_PROJECT_SCHEMA_VERSION,
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
             }
         for key, value in updates.items():
@@ -1467,6 +1541,24 @@ class LabelingApp(QMainWindow):
             atomic_write_text(path, json.dumps(payload, indent=2))
         except Exception:
             pass
+
+    def _show_project_meta_recovery(self):
+        recovery = getattr(self, "_project_meta_recovery", None)
+        if not recovery:
+            return
+        backup_path, detail = recovery
+        self._project_meta_recovery = None
+        if backup_path:
+            message = (
+                "The project metadata file was invalid and has been replaced with defaults.\n\n"
+                f"The original file was preserved at:\n{backup_path}\n\n{detail}"
+            )
+        else:
+            message = (
+                "The project metadata file is invalid and could not be backed up.\n\n"
+                f"{detail}"
+            )
+        QMessageBox.warning(self, "Project Metadata Recovered", message)
 
     def _meta_normalize_path(self, path: str) -> str:
         raw = str(path or "").strip()
@@ -1959,13 +2051,24 @@ class LabelingApp(QMainWindow):
         self._write_list_file(self.keypoint_file, self.kp_names)
         return self._kp_index_lookup[name]
 
+    def _label_file_is_usable(self, label_file: str) -> bool:
+        state = getattr(self, "__dict__", {})
+        workflow = state.get("active_workflow", WORKFLOW_POSE)
+        mode = DATASET_SEGMENT if workflow == WORKFLOW_SEG else DATASET_POSE
+        return label_file_has_usable_rows(
+            label_file,
+            mode=mode,
+            class_count=len(state.get("classes", []) or []),
+            keypoint_count=len(state.get("kp_names", []) or []),
+        )
+
     def _count_labeled_images(self, images: list[str], label_dir: str) -> tuple[int, int]:
         total = len(images)
         labeled = 0
         for img in images:
             base = os.path.splitext(img)[0]
             label_file = os.path.join(label_dir, f"{base}.txt")
-            if os.path.exists(label_file):
+            if self._label_file_is_usable(label_file):
                 labeled += 1
         return labeled, total
 
@@ -2980,14 +3083,38 @@ class LabelingApp(QMainWindow):
             self.current_idx = max(0, len(self.images) - 1)
         self._update_progress_label()
 
-    def _refresh_queue_images(self):
-        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
+    def _warn_image_stem_collisions(self):
+        collisions = getattr(self, "_queue_stem_collisions", {}) or {}
+        if not collisions:
+            self._reported_stem_collision_signature = None
+            return
+        signature = tuple((stem, tuple(names)) for stem, names in sorted(collisions.items()))
+        if signature == getattr(self, "_reported_stem_collision_signature", None):
+            return
+        self._reported_stem_collision_signature = signature
+        groups = [" / ".join(names) for names in collisions.values()]
+        preview = "\n".join(groups[:10])
+        if len(groups) > 10:
+            preview += f"\n...{len(groups) - 10} more"
+        QMessageBox.warning(
+            self,
+            "Duplicate Image Names",
+            "Images that share the same filename stem cannot have independent YOLO labels. "
+            "The following files are excluded until they are renamed:\n\n"
+            + preview,
+        )
+
+    def _refresh_queue_images(self, *, show_warning: bool = True):
         try:
-            self.images_queue = sorted(
-                f for f in os.listdir(self.image_dir_queue) if f.lower().endswith(exts)
-            )
+            candidates = sorted(list_image_files(self.image_dir_queue))
+            self.images_queue, self._queue_stem_collisions = filter_image_stem_collisions(candidates)
         except Exception:
             self.images_queue = []
+            self._queue_stem_collisions = {}
+        if not self._queue_stem_collisions:
+            self._reported_stem_collision_signature = None
+        elif show_warning:
+            QTimer.singleShot(0, self._warn_image_stem_collisions)
 
     def __init__(
         self,
@@ -3020,8 +3147,9 @@ class LabelingApp(QMainWindow):
         self.seg_class_file = os.path.join(self.project_root, "classes_seg.txt")
         self.base_dir = self.project_root
 
-        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-        self.images_queue = sorted(f for f in os.listdir(self.image_dir_queue) if f.lower().endswith(exts))
+        self._queue_stem_collisions: dict[str, list[str]] = {}
+        self._reported_stem_collision_signature = None
+        self._refresh_queue_images(show_warning=False)
         self.images = self.images_queue[:]
         self.active_image_dir = self.image_dir_queue
         self.current_image_path = ""
@@ -3081,6 +3209,7 @@ class LabelingApp(QMainWindow):
         self._seg_setup_prompted = False
         self.nav_filter = 'all'  # 'all' | 'labeled' | 'unlabeled'
 
+        self._project_meta_recovery: Optional[tuple[str, str]] = None
         self._load_project_preferences()
         self._bind_workflow_state(self.active_workflow)
         self._save_project_preferences()
@@ -3117,15 +3246,23 @@ class LabelingApp(QMainWindow):
         self._update_workflow_ui_state()
         self.load_image()
         self._update_progress_label()
+        if self._queue_stem_collisions:
+            QTimer.singleShot(0, self._warn_image_stem_collisions)
+        if self._project_meta_recovery:
+            QTimer.singleShot(0, self._show_project_meta_recovery)
         if self._is_seg_workflow():
             QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
         else:
             QTimer.singleShot(0, self._maybe_prompt_class_manager)
     def closeEvent(self, event):
-        if self._inference_process is not None and self._inference_process.state() != QProcess.ProcessState.NotRunning:
-            self._cancel_inference_process()
-        if self._prediction_process is not None and self._prediction_process.state() != QProcess.ProcessState.NotRunning:
-            self._cancel_prediction_process()
+        _shutdown_qprocess(self._inference_process)
+        _shutdown_qprocess(self._prediction_process)
+        _remove_file_quietly(self._inference_config_path)
+        _remove_file_quietly(self._prediction_config_path)
+        self._inference_process = None
+        self._prediction_process = None
+        self._inference_config_path = None
+        self._prediction_config_path = None
         super().closeEvent(event)
 
     def _setup_menu(self):
@@ -3642,6 +3779,12 @@ class LabelingApp(QMainWindow):
         self.export_dataset_btn.clicked.connect(self.export_dataset)
         training_row.addWidget(self.export_dataset_btn)
 
+        self.project_health_btn = QPushButton("Project Health")
+        self.project_health_btn.setToolTip("Report orphan labels, duplicate stems, and stale transaction files")
+        self.project_health_btn.setMinimumHeight(30)
+        self.project_health_btn.clicked.connect(self.show_project_health)
+        training_row.addWidget(self.project_health_btn)
+
         self.train_btn = QPushButton("Train Model")
         self.train_btn.setToolTip("Launch a training run for a selected dataset")
         self.train_btn.setMinimumHeight(30)
@@ -4034,9 +4177,9 @@ class LabelingApp(QMainWindow):
             return self._segmentation_entry_to_line(entry)
         return pose_annotation_to_line(entry, kp_names=self.kp_names, img_w=self.img_w, img_h=self.img_h)
 
-    def _render_overlay_from_cache(self, out_path: str):
+    def _render_overlay_from_cache(self, out_path: str) -> bool:
         if self.img_w <= 0 or self.img_h <= 0:
-            return
+            return False
         rect = QRectF(0, 0, self.img_w, self.img_h)
         render_w = int(rect.width())
         render_h = int(rect.height())
@@ -4123,10 +4266,13 @@ class LabelingApp(QMainWindow):
         finally:
             painter.end()
         try:
-            pm.save(out_path)
+            if not pm.save(out_path):
+                raise OSError(f"Qt could not encode overlay image: {out_path}")
             print(f"✅ Saved annotated image to {out_path}")
+            return True
         except Exception as e:
             print(f"⚠️ Failed to save annotated image: {e}")
+            return False
 
     # ---------- Navigation helpers ----------
 
@@ -4140,7 +4286,7 @@ class LabelingApp(QMainWindow):
             idx = (idx + 1) % total
             base = os.path.splitext(self.images_queue[idx])[0]
             label_file = os.path.join(self.label_dir, f"{base}.txt")
-            if not os.path.exists(label_file):
+            if not self._label_file_is_usable(label_file):
                 return idx
         return start_from  # all labeled
 
@@ -4148,7 +4294,7 @@ class LabelingApp(QMainWindow):
     def _is_labeled_index(self, idx: int) -> bool:
         base = os.path.splitext(self.images[idx])[0]
         label_file = os.path.join(self.label_dir, f"{base}.txt")
-        return os.path.exists(label_file)
+        return self._label_file_is_usable(label_file)
 
     def _filtered_indices(self) -> list[int]:
         if not self.images:
@@ -4229,9 +4375,7 @@ class LabelingApp(QMainWindow):
                     "Accept the current SAM preview mask before completing this frame.",
                 )
                 return
-            self.save_labels()
-            base = os.path.splitext(self.images[self.current_idx])[0]
-            if not os.path.exists(os.path.join(self.label_dir, f"{base}.txt")):
+            if not self.save_labels():
                 return
             next_idx = self._find_next_unlabeled(self.current_idx)
             if next_idx == self.current_idx:
@@ -4246,7 +4390,8 @@ class LabelingApp(QMainWindow):
             QMessageBox.information(self, "Incomplete",
                                     "Place one bounding box and all keypoints to complete this frame.")
             return
-        self.save_labels()
+        if not self.save_labels():
+            return
         next_idx = self._find_next_unlabeled(self.current_idx)
         if next_idx == self.current_idx:
             popup = CongratsPopup(); popup.exec()
@@ -4361,6 +4506,22 @@ class LabelingApp(QMainWindow):
             return
 
         file_name = os.path.basename(self.images[self.current_idx])
+        base = os.path.splitext(file_name)[0].casefold()
+        conflicting_names: set[str] = set()
+        for directory in (self.image_dir_queue, self.image_dir_all):
+            for candidate in list_image_files(directory):
+                if os.path.splitext(candidate)[0].casefold() == base and candidate != file_name:
+                    conflicting_names.add(candidate)
+        if conflicting_names:
+            QMessageBox.warning(
+                self,
+                "Duplicate Image Name",
+                f"Cannot safely delete '{file_name}' because another project image shares its label stem:\n\n"
+                f"{', '.join(sorted(conflicting_names, key=str.casefold))}\n\n"
+                "Rename the conflicting image first.",
+            )
+            return
+
         existing_paths = [p for p in self._image_delete_paths(file_name) if os.path.exists(p)]
         if not existing_paths:
             QMessageBox.information(
@@ -4414,7 +4575,7 @@ class LabelingApp(QMainWindow):
 
     def run_video_inference(self):
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Install OpenCV:\n\n  pip install opencv-python")
+            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
         if not getattr(self, "predict_model_path", None):
             QMessageBox.information(self, "No Model", "Load a model before running inference.")
@@ -4627,6 +4788,8 @@ class LabelingApp(QMainWindow):
             self._inference_stderr += process.errorString() + "\n"
 
     def _finish_inference_process(self, exit_code: int, exit_status) -> None:
+        if self._inference_process is None and self._inference_config_path is None:
+            return
         if self._inference_stdout_buffer.strip():
             self._handle_inference_event_line(self._inference_stdout_buffer.strip())
             self._inference_stdout_buffer = ""
@@ -4651,12 +4814,7 @@ class LabelingApp(QMainWindow):
         cancel_requested = self._inference_cancel_requested
         stderr_text = self._inference_stderr.strip()
 
-        if config_path:
-            try:
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-            except Exception:
-                pass
+        _remove_file_quietly(config_path)
 
         self._inference_process = None
         self._inference_progress = None
@@ -4909,17 +5067,14 @@ class LabelingApp(QMainWindow):
             self._prediction_stderr += process.errorString() + "\n"
 
     def _finish_prediction_process(self, exit_code: int, exit_status) -> None:
+        if self._prediction_process is None and self._prediction_config_path is None:
+            return
         if self._prediction_stdout_buffer.strip():
             self._handle_prediction_event_line(self._prediction_stdout_buffer.strip())
             self._prediction_stdout_buffer = ""
 
         config_path = self._prediction_config_path
-        if config_path:
-            try:
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-            except Exception:
-                pass
+        _remove_file_quietly(config_path)
 
         event = self._prediction_result_event
         stderr_text = self._prediction_stderr.strip()
@@ -5336,12 +5491,26 @@ class LabelingApp(QMainWindow):
                 )
                 return False
 
-        self._write_list_file(self.class_file, classes_clean)
-        self._write_list_file(self.keypoint_file, canonical)
+        try:
+            atomic_write_text_files(
+                {
+                    self.class_file: "".join(f"{name}\n" for name in classes_clean),
+                    self.keypoint_file: "".join(f"{name}\n" for name in canonical),
+                    self.class_keypoints_path: json.dumps(normalized_map, indent=2),
+                }
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Schema Save Error",
+                "Could not update the class/keypoint schema. Existing schema files were restored.\n\n"
+                f"{e}",
+            )
+            return False
+
         self.classes = classes_clean
         self.kp_names = canonical
         self.class_keypoints = normalized_map
-        self._save_class_keypoints()
         self._refresh_kp_index_lookup()
         current_name = self.class_selector.currentText()
         self.class_selector.blockSignals(True)
@@ -5903,9 +6072,9 @@ class LabelingApp(QMainWindow):
                 break
         self.current_kp_idx = min(count, len(self._active_kp_names()))
 
-    def save_labels(self):
+    def save_labels(self) -> bool:
         if not self.images:
-            return
+            return False
 
         if self._is_seg_workflow() and self.seg_preview_points:
             QMessageBox.information(
@@ -5913,15 +6082,16 @@ class LabelingApp(QMainWindow):
                 "Pending preview",
                 "Accept the current SAM preview mask before saving.",
             )
-            return
+            return False
 
         if self._is_pose_workflow() and not self._cache_active_annotation():
             QMessageBox.warning(self, "Save Error", "Place one bounding box and all keypoints for the selected class before saving.")
-            return
+            return False
         if self._is_seg_workflow():
             self._cache_active_annotation()
 
-        base = os.path.splitext(self.images[self.current_idx])[0]
+        file_name = os.path.basename(self.images[self.current_idx])
+        base = os.path.splitext(file_name)[0]
 
         project_root = self.project_root
         images_all_dir = os.path.join(project_root, "images_all")
@@ -5933,7 +6103,23 @@ class LabelingApp(QMainWindow):
 
         label_out_path = os.path.join(labels_all_dir, f"{base}.txt")
         annotated_out_path = os.path.join(annotations_dir, f"{base}_annotated.png")
-        image_out_path = os.path.join(images_all_dir, self.images[self.current_idx])
+        image_out_path = os.path.join(images_all_dir, file_name)
+
+        conflicting_images = [
+            name
+            for name in list_image_files(images_all_dir)
+            if os.path.splitext(name)[0].casefold() == base.casefold()
+            and name != file_name
+        ]
+        if conflicting_images:
+            QMessageBox.warning(
+                self,
+                "Duplicate Image Name",
+                f"Cannot save '{file_name}' because images_all already contains another image "
+                f"with the same stem:\n\n{', '.join(conflicting_images)}\n\n"
+                "Rename one of the images before saving.",
+            )
+            return False
 
         lines = []
         for class_idx in range(len(self.classes)):
@@ -5946,19 +6132,8 @@ class LabelingApp(QMainWindow):
 
         if not lines:
             QMessageBox.warning(self, "No annotations", "Nothing to save for this image.")
-            return
+            return False
 
-        try:
-            atomic_write_text(label_out_path, "\n".join(lines) + "\n")
-        except Exception as e:
-            QMessageBox.warning(self, "Save Error", f"Could not write label file:\n{label_out_path}\n\n{e}")
-            return
-        print(f"✅ Saved label to {label_out_path}")
-        self._schema_locked = True
-
-        self._render_overlay_from_cache(annotated_out_path)
-
-        file_name = self.images[self.current_idx]
         src_candidates: list[str] = []
         if self.current_image_path:
             src_candidates.append(self.current_image_path)
@@ -5981,32 +6156,47 @@ class LabelingApp(QMainWindow):
                 src_path = cand
                 break
 
-        copied_ok = False
-        if src_path:
-            try:
-                if os.path.abspath(src_path) != os.path.abspath(image_out_path):
-                    shutil.copy2(src_path, image_out_path)
-                    print(f"✅ Copied original image to {image_out_path}")
-                else:
-                    print(f"ℹ️ Image already stored at {image_out_path}")
-                copied_ok = True
-            except Exception as e:
-                print(f"⚠️ Warning: Failed to copy image {src_path}: {e}")
-
-        if not copied_ok and not os.path.exists(image_out_path):
+        if not src_path and not os.path.exists(image_out_path):
             tried = "\n".join(sorted(seen))
             msg = (
                 f"Could not locate source image for '{file_name}'.\n\n"
                 f"Tried:\n{tried}"
             )
-            print(f"⚠️ Warning: {msg}")
-            try:
-                QMessageBox.warning(self, "Image copy warning", msg)
-            except Exception:
-                pass
+            QMessageBox.warning(self, "Save Error", msg)
+            return False
 
-        # Update the labeled frame counter immediately after saving.
+        staged_replacements: list[tuple[str, str]] = []
+        try:
+            if src_path and os.path.abspath(src_path) != os.path.abspath(image_out_path):
+                staged_replacements.append((stage_copy_file(src_path, image_out_path), image_out_path))
+
+            staged_overlay = staging_path_for(annotated_out_path)
+            if not self._render_overlay_from_cache(staged_overlay):
+                remove_path(staged_overlay)
+                raise OSError("Could not render the annotated preview image.")
+            staged_replacements.append((staged_overlay, annotated_out_path))
+
+            staged_label = stage_text_file(label_out_path, "\n".join(lines) + "\n")
+            staged_replacements.append((staged_label, label_out_path))
+            commit_staged_paths(staged_replacements)
+        except Exception as e:
+            for staged_path, _ in staged_replacements:
+                try:
+                    remove_path(staged_path)
+                except Exception:
+                    pass
+            QMessageBox.warning(
+                self,
+                "Save Error",
+                "Could not save the annotation. Existing project files were restored.\n\n"
+                f"{e}",
+            )
+            return False
+
+        print(f"✅ Saved label to {label_out_path}")
+        self._schema_locked = True
         self._update_progress_label()
+        return True
 
     # ---------- Video ----------
     def export_dataset(self):
@@ -6025,7 +6215,17 @@ class LabelingApp(QMainWindow):
                                     f"Expected {labels_all_dir} to exist.")
             return
 
-        images = list_image_files(images_all_dir)
+        images, image_collisions = filter_image_stem_collisions(list_image_files(images_all_dir))
+        if image_collisions:
+            groups = "\n".join(" / ".join(names) for names in image_collisions.values())
+            QMessageBox.warning(
+                self,
+                "Duplicate Image Names",
+                "Dataset export cannot continue because images_all contains files that share "
+                "the same stem and therefore map to the same label:\n\n"
+                f"{groups}\n\nRename the conflicting images first.",
+            )
+            return
         if not images:
             QMessageBox.information(self, "Nothing to export",
                                     "images_all does not contain any images.")
@@ -6073,20 +6273,42 @@ class LabelingApp(QMainWindow):
         else:
             dataset_mode = DATASET_POSE if pose_mode else DATASET_DETECT
 
-        paths = dataset_export_paths(project_root, dataset_mode)
-        os.makedirs(paths.base_dir, exist_ok=True)
+        images, skipped_images = partition_images_by_usable_labels(
+            images,
+            labels_dir=labels_all_dir,
+            mode=dataset_mode,
+            class_count=len(self.classes),
+            keypoint_count=len(self.kp_names),
+        )
+        if not images:
+            label_kind = "segmentation" if seg_mode else "pose"
+            QMessageBox.information(
+                self,
+                "No labeled images",
+                f"No images in images_all have usable {label_kind} labels for this export.\n\n"
+                "Validate labels or switch to the workflow containing the labels you want to export.",
+            )
+            return
 
-        if dataset_dirs_have_files(paths):
+        paths = dataset_export_paths(project_root, dataset_mode)
+        os.makedirs(os.path.dirname(paths.base_dir), exist_ok=True)
+
+        existing_dataset = (
+            dataset_dirs_have_files(paths)
+            or os.path.exists(paths.dataset_yaml_path)
+            or os.path.exists(os.path.join(paths.base_dir, "images"))
+            or os.path.exists(os.path.join(paths.base_dir, "labels"))
+        )
+        if existing_dataset:
             confirm = QMessageBox.question(
                 self,
-                "Overwrite dataset?",
-                "Existing train/val folders contain files. Overwrite them?",
+                "Replace dataset?",
+                "An exported dataset already exists. Replace it after the new export completes successfully?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
-            remove_dataset_split_dirs(paths)
 
         images = sorted(images)
         random.Random(split_seed).shuffle(images)
@@ -6104,42 +6326,150 @@ class LabelingApp(QMainWindow):
             prog.setLabelText(f"Copying {img_file}")
             QApplication.processEvents()
 
+        staging_base = tempfile.mkdtemp(
+            prefix=f".{dataset_mode}-export-",
+            dir=os.path.dirname(paths.base_dir),
+        )
+        staging_paths = dataset_export_paths_from_base(staging_base)
+        export_result = None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             export_result = export_dataset_files(
                 images_all_dir=images_all_dir,
                 labels_all_dir=labels_all_dir,
-                paths=paths,
+                paths=staging_paths,
                 train_images=train_images,
                 val_images=val_images,
                 mode=dataset_mode,
+                class_count=len(self.classes),
+                keypoint_count=len(self.kp_names),
                 progress_callback=_progress,
                 cancel_requested=prog.wasCanceled,
             )
             export_result.split_seed = split_seed
+            export_result.skipped_images = skipped_images
+        except Exception as e:
+            remove_path(staging_base)
+            QMessageBox.critical(self, "Dataset Export Error", f"Could not stage the dataset:\n{e}")
+            return
         finally:
             QApplication.restoreOverrideCursor()
             prog.close()
 
+        if export_result is None:
+            remove_path(staging_base)
+            return
         if export_result.canceled:
+            remove_path(staging_base)
             QMessageBox.information(self, "Export canceled",
-                                    "Dataset export was canceled. Partially copied files may remain.")
+                                    "Dataset export was canceled. The previous dataset was left unchanged.")
+            return
+
+        if export_result.errors:
+            errors = "\n".join(export_result.errors[:10])
+            if len(export_result.errors) > 10:
+                errors += f"\n...{len(export_result.errors) - 10} more"
+            remove_path(staging_base)
+            QMessageBox.critical(
+                self,
+                "Dataset Export Error",
+                "The new dataset could not be completed. The previous dataset was left unchanged.\n\n"
+                + errors,
+            )
             return
 
         try:
             export_result.dataset_yaml_path = write_dataset_yaml_for_mode(
-                paths.base_dir,
+                staging_paths.base_dir,
                 dataset_mode,
                 self.classes,
                 self.kp_names,
+                dataset_path=paths.base_dir,
             )
         except Exception as e:
+            remove_path(staging_base)
             QMessageBox.warning(self, "dataset.yaml error",
-                                f"Failed to create dataset.yaml:\n{e}")
+                                "Failed to create dataset.yaml. The previous dataset was left unchanged.\n\n"
+                                f"{e}")
+            return
+
+        try:
+            os.makedirs(paths.base_dir, exist_ok=True)
+            commit_staged_paths(
+                [
+                    (os.path.join(staging_base, "images"), os.path.join(paths.base_dir, "images")),
+                    (os.path.join(staging_base, "labels"), os.path.join(paths.base_dir, "labels")),
+                    (staging_paths.dataset_yaml_path, paths.dataset_yaml_path),
+                ]
+            )
+            remove_path(staging_base)
+            export_result.dataset_yaml_path = paths.dataset_yaml_path
+        except Exception as e:
+            try:
+                remove_path(staging_base)
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self,
+                "Dataset Export Error",
+                "Could not install the new dataset. The previous dataset was restored.\n\n"
+                f"{e}",
+            )
             return
 
         QMessageBox.information(self, "Dataset exported", format_dataset_export_summary(export_result))
         self.update_status_bar("Dataset export complete.")
+
+    def show_project_health(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            report = scan_project_health(
+                self.project_root,
+                pose_class_count=len(self.pose_classes),
+                pose_keypoint_count=len(self.pose_kp_names),
+                segmentation_class_count=len(self.seg_classes),
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self,
+            "Project Health",
+            format_project_health_summary(report),
+        )
+        if not report.temporary_paths:
+            self.update_status_bar("Project health scan complete.")
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Remove Temporary Files?",
+            (
+                f"Remove {len(report.temporary_paths)} stale transaction "
+                "file(s) or staging folder(s)?\n\n"
+                "Worker config files and project data will not be removed."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.update_status_bar("Project health scan complete.")
+            return
+
+        errors = cleanup_project_temporary_paths(report)
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Cleanup Incomplete",
+                "Some temporary paths could not be removed:\n\n" + "\n".join(errors[:8]),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Cleanup Complete",
+                f"Removed {len(report.temporary_paths)} temporary path(s).",
+            )
+        self.update_status_bar("Project health cleanup complete.")
 
     def normalize_labels_all(self):
         labels_dir = self.label_dir
@@ -6186,11 +6516,13 @@ class LabelingApp(QMainWindow):
             prog.close()
 
         if result.canceled:
+            self._update_progress_label()
             QMessageBox.information(self, "Normalization canceled",
                                     "Operation canceled. Some files may have been processed already.")
             return
 
         QMessageBox.information(self, "Normalization complete", format_label_normalization_summary(result))
+        self._update_progress_label()
         status = "Segmentation label normalization complete." if seg_mode else "Label normalization complete."
         self.update_status_bar(status)
 
@@ -6207,7 +6539,7 @@ class LabelingApp(QMainWindow):
 
     def open_video_reviewer(self):
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Install OpenCV:\n\n  pip install opencv-python")
+            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
         # It’s okay if no model is loaded yet; dialog will warn before predicting
         dlg = VideoReviewDialog(
@@ -6252,6 +6584,7 @@ class VideoReviewDialog(QDialog):
         self.cap = None
         self.path: Optional[str] = None
         self.base: str = ""
+        self.video_source_id: str = ""
         self.total: int = 0
         self.fps: float = 0.0
         self.cur: int = 0
@@ -6573,7 +6906,7 @@ class VideoReviewDialog(QDialog):
             self.cap = None
 
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Install OpenCV: pip install opencv-python")
+            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
 
         cap = _cv2.VideoCapture(path)
@@ -6584,6 +6917,7 @@ class VideoReviewDialog(QDialog):
         self.cap = cap
         self.path = path
         self.base = os.path.splitext(os.path.basename(path))[0]
+        self.video_source_id = stable_path_id(path)
         self.total = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
         self.fps = float(cap.get(_cv2.CAP_PROP_FPS) or 0.0)
 
@@ -6808,6 +7142,8 @@ class VideoReviewDialog(QDialog):
             self._review_stderr += process.errorString() + "\n"
 
     def _finish_review_prediction_process(self, exit_code: int, exit_status):
+        if self._review_process is None and self._review_config_path is None:
+            return
         if self._review_stdout_buffer.strip():
             self._handle_review_prediction_event_line(self._review_stdout_buffer.strip())
             self._review_stdout_buffer = ""
@@ -6817,12 +7153,7 @@ class VideoReviewDialog(QDialog):
             progress.close()
 
         config_path = self._review_config_path
-        if config_path:
-            try:
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-            except Exception:
-                pass
+        _remove_file_quietly(config_path)
 
         event = self._review_result_event
         stderr_text = self._review_stderr.strip()
@@ -6959,15 +7290,14 @@ class VideoReviewDialog(QDialog):
 
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            base_name = f"{self.base}_f{self.cur:06d}.png"
+            base_name = f"{self.base}_{self.video_source_id}_f{self.cur:06d}.png"
             out_path = os.path.join(dest_dir, base_name)
 
             if _cv2 is None:
-                QMessageBox.warning(self, "OpenCV missing", "Install OpenCV: pip install opencv-python")
+                QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
                 return
 
-            ok = _cv2.imwrite(out_path, self._last_frame_bgr)
-            if not ok:
+            if not self._write_frame_image(out_path, self._last_frame_bgr):
                 QMessageBox.warning(self, "Export Error", "cv2.imwrite failed to save the image.")
                 return
 
@@ -6981,6 +7311,21 @@ class VideoReviewDialog(QDialog):
             QMessageBox.information(self, "Exported", f"Saved: {out_path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", f"Failed to export frame:\n{e}")
+
+    def _write_frame_image(self, out_path: str, frame) -> bool:
+        staged_path = staging_path_for(out_path)
+        try:
+            if not _cv2.imwrite(staged_path, frame):
+                remove_path(staged_path)
+                return False
+            commit_staged_paths([(staged_path, out_path)])
+            return True
+        except Exception:
+            try:
+                remove_path(staged_path)
+            except Exception:
+                pass
+            return False
             
     def _export_random_frames(self):
         """Export N random frames from the loaded video for fresh labeling."""
@@ -6993,7 +7338,7 @@ class VideoReviewDialog(QDialog):
             QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
             return
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Install OpenCV: pip install opencv-python")
+            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -7046,13 +7391,16 @@ class VideoReviewDialog(QDialog):
             if not ok or frame is None:
                 failed.append((fi, "read-failed"))
             else:
-                base_name = f"{self.base}_f{fi:06d}.png"
+                base_name = f"{self.base}_{self.video_source_id}_f{fi:06d}.png"
                 dest_path = os.path.join(dest_dir, base_name)
                 suffix = 1
                 while os.path.exists(dest_path):
-                    dest_path = os.path.join(dest_dir, f"{self.base}_f{fi:06d}_{suffix}.png")
+                    dest_path = os.path.join(
+                        dest_dir,
+                        f"{self.base}_{self.video_source_id}_f{fi:06d}_{suffix}.png",
+                    )
                     suffix += 1
-                if _cv2.imwrite(dest_path, frame):
+                if self._write_frame_image(dest_path, frame):
                     saved += 1
                 else:
                     failed.append((fi, "write-failed"))
@@ -7103,8 +7451,11 @@ class VideoReviewDialog(QDialog):
             return out
         try:
             import re
-            # Matches: {base}_f000123.png (optionally with suffixes, any common image ext)
-            pat = re.compile(rf"^{re.escape(self.base)}_f(\d{{6}})(?:_.*)?\.(?:png|jpg|jpeg|bmp|webp)$", re.IGNORECASE)
+            prefix = f"{self.base}_{self.video_source_id}_f"
+            pat = re.compile(
+                rf"^{re.escape(prefix)}(\d{{6}})(?:_.*)?\.(?:png|jpg|jpeg|bmp|webp)$",
+                re.IGNORECASE,
+            )
             for fn in os.listdir(dest_dir):
                 m = pat.match(fn)
                 if m:
@@ -7177,7 +7528,7 @@ class VideoReviewDialog(QDialog):
             QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
             return
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Install OpenCV: pip install opencv-python")
+            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -7205,13 +7556,16 @@ class VideoReviewDialog(QDialog):
             if not ok or frame is None:
                 failed.append((fi, "read-failed"))
             else:
-                base_name = f"{self.base}_f{fi:06d}.png"
+                base_name = f"{self.base}_{self.video_source_id}_f{fi:06d}.png"
                 dest_path = os.path.join(dest_dir, base_name)
                 suffix = 1
                 while os.path.exists(dest_path):
-                    dest_path = os.path.join(dest_dir, f"{self.base}_f{fi:06d}_{suffix}.png")
+                    dest_path = os.path.join(
+                        dest_dir,
+                        f"{self.base}_{self.video_source_id}_f{fi:06d}_{suffix}.png",
+                    )
                     suffix += 1
-                if _cv2.imwrite(dest_path, frame):
+                if self._write_frame_image(dest_path, frame):
                     saved += 1
                     saved_confs.append(conf_map.get(fi, 0.0))
                 else:
@@ -7399,9 +7753,22 @@ class VideoReviewDialog(QDialog):
 
     def reject(self):
         if self._review_process is not None and self._review_process.state() != QProcess.ProcessState.NotRunning:
-            self._cancel_review_prediction_process()
-            QMessageBox.information(self, "Prediction running", "Canceling video prediction. Close the reviewer after it stops.")
-            return
+            answer = QMessageBox.question(
+                self,
+                "Cancel prediction?",
+                "Video prediction is still running. Cancel it and close the reviewer?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            _shutdown_qprocess(self._review_process)
+            _remove_file_quietly(self._review_config_path)
+            if self._review_progress is not None:
+                self._review_progress.close()
+            self._review_process = None
+            self._review_progress = None
+            self._review_config_path = None
         # cleanup
         try:
             if self.cap is not None:
@@ -7911,9 +8278,21 @@ class TrainDialog(QDialog):
 
     def closeEvent(self, event):
         if self.training_running:
-            QMessageBox.information(self, "Training running", "Cancel training before closing this dialog.")
-            event.ignore()
-            return
+            answer = QMessageBox.question(
+                self,
+                "Cancel training?",
+                "Training is still running. Cancel it and close this dialog?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            _shutdown_qprocess(self.train_process)
+            _remove_file_quietly(self.train_config_path)
+            self.train_process = None
+            self.train_config_path = None
+            self.training_running = False
         super().closeEvent(event)
 
     def _resolve_model_config(self, base_cfg: str, task_value: Optional[str]) -> tuple[str, Optional[str]]:
@@ -7948,13 +8327,7 @@ class TrainDialog(QDialog):
                 data = yaml.safe_load(f)
         except Exception:
             return None
-        if isinstance(data, dict):
-            task_raw = str(data.get("task", "")).strip().lower()
-            if task_raw in {"segment", "seg"}:
-                return "segment"
-            if "kpt_shape" in data or "kp_names" in data:
-                return "pose"
-        return "detect"
+        return infer_dataset_task(data)
 
     def _start_training(self):
         if self.training_running:
@@ -8057,6 +8430,16 @@ class TrainDialog(QDialog):
             task_value = "segment"
         else:
             task_value = "pose"
+
+        dataset_task = self._infer_task_from_yaml(resolved) if resolved else None
+        if task_value and dataset_task and task_value != dataset_task:
+            QMessageBox.warning(
+                self,
+                "Dataset Task Mismatch",
+                f"The selected dataset is '{dataset_task}', but the training task is '{task_value}'.\n\n"
+                "Choose the matching task or select a different dataset.",
+            )
+            return
 
         model_cfg = (
             distilled_path
@@ -8258,18 +8641,15 @@ class TrainDialog(QDialog):
             self.train_stderr_buffer += process.errorString() + "\n"
 
     def _finish_training_process(self, exit_code: int, exit_status):
+        if self.train_process is None and self.train_config_path is None:
+            return
         self._flush_training_terminal_output()
         if self.train_stdout_buffer.strip():
             self._handle_training_event_line(self.train_stdout_buffer.strip())
             self.train_stdout_buffer = ""
 
         config_path = self.train_config_path
-        if config_path:
-            try:
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-            except Exception:
-                pass
+        _remove_file_quietly(config_path)
 
         event = self.train_result_event
         stderr_text = self.train_stderr_buffer.strip()

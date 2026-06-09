@@ -10,6 +10,7 @@ import sys
 from typing import Any, Callable, Optional
 
 from prediction_ops import serialize_prediction_result, top_prediction_from_payload
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -112,6 +113,15 @@ def run_video_review_worker(
     try:
         with contextlib.redirect_stdout(sys.stderr):
             model = factory(model_path)
+
+        task_error = model_task_mismatch_message(
+            getattr(model, "task", None),
+            workflow,
+            subject="Video review model",
+        )
+        if task_error:
+            event_writer({"event": "error", "error_message": task_error})
+            return 1
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
         idx = start

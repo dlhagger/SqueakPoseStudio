@@ -8,8 +8,111 @@ from __future__ import annotations
 
 import os
 import math
+import hashlib
+import shutil
 import tempfile
+import uuid
+from collections.abc import Iterable, Mapping
 from typing import Any, Optional
+
+CURRENT_PROJECT_SCHEMA_VERSION = 2
+
+
+def normalize_yolo_task(value: Any) -> Optional[str]:
+    """Return a canonical Ultralytics task name when recognized."""
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "pose": "pose",
+        "keypoint": "pose",
+        "keypoints": "pose",
+        "segment": "segment",
+        "segmentation": "segment",
+        "seg": "segment",
+        "detect": "detect",
+        "detection": "detect",
+        "bbox": "detect",
+    }
+    return aliases.get(raw)
+
+
+def model_task_mismatch_message(
+    actual_task: Any,
+    expected_task: Any,
+    *,
+    subject: str = "Model",
+) -> Optional[str]:
+    """Return an actionable error when known model and requested tasks differ."""
+    actual = normalize_yolo_task(actual_task)
+    expected = normalize_yolo_task(expected_task)
+    if actual is None or expected is None or actual == expected:
+        return None
+    return (
+        f"{subject} task mismatch: loaded a '{actual}' model, "
+        f"but this operation requires '{expected}'."
+    )
+
+
+def infer_dataset_task(payload: Any) -> Optional[str]:
+    """Infer a YOLO dataset task from parsed dataset.yaml contents."""
+    if not isinstance(payload, Mapping):
+        return None
+    explicit = normalize_yolo_task(payload.get("task"))
+    if explicit is not None:
+        return explicit
+    if "kpt_shape" in payload or "kp_names" in payload:
+        return "pose"
+    if "train" in payload or "val" in payload:
+        return "detect"
+    return None
+
+
+def migrate_project_metadata(
+    payload: Mapping[str, Any],
+    *,
+    created_at: Optional[str] = None,
+) -> tuple[dict[str, Any], bool]:
+    """Migrate project metadata to the current schema without dropping extras."""
+    migrated = dict(payload)
+    changed = False
+
+    try:
+        version = int(migrated.get("schema_version", 1))
+    except (TypeError, ValueError):
+        version = 1
+        changed = True
+
+    if version > CURRENT_PROJECT_SCHEMA_VERSION:
+        return migrated, changed
+
+    if "active_workflow" not in migrated and "workflow" in migrated:
+        migrated["active_workflow"] = migrated.pop("workflow")
+        changed = True
+    if "sam_model_path" not in migrated and "sam_path" in migrated:
+        migrated["sam_model_path"] = migrated.pop("sam_path")
+        changed = True
+
+    workflow = str(migrated.get("active_workflow", "") or "").strip().lower()
+    normalized_workflow = {
+        "pose": "pose",
+        "keypoint": "pose",
+        "keypoints": "pose",
+        "segment": "segmentation",
+        "seg": "segmentation",
+        "segmentation": "segmentation",
+    }.get(workflow)
+    if normalized_workflow and normalized_workflow != migrated.get("active_workflow"):
+        migrated["active_workflow"] = normalized_workflow
+        changed = True
+
+    if not migrated.get("created_at") and created_at:
+        migrated["created_at"] = created_at
+        changed = True
+
+    if version != CURRENT_PROJECT_SCHEMA_VERSION:
+        migrated["schema_version"] = CURRENT_PROJECT_SCHEMA_VERSION
+        changed = True
+
+    return migrated, changed
 
 
 def find_duplicate_names(names: list[str]) -> list[str]:
@@ -91,6 +194,178 @@ def atomic_write_text(path: str, text: str, *, encoding: str = "utf-8") -> None:
             os.unlink(tmp_path)
         except OSError:
             pass
+        raise
+
+
+def image_stem_collisions(file_names: Iterable[str]) -> dict[str, list[str]]:
+    """Return case-insensitive image-stem collisions keyed by normalized stem."""
+    grouped: dict[str, list[str]] = {}
+    for raw_name in file_names:
+        name = os.path.basename(str(raw_name))
+        stem = os.path.splitext(name)[0].casefold()
+        if stem:
+            grouped.setdefault(stem, []).append(name)
+    return {
+        stem: sorted(names, key=str.casefold)
+        for stem, names in grouped.items()
+        if len(names) > 1
+    }
+
+
+def filter_image_stem_collisions(file_names: Iterable[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """Return files with ambiguous stems removed, plus the collision map."""
+    names = list(file_names)
+    collisions = image_stem_collisions(names)
+    blocked = set(collisions)
+    accepted = [
+        name
+        for name in names
+        if os.path.splitext(os.path.basename(name))[0].casefold() not in blocked
+    ]
+    return accepted, collisions
+
+
+def stable_path_id(path: str, *, length: int = 8) -> str:
+    """Return a short stable identifier for a canonical filesystem path."""
+    canonical = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest[:max(4, int(length))]
+
+
+def staging_path_for(target_path: str) -> str:
+    """Create and return an empty sibling staging file for a target path."""
+    target = os.path.abspath(target_path)
+    directory = os.path.dirname(target) or os.getcwd()
+    os.makedirs(directory, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(target))
+    fd, staged_path = tempfile.mkstemp(
+        prefix=f".{base}.",
+        suffix=f".tmp{ext}",
+        dir=directory,
+    )
+    os.close(fd)
+    return staged_path
+
+
+def stage_text_file(target_path: str, text: str, *, encoding: str = "utf-8") -> str:
+    """Write text to a sibling staging file and return its path."""
+    staged_path = staging_path_for(target_path)
+    try:
+        with open(staged_path, "w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+        return staged_path
+    except Exception:
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+        raise
+
+
+def stage_copy_file(source_path: str, target_path: str) -> str:
+    """Copy a file to a sibling staging path and return the staged path."""
+    staged_path = staging_path_for(target_path)
+    try:
+        shutil.copy2(source_path, staged_path)
+        return staged_path
+    except Exception:
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+        raise
+
+
+def remove_path(path: str) -> None:
+    """Remove a file, symlink, or directory when it exists."""
+    if not os.path.lexists(path):
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def commit_staged_paths(replacements: Iterable[tuple[str, str]]) -> None:
+    """Replace multiple paths as one rollback-capable transaction.
+
+    Replacements are committed in the supplied order. Existing targets are
+    moved to sibling backups first. If any replacement fails, all earlier
+    replacements are rolled back.
+    """
+    pairs = [(os.path.abspath(stage), os.path.abspath(target)) for stage, target in replacements]
+    if not pairs:
+        return
+
+    targets = [target for _, target in pairs]
+    if len(set(targets)) != len(targets):
+        raise ValueError("Transaction targets must be unique")
+    for staged_path, _ in pairs:
+        if not os.path.lexists(staged_path):
+            raise FileNotFoundError(staged_path)
+
+    records: list[dict[str, object]] = []
+    try:
+        for staged_path, target_path in pairs:
+            os.makedirs(os.path.dirname(target_path) or os.getcwd(), exist_ok=True)
+            backup_path: Optional[str] = None
+            if os.path.lexists(target_path):
+                backup_path = f"{target_path}.backup-{uuid.uuid4().hex}"
+                os.replace(target_path, backup_path)
+
+            record = {
+                "target": target_path,
+                "backup": backup_path,
+                "installed": False,
+            }
+            records.append(record)
+            os.replace(staged_path, target_path)
+            record["installed"] = True
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for record in reversed(records):
+            target_path = str(record["target"])
+            backup_path = record["backup"]
+            try:
+                if bool(record["installed"]) and os.path.lexists(target_path):
+                    remove_path(target_path)
+                if backup_path and os.path.lexists(str(backup_path)):
+                    os.replace(str(backup_path), target_path)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{target_path}: {rollback_exc}")
+        for staged_path, _ in pairs:
+            try:
+                remove_path(staged_path)
+            except Exception:
+                pass
+        if rollback_errors:
+            detail = "; ".join(rollback_errors)
+            raise RuntimeError(f"{exc}; rollback failed: {detail}") from exc
+        raise
+    else:
+        for record in records:
+            backup_path = record["backup"]
+            if backup_path:
+                try:
+                    remove_path(str(backup_path))
+                except Exception:
+                    pass
+
+
+def atomic_write_text_files(files: Mapping[str, str], *, encoding: str = "utf-8") -> None:
+    """Atomically replace a collection of text files with rollback."""
+    staged: list[tuple[str, str]] = []
+    try:
+        for target_path, text in files.items():
+            staged.append((stage_text_file(target_path, text, encoding=encoding), target_path))
+        commit_staged_paths(staged)
+    except Exception:
+        for staged_path, _ in staged:
+            try:
+                remove_path(staged_path)
+            except Exception:
+                pass
         raise
 
 
@@ -229,6 +504,7 @@ def normalize_segmentation_label_lines(
             continue
 
         coords: list[str] = []
+        points: list[tuple[float, float]] = []
         parse_failed = False
         for cidx in range(0, len(coord_tokens), 2):
             try:
@@ -241,10 +517,25 @@ def normalize_segmentation_label_lines(
             yn_clamped = _clamp01(yn)
             if xn_clamped != xn or yn_clamped != yn:
                 warnings.append(f"line {line_no} polygon coordinates were clamped")
+            points.append((xn_clamped, yn_clamped))
             coords.append(f"{xn_clamped:.6f}")
             coords.append(f"{yn_clamped:.6f}")
         if parse_failed or len(coords) < 6:
             warnings.append(f"line {line_no} parse error")
+            continue
+        if len(set(points)) < 3:
+            warnings.append(f"line {line_no} has <3 unique polygon points")
+            continue
+        area = abs(
+            sum(
+                points[idx][0] * points[(idx + 1) % len(points)][1]
+                - points[(idx + 1) % len(points)][0] * points[idx][1]
+                for idx in range(len(points))
+            )
+            / 2.0
+        )
+        if area <= 1e-12:
+            warnings.append(f"line {line_no} has zero-area polygon")
             continue
         normalized.append(f"{cid} " + " ".join(coords))
 

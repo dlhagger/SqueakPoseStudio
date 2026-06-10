@@ -9,6 +9,8 @@ The application is built with PyQt6, PyTorch, and Ultralytics YOLO. Model-heavy
 operations run in child processes so training, prediction, and inference do not
 block the main interface.
 
+[![Tests](https://github.com/dlhagger/SqueakPoseStudio/actions/workflows/tests.yml/badge.svg)](https://github.com/dlhagger/SqueakPoseStudio/actions/workflows/tests.yml)
+
 ## Features
 
 - Project launcher with **Create Project** and **Open Project** workflows.

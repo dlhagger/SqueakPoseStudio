@@ -31,6 +31,12 @@ dependencies = [
     "umap-learn>=0.5.11",
 ]
 
+[dependency-groups]
+test = [
+    "pyqt6>=6.11.0",
+    "pyyaml>=6.0.2",
+]
+
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },

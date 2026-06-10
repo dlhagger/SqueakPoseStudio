@@ -341,6 +341,12 @@ uv run python torch_ultralytics_checks.py
 The environment check reports the selected PyTorch device and verifies that the
 core model stack imports successfully.
 
+## Benchmarking
+
+Datasets for benchmarking in the SqueakPose Studio publication can be found at: 
+
+https://zenodo.org/records/20629815
+
 ## License
 
 See [`LICENSE`](LICENSE).

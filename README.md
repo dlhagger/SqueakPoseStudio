@@ -349,6 +349,13 @@ Datasets for benchmarking in the SqueakPose Studio publication can be found at:
 
 https://zenodo.org/records/20629815
 
+## Dependency Docs
+https://docs.ultralytics.com/help/FAQ#faq
+
+https://pytorch.org/get-started/locally/
+
+https://doc.qt.io/qtforpython-6/
+
 ## License
 
 See [`LICENSE`](LICENSE).

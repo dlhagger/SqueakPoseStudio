@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QLabel, QSplashScreen, QMessageBox,
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
-    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QListView
+    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QListView,
+    QScrollArea
 )
 from PyQt6.QtGui import (
     QPixmap, QPen, QBrush, QKeySequence, QFont, QPainter, QShortcut,
@@ -72,6 +73,17 @@ from inference_ops import (
     probe_video_metadata,
     segmentation_rows_from_result,
 )
+from analysis_dialog import AnalysisDialog
+from ui_style import (
+    app_stylesheet,
+    apply_panel_shadow,
+    hud_stylesheet,
+    launcher_stylesheet,
+    sidebar_stylesheet,
+    style_combo_popup,
+    ThemedComboBox,
+    train_dialog_stylesheet,
+)
 
 DEFAULT_CLASS_NAMES = ["mouse"]
 DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
@@ -123,6 +135,14 @@ def _retain_main_window(window) -> None:
         app._squeakpose_main_window = window
 
 
+def _refresh_qt_style(widget: Optional[QWidget]) -> None:
+    if widget is None:
+        return
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
+
+
 def _project_paths(project_root: str) -> dict[str, str]:
     root = os.path.abspath(project_root)
     return {
@@ -136,6 +156,7 @@ def _project_paths(project_root: str) -> dict[str, str]:
         "runs": os.path.join(root, "runs"),
         "templates": os.path.join(root, "templates"),
         "inference_outputs": os.path.join(root, "inference outputs"),
+        "analysis_outputs": os.path.join(root, "analysis outputs"),
         "logs": os.path.join(root, "logs"),
         "classes_file": os.path.join(root, "classes.txt"),
         "keypoints_file": os.path.join(root, "keypoints.txt"),
@@ -162,6 +183,7 @@ def _ensure_project_structure(project_root: str) -> dict[str, str]:
         "runs",
         "templates",
         "inference_outputs",
+        "analysis_outputs",
         "logs",
     ):
         os.makedirs(paths[key], exist_ok=True)
@@ -283,9 +305,13 @@ class ProjectLauncherDialog(QDialog):
 
         self.setWindowTitle("SqueakPose Studio")
         self.setModal(True)
-        self.setMinimumWidth(520)
+        self.setMinimumSize(640, 500)
+        self.setStyleSheet(launcher_stylesheet())
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(36, 28, 36, 28)
+        layout.setSpacing(18)
+        layout.addStretch(1)
         if logo_path and os.path.exists(logo_path):
             pix = QPixmap(logo_path)
             if not pix.isNull():
@@ -302,19 +328,22 @@ class ProjectLauncherDialog(QDialog):
                 layout.addWidget(logo_label)
 
         title = QLabel("Open a project or create a new one")
+        title.setObjectName("LauncherTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 14pt; font-weight: bold;")
         layout.addWidget(title)
 
         subtitle = QLabel(
             "Project folders contain classes, keypoints, images, labels, datasets, runs, and analysis outputs."
         )
+        subtitle.setObjectName("LauncherSubtitle")
         subtitle.setWordWrap(True)
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
         open_btn = QPushButton("Open Project")
+        open_btn.setObjectName("PrimaryLauncherButton")
         open_btn.clicked.connect(self._open_project)
         btn_row.addWidget(open_btn)
 
@@ -326,6 +355,7 @@ class ProjectLauncherDialog(QDialog):
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         layout.addWidget(cancel_btn)
+        layout.addStretch(1)
 
     def _open_project(self):
         chosen = _choose_project_root(self.default_dir, parent=self)
@@ -461,9 +491,10 @@ def _ui_font(px: int) -> QFont:
     available = set(QFontDatabase.families())
     system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
     ordered = ["Fira Sans", system_family, "Segoe UI", "Arial", "Helvetica"]
+    ignored = {"Sans Serif", "SansSerif", "sans"}
     seen = set()
     for family in ordered:
-        if not family or family in seen:
+        if not family or family in ignored or family in seen:
             continue
         seen.add(family)
         if family in available:
@@ -1135,6 +1166,9 @@ class LabelView(QGraphicsView):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setCacheMode(QGraphicsView.CacheModeFlag.CacheBackground)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -1783,6 +1817,8 @@ class LabelingApp(QMainWindow):
         self.normalize_btn.setEnabled(True)
         self.export_dataset_btn.setEnabled(True)
         self.train_btn.setEnabled(True)
+        if hasattr(self, "analysis_btn"):
+            self.analysis_btn.setEnabled(True)
         if hasattr(self, "delete_image_btn"):
             self.delete_image_btn.setEnabled(True)
         self.load_model_btn.setEnabled(True)
@@ -2413,13 +2449,6 @@ class LabelingApp(QMainWindow):
         self.seg_brush_size_label.setText(f"Brush: {radius}px")
         if self._is_seg_workflow():
             self.seg_brush_size_label.setVisible(True)
-            fg = "#ecf5ff"
-            bg = "rgba(69, 101, 132, 190)"
-            border = "rgba(164, 195, 226, 180)"
-            self.seg_brush_size_label.setStyleSheet(
-                "font-size: 9pt; font-weight: 700; padding: 2px 9px; border-radius: 8px; "
-                f"color: {fg}; background-color: {bg}; border: 1px solid {border};"
-            )
         else:
             self.seg_brush_size_label.setVisible(False)
 
@@ -2619,25 +2648,17 @@ class LabelingApp(QMainWindow):
         if hasattr(self, "sam_load_btn"):
             self.sam_load_btn.setEnabled(load_enabled)
             self.sam_load_btn.setText("Load SAM" if load_enabled else ("SAM Ready" if model_loaded else "SAM N/A"))
-            self.sam_load_btn.setStyleSheet(
-                "background-color: rgba(84, 98, 112, 225); border-color: rgba(164, 180, 195, 165);"
-                if load_enabled else ""
-            )
+            self.sam_load_btn.setProperty("tone", "load" if load_enabled else "")
+            _refresh_qt_style(self.sam_load_btn)
         self.sam_run_btn.setEnabled(run_enabled)
         self.sam_accept_btn.setEnabled(accept_enabled)
         self.sam_clear_btn.setEnabled(clear_enabled)
-        self.sam_run_btn.setStyleSheet(
-            "background-color: rgba(67, 104, 149, 230); border-color: rgba(150, 178, 207, 170);"
-            if (run_enabled and not has_preview) else ""
-        )
-        self.sam_accept_btn.setStyleSheet(
-            "background-color: rgba(62, 124, 92, 235); border-color: rgba(137, 201, 169, 180);"
-            if accept_enabled else ""
-        )
-        self.sam_clear_btn.setStyleSheet(
-            "background-color: rgba(108, 79, 79, 220); border-color: rgba(183, 147, 147, 165);"
-            if clear_enabled else ""
-        )
+        self.sam_run_btn.setProperty("tone", "run" if (run_enabled and not has_preview) else "")
+        self.sam_accept_btn.setProperty("tone", "accept" if accept_enabled else "")
+        self.sam_clear_btn.setProperty("tone", "clear" if clear_enabled else "")
+        _refresh_qt_style(self.sam_run_btn)
+        _refresh_qt_style(self.sam_accept_btn)
+        _refresh_qt_style(self.sam_clear_btn)
         if not model_loaded:
             self.sam_run_btn.setToolTip("Load SAM model first, then add prompts and run.")
         elif not has_image:
@@ -2650,30 +2671,31 @@ class LabelingApp(QMainWindow):
         if self.mode == "segedit":
             brush_px = int(getattr(self, "seg_brush_radius", 8))
             tool_text = "Brush"
-            edit_text = f"left-drag add, right-drag erase (brush {brush_px}px, ,/. resize)."
+            edit_text = f"left add, right erase (brush {brush_px}px; ,/. size)."
             if has_preview or has_mask:
                 action = f"Mask edit ({tool_text}): {edit_text}"
             else:
-                action = "No mask yet. Run SAM and accept, or edit a current preview."
+                action = "No mask yet. Run SAM, then accept or edit."
         elif not model_loaded:
-            action = "Next: Load SAM, add prompts, then Run (G)."
+            action = "Load SAM, add prompts, then Run (G)."
         elif not has_image:
             action = "Open an image to segment."
         elif not in_segment_mode:
-            action = "Press 2 for Segment mode. Left click = positive prompt, right click = negative prompt."
+            action = "Press 2. Left=positive, right=negative."
         elif not total_prompts and not has_preview:
-            action = "Left click = positive prompt, right click = negative prompt."
+            action = "Left=positive, right=negative."
         elif total_prompts and not has_preview:
-            action = "Run SAM (G) to generate a preview mask."
+            action = "Run SAM (G) for preview."
         else:
-            action = "Accept (Shift+Enter) to commit this mask."
+            action = "Accept (Shift+Enter) to save mask."
 
         mask_text = "saved" if has_mask else "none"
         preview_text = "ready" if has_preview else "none"
         model_text = "ready" if model_loaded else ("missing" if SAM is not None else "unavailable")
         self.sam_helper_label.setText(
             f"Class {class_name} | Done {completed}/{len(self.classes)} | Model {model_text} | Mask {mask_text}\n"
-            f"Prompts +{pos_prompts}/-{neg_prompts} | Preview {preview_text} | {action}"
+            f"Prompts +{pos_prompts}/-{neg_prompts} | Preview {preview_text}\n"
+            f"{action}"
         )
 
     def _load_sam_model_interactive(self):
@@ -3126,6 +3148,8 @@ class LabelingApp(QMainWindow):
         force_initial_setup: bool = False,
     ):
         super().__init__()
+        self.resize(1400, 860)
+        self.setMinimumSize(1180, 700)
         self.app_base_dir = os.path.dirname(__file__)
         inferred_root = project_root or os.path.dirname(image_dir or "") or os.getcwd()
         self.project_root = os.path.abspath(inferred_root)
@@ -3352,233 +3376,87 @@ class LabelingApp(QMainWindow):
         self.scene = QGraphicsScene()
         self.view = LabelView(self.scene, self)
 
-        panel_style = """
-            QFrame {
-                background-color: rgba(34, 38, 42, 200);
-                border: 1px solid rgba(128, 141, 152, 130);
-                border-radius: 13px;
-            }
-            QLabel {
-                background: transparent;
-                border: none;
-                padding: 0px;
-                color: #e2e8ee;
-            }
-            QLabel#panelTitle {
-                font-weight: 700;
-                font-size: 10pt;
-                color: #f5f8fb;
-                padding-bottom: 4px;
-                border-bottom: 1px solid rgba(130, 144, 156, 110);
-            }
-            QLabel#fieldLabel {
-                font-size: 9pt;
-                color: #c8d0d8;
-            }
-            QLabel#brushSizeBadge {
-                font-size: 9pt;
-                font-weight: 700;
-                color: #dce8f4;
-                background-color: rgba(65, 76, 87, 170);
-                border: 1px solid rgba(130, 145, 160, 130);
-                border-radius: 8px;
-                padding: 2px 9px;
-                min-width: 84px;
-            }
-            QLabel#sectionLabel {
-                font-size: 8pt;
-                font-weight: 700;
-                color: #aebac8;
-                letter-spacing: 0.8px;
-            }
-            QLabel#samHelper {
-                font-size: 9pt;
-                color: #e3ebf3;
-                background-color: rgba(56, 64, 72, 150);
-                border: 1px solid rgba(120, 135, 149, 120);
-                border-radius: 8px;
-                padding: 5px 7px;
-                line-height: 1.15;
-            }
-            QLabel#progressBadge {
-                font-weight: 700;
-                color: #f3f7fb;
-                background-color: rgba(69, 82, 93, 165);
-                border: 1px solid rgba(130, 144, 156, 130);
-                border-radius: 8px;
-                padding: 3px 8px;
-            }
-            QPushButton {
-                background-color: rgba(52, 58, 64, 220);
-                border: 1px solid rgba(133, 146, 158, 120);
-                border-radius: 8px;
-                padding: 4px 10px;
-                color: #eff3f7;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: rgba(67, 75, 83, 230);
-                border-color: rgba(154, 169, 183, 160);
-            }
-            QPushButton:pressed {
-                background-color: rgba(42, 48, 53, 235);
-            }
-            QPushButton:disabled {
-                color: rgba(224, 232, 239, 155);
-                background-color: rgba(51, 58, 64, 196);
-                border-color: rgba(134, 147, 159, 125);
-            }
-            QPushButton#samAcceptButton:disabled {
-                color: rgba(229, 236, 241, 170);
-                background-color: rgba(54, 68, 62, 198);
-                border-color: rgba(135, 158, 147, 148);
-            }
-            QComboBox {
-                background-color: rgba(43, 49, 54, 218);
-                border: 1px solid rgba(129, 142, 154, 120);
-                border-radius: 8px;
-                padding: 3px 8px;
-                min-height: 24px;
-                color: #eef3f8;
-            }
-            QComboBox::drop-down {
-                border-left: 1px solid rgba(129, 142, 154, 100);
-                width: 18px;
-            }
-            QComboBox::down-arrow {
-                width: 10px;
-                height: 10px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: rgba(35, 40, 45, 242);
-                border: 1px solid rgba(120, 133, 145, 140);
-                selection-background-color: rgba(94, 129, 161, 210);
-                selection-color: #ffffff;
-            }
-            QComboBox#workflowSelector {
-                combobox-popup: 0;
-                font-size: 10pt;
-                font-weight: 600;
-                padding: 4px 12px;
-                min-height: 31px;
-            }
-            QComboBox#workflowSelector::drop-down {
-                width: 24px;
-            }
-            QComboBox#workflowSelector QAbstractItemView {
-                font-size: 10pt;
-                background-color: rgba(36, 42, 48, 246);
-                color: #edf4fc;
-                border: 1px solid rgba(129, 146, 162, 176);
-                border-radius: 9px;
-                outline: 0px;
-                padding: 4px;
-                selection-background-color: rgba(97, 136, 171, 230);
-                selection-color: #ffffff;
-            }
-            QComboBox#workflowSelector QAbstractItemView::item {
-                min-height: 30px;
-                padding: 4px 10px;
-            }
-            QComboBox#browseSelector {
-                combobox-popup: 0;
-                font-size: 10pt;
-                font-weight: 600;
-                padding: 4px 10px;
-                min-height: 31px;
-            }
-            QComboBox#browseSelector::drop-down {
-                width: 22px;
-            }
-            QComboBox#browseSelector QAbstractItemView {
-                font-size: 10pt;
-                background-color: rgba(36, 42, 48, 246);
-                color: #edf4fc;
-                border: 1px solid rgba(129, 146, 162, 176);
-                border-radius: 9px;
-                outline: 0px;
-                padding: 4px;
-                selection-background-color: rgba(97, 136, 171, 230);
-                selection-color: #ffffff;
-            }
-            QComboBox#browseSelector QAbstractItemView::item {
-                min-height: 28px;
-                padding: 4px 10px;
-            }
-            QComboBox#classSelector {
-                combobox-popup: 0;
-                font-size: 10pt;
-                font-weight: 600;
-                padding: 4px 10px;
-                min-height: 31px;
-            }
-            QComboBox#classSelector::drop-down {
-                width: 22px;
-            }
-            QComboBox#classSelector QAbstractItemView {
-                font-size: 10pt;
-                background-color: rgba(36, 42, 48, 246);
-                color: #edf4fc;
-                border: 1px solid rgba(129, 146, 162, 176);
-                border-radius: 9px;
-                outline: 0px;
-                padding: 4px;
-                selection-background-color: rgba(97, 136, 171, 230);
-                selection-color: #ffffff;
-            }
-            QComboBox#classSelector QAbstractItemView::item {
-                min-height: 28px;
-                padding: 4px 10px;
-            }
-        """
+        # Main layout: reserve permanent tool space around a clean canvas.
+        panel_style = sidebar_stylesheet()
+        central.setStyleSheet(panel_style)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
 
-        # Main layout: keep canvas clean and place controls as hot-corner overlays.
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self.view)
+        self.left_sidebar_content = QWidget()
+        self.left_sidebar_content.setObjectName("SidebarContent")
+        self.left_sidebar_layout = QVBoxLayout(self.left_sidebar_content)
+        self.left_sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_sidebar_layout.setSpacing(10)
+
+        self.left_sidebar = QScrollArea()
+        self.left_sidebar.setWidgetResizable(True)
+        self.left_sidebar.setFrameShape(QFrame.Shape.NoFrame)
+        self.left_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.left_sidebar.setWidget(self.left_sidebar_content)
+        self.left_sidebar.setFixedWidth(360)
+
+        self.right_sidebar_content = QWidget()
+        self.right_sidebar_content.setObjectName("SidebarContent")
+        self.right_sidebar_layout = QVBoxLayout(self.right_sidebar_content)
+        self.right_sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_sidebar_layout.setSpacing(10)
+
+        self.right_sidebar = QScrollArea()
+        self.right_sidebar.setWidgetResizable(True)
+        self.right_sidebar.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_sidebar.setWidget(self.right_sidebar_content)
+        self.right_sidebar.setFixedWidth(360)
+
+        self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self.left_sidebar)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(self.right_sidebar)
         central.setLayout(layout)
 
-        def apply_panel_shadow(frame: QFrame):
-            shadow = QGraphicsDropShadowEffect(frame)
-            shadow.setBlurRadius(24)
-            shadow.setOffset(0, 3)
-            shadow.setColor(QColor(0, 0, 0, 120))
-            frame.setGraphicsEffect(shadow)
+        def prepare_panel_button(button: QPushButton, min_height: int = 30) -> QPushButton:
+            button.setMinimumHeight(min_height)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            return button
 
         # Shared widgets/state
-        self.class_selector = QComboBox()
+        self.class_selector = ThemedComboBox()
         self.class_selector.setObjectName("classSelector")
         self.class_selector.addItems(self.classes)
         self.class_selector.setToolTip("Choose the active class to label")
-        self.class_selector.setMinimumContentsLength(14)
+        self.class_selector.setMinimumContentsLength(12)
         self.class_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.class_selector.setMinimumWidth(156)
+        self.class_selector.setMinimumWidth(0)
         self.class_selector.setMinimumHeight(34)
+        self.class_selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.class_selector.setMaxVisibleItems(8)
         class_popup = QListView(self.class_selector)
         class_popup.setUniformItemSizes(True)
         class_popup.setSpacing(2)
         class_popup.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         class_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        style_combo_popup(class_popup)
         self.class_selector.setView(class_popup)
         self._fit_class_selector_to_items()
         self.class_selector.currentIndexChanged.connect(self._on_class_changed)
         self._active_class_id = self.class_selector.currentIndex()
-        self.workflow_selector = QComboBox()
+        self.workflow_selector = ThemedComboBox()
         self.workflow_selector.setObjectName("workflowSelector")
         self.workflow_selector.addItem("Pose Workflow (BBox + Keypoints)", WORKFLOW_POSE)
         self.workflow_selector.addItem("Segmentation Workflow (SAM)", WORKFLOW_SEG)
         self.workflow_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.workflow_selector.setMinimumContentsLength(30)
-        self.workflow_selector.setMinimumWidth(286)
+        self.workflow_selector.setMinimumContentsLength(18)
+        self.workflow_selector.setMinimumWidth(0)
         self.workflow_selector.setMinimumHeight(34)
+        self.workflow_selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.workflow_selector.setMaxVisibleItems(6)
         workflow_popup = QListView(self.workflow_selector)
         workflow_popup.setUniformItemSizes(True)
         workflow_popup.setSpacing(2)
         workflow_popup.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         workflow_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        style_combo_popup(workflow_popup)
         self.workflow_selector.setView(workflow_popup)
         self.workflow_selector.setToolTip(
             "Choose labeling workflow: Pose for boxes/keypoints, or Segmentation for SAM masks."
@@ -3588,7 +3466,8 @@ class LabelingApp(QMainWindow):
         # -----------------------------
         # Top-left: navigation + labeling
         # -----------------------------
-        self.top_left_frame = QFrame(self.view)
+        self.top_left_frame = QFrame(self.left_sidebar_content)
+        self.top_left_frame.setObjectName("ToolPanel")
         self.top_left_frame.setStyleSheet(panel_style)
         apply_panel_shadow(self.top_left_frame)
         top_left_layout = QVBoxLayout(self.top_left_frame)
@@ -3601,20 +3480,22 @@ class LabelingApp(QMainWindow):
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(6)
-        self.filter_combo = QComboBox()
+        self.filter_combo = ThemedComboBox()
         self.filter_combo.setObjectName("browseSelector")
         self.filter_combo.addItems(["All", "Labeled", "Unlabeled"])
         self.filter_combo.setToolTip("Which images to browse with Prev/Next")
         self.filter_combo.setMinimumContentsLength(10)
         self.filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.filter_combo.setMinimumWidth(132)
+        self.filter_combo.setMinimumWidth(0)
         self.filter_combo.setMinimumHeight(34)
+        self.filter_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.filter_combo.setMaxVisibleItems(8)
         filter_popup = QListView(self.filter_combo)
         filter_popup.setUniformItemSizes(True)
         filter_popup.setSpacing(2)
         filter_popup.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         filter_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        style_combo_popup(filter_popup)
         self.filter_combo.setView(filter_popup)
         self.filter_combo.currentTextChanged.connect(lambda t: self._set_nav_filter(t.lower()))
         browse_label = QLabel("Browse")
@@ -3632,42 +3513,38 @@ class LabelingApp(QMainWindow):
         workflow_row.addWidget(self.workflow_selector, 1)
         top_left_layout.addLayout(workflow_row)
 
-        nav_row = QHBoxLayout()
-        nav_row.setSpacing(6)
+        nav_grid = QGridLayout()
+        nav_grid.setHorizontalSpacing(6)
+        nav_grid.setVerticalSpacing(6)
         btn_prev = QPushButton('◀ Prev')
         btn_prev.clicked.connect(self.prev_index)
-        nav_row.addWidget(btn_prev)
+        nav_grid.addWidget(btn_prev, 0, 0)
 
         btn_next = QPushButton('Next ▶')
         btn_next.clicked.connect(self.next_index)
-        nav_row.addWidget(btn_next)
+        nav_grid.addWidget(btn_next, 0, 1)
 
         self.complete_btn = QPushButton('Complete')
         self.complete_btn.setToolTip("Save and jump to next unlabeled image")
         self.complete_btn.clicked.connect(self.complete_and_next_unlabeled)
-        nav_row.addWidget(self.complete_btn)
+        nav_grid.addWidget(self.complete_btn, 0, 2)
 
         self.skip_btn = QPushButton('Skip')
         self.skip_btn.setToolTip("Jump to next unlabeled image")
         self.skip_btn.clicked.connect(self.skip_to_next_unlabeled)
-        nav_row.addWidget(self.skip_btn)
+        nav_grid.addWidget(self.skip_btn, 1, 0)
 
         self.save_btn = QPushButton('Save')
         self.save_btn.clicked.connect(self.save_labels)
-        nav_row.addWidget(self.save_btn)
-        for btn in (btn_prev, btn_next, self.complete_btn, self.skip_btn, self.save_btn):
-            btn.setMinimumHeight(28)
-        top_left_layout.addLayout(nav_row)
+        nav_grid.addWidget(self.save_btn, 1, 1)
 
-        delete_row = QHBoxLayout()
-        delete_row.setSpacing(6)
         self.delete_image_btn = QPushButton("Delete Image")
         self.delete_image_btn.setToolTip("Delete the current image after confirmation")
-        self.delete_image_btn.setMinimumHeight(28)
         self.delete_image_btn.clicked.connect(self.delete_current_image)
-        delete_row.addWidget(self.delete_image_btn)
-        delete_row.addStretch(1)
-        top_left_layout.addLayout(delete_row)
+        nav_grid.addWidget(self.delete_image_btn, 1, 2)
+        for btn in (btn_prev, btn_next, self.complete_btn, self.skip_btn, self.save_btn, self.delete_image_btn):
+            prepare_panel_button(btn, min_height=30)
+        top_left_layout.addLayout(nav_grid)
 
         mode_section = QLabel("Mode")
         mode_section.setObjectName("sectionLabel")
@@ -3714,17 +3591,18 @@ class LabelingApp(QMainWindow):
         top_left_layout.addLayout(mode_grid)
         self._reflow_mode_grid(is_pose=self._is_pose_workflow())
 
-        class_row = QHBoxLayout()
-        class_row.setSpacing(6)
+        class_controls = QVBoxLayout()
+        class_controls.setSpacing(5)
         self.class_label_widget = QLabel("Class")
         self.class_label_widget.setObjectName("fieldLabel")
-        class_row.addWidget(self.class_label_widget)
-        class_row.addWidget(self.class_selector, 1)
+        class_controls.addWidget(self.class_label_widget)
+        class_controls.addWidget(self.class_selector)
         self.manage_classes_btn = QPushButton("Classes…")
         self.manage_classes_btn.setToolTip("Manage classes and per-class keypoints")
         self.manage_classes_btn.clicked.connect(self.open_class_manager)
-        class_row.addWidget(self.manage_classes_btn)
-        top_left_layout.addLayout(class_row)
+        prepare_panel_button(self.manage_classes_btn, min_height=30)
+        class_controls.addWidget(self.manage_classes_btn)
+        top_left_layout.addLayout(class_controls)
 
         progress_row = QHBoxLayout()
         progress_row.setSpacing(6)
@@ -3733,11 +3611,13 @@ class LabelingApp(QMainWindow):
         progress_row.addWidget(self.progress_label)
         progress_row.addStretch(1)
         top_left_layout.addLayout(progress_row)
+        self.left_sidebar_layout.addWidget(self.top_left_frame)
 
         # -----------------------------
         # Top-right: video tools
         # -----------------------------
-        self.top_right_frame = QFrame(self.view)
+        self.top_right_frame = QFrame(self.right_sidebar_content)
+        self.top_right_frame.setObjectName("ToolPanel")
         self.top_right_frame.setStyleSheet(panel_style)
         apply_panel_shadow(self.top_right_frame)
         top_right_layout = QVBoxLayout(self.top_right_frame)
@@ -3752,11 +3632,32 @@ class LabelingApp(QMainWindow):
         btn_video.clicked.connect(self.open_video_reviewer)
         top_right_layout.addWidget(btn_video)
         top_right_layout.addSpacing(2)
+        self.right_sidebar_layout.addWidget(self.top_right_frame)
+
+        # -----------------------------
+        # Right: analysis workflow
+        # -----------------------------
+        self.analysis_frame = QFrame(self.right_sidebar_content)
+        self.analysis_frame.setObjectName("ToolPanel")
+        self.analysis_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.analysis_frame)
+        analysis_layout = QVBoxLayout(self.analysis_frame)
+        analysis_layout.setContentsMargins(12, 11, 12, 14)
+        analysis_layout.setSpacing(8)
+        analysis_title = QLabel("Analysis")
+        analysis_title.setObjectName("panelTitle")
+        analysis_layout.addWidget(analysis_title)
+        self.analysis_btn = QPushButton("Analysis")
+        self.analysis_btn.setToolTip("Run the inference analysis workflow from a GUI")
+        self.analysis_btn.clicked.connect(self.open_analysis_dialog)
+        prepare_panel_button(self.analysis_btn, min_height=34)
+        analysis_layout.addWidget(self.analysis_btn)
 
         # -----------------------------
         # Bottom-left: training tools
         # -----------------------------
-        self.bottom_left_frame = QFrame(self.view)
+        self.bottom_left_frame = QFrame(self.right_sidebar_content)
+        self.bottom_left_frame.setObjectName("ToolPanel")
         self.bottom_left_frame.setStyleSheet(panel_style)
         apply_panel_shadow(self.bottom_left_frame)
         bottom_left_layout = QVBoxLayout(self.bottom_left_frame)
@@ -3765,38 +3666,38 @@ class LabelingApp(QMainWindow):
         bottom_left_title = QLabel("Dataset & Training")
         bottom_left_title.setObjectName("panelTitle")
         bottom_left_layout.addWidget(bottom_left_title)
-        training_row = QHBoxLayout()
-        training_row.setSpacing(6)
+        training_grid = QGridLayout()
+        training_grid.setHorizontalSpacing(6)
+        training_grid.setVerticalSpacing(6)
         self.normalize_btn = QPushButton("Validate Labels")
         self.normalize_btn.setToolTip("Rewrite labels_all files and ensure matching images exist in images_all")
-        self.normalize_btn.setMinimumHeight(30)
         self.normalize_btn.clicked.connect(self.normalize_labels_all)
-        training_row.addWidget(self.normalize_btn)
+        training_grid.addWidget(self.normalize_btn, 0, 0)
 
         self.export_dataset_btn = QPushButton("Export Dataset")
         self.export_dataset_btn.setToolTip("Split images_all/labels_all into train/val and regenerate dataset.yaml")
-        self.export_dataset_btn.setMinimumHeight(30)
         self.export_dataset_btn.clicked.connect(self.export_dataset)
-        training_row.addWidget(self.export_dataset_btn)
+        training_grid.addWidget(self.export_dataset_btn, 0, 1)
 
         self.project_health_btn = QPushButton("Project Health")
         self.project_health_btn.setToolTip("Report orphan labels, duplicate stems, and stale transaction files")
-        self.project_health_btn.setMinimumHeight(30)
         self.project_health_btn.clicked.connect(self.show_project_health)
-        training_row.addWidget(self.project_health_btn)
+        training_grid.addWidget(self.project_health_btn, 1, 0)
 
         self.train_btn = QPushButton("Train Model")
         self.train_btn.setToolTip("Launch a training run for a selected dataset")
-        self.train_btn.setMinimumHeight(30)
         self.train_btn.clicked.connect(self.open_train_dialog)
-        training_row.addWidget(self.train_btn)
+        training_grid.addWidget(self.train_btn, 1, 1)
+        for btn in (self.normalize_btn, self.export_dataset_btn, self.project_health_btn, self.train_btn):
+            prepare_panel_button(btn)
 
-        bottom_left_layout.addLayout(training_row)
+        bottom_left_layout.addLayout(training_grid)
 
         # -----------------------------
         # Bottom-right: model + inference
         # -----------------------------
-        self.bottom_right_frame = QFrame(self.view)
+        self.bottom_right_frame = QFrame(self.right_sidebar_content)
+        self.bottom_right_frame.setObjectName("ToolPanel")
         self.bottom_right_frame.setStyleSheet(panel_style)
         apply_panel_shadow(self.bottom_right_frame)
         bottom_right_layout = QVBoxLayout(self.bottom_right_frame)
@@ -3805,36 +3706,38 @@ class LabelingApp(QMainWindow):
         bottom_right_title = QLabel("Model & Inference")
         bottom_right_title.setObjectName("panelTitle")
         bottom_right_layout.addWidget(bottom_right_title)
-        inference_row = QHBoxLayout()
-        inference_row.setSpacing(6)
+        inference_grid = QGridLayout()
+        inference_grid.setHorizontalSpacing(6)
+        inference_grid.setVerticalSpacing(6)
         self.load_model_btn = QPushButton("Load Model")
-        self.load_model_btn.setMinimumHeight(30)
         self.load_model_btn.clicked.connect(self.load_model)
-        inference_row.addWidget(self.load_model_btn)
+        inference_grid.addWidget(self.load_model_btn, 0, 0)
 
-        self.template_apply_btn = QPushButton("Apply Tmpl")
+        self.template_apply_btn = QPushButton("Apply Template")
         self.template_apply_btn.setToolTip("Apply the saved template for the selected class")
-        self.template_apply_btn.setMinimumHeight(30)
         self.template_apply_btn.clicked.connect(self.apply_template_for_current_class)
-        inference_row.addWidget(self.template_apply_btn)
+        inference_grid.addWidget(self.template_apply_btn, 1, 0)
 
-        self.template_save_btn = QPushButton("Save Tmpl")
+        self.template_save_btn = QPushButton("Save Template")
         self.template_save_btn.setToolTip("Capture the current annotation as the class template")
-        self.template_save_btn.setMinimumHeight(30)
         self.template_save_btn.clicked.connect(self.save_template_for_current_class)
-        inference_row.addWidget(self.template_save_btn)
+        inference_grid.addWidget(self.template_save_btn, 1, 1)
 
         self.inference_btn = QPushButton("Inference")
         self.inference_btn.setToolTip("Select a video, run YOLO, and export per-frame metrics to CSV")
-        self.inference_btn.setMinimumHeight(30)
         self.inference_btn.clicked.connect(self.run_video_inference)
-        inference_row.addWidget(self.inference_btn)
-        bottom_right_layout.addLayout(inference_row)
+        inference_grid.addWidget(self.inference_btn, 0, 1)
+        for btn in (self.load_model_btn, self.template_apply_btn, self.template_save_btn, self.inference_btn):
+            prepare_panel_button(btn)
+        bottom_right_layout.addLayout(inference_grid)
+        self.right_sidebar_layout.addWidget(self.bottom_right_frame)
+        self.right_sidebar_layout.addWidget(self.bottom_left_frame)
 
         # -----------------------------
         # Bottom-left overlay: segmentation tools/help
         # -----------------------------
-        self.seg_tools_frame = QFrame(self.view)
+        self.seg_tools_frame = QFrame(self.left_sidebar_content)
+        self.seg_tools_frame.setObjectName("ToolPanel")
         self.seg_tools_frame.setStyleSheet(panel_style)
         apply_panel_shadow(self.seg_tools_frame)
         seg_tools_layout = QVBoxLayout(self.seg_tools_frame)
@@ -3856,33 +3759,32 @@ class LabelingApp(QMainWindow):
         seg_brush_row.addStretch(1)
         seg_tools_layout.addLayout(seg_brush_row)
 
-        sam_row = QHBoxLayout()
-        sam_row.setSpacing(6)
+        sam_grid = QGridLayout()
+        sam_grid.setHorizontalSpacing(6)
+        sam_grid.setVerticalSpacing(6)
         self.sam_load_btn = QPushButton("Load SAM")
         self.sam_load_btn.setToolTip("Load a SAM model file for segmentation prompts")
-        self.sam_load_btn.setMinimumHeight(28)
         self.sam_load_btn.clicked.connect(self._load_sam_model_interactive)
-        sam_row.addWidget(self.sam_load_btn)
+        sam_grid.addWidget(self.sam_load_btn, 0, 0)
 
         self.sam_run_btn = QPushButton("Run (G)")
         self.sam_run_btn.setToolTip("Run SAM using current positive/negative prompts")
-        self.sam_run_btn.setMinimumHeight(28)
         self.sam_run_btn.clicked.connect(self._run_sam_segmentation)
-        sam_row.addWidget(self.sam_run_btn)
+        sam_grid.addWidget(self.sam_run_btn, 0, 1)
 
         self.sam_accept_btn = QPushButton("Accept")
         self.sam_accept_btn.setObjectName("samAcceptButton")
         self.sam_accept_btn.setToolTip("Commit the current SAM mask preview to this class")
-        self.sam_accept_btn.setMinimumHeight(28)
         self.sam_accept_btn.clicked.connect(self._accept_segmentation_preview)
-        sam_row.addWidget(self.sam_accept_btn)
+        sam_grid.addWidget(self.sam_accept_btn, 1, 0)
 
         self.sam_clear_btn = QPushButton("Reset")
         self.sam_clear_btn.setToolTip("Remove prompt points and the current SAM preview")
-        self.sam_clear_btn.setMinimumHeight(28)
         self.sam_clear_btn.clicked.connect(self._clear_seg_prompt_state)
-        sam_row.addWidget(self.sam_clear_btn)
-        seg_tools_layout.addLayout(sam_row)
+        sam_grid.addWidget(self.sam_clear_btn, 1, 1)
+        for btn in (self.sam_load_btn, self.sam_run_btn, self.sam_accept_btn, self.sam_clear_btn):
+            prepare_panel_button(btn, min_height=30)
+        seg_tools_layout.addLayout(sam_grid)
 
         self.sam_helper_label = QLabel("")
         self.sam_helper_label.setWordWrap(True)
@@ -3890,6 +3792,10 @@ class LabelingApp(QMainWindow):
         seg_tools_layout.addWidget(self.sam_helper_label)
         self._refresh_seg_brush_size_badge()
         self.seg_tools_frame.hide()
+        self.left_sidebar_layout.addWidget(self.seg_tools_frame)
+        self.left_sidebar_layout.addStretch(1)
+        self.right_sidebar_layout.addStretch(1)
+        self.right_sidebar_layout.addWidget(self.analysis_frame)
 
         # reflect initial nav filter in the dropdown
         try:
@@ -3901,30 +3807,7 @@ class LabelingApp(QMainWindow):
 
         self._layout_hot_corners()
 
-        hud_style = """
-            QFrame {
-                background-color: rgba(34, 38, 42, 200);
-                border: 1px solid rgba(128, 141, 152, 130);
-                border-radius: 13px;
-            }
-            QLabel {
-                background: transparent;
-                border: none;
-                padding: 0px;
-                color: #e2e8ee;
-            }
-            QLabel#hudTitle {
-                font-weight: 700;
-                font-size: 10pt;
-                color: #f5f8fb;
-                padding-bottom: 2px;
-            }
-            QLabel#zoomValue {
-                font-weight: 700;
-                font-size: 11pt;
-                color: #f3f7fb;
-            }
-        """
+        hud_style = hud_stylesheet()
 
         # --- legend (bottom-left) ---
         self.legend_frame = QFrame(self.view)
@@ -3938,9 +3821,7 @@ class LabelingApp(QMainWindow):
         legend_layout.setSpacing(6)
 
         self.legend_title = QLabel("Keypoint Visibility")
-        self.legend_title.setStyleSheet(
-            "background: transparent; border: none; font-weight: 700; font-size: 10pt; color: #f5f8fb;"
-        )
+        self.legend_title.setObjectName("hudTitle")
         legend_layout.addWidget(self.legend_title)
 
         # multiline, can wrap, can expand
@@ -3950,7 +3831,6 @@ class LabelingApp(QMainWindow):
             "0: mark next invisible   Shift+0: selected → invisible"
         )
         self.legend_label.setWordWrap(True)
-        self.legend_label.setStyleSheet("background: transparent; border: none; font-size: 10pt; color: #e2e8ee;")
         self.legend_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         legend_layout.addWidget(self.legend_label)
 
@@ -3968,9 +3848,7 @@ class LabelingApp(QMainWindow):
         zoom_layout.setSpacing(4)
 
         self.zoom_label = QLabel("Zoom: 100%")
-        self.zoom_label.setStyleSheet(
-            "background: transparent; border: none; font-weight: 700; font-size: 11pt; color: #f3f7fb;"
-        )
+        self.zoom_label.setObjectName("zoomValue")
         zoom_layout.addWidget(self.zoom_label)
 
         self.zoom_frame.move(10, 150)
@@ -5926,10 +5804,8 @@ class LabelingApp(QMainWindow):
             'predict': self.predict_btn,
         }
         for mode_name, button in buttons.items():
-            if self.mode == mode_name:
-                button.setStyleSheet("background-color: #505357; font-weight: bold;")
-            else:
-                button.setStyleSheet("")
+            button.setProperty("activeMode", self.mode == mode_name)
+            _refresh_qt_style(button)
 
         # Show filtered index / total in status bar
         fi = self._filtered_indices()
@@ -5962,68 +5838,35 @@ class LabelingApp(QMainWindow):
         self.zoom_label.setText(f"Zoom: {zoom}%")
 
     def _layout_hot_corners(self):
+        return
+
+    def _layout_overlays(self):
+        """Dynamically position and size legend / zoom overlays."""
         if not hasattr(self, "view"):
             return
         vw = self.view.viewport().width()
         vh = self.view.viewport().height()
-        margin = 10
-        gap = 8
-
-        if hasattr(self, "top_left_frame"):
-            self.top_left_frame.adjustSize()
-            self.top_left_frame.move(margin, margin)
-
-        if hasattr(self, "top_right_frame"):
-            self.top_right_frame.adjustSize()
-            tr_w = self.top_right_frame.sizeHint().width()
-            self.top_right_frame.move(max(margin, vw - tr_w - margin), margin)
-
-        if hasattr(self, "bottom_left_frame"):
-            self.bottom_left_frame.adjustSize()
-            bl_h = self.bottom_left_frame.sizeHint().height()
-            self.bottom_left_frame.move(margin, max(margin, vh - bl_h - margin))
-
-        if hasattr(self, "bottom_right_frame"):
-            self.bottom_right_frame.adjustSize()
-            br_w = self.bottom_right_frame.sizeHint().width()
-            br_h = self.bottom_right_frame.sizeHint().height()
-            self.bottom_right_frame.move(max(margin, vw - br_w - margin), max(margin, vh - br_h - margin))
-
-    def _layout_overlays(self):
-        """Dynamically position and size legend / zoom overlays."""
-        vw = self.view.viewport().width()
-        vh = self.view.viewport().height()
-
-        # Keep overlays above the bottom-left tool panel.
-        bottom_offset = 10
-        if hasattr(self, "bottom_left_frame") and self.bottom_left_frame.isVisible():
-            bottom_offset += self.bottom_left_frame.sizeHint().height() + 8
 
         x = 10
-        cursor_y = vh - bottom_offset
-
-        # Segmentation tools box (seg workflow).
-        if hasattr(self, "seg_tools_frame") and self.seg_tools_frame.isVisible():
-            self.seg_tools_frame.adjustSize()
-            sh = self.seg_tools_frame.sizeHint().height()
-            self.seg_tools_frame.move(x, cursor_y - sh)
-            cursor_y -= sh + 8
+        cursor_y = vh - 10
 
         # Keypoint legend (pose workflow / keypoint mode).
         if hasattr(self, "legend_frame") and self.legend_frame.isVisible():
             fm = self.legend_label.fontMetrics()
             ch = fm.horizontalAdvance('M')  # approx width of one character
             preferred = int(ch * 30 + 24)
-            w = max(250, min(preferred, int(vw * 0.36), 400))
+            w = max(250, min(preferred, int(vw * 0.42), 420))
             self.legend_frame.setFixedWidth(w)
+            self.legend_frame.adjustSize()
             lh = self.legend_frame.sizeHint().height()
-            self.legend_frame.move(x, cursor_y - lh)
-            cursor_y -= lh + 8
+            top = max(10, cursor_y - lh)
+            self.legend_frame.move(x, top)
+            cursor_y = top - 8
 
         # Keep zoom HUD stacked above whichever lower-left overlays are visible.
         if hasattr(self, "zoom_frame") and self.zoom_frame.isVisible():
             zh = self.zoom_frame.sizeHint().height()
-            self.zoom_frame.move(x, cursor_y - zh)
+            self.zoom_frame.move(x, max(10, cursor_y - zh))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -6535,6 +6378,14 @@ class LabelingApp(QMainWindow):
         else:
             default_dataset = resolve_default_training_dataset_path(self.project_root)
             dlg = TrainDialog(self, default_dataset=default_dataset, default_task=None)
+        dlg.exec()
+
+    def open_analysis_dialog(self):
+        dlg = AnalysisDialog(
+            self,
+            project_root=self.project_root,
+            app_base_dir=self.app_base_dir,
+        )
         dlg.exec()
 
     def open_video_reviewer(self):
@@ -7848,6 +7699,7 @@ class TrainDialog(QDialog):
         header.addStretch(1)
         self.train_status_label = QLabel("Idle")
         self.train_status_label.setObjectName("TrainStatusLabel")
+        self.train_status_label.setProperty("tone", "idle")
         header.addWidget(self.train_status_label)
         settings_layout.addLayout(header)
 
@@ -7871,7 +7723,7 @@ class TrainDialog(QDialog):
         form.addRow("Dataset path:", ds_row)
 
         # Backbone source selection
-        self.source_combo = QComboBox()
+        self.source_combo = ThemedComboBox()
         self.source_combo.addItems([
             "Standard YOLO backbone",
             "DINO distillation export",
@@ -7882,20 +7734,21 @@ class TrainDialog(QDialog):
         form.addRow("Backbone source:", self.source_combo)
 
         # Model choice
-        self.model_combo = QComboBox()
+        self.model_combo = ThemedComboBox()
         self.model_combo.addItems(self.MODEL_OPTIONS.keys())
         self.model_row = QWidget()
         model_layout = QHBoxLayout(self.model_row)
         model_layout.setContentsMargins(0, 0, 0, 0)
         model_layout.addWidget(self.model_combo)
-        form.addRow("YOLO model:", self.model_row)
+        self.model_form_label = QLabel("YOLO model:")
+        form.addRow(self.model_form_label, self.model_row)
 
         # DINO export selection
         self.dino_row = QWidget()
         dino_layout = QVBoxLayout(self.dino_row)
         dino_layout.setContentsMargins(0, 0, 0, 0)
         dino_top = QHBoxLayout()
-        self.dino_combo = QComboBox()
+        self.dino_combo = ThemedComboBox()
         self.dino_combo.currentIndexChanged.connect(self._on_dino_combo_changed)
         dino_top.addWidget(self.dino_combo, 1)
         self.dino_refresh_btn = QPushButton("Refresh")
@@ -7909,8 +7762,10 @@ class TrainDialog(QDialog):
         self.dino_path_edit.setReadOnly(True)
         self.dino_path_edit.setPlaceholderText("No distillation export selected")
         dino_layout.addWidget(self.dino_path_edit)
-        form.addRow("Distilled export:", self.dino_row)
+        self.dino_form_label = QLabel("Distilled export:")
+        form.addRow(self.dino_form_label, self.dino_row)
         self.dino_row.hide()
+        self.dino_form_label.hide()
         self._refresh_dino_list()
 
         # Resume YOLO selection
@@ -7918,7 +7773,7 @@ class TrainDialog(QDialog):
         resume_layout = QVBoxLayout(self.resume_row)
         resume_layout.setContentsMargins(0, 0, 0, 0)
         resume_top = QHBoxLayout()
-        self.resume_combo = QComboBox()
+        self.resume_combo = ThemedComboBox()
         self.resume_combo.currentIndexChanged.connect(self._on_resume_combo_changed)
         resume_top.addWidget(self.resume_combo, 1)
         self.resume_refresh_btn = QPushButton("Refresh")
@@ -7932,8 +7787,10 @@ class TrainDialog(QDialog):
         self.resume_path_edit.setReadOnly(True)
         self.resume_path_edit.setPlaceholderText("No previous run selected")
         resume_layout.addWidget(self.resume_path_edit)
-        form.addRow("Checkpoint:", self.resume_row)
+        self.resume_form_label = QLabel("Checkpoint:")
+        form.addRow(self.resume_form_label, self.resume_row)
         self.resume_row.hide()
+        self.resume_form_label.hide()
         self._refresh_resume_list()
 
         # Device info
@@ -7941,7 +7798,7 @@ class TrainDialog(QDialog):
         form.addRow("Device:", self.device_label)
 
         # Task selection
-        self.task_combo = QComboBox()
+        self.task_combo = ThemedComboBox()
         self.task_combo.addItems([
             "Auto (from dataset)",
             "Detection",
@@ -7955,6 +7812,15 @@ class TrainDialog(QDialog):
         elif self.default_task == "detect":
             self.task_combo.setCurrentText("Detection")
         form.addRow("Training task:", self.task_combo)
+        train_combos = (
+            self.source_combo,
+            self.model_combo,
+            self.dino_combo,
+            self.resume_combo,
+            self.task_combo,
+        )
+        for combo in train_combos:
+            style_combo_popup(combo.view())
 
         # Hyperparameters
         self.epoch_spin = QSpinBox()
@@ -7969,7 +7835,7 @@ class TrainDialog(QDialog):
         form.addRow("Batch size:", self.batch_spin)
 
         self.batch_hint = QLabel("")
-        self.batch_hint.setStyleSheet("color: #bbbbbb; font-size: 9pt;")
+        self.batch_hint.setObjectName("TrainHintLabel")
         form.addRow("", self.batch_hint)
 
         settings_layout.addLayout(form)
@@ -8013,40 +7879,7 @@ class TrainDialog(QDialog):
 
         layout.addWidget(button_box)
 
-        self.setStyleSheet(
-            self.styleSheet()
-            + """
-            QFrame#TrainSettingsPanel, QFrame#TrainOutputPanel {
-                background-color: #24272a;
-                border: 1px solid #3e4449;
-                border-radius: 8px;
-            }
-            QLabel#TrainPanelTitle {
-                background: transparent;
-                border: none;
-                color: #f0f3f5;
-                font-size: 12pt;
-                font-weight: 700;
-                padding: 0;
-            }
-            QLabel#TrainStatusLabel {
-                background-color: #343a40;
-                border: 1px solid #515a61;
-                border-radius: 10px;
-                color: #dce3e8;
-                font-size: 9pt;
-                padding: 3px 10px;
-            }
-            QPlainTextEdit#TrainLogView {
-                background-color: #0e1113;
-                color: #d8dee4;
-                border: 1px solid #2f363d;
-                border-radius: 6px;
-                padding: 8px;
-                selection-background-color: #315f8f;
-            }
-            """
-        )
+        self.setStyleSheet(train_dialog_stylesheet())
 
         self._update_source_controls()
         self._configure_batch_controls()
@@ -8067,8 +7900,11 @@ class TrainDialog(QDialog):
         use_exact_resume = idx == 3
         use_resume = use_checkpoint_continue or use_exact_resume
         self.model_row.setVisible(idx == 0)
+        self.model_form_label.setVisible(idx == 0)
         self.dino_row.setVisible(use_dino)
+        self.dino_form_label.setVisible(use_dino)
         self.resume_row.setVisible(use_resume)
+        self.resume_form_label.setVisible(use_resume)
         if use_exact_resume:
             self.resume_path_edit.setPlaceholderText("Select weights/last.pt from a prior run")
         else:
@@ -8238,18 +8074,9 @@ class TrainDialog(QDialog):
 
     def _set_training_status(self, text: str, tone: str = "idle"):
         self.train_status_label.setText(text)
-        colors = {
-            "idle": ("#343a40", "#515a61", "#dce3e8"),
-            "running": ("#214f63", "#3f879c", "#dff8ff"),
-            "complete": ("#214f3a", "#3d8b61", "#e4fff1"),
-            "failed": ("#5a2528", "#94434a", "#ffe4e8"),
-            "canceled": ("#5a4a25", "#93763c", "#fff5d8"),
-        }
-        bg, border, fg = colors.get(tone, colors["idle"])
-        self.train_status_label.setStyleSheet(
-            f"background-color: {bg}; border: 1px solid {border}; border-radius: 10px; "
-            f"color: {fg}; font-size: 9pt; padding: 3px 10px;"
-        )
+        tone = tone if tone in {"idle", "running", "complete", "failed", "canceled"} else "idle"
+        self.train_status_label.setProperty("tone", tone)
+        _refresh_qt_style(self.train_status_label)
 
     def _clean_training_output(self, text: str) -> str:
         cleaned = self.ANSI_ESCAPE_RE.sub("", text)
@@ -8752,33 +8579,7 @@ if __name__ == '__main__':
         else:
             print("⚠️ Failed to load bundled Fira Sans font; using system font.")
 
-    dark_stylesheet = f"""
-    QWidget {{
-        background-color: #2b2b2b;
-        color: #e0e0e0;
-        font-family: '{preferred_family}', '{system_family}', 'Arial', 'Helvetica';
-        font-size: 11pt;
-    }}
-    QPushButton {{
-        background-color: #3c3f41;
-        border: 1px solid #555;
-        border-radius: 6px;
-        padding: 6px;
-    }}
-    QPushButton:hover {{ background-color: #505357; }}
-    QComboBox, QLabel {{
-        background-color: #3c3f41;
-        border: 1px solid #555;
-        border-radius: 6px;
-        padding: 4px;
-    }}
-    QComboBox QAbstractItemView {{
-        background-color: #2b2b2b;
-        selection-background-color: #606366;
-    }}
-    QGraphicsView {{ background-color: #1e1e1e; }}
-    """
-    app.setStyleSheet(dark_stylesheet)
+    app.setStyleSheet(app_stylesheet(preferred_family, system_family))
 
     def start_main_window():
         window = LabelingApp(

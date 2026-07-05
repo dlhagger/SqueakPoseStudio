@@ -306,6 +306,25 @@ Closing a window with an active worker terminates the child process before the
 window exits and removes its temporary config file. Canceled inference keeps
 already-written CSV rows and reports the output as partial.
 
+## Analysis
+
+Use **Analysis** in the right-hand panel to run the repeatable parts of
+`analysis_toolset/analysis_toolkit.ipynb` from a GUI. The dialog loads a source
+frame when a video is available, lets you click two scale points, draw named
+rectangular ROIs, and then runs the workflow on an inference CSV with the
+selected smoothing and output options.
+
+The analysis worker writes `analysis_features.csv`, `analysis_summary.json`,
+ROI summaries, and optional plots into the active project's
+`analysis outputs/` directory. Optional video-dependent outputs include
+annotated videos and behavior-cluster clips when UMAP/HDBSCAN clustering is
+enabled.
+
+Segmentation inference CSVs are routed through a segmentation-specific workflow.
+It parses `mask_polygon`, computes mask geometry, tracks the primary mask
+centroid per frame, writes `segmentation_detections.csv`, and includes
+segmentation coverage, mask area, trajectory, and ROI occupancy outputs.
+
 ## Repository Layout
 
 ```text
@@ -319,6 +338,9 @@ inference_ops.py           Video inference row generation
 predict_worker.py          Single-image prediction process
 video_review_worker.py     Video review prediction process
 inference_worker.py        Video inference process
+analysis_ops.py            Inference CSV analysis workflow
+analysis_worker.py         Analysis child process
+analysis_dialog.py         PyQt6 analysis dialog
 train_worker.py            Ultralytics training process
 tests/                     Unit test suite
 example_datasets/          Example pose images, labels, and overlays

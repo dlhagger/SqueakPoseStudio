@@ -255,8 +255,12 @@ training begins.
 Device selection prefers CUDA, then MPS, then CPU. CUDA uses automatic batch
 sizing in the UI; MPS requires a positive manual batch size.
 
-The optional DINO workflow is documented separately in
-[`dino_distillation/README.md`](dino_distillation/README.md).
+Use **Distillation** in the Dataset & Training panel to explicitly create an
+unlabeled image corpus from project videos and launch DINO distillation. Images
+default to `<project>/distillation/unlabeled_images/`, and outputs are stored
+under `<project>/runs/distillation/<run-name>/`. The GUI requires confirmation
+before extracting frames and supports sampling intervals and per-video limits.
+The project-aware command-line entry point is `distillation/distiller.py`.
 
 ## Prediction and Video Review
 
@@ -345,7 +349,7 @@ train_worker.py            Ultralytics training process
 tests/                     Unit test suite
 example_datasets/          Example pose images, labels, and overlays
 analysis_toolset/          Example inference analysis notebook
-dino_distillation/         Optional DINO distillation workflow
+distillation/              Project-aware DINO distillation entry point
 ```
 
 ## Development Checks

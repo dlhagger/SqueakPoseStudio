@@ -18,13 +18,29 @@ def _is_optional_studio_import_error(exc: Exception) -> bool:
 
 
 try:
-    from squeakpose_studio import LabelingApp, VideoReviewDialog, WORKFLOW_POSE, WORKFLOW_SEG, _retain_main_window
+    from squeakpose_studio import (
+        LabelingApp,
+        VideoReviewDialog,
+        WORKFLOW_POSE,
+        WORKFLOW_SEG,
+        _discover_distillation_exports,
+        _distillation_export_search_roots,
+        _distillation_sample_count,
+        _ensure_project_structure,
+        _project_paths,
+        _retain_main_window,
+    )
     _STUDIO_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - environment-dependent import gate
     if not _is_optional_studio_import_error(exc):
         raise
     LabelingApp = None
     VideoReviewDialog = None
+    _discover_distillation_exports = None
+    _distillation_export_search_roots = None
+    _distillation_sample_count = None
+    _ensure_project_structure = None
+    _project_paths = None
     _retain_main_window = None
     WORKFLOW_POSE = "pose"
     WORKFLOW_SEG = "segmentation"
@@ -449,6 +465,55 @@ class StudioVideoReviewTests(unittest.TestCase):
         LabelingApp._fit_class_selector_to_items(app)
 
         self.assertEqual(app.class_selector.minimum_contents_length, len("very_long_behavioral_state"))
+
+    def test_distillation_sample_count_applies_stride_and_cap(self):
+        self.assertEqual(_distillation_sample_count(0, 30), 0)
+        self.assertEqual(_distillation_sample_count(1, 30), 1)
+        self.assertEqual(_distillation_sample_count(61, 30), 3)
+        self.assertEqual(_distillation_sample_count(1000, 30, 10), 10)
+        self.assertEqual(_distillation_sample_count(100, 0), 100)
+
+    def test_ensure_project_structure_creates_distillation_directories(self):
+        with TemporaryDirectory() as tmp:
+            paths = _ensure_project_structure(tmp)
+
+            for key in (
+                "videos",
+                "distillation",
+                "distillation_unlabeled_images",
+                "distillation_runs",
+            ):
+                self.assertTrue(os.path.isdir(paths[key]), key)
+
+            expected = _project_paths(tmp)
+            self.assertEqual(paths["videos"], expected["videos"])
+            self.assertEqual(paths["distillation_runs"], expected["distillation_runs"])
+
+    def test_distillation_export_discovery_uses_project_runs(self):
+        with TemporaryDirectory() as tmp:
+            export_path = os.path.join(
+                tmp,
+                "runs",
+                "distillation",
+                "dinov3-pose",
+                "exported_models",
+                "exported_last.pt",
+            )
+            os.makedirs(os.path.dirname(export_path), exist_ok=True)
+            with open(export_path, "wb") as fh:
+                fh.write(b"weights")
+
+            roots = _distillation_export_search_roots(tmp)
+            exports = _discover_distillation_exports(roots)
+
+            self.assertEqual(
+                roots,
+                [("Project runs", os.path.join(tmp, "runs", "distillation"))],
+            )
+            self.assertEqual(exports, [
+                ("Project runs: dinov3-pose", os.path.abspath(export_path)),
+            ])
+
 
 
 if __name__ == "__main__":

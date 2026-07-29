@@ -181,3 +181,116 @@ def top_prediction_from_payload(payload: dict[str, Any], *, workflow: str) -> di
                 continue
         out["kps"] = keypoints
     return out
+
+
+def best_predictions_by_class_from_payload(payload: dict[str, Any], *, workflow: str) -> list[dict[str, Any]]:
+    """Return the highest-confidence serialized detection for each model class."""
+    detections = payload.get("detections") or []
+    if not isinstance(detections, list):
+        return []
+
+    best_by_class: dict[int, dict[str, Any]] = {}
+    for det in detections:
+        if not isinstance(det, dict):
+            continue
+        try:
+            class_id = int(det.get("class_id", 0))
+        except Exception:
+            class_id = 0
+        try:
+            confidence = float(det.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        previous = best_by_class.get(class_id)
+        if previous is None or confidence >= float(previous.get("confidence", 0.0) or 0.0):
+            best_by_class[class_id] = det
+
+    predictions: list[dict[str, Any]] = []
+    for class_id in sorted(best_by_class):
+        one_payload = {"detections": [best_by_class[class_id]]}
+        predictions.append(top_prediction_from_payload(one_payload, workflow=workflow))
+    return predictions
+
+
+def prediction_confidences_by_class(prediction: dict[str, Any]) -> dict[int, float]:
+    """Return the best available detection confidence for each class in one frame."""
+    raw_detections = prediction.get("detections")
+    detections = raw_detections if isinstance(raw_detections, list) else [prediction]
+    confidences: dict[int, float] = {}
+    for detection in detections:
+        if not isinstance(detection, dict) or not detection.get("ok"):
+            continue
+        try:
+            class_id = int(detection.get("cls", 0))
+            confidence = float(detection.get("conf", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if class_id not in confidences or confidence >= confidences[class_id]:
+            confidences[class_id] = confidence
+    return confidences
+
+
+def rank_prediction_frames(
+    predictions: dict[int, dict[str, Any]],
+    *,
+    class_ids: list[int],
+    order: str,
+    balanced: bool = False,
+) -> list[tuple[int, float, int]]:
+    """Rank frames by class confidence, optionally round-robin balancing classes.
+
+    Returned tuples are ``(frame_index, confidence, ranking_class_id)``. For low
+    confidence ranking, a successful frame with no detection for the requested
+    class receives 0.0. High confidence ranking excludes missing classes.
+    """
+    order_key = "high" if str(order).lower() == "high" else "low"
+    valid_class_ids = list(dict.fromkeys(int(cid) for cid in class_ids))
+    if not valid_class_ids:
+        return []
+
+    per_class: dict[int, list[tuple[int, float, int]]] = {}
+    for class_id in valid_class_ids:
+        ranked: list[tuple[int, float, int]] = []
+        for frame_idx, prediction in predictions.items():
+            if not isinstance(prediction, dict) or prediction.get("error"):
+                continue
+            confidences = prediction_confidences_by_class(prediction)
+            if class_id not in confidences:
+                if order_key == "high":
+                    continue
+                confidence = 0.0
+            else:
+                confidence = confidences[class_id]
+            ranked.append((int(frame_idx), float(confidence), class_id))
+        if order_key == "high":
+            ranked.sort(key=lambda item: (-item[1], item[0]))
+        else:
+            ranked.sort(key=lambda item: (item[1], item[0]))
+        per_class[class_id] = ranked
+
+    if not balanced or len(valid_class_ids) == 1:
+        return per_class[valid_class_ids[0]]
+
+    positions = {class_id: 0 for class_id in valid_class_ids}
+    selected: list[tuple[int, float, int]] = []
+    selected_frames: set[int] = set()
+    while True:
+        added_this_round = False
+        queues_exhausted = True
+        for class_id in valid_class_ids:
+            queue = per_class[class_id]
+            pos = positions[class_id]
+            while pos < len(queue) and queue[pos][0] in selected_frames:
+                pos += 1
+            positions[class_id] = pos
+            if pos >= len(queue):
+                continue
+            queues_exhausted = False
+            item = queue[pos]
+            positions[class_id] = pos + 1
+            selected.append(item)
+            selected_frames.add(item[0])
+            added_this_round = True
+        if queues_exhausted or not added_this_round:
+            break
+    return selected

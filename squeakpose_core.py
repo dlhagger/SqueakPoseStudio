@@ -135,7 +135,8 @@ def effective_prediction_batch(requested_batch: int, device: str) -> int:
     """Resolve a positive chunk size for review-time prediction batching."""
     if requested_batch > 0:
         return requested_batch
-    return 8 if (device or "").lower() in {"cuda", "mps"} else 1
+    device_type = (device or "").lower().split(":", 1)[0]
+    return 8 if device_type in {"cuda", "mps"} else 1
 
 
 def resolve_default_training_dataset_path(project_root: str) -> str:

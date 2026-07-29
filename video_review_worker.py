@@ -9,7 +9,7 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
-from prediction_ops import serialize_prediction_result, top_prediction_from_payload
+from prediction_ops import best_predictions_by_class_from_payload, serialize_prediction_result, top_prediction_from_payload
 from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
@@ -18,7 +18,6 @@ _CANCEL_REQUESTED = False
 def _handle_cancel_signal(_signum, _frame):
     global _CANCEL_REQUESTED
     _CANCEL_REQUESTED = True
-    raise SystemExit(130)
 
 
 def _stdout_event_writer(payload: dict[str, Any]) -> None:
@@ -46,6 +45,28 @@ def _load_cv2(cv2_module: Any = None) -> Any:
     return cv2
 
 
+def _is_device_memory_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "out of memory" in text
+        or "cuda error: out of memory" in text
+        or "mps backend out of memory" in text
+    )
+
+
+def _clear_device_cache(device: str) -> None:
+    try:
+        import torch
+
+        normalized = (device or "").lower()
+        if normalized.startswith("cuda") and hasattr(torch, "cuda"):
+            torch.cuda.empty_cache()
+        elif normalized == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def run_video_review_worker(
     config: dict[str, Any],
     *,
@@ -66,11 +87,10 @@ def run_video_review_worker(
     imgsz = int(config.get("imgsz") or 640)
     conf = float(config.get("conf") if config.get("conf") is not None else 0.25)
     iou = float(config.get("iou") if config.get("iou") is not None else 0.5)
-    requested_batch = int(config.get("batch") if config.get("batch") is not None else 1)
-    effective_batch = int(config.get("effective_batch") if config.get("effective_batch") is not None else requested_batch)
+    requested_batch = int(config.get("batch") if config.get("batch") is not None else 0)
+    effective_batch = int(config.get("effective_batch") if config.get("effective_batch") is not None else 1)
     effective_batch = max(1, effective_batch)
-    batch_kwargs = {} if requested_batch <= 0 else {"batch": requested_batch}
-
+    auto_batch = requested_batch <= 0 and (device or "").lower().split(":", 1)[0] in {"cuda", "mps"}
     if not model_path:
         event_writer({"event": "error", "error_message": "model_path is required"})
         return 1
@@ -128,63 +148,112 @@ def run_video_review_worker(
         frames: list[Any] = []
         frame_indices: list[int] = []
 
+        def flush_frames() -> None:
+            nonlocal processed, effective_batch
+            offset = 0
+            while offset < len(frames) and not _CANCEL_REQUESTED:
+                chunk_size = min(effective_batch, len(frames) - offset)
+                chunk_frames = frames[offset : offset + chunk_size]
+                chunk_indices = frame_indices[offset : offset + chunk_size]
+                try:
+                    with contextlib.redirect_stdout(sys.stderr):
+                        results_list = model.predict(
+                            source=chunk_frames,
+                            imgsz=imgsz,
+                            conf=conf,
+                            iou=iou,
+                            device=device,
+                            batch=chunk_size,
+                            verbose=False,
+                        )
+                    results = list(results_list or [])
+                    if len(results) != len(chunk_frames):
+                        raise RuntimeError(
+                            f"Prediction returned {len(results)} results for {len(chunk_frames)} frames."
+                        )
+                    completed: dict[str, dict[str, Any]] = {}
+                    for frame_idx, result in zip(chunk_indices, results):
+                        payload = serialize_prediction_result(
+                            result,
+                            workflow=workflow,
+                            cv2_module=cv2,
+                            numpy_module=numpy_module,
+                        )
+                        prediction = top_prediction_from_payload(payload, workflow=workflow)
+                        prediction["detections"] = best_predictions_by_class_from_payload(
+                            payload,
+                            workflow=workflow,
+                        )
+                        preds[frame_idx] = prediction
+                        completed[str(frame_idx)] = prediction
+                except Exception as exc:
+                    if auto_batch and chunk_size > 1 and _is_device_memory_error(exc):
+                        previous_batch = effective_batch
+                        effective_batch = max(1, chunk_size // 2)
+                        _clear_device_cache(device)
+                        event_writer(
+                            {
+                                "event": "batch_adjusted",
+                                "previous_batch": previous_batch,
+                                "effective_batch": effective_batch,
+                                "message": (
+                                    f"Device memory limit: reducing batch "
+                                    f"{previous_batch} → {effective_batch}"
+                                ),
+                            }
+                        )
+                        continue
+                    error_text = str(exc)
+                    completed = {}
+                    for frame_idx in chunk_indices:
+                        prediction = {"ok": False, "error": error_text}
+                        preds[frame_idx] = prediction
+                        completed[str(frame_idx)] = prediction
+                    prediction_errors.append(
+                        f"frames {chunk_indices[0]}-{chunk_indices[-1]}: {error_text}"
+                    )
+
+                processed += chunk_size
+                event_writer(
+                    {
+                        "event": "progress",
+                        "processed": processed,
+                        "total": total_steps,
+                        "message": (
+                            f"Predicted frames {chunk_indices[0]}-{chunk_indices[-1]} "
+                            f"(batch {chunk_size})"
+                        ),
+                        "effective_batch": effective_batch,
+                        "predictions": completed,
+                    }
+                )
+                offset += chunk_size
+
         while idx <= end:
             if _CANCEL_REQUESTED:
                 break
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
-
             frames.append(frame)
             frame_indices.append(idx)
 
-            if len(frames) >= effective_batch or (idx + stride) > end:
-                try:
-                    with contextlib.redirect_stdout(sys.stderr):
-                        results_list = model.predict(
-                            source=frames,
-                            imgsz=imgsz,
-                            conf=conf,
-                            iou=iou,
-                            device=device,
-                            verbose=False,
-                            **batch_kwargs,
-                        )
-                    results = list(results_list or [])
-                    for pos, fi in enumerate(frame_indices):
-                        if pos >= len(results):
-                            err = "Prediction returned fewer results than frames."
-                            preds[fi] = {"ok": False, "error": err}
-                            prediction_errors.append(f"frame {fi}: {err}")
-                            continue
-                        payload = serialize_prediction_result(
-                            results[pos],
-                            workflow=workflow,
-                            cv2_module=cv2,
-                            numpy_module=numpy_module,
-                        )
-                        preds[fi] = top_prediction_from_payload(payload, workflow=workflow)
-                except Exception as exc:
-                    error_text = str(exc)
-                    for fi in frame_indices:
-                        preds[fi] = {"ok": False, "error": error_text}
-                    prediction_errors.append(f"frames {frame_indices[0]}-{frame_indices[-1]}: {error_text}")
-
-                processed += len(frame_indices)
-                event_writer(
-                    {
-                        "event": "progress",
-                        "processed": processed,
-                        "total": total_steps,
-                        "message": f"Predicting frames {frame_indices[0]}-{frame_indices[-1]}",
-                    }
-                )
+            if len(frames) >= effective_batch:
+                flush_frames()
                 frames = []
                 frame_indices = []
 
-            idx += stride
-            if idx <= end:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            if _CANCEL_REQUESTED:
+                break
+            next_idx = idx + stride
+            for _ in range(stride - 1):
+                if next_idx > end or not cap.grab():
+                    next_idx = end + 1
+                    break
+            idx = next_idx
+
+        if frames and not _CANCEL_REQUESTED:
+            flush_frames()
 
         had_error = bool(prediction_errors) and not _CANCEL_REQUESTED
         error_message = "; ".join(prediction_errors[:3])
@@ -196,7 +265,13 @@ def run_video_review_worker(
                 "canceled": bool(_CANCEL_REQUESTED),
                 "had_error": had_error,
                 "error_message": error_message,
-                "preds": {str(k): v for k, v in preds.items()},
+                # Predictions are streamed in bounded progress events as each
+                # batch completes. Re-emitting a large range here can create a
+                # final JSON line hundreds of megabytes long and prevent the Qt
+                # process from ever reaching its finished handler.
+                "preds": {},
+                "preds_streamed": True,
+                "prediction_count": len(preds),
             }
         )
         return 1 if had_error else 0
@@ -207,7 +282,9 @@ def run_video_review_worker(
                 "canceled": bool(_CANCEL_REQUESTED),
                 "had_error": not _CANCEL_REQUESTED,
                 "error_message": "" if _CANCEL_REQUESTED else str(exc),
-                "preds": {str(k): v for k, v in preds.items()},
+                "preds": {},
+                "preds_streamed": True,
+                "prediction_count": len(preds),
             }
         )
         return 1 if not _CANCEL_REQUESTED else 0

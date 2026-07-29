@@ -39,6 +39,7 @@ from squeakpose_core import (
     stage_text_file,
     staging_path_for,
 )
+from prediction_ops import rank_prediction_frames
 from dataset_ops import (
     DATASET_DETECT,
     DATASET_POSE,
@@ -1986,6 +1987,8 @@ class LabelingApp(QMainWindow):
             QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
         else:
             self.update_status_bar("Pose workflow enabled.")
+        if self.predict_model_path:
+            self._restart_prediction_worker(warm=True)
 
     def _on_workflow_changed(self, _index: int):
         self._ensure_workflow_selector_items()
@@ -3343,6 +3346,11 @@ class LabelingApp(QMainWindow):
         self._prediction_config_path: Optional[str] = None
         self._prediction_image_path: Optional[str] = None
         self._prediction_cancel_requested = False
+        self._prediction_worker_ready = False
+        self._prediction_pending_request: Optional[dict] = None
+        self._prediction_request_counter = 0
+        self._prediction_current_request_id: Optional[int] = None
+        self._prediction_expected_stop = False
         # Auto-select device once at startup
         self._device = _auto_device()
         print(f"🧠 Inference device: {self._device}")
@@ -3361,6 +3369,7 @@ class LabelingApp(QMainWindow):
             QTimer.singleShot(0, self._maybe_prompt_class_manager)
     def closeEvent(self, event):
         _shutdown_qprocess(self._inference_process)
+        self._prediction_expected_stop = True
         _shutdown_qprocess(self._prediction_process)
         _remove_file_quietly(self._inference_config_path)
         _remove_file_quietly(self._prediction_config_path)
@@ -4539,6 +4548,7 @@ class LabelingApp(QMainWindow):
             # Re-detect device in case hardware/availability changed
             self._device = _auto_device()
             print(f"🧠 Inference device: {self._device}")
+            self._restart_prediction_worker(warm=True)
             QMessageBox.information(self, "Model Selected", f"Selected model:\n{os.path.basename(model_file)}")
         except Exception as e:
             QMessageBox.warning(self, "Model Load Error", f"Could not load model:\n{e}")
@@ -4931,32 +4941,32 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("Prediction already running...")
             return
 
-        if self._prediction_process is not None and self._prediction_process.state() != QProcess.ProcessState.NotRunning:
-            self.update_status_bar("Prediction already running...")
-            return
-
-        config = {
+        self._prediction_request_counter += 1
+        request_id = self._prediction_request_counter
+        request = {
+            "command": "predict",
+            "request_id": request_id,
             "model_path": self.predict_model_path,
             "image_path": img_path,
             "workflow": self.active_workflow,
             "device": self._device,
         }
-        try:
-            os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
-            config_path = os.path.join(os.path.dirname(self._log_path), ".single_image_predict_config.json")
-            atomic_write_text(config_path, json.dumps(config, indent=2))
-        except Exception as e:
-            QMessageBox.warning(self, "Prediction Error", f"Could not write prediction config:\n{e}")
-            return
 
         self._predict_busy = True
+        self._prediction_current_request_id = request_id
+        self._prediction_image_path = img_path
         if hasattr(self, 'predict_btn'):
             self.predict_btn.setEnabled(False)
         self.update_status_bar("Running prediction...")
+        self._send_prediction_request(request)
 
+    def _start_prediction_worker(self) -> None:
+        process = self._prediction_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            return
         process = QProcess(self)
         process.setProgram(sys.executable)
-        process.setArguments(["-m", "predict_worker", "--config", config_path])
+        process.setArguments(["-m", "predict_worker", "--server"])
         process.setWorkingDirectory(os.path.dirname(os.path.abspath(__file__)))
         process.readyReadStandardOutput.connect(self._read_prediction_process_stdout)
         process.readyReadStandardError.connect(self._read_prediction_process_stderr)
@@ -4967,14 +4977,51 @@ class LabelingApp(QMainWindow):
         self._prediction_stdout_buffer = ""
         self._prediction_stderr = ""
         self._prediction_result_event = None
-        self._prediction_config_path = config_path
-        self._prediction_image_path = img_path
+        self._prediction_config_path = None
         self._prediction_cancel_requested = False
+        self._prediction_worker_ready = False
+        self._prediction_expected_stop = False
         process.start()
         if not process.waitForStarted(1000):
             self._prediction_stderr = process.errorString()
             self._finish_prediction_process(1, QProcess.ExitStatus.CrashExit)
+
+    def _send_prediction_request(self, request: dict) -> None:
+        self._start_prediction_worker()
+        process = self._prediction_process
+        if (
+            process is None
+            or process.state() == QProcess.ProcessState.NotRunning
+            or not self._prediction_worker_ready
+        ):
+            self._prediction_pending_request = request
             return
+        payload = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+        if process.write(payload) < 0:
+            self._prediction_pending_request = request
+            self._prediction_stderr += "Could not write prediction request to worker.\n"
+
+    def _restart_prediction_worker(self, *, warm: bool = False) -> None:
+        process = self._prediction_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            self._prediction_expected_stop = True
+            _shutdown_qprocess(process)
+        self._prediction_process = None
+        self._prediction_worker_ready = False
+        self._prediction_pending_request = None
+        self._prediction_current_request_id = None
+        if not warm or not self.predict_model_path:
+            return
+        self._prediction_request_counter += 1
+        self._send_prediction_request(
+            {
+                "command": "load",
+                "request_id": self._prediction_request_counter,
+                "model_path": self.predict_model_path,
+                "workflow": self.active_workflow,
+                "device": self._device,
+            }
+        )
 
     def _read_prediction_process_stdout(self) -> None:
         process = self._prediction_process
@@ -5006,23 +5053,56 @@ class LabelingApp(QMainWindow):
         except Exception:
             self._prediction_stderr += line + "\n"
             return
-        if event.get("event") == "result":
-            self._prediction_result_event = event
-        elif event.get("event") == "error":
-            self._prediction_result_event = {
-                "event": "result",
-                "canceled": False,
-                "had_error": True,
-                "error_message": str(event.get("error_message") or "Prediction worker error"),
-                "prediction": None,
-            }
-        elif event.get("event") == "started":
+        event_type = event.get("event")
+        request_id = event.get("request_id")
+        if event_type == "ready":
+            self._prediction_worker_ready = True
+            pending = self._prediction_pending_request
+            self._prediction_pending_request = None
+            if pending is not None:
+                self._send_prediction_request(pending)
+        elif event_type == "loading":
+            self.update_status_bar("Loading prediction model...")
+        elif event_type == "loaded":
+            self.update_status_bar("Prediction model ready.")
+        elif event_type == "started":
             self.update_status_bar("Prediction worker started...")
+        elif event_type == "error":
+            error_text = str(event.get("error_message") or "Prediction worker error")
+            if request_id is None or request_id == self._prediction_current_request_id:
+                self._prediction_current_request_id = None
+                self._prediction_image_path = None
+                self._predict_busy = False
+                if hasattr(self, "predict_btn"):
+                    self.predict_btn.setEnabled(True)
+                self._on_predict_error(error_text)
+            else:
+                self.update_status_bar(f"Prediction model error: {error_text}")
+        elif event_type == "result":
+            if request_id != self._prediction_current_request_id:
+                return
+            self._prediction_current_request_id = None
+            self._prediction_image_path = None
+            self._predict_busy = False
+            if hasattr(self, "predict_btn"):
+                self.predict_btn.setEnabled(True)
+            if bool(event.get("canceled")):
+                self.update_status_bar("Prediction canceled.")
+                return
+            if bool(event.get("had_error")):
+                self._on_predict_error(str(event.get("error_message") or "Unknown prediction error"))
+                return
+            prediction = event.get("prediction")
+            if not isinstance(prediction, dict):
+                self._on_predict_error("Prediction worker returned no prediction payload.")
+                return
+            self._apply_prediction_payload(prediction)
 
     def _cancel_prediction_process(self) -> None:
         process = self._prediction_process
         if process is not None and process.state() != QProcess.ProcessState.NotRunning:
             self._prediction_cancel_requested = True
+            self._prediction_expected_stop = True
             process.terminate()
             QTimer.singleShot(3000, self._kill_prediction_process_if_running)
 
@@ -5037,46 +5117,45 @@ class LabelingApp(QMainWindow):
             self._prediction_stderr += process.errorString() + "\n"
 
     def _finish_prediction_process(self, exit_code: int, exit_status) -> None:
-        if self._prediction_process is None and self._prediction_config_path is None:
+        if self._prediction_process is None:
             return
         if self._prediction_stdout_buffer.strip():
             self._handle_prediction_event_line(self._prediction_stdout_buffer.strip())
             self._prediction_stdout_buffer = ""
 
-        config_path = self._prediction_config_path
-        _remove_file_quietly(config_path)
-
-        event = self._prediction_result_event
         stderr_text = self._prediction_stderr.strip()
         cancel_requested = self._prediction_cancel_requested
+        expected_stop = self._prediction_expected_stop
         self._prediction_process = None
         self._prediction_config_path = None
-        self._prediction_image_path = None
         self._prediction_result_event = None
         self._prediction_stdout_buffer = ""
         self._prediction_stderr = ""
         self._prediction_cancel_requested = False
-        self._predict_busy = False
-        if hasattr(self, 'predict_btn'):
-            self.predict_btn.setEnabled(True)
+        self._prediction_worker_ready = False
+        self._prediction_expected_stop = False
 
-        if cancel_requested and event is None:
+        if cancel_requested:
+            self._prediction_pending_request = None
+            self._prediction_current_request_id = None
+            self._prediction_image_path = None
+            self._predict_busy = False
+            if hasattr(self, "predict_btn"):
+                self.predict_btn.setEnabled(True)
             self.update_status_bar("Prediction canceled.")
             return
-        if event is None:
-            self._on_predict_error(stderr_text or f"Process exited with code {exit_code}.")
+        if expected_stop:
             return
-        if bool(event.get("canceled")):
-            self.update_status_bar("Prediction canceled.")
-            return
-        if bool(event.get("had_error")) or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
-            self._on_predict_error(str(event.get("error_message") or stderr_text or "Unknown prediction error"))
-            return
-        prediction = event.get("prediction")
-        if not isinstance(prediction, dict):
-            self._on_predict_error("Prediction worker returned no prediction payload.")
-            return
-        self._apply_prediction_payload(prediction)
+        if self._predict_busy:
+            self._prediction_pending_request = None
+            self._prediction_current_request_id = None
+            self._prediction_image_path = None
+            self._predict_busy = False
+            if hasattr(self, "predict_btn"):
+                self.predict_btn.setEnabled(True)
+            self._on_predict_error(stderr_text or f"Prediction worker exited with code {exit_code}.")
+        else:
+            self.update_status_bar("Prediction worker stopped; it will restart on the next prediction.")
 
     def _apply_prediction_payload(self, prediction: dict):
         try:
@@ -6542,6 +6621,7 @@ class VideoReviewDialog(QDialog):
         self._review_stdout_buffer = ""
         self._review_stderr = ""
         self._review_result_event: Optional[dict] = None
+        self._review_partial_preds: dict[int, dict] = {}
         self._review_config_path: Optional[str] = None
         self._review_cancel_requested = False
         self._review_run_meta: Optional[dict] = None
@@ -6601,10 +6681,12 @@ class VideoReviewDialog(QDialog):
 
         controls_row_1.addWidget(QLabel("Batch"))
         self.spin_batch = QSpinBox()
-        self.spin_batch.setRange(-1, 256)
+        self.spin_batch.setRange(0, 256)
         self.spin_batch.setSpecialValueText("Auto")
-        self.spin_batch.setValue(8)  # default batch size
-        self.spin_batch.setToolTip("Auto uses a safe chunk size (8 on CUDA/MPS, 1 on CPU).")
+        self.spin_batch.setValue(0)
+        self.spin_batch.setToolTip(
+            "Auto uses batched inference on CUDA/MPS with memory fallback; CPU defaults to one frame."
+        )
         self.spin_batch.setMaximumWidth(90)
         controls_row_1.addWidget(self.spin_batch)
 
@@ -6681,13 +6763,17 @@ class VideoReviewDialog(QDialog):
         buttons.addButton(self.btn_send, QDialogButtonBox.ButtonRole.ActionRole)
 
         self.btn_send_low = QPushButton("Send Low…")
-        self.btn_send_low.setToolTip("Export N lowest-confidence predicted frames to the labeler")
+        self.btn_send_low.setToolTip(
+            "Export lowest-confidence frames for one class or balanced across classes"
+        )
         self.btn_send_low.setEnabled(False)
         self.btn_send_low.clicked.connect(self._export_low_confidence_frames)
         buttons.addButton(self.btn_send_low, QDialogButtonBox.ButtonRole.ActionRole)
 
         self.btn_send_high = QPushButton("Send High…")
-        self.btn_send_high.setToolTip("Export N highest-confidence predicted frames to the labeler")
+        self.btn_send_high.setToolTip(
+            "Export highest-confidence frames for one class or balanced across classes"
+        )
         self.btn_send_high.setEnabled(False)
         self.btn_send_high.clicked.connect(self._export_high_confidence_frames)
         buttons.addButton(self.btn_send_high, QDialogButtonBox.ButtonRole.ActionRole)
@@ -6919,7 +7005,7 @@ class VideoReviewDialog(QDialog):
         stride = max(1, int(self.spin_stride.value()))
         conf = float(self.spin_conf.value())
         iou = float(self.spin_iou.value())
-        requested_batch = int(self.spin_batch.value()) if hasattr(self, "spin_batch") else 1
+        requested_batch = int(self.spin_batch.value()) if hasattr(self, "spin_batch") else 0
         effective_batch = effective_prediction_batch(requested_batch, self.device)
         imgsz = 640
         kpvis = float(self.spin_kpvis.value()) if (hasattr(self, "spin_kpvis") and not self._is_seg_workflow()) else None
@@ -6947,6 +7033,8 @@ class VideoReviewDialog(QDialog):
             "start": start,
             "end": end,
             "stride": stride,
+            "batch": requested_batch,
+            "initial_effective_batch": effective_batch,
             "total": self.total,
             "fps": self.fps,
             "classes": self.classes,
@@ -6994,6 +7082,7 @@ class VideoReviewDialog(QDialog):
         self._review_stdout_buffer = ""
         self._review_stderr = ""
         self._review_result_event = None
+        self._review_partial_preds = {}
         self._review_config_path = config_path
         self._review_cancel_requested = False
         self._review_run_meta = meta
@@ -7048,6 +7137,22 @@ class VideoReviewDialog(QDialog):
             if progress is not None:
                 progress.setLabelText("Loading model in video prediction process…")
         elif event_type == "progress":
+            streamed_predictions = event.get("predictions")
+            if isinstance(streamed_predictions, dict):
+                for raw_idx, prediction in streamed_predictions.items():
+                    try:
+                        frame_idx = int(raw_idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(prediction, dict):
+                        self._review_partial_preds[frame_idx] = prediction
+            try:
+                frame_idx = int(event.get("frame_idx"))
+                prediction = event.get("prediction")
+                if isinstance(prediction, dict):
+                    self._review_partial_preds[frame_idx] = prediction
+            except (TypeError, ValueError):
+                pass
             progress = self._review_progress
             if progress is not None:
                 processed = int(event.get("processed") or 0)
@@ -7055,6 +7160,16 @@ class VideoReviewDialog(QDialog):
                 progress.setMaximum(max(1, total))
                 progress.setValue(min(processed, max(1, total)))
                 progress.setLabelText(str(event.get("message") or f"Predicting {processed}/{total}"))
+            QApplication.processEvents()
+        elif event_type == "batch_adjusted":
+            effective_batch = int(event.get("effective_batch") or 1)
+            if self._review_run_meta is not None:
+                self._review_run_meta["final_effective_batch"] = effective_batch
+            progress = self._review_progress
+            if progress is not None:
+                progress.setLabelText(
+                    str(event.get("message") or f"Reducing inference batch to {effective_batch}")
+                )
             QApplication.processEvents()
         elif event_type == "result":
             self._review_result_event = event
@@ -7103,6 +7218,7 @@ class VideoReviewDialog(QDialog):
         _remove_file_quietly(config_path)
 
         event = self._review_result_event
+        partial_preds = dict(self._review_partial_preds)
         stderr_text = self._review_stderr.strip()
         cancel_requested = self._review_cancel_requested
         run_meta = self._review_run_meta or {}
@@ -7111,6 +7227,7 @@ class VideoReviewDialog(QDialog):
         self._review_progress = None
         self._review_config_path = None
         self._review_result_event = None
+        self._review_partial_preds = {}
         self._review_stdout_buffer = ""
         self._review_stderr = ""
         self._review_cancel_requested = False
@@ -7118,8 +7235,13 @@ class VideoReviewDialog(QDialog):
         self.btn_predict.setEnabled(self.cap is not None)
 
         if cancel_requested and event is None:
-            QMessageBox.information(self, "Prediction canceled", "Video prediction was canceled.")
-            return
+            event = {
+                "event": "result",
+                "canceled": True,
+                "had_error": False,
+                "error_message": "",
+                "preds": {},
+            }
 
         if event is None:
             detail = stderr_text or f"Process exited with code {exit_code}."
@@ -7128,6 +7250,8 @@ class VideoReviewDialog(QDialog):
 
         raw_preds = event.get("preds") or {}
         self.preds = {}
+        for key, value in partial_preds.items():
+            self.preds[key] = value
         if isinstance(raw_preds, dict):
             for key, value in raw_preds.items():
                 try:
@@ -7135,8 +7259,10 @@ class VideoReviewDialog(QDialog):
                 except Exception:
                     continue
 
-        had_error = bool(event.get("had_error")) or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0
         canceled = bool(event.get("canceled")) or cancel_requested
+        had_error = bool(event.get("had_error")) or (
+            not canceled and (exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0)
+        )
         error_message = str(event.get("error_message") or stderr_text or "Unknown video prediction error")
 
         if self.preds:
@@ -7432,25 +7558,61 @@ class VideoReviewDialog(QDialog):
             QMessageBox.information(self, "No video", "Load a video first.")
             return
 
-        candidates = [(fi, float(p.get("conf", 0.0))) for fi, p in self.preds.items() if p.get("ok")]
+        mode_choices = ["Balanced by class"] + [
+            self.classes[class_id] if class_id < len(self.classes) else str(class_id)
+            for class_id in range(len(self.classes))
+        ]
+        ranking_choice, choice_ok = QInputDialog.getItem(
+            self,
+            "Confidence Ranking",
+            "Rank frames for which class?",
+            mode_choices,
+            0,
+            False,
+        )
+        if not choice_ok:
+            return
+
+        balanced = ranking_choice == "Balanced by class"
+        if balanced:
+            ranking_class_ids = list(range(len(self.classes)))
+            ranking_label = "balanced by class"
+        else:
+            try:
+                ranking_class_ids = [mode_choices.index(ranking_choice) - 1]
+            except ValueError:
+                return
+            ranking_label = ranking_choice
+
+        candidates = rank_prediction_frames(
+            self.preds,
+            class_ids=ranking_class_ids,
+            order=order_key,
+            balanced=balanced,
+        )
         if not candidates:
-            QMessageBox.information(self, "No predictions", "No successful predictions available to export.")
+            QMessageBox.information(
+                self,
+                "No predictions",
+                f"No predictions are available for the {ranking_label} ranking.",
+            )
             return
 
         if order_key == "low":
-            candidates.sort(key=lambda t: t[1])
             order_label = "lowest"
             dialog_title = "Export Lowest Confidence"
         else:
-            candidates.sort(key=lambda t: (-t[1], t[0]))
             order_label = "highest"
             dialog_title = "Export Highest Confidence"
-        conf_map = {fi: conf for fi, conf in candidates}
 
         already = self._existing_export_indices()
-        pending = [fi for fi, _ in candidates if fi not in already]
+        pending = [candidate for candidate in candidates if candidate[0] not in already]
         if not pending:
-            QMessageBox.information(self, "Nothing to export", f"All {order_label}-confidence frames are already exported.")
+            QMessageBox.information(
+                self,
+                "Nothing to export",
+                f"All {order_label}-confidence frames for {ranking_label} are already exported.",
+            )
             return
 
         max_n = len(pending)
@@ -7458,7 +7620,7 @@ class VideoReviewDialog(QDialog):
         n, ok = QInputDialog.getInt(
             self,
             dialog_title,
-            "How many frames should I send to the labeler?",
+            f"How many {ranking_label} frames should I send to the labeler?",
             default_n,
             1,
             max_n,
@@ -7490,11 +7652,11 @@ class VideoReviewDialog(QDialog):
         prog.setValue(0)
 
         saved = 0
-        saved_confs: list[float] = []
+        saved_rankings: list[tuple[float, int]] = []
         failed: list[tuple[int, str]] = []
         cur_pos = int(self.cur)
 
-        for i, fi in enumerate(selected, start=1):
+        for i, (fi, ranking_conf, ranking_class_id) in enumerate(selected, start=1):
             if prog.wasCanceled():
                 break
 
@@ -7514,7 +7676,7 @@ class VideoReviewDialog(QDialog):
                     suffix += 1
                 if self._write_frame_image(dest_path, frame):
                     saved += 1
-                    saved_confs.append(conf_map.get(fi, 0.0))
+                    saved_rankings.append((ranking_conf, ranking_class_id))
                 else:
                     failed.append((fi, "write-failed"))
 
@@ -7539,10 +7701,21 @@ class VideoReviewDialog(QDialog):
 
         if saved > 0:
             msg = f"Saved {saved} frame(s) to:\n{dest_dir}"
-            if saved_confs:
-                lo = min(saved_confs)
-                hi = max(saved_confs)
-                msg += f"\nConfidence range of exported set: {lo:.2f}–{hi:.2f}"
+            if saved_rankings:
+                msg += f"\nRanking: {order_label} confidence, {ranking_label}"
+                for class_id in ranking_class_ids:
+                    class_confs = [
+                        confidence
+                        for confidence, ranked_class_id in saved_rankings
+                        if ranked_class_id == class_id
+                    ]
+                    if not class_confs:
+                        continue
+                    class_name = self.classes[class_id] if class_id < len(self.classes) else str(class_id)
+                    msg += (
+                        f"\n{class_name}: {min(class_confs):.2f}–{max(class_confs):.2f} "
+                        f"({len(class_confs)} frame(s))"
+                    )
             if canceled and saved < len(selected):
                 msg += "\n\nExport canceled before completing all requested frames."
             QMessageBox.information(self, "Export complete", msg)
@@ -7578,6 +7751,15 @@ class VideoReviewDialog(QDialog):
         if not p or not p.get("ok"):
             return
 
+        detections = p.get("detections")
+        if isinstance(detections, list) and detections:
+            for detection in detections:
+                if isinstance(detection, dict) and detection.get("ok"):
+                    self._draw_prediction_overlay(detection)
+            return
+        self._draw_prediction_overlay(p)
+
+    def _draw_prediction_overlay(self, p: dict):
         cls_id = int(p.get("cls", 0))
         class_name = self.classes[cls_id] if 0 <= cls_id < len(self.classes) else str(cls_id)
         if self._is_seg_workflow():
@@ -7659,6 +7841,11 @@ class VideoReviewDialog(QDialog):
         # ---- Keypoints (map kp conf → visibility) ----
         thr = float(self.spin_kpvis.value()) if hasattr(self, "spin_kpvis") else 0.5
         for i, kp in enumerate(p.get("kps", [])):
+            if i >= len(self.kp_names):
+                break
+            name = self.kp_names[i]
+            if name not in class_kp_names:
+                continue
             x, y, conf = kp
             vis = 2 if conf >= thr else 1  # 2=visible(red), 1=occluded(yellow)
 
@@ -7676,12 +7863,6 @@ class VideoReviewDialog(QDialog):
             self.scene.addItem(dot); self._overlay_items.append(dot)
 
             # label next to kp
-            if i < len(class_kp_names):
-                name = class_kp_names[i]
-            elif i < len(self.kp_names):
-                name = self.kp_names[i]
-            else:
-                name = f"kp{i}"
             lbl = QGraphicsSimpleTextItem(name)
             lbl.setFont(_ui_font(18))
             lbl.setBrush(QBrush(color))

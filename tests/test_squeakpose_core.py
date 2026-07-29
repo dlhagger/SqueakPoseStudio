@@ -76,6 +76,7 @@ class CoreHelpersTests(unittest.TestCase):
     def test_effective_prediction_batch_auto_and_explicit(self):
         self.assertEqual(effective_prediction_batch(12, "cpu"), 12)
         self.assertEqual(effective_prediction_batch(-1, "cuda"), 8)
+        self.assertEqual(effective_prediction_batch(0, "cuda:0"), 8)
         self.assertEqual(effective_prediction_batch(0, "mps"), 8)
         self.assertEqual(effective_prediction_batch(-1, "cpu"), 1)
 

@@ -332,7 +332,18 @@ segmentation coverage, mask area, trajectory, and ROI occupancy outputs.
 ## Repository Layout
 
 ```text
-squeakpose_studio.py       Main PyQt6 application
+squeakpose_studio.py       Backward-compatible launcher and import facade
+squeakpose/                Extracted application package
+squeakpose/app.py          QApplication setup and startup
+squeakpose/project/        Canonical project paths and metadata persistence
+squeakpose/annotation/     Qt-free annotation state and reusable views
+squeakpose/services/       Transactional annotation and dataset operations
+squeakpose/workers/        Worker protocol and process lifecycle helpers
+squeakpose/ui/             Main window and feature dialogs
+squeakpose/ui/main_window.py  Main annotation window
+squeakpose/ui/video_reviewer.py  Video review and frame export
+squeakpose/ui/training_dialog.py  YOLO training configuration
+squeakpose/ui/distillation_dialog.py  DINO corpus and training workflow
 squeakpose_core.py         Qt-free project and workflow logic
 label_io.py                Label parsing and normalization
 dataset_builder.py         YOLO pose dataset YAML generation
@@ -351,6 +362,12 @@ example_datasets/          Example pose images, labels, and overlays
 analysis_toolset/          Example inference analysis notebook
 distillation/              Project-aware DINO distillation entry point
 ```
+
+`squeakpose_studio.py` remains the compatible direct launcher while UI
+responsibilities are incrementally moved into the `squeakpose` package. Project
+formats and worker entry points remain backward compatible during this
+transition. See `REFACTOR_PLAN.md` for the architectural guardrails and target
+boundaries.
 
 ## Development Checks
 

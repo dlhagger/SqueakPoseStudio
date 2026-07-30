@@ -48,28 +48,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from squeakpose.workers.process import remove_file_quietly, shutdown_qprocess
+from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from ui_style import analysis_dialog_stylesheet
 
 
 def _remove_file_quietly(path: Optional[str]) -> None:
-    if not path:
-        return
-    try:
-        if os.path.isfile(path) or os.path.islink(path):
-            os.unlink(path)
-    except OSError:
-        pass
+    remove_file_quietly(path)
 
 
 def _shutdown_qprocess(process: Optional[QProcess]) -> bool:
-    if process is None or process.state() == QProcess.ProcessState.NotRunning:
-        return True
-    process.terminate()
-    if process.waitForFinished(2000):
-        return True
-    process.kill()
-    process.waitForFinished(1000)
-    return process.state() == QProcess.ProcessState.NotRunning
+    return shutdown_qprocess(process)
 
 
 def _safe_stem(path: str) -> str:
@@ -1018,8 +1007,8 @@ class AnalysisDialog(QDialog):
         if not line:
             return
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            event = parse_event_line(line).as_dict()
+        except WorkerProtocolError:
             self._append_log(line)
             return
 

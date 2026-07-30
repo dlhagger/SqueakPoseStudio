@@ -1,0 +1,118 @@
+"""Atomic project metadata persistence and recovery."""
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+from dataclasses import dataclass
+from typing import Any
+
+from squeakpose_core import (
+    CURRENT_PROJECT_SCHEMA_VERSION,
+    atomic_write_text,
+    migrate_project_metadata,
+)
+
+from .paths import PROJECT_META_FILE
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataReadResult:
+    data: dict[str, Any]
+    recovery_path: str = ""
+    recovery_error: str = ""
+
+
+class ProjectMetadataStore:
+    """Own metadata loading, migration, recovery, and path serialization."""
+
+    def __init__(self, project_root: str):
+        self.project_root = os.path.abspath(project_root)
+        self.path = os.path.join(self.project_root, PROJECT_META_FILE)
+
+    def read(self) -> MetadataReadResult:
+        if not os.path.isfile(self.path):
+            return MetadataReadResult({})
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("project metadata must contain a JSON object")
+        except Exception as exc:
+            backup_path = self._corrupt_backup_path()
+            try:
+                os.replace(self.path, backup_path)
+            except OSError:
+                backup_path = ""
+            return MetadataReadResult(
+                {},
+                recovery_path=backup_path,
+                recovery_error=str(exc),
+            )
+
+        migrated, changed = migrate_project_metadata(
+            data,
+            created_at=datetime.datetime.now().isoformat(timespec="seconds"),
+        )
+        if changed:
+            atomic_write_text(self.path, json.dumps(migrated, indent=2))
+        return MetadataReadResult(migrated)
+
+    def update(self, updates: dict[str, Any]) -> MetadataReadResult:
+        result = self.read()
+        payload = dict(result.data)
+        if not payload:
+            payload = {
+                "schema_version": CURRENT_PROJECT_SCHEMA_VERSION,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+        for key, value in updates.items():
+            if value is None:
+                payload.pop(str(key), None)
+            else:
+                payload[str(key)] = value
+        atomic_write_text(self.path, json.dumps(payload, indent=2))
+        return MetadataReadResult(
+            payload,
+            recovery_path=result.recovery_path,
+            recovery_error=result.recovery_error,
+        )
+
+    def resolve_path(self, path: str) -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        if os.path.isabs(raw):
+            return os.path.abspath(raw)
+        return os.path.abspath(os.path.join(self.project_root, raw))
+
+    def store_path(self, path: str) -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        abs_path = os.path.abspath(raw)
+        try:
+            relative = os.path.relpath(abs_path, self.project_root)
+        except ValueError:
+            return abs_path
+        if relative == ".":
+            return os.path.basename(abs_path)
+        if relative != ".." and not relative.startswith(f"..{os.sep}"):
+            return relative
+        return abs_path
+
+    def _corrupt_backup_path(self) -> str:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = os.path.join(
+            self.project_root,
+            f"squeakpose_project.corrupt-{timestamp}.json",
+        )
+        suffix = 1
+        while os.path.exists(backup_path):
+            backup_path = os.path.join(
+                self.project_root,
+                f"squeakpose_project.corrupt-{timestamp}-{suffix}.json",
+            )
+            suffix += 1
+        return backup_path

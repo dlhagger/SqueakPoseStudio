@@ -99,7 +99,7 @@ class StudioVideoReviewTests(unittest.TestCase):
         fake_app = type("FakeApp", (), {})()
         marker = object()
 
-        with patch("squeakpose_studio._qt_app_instance", return_value=fake_app):
+        with patch("squeakpose.ui.main_window._qt_app_instance", return_value=fake_app):
             _retain_main_window(marker)
 
         self.assertIs(fake_app._squeakpose_main_window, marker)
@@ -290,8 +290,8 @@ class StudioVideoReviewTests(unittest.TestCase):
 
             app = DeleteDummy()
             with (
-                patch("squeakpose_studio.QMessageBox.warning") as warning,
-                patch("squeakpose_studio.QMessageBox.question") as question,
+                patch("squeakpose.ui.main_window.QMessageBox.warning") as warning,
+                patch("squeakpose.ui.main_window.QMessageBox.question") as question,
             ):
                 LabelingApp.delete_current_image(app)
 
@@ -356,8 +356,8 @@ class StudioVideoReviewTests(unittest.TestCase):
             app.image_dir_all = images_all
 
             with (
-                patch("squeakpose_studio.commit_staged_paths", side_effect=OSError("injected failure")),
-                patch("squeakpose_studio.QMessageBox.warning"),
+                patch("squeakpose.ui.main_window.commit_staged_paths", side_effect=OSError("injected failure")),
+                patch("squeakpose.ui.main_window.QMessageBox.warning"),
             ):
                 saved = LabelingApp.save_labels(app)
 
@@ -405,8 +405,8 @@ class StudioVideoReviewTests(unittest.TestCase):
             app.class_keypoints_path = os.path.join(tmp, "class_keypoints.json")
 
             with (
-                patch("squeakpose_studio.atomic_write_text_files", side_effect=OSError("disk full")),
-                patch("squeakpose_studio.QMessageBox.warning"),
+                patch("squeakpose.ui.main_window.atomic_write_text_files", side_effect=OSError("disk full")),
+                patch("squeakpose.ui.main_window.QMessageBox.warning"),
             ):
                 changed = LabelingApp._apply_class_manager_results(
                     app,

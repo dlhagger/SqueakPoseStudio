@@ -18,7 +18,10 @@ dependencies = [
     "ipykernel>=7.1.0",
     "ipywidgets>=8.1.8",
     "lightly-train>=0.14.0",
+    "matplotlib>=3.10.0",
+    "numpy>=2.2.0",
     "oneeurofilter>=0.2.1",
+    "opencv-python>=4.11.0",
     "pandas>=2.3.3",
     "pyqt6>=6.11.0",
     "pyyaml>=6.0.2",
@@ -29,13 +32,17 @@ dependencies = [
     "torchvision",
     "tqdm>=4.67.1",
     "ultralytics>=8.3.233",
-    "umap-learn>=0.5.11",
 ]
 
 [dependency-groups]
 test = [
+    "matplotlib>=3.10.0",
+    "numpy>=2.2.0",
+    "oneeurofilter>=0.2.1",
+    "pandas>=2.3.3",
     "pyqt6>=6.11.0",
     "pyyaml>=6.0.2",
+    "seaborn>=0.13.2",
 ]
 
 [tool.uv]

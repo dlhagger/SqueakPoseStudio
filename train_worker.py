@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import signal
 import sys
 from typing import Any, Callable, Optional
 
 from squeakpose_core import model_task_mismatch_message
+from squeakpose.workers.protocol import read_config, write_event
 
 _CANCEL_REQUESTED = False
 
@@ -21,7 +21,7 @@ def _handle_cancel_signal(_signum, _frame):
 
 
 def _stdout_event_writer(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, sort_keys=True), flush=True)
+    write_event(payload)
 
 
 def _emit_event(event_writer: Callable[[dict[str, Any]], None], payload: dict[str, Any]) -> None:
@@ -122,8 +122,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        with open(args.config, "r", encoding="utf-8") as fh:
-            config = json.load(fh)
+        config = read_config(args.config)
     except Exception as exc:
         _stdout_event_writer({"event": "error", "error_message": f"Could not read config: {exc}"})
         return 1

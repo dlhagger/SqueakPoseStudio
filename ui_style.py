@@ -401,6 +401,33 @@ def sidebar_stylesheet() -> str:
         padding: 7px 8px;
         line-height: 1.15;
     }}
+    QPushButton[layerVisibilityPill="true"] {{
+        min-height: 24px;
+        padding: 3px 8px;
+        background-color: {COLORS["input_bg"]};
+        border: 1px solid {COLORS["input_border"]};
+        border-radius: 12px;
+        color: {COLORS["text_subtle"]};
+        font-size: 9pt;
+        font-weight: 650;
+    }}
+    QPushButton[layerVisibilityPill="true"]:hover {{
+        background-color: {COLORS["button_bg_hover"]};
+        border-color: {COLORS["accent_hover"]};
+        color: {COLORS["text"]};
+    }}
+    QPushButton[layerVisibilityPill="true"]:checked {{
+        background-color: #263b4c;
+        border-color: {COLORS["accent"]};
+        color: #dcefff;
+    }}
+    QPushButton[layerVisibilityPill="true"][activeLayer="true"],
+    QPushButton[layerVisibilityPill="true"][activeLayer="true"]:disabled {{
+        background-color: #35546d;
+        border-color: #79a9d2;
+        color: #ffffff;
+        font-weight: 800;
+    }}
     QPushButton#samAcceptButton:disabled {{
         color: #7d8a84;
         background-color: #253129;
@@ -448,6 +475,15 @@ def hud_stylesheet() -> str:
         font-weight: 800;
         font-size: 11pt;
         color: {COLORS["text"]};
+    }}
+    QLabel#layerEditing {{
+        font-weight: 800;
+        font-size: 9pt;
+        color: #ffffff;
+    }}
+    QLabel#layerReference {{
+        font-size: 8pt;
+        color: #a9cce7;
     }}
     """
 

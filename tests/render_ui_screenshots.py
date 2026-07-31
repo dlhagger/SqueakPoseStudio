@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import QApplication
 
 import squeakpose_studio as studio
 from ui_style import app_stylesheet
+from squeakpose.ui.project_models_dialog import ProjectModelsDialog
 
 
 def _ensure_app() -> QApplication:
@@ -77,6 +78,17 @@ def _build_demo_project(root: Path) -> dict[str, str]:
     )
     Path(paths["classes_seg_file"]).write_text("mouse\n", encoding="utf-8")
     _write_demo_image(Path(paths["images_to_label"]) / "frame001.png")
+    Path(paths["labels_all"], "frame001.txt").write_text(
+        "0 0.505 0.505 0.350 0.310 "
+        "0.635 0.510 2 0.590 0.475 2 0.565 0.440 2 "
+        "0.580 0.525 2 0.480 0.485 2 0.345 0.515 2\n",
+        encoding="utf-8",
+    )
+    Path(paths["labels_seg_all"], "frame001.txt").write_text(
+        "0 0.340 0.405 0.485 0.365 0.610 0.395 0.655 0.485 "
+        "0.625 0.590 0.445 0.625 0.335 0.535\n",
+        encoding="utf-8",
+    )
     return paths
 
 
@@ -136,6 +148,82 @@ def render_screenshots(output_dir: Path) -> list[Path]:
     seg_path = output_dir / "main_segmentation.png"
     _save_widget(window, seg_path, app)
     screenshots.append(seg_path)
+
+    models_dir = project_dir / "models"
+    models_dir.mkdir(exist_ok=True)
+    pose_model = models_dir / "mouse-keypoints.pt"
+    seg_model = models_dir / "mouse-segmentation.pt"
+    pose_model.write_bytes(b"demo")
+    seg_model.write_bytes(b"demo")
+    project_models = ProjectModelsDialog(
+        window,
+        {
+            "keypoints": str(pose_model),
+            "segmentation": str(seg_model),
+        },
+        active_layer="segmentation",
+    )
+    project_models.resize(900, 330)
+    project_models_path = output_dir / "project_models_dialog.png"
+    _save_widget(project_models, project_models_path, app)
+    screenshots.append(project_models_path)
+    project_models.close()
+
+    reviewer = studio.VideoReviewDialog(
+        window,
+        "cpu",
+        ["nose", "head", "left_ear", "right_ear", "back", "tail_base"],
+        ["mouse"],
+        class_keypoints={
+            "mouse": [
+                "nose",
+                "head",
+                "left_ear",
+                "right_ear",
+                "back",
+                "tail_base",
+            ]
+        },
+        workflow="segmentation",
+        layer_id="segmentation",
+        model_paths={
+            "keypoints": str(pose_model),
+            "segmentation": str(seg_model),
+        },
+        layer_schemas={
+            "keypoints": {
+                "classes": ["mouse"],
+                "kp_names": [
+                    "nose",
+                    "head",
+                    "left_ear",
+                    "right_ear",
+                    "back",
+                    "tail_base",
+                ],
+                "class_keypoints": {
+                    "mouse": [
+                        "nose",
+                        "head",
+                        "left_ear",
+                        "right_ear",
+                        "back",
+                        "tail_base",
+                    ]
+                },
+            },
+            "segmentation": {
+                "classes": ["mouse"],
+                "kp_names": [],
+                "class_keypoints": {},
+            },
+        },
+    )
+    reviewer.resize(1180, 780)
+    reviewer_path = output_dir / "video_reviewer_project_models.png"
+    _save_widget(reviewer, reviewer_path, app)
+    screenshots.append(reviewer_path)
+    reviewer.close()
 
     train = studio.TrainDialog(window, str(Path(paths["datasets"]) / "demo_dataset"), default_task="pose")
     train.resize(1100, 720)

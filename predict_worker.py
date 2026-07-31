@@ -91,6 +91,7 @@ def run_predict_server(
 
         model_path = str(request.get("model_path") or "")
         workflow = str(request.get("workflow") or "pose")
+        layer_id = str(request.get("layer_id") or workflow)
         device = str(request.get("device") or "cpu")
         image_path = str(request.get("image_path") or "")
         if not model_path:
@@ -147,6 +148,7 @@ def run_predict_server(
             prediction = serialize_prediction_result(
                 results[0],
                 workflow=workflow,
+                layer_id=layer_id,
                 cv2_module=cv2_module,
                 numpy_module=numpy_module,
             )
@@ -186,6 +188,7 @@ def run_predict_worker(
     model_path = str(config.get("model_path") or "")
     image_path = str(config.get("image_path") or "")
     workflow = str(config.get("workflow") or "pose")
+    layer_id = str(config.get("layer_id") or workflow)
     device = str(config.get("device") or "cpu")
 
     if not model_path:
@@ -238,6 +241,7 @@ def run_predict_worker(
         prediction = serialize_prediction_result(
             results[0],
             workflow=workflow,
+            layer_id=layer_id,
             cv2_module=cv2_module,
             numpy_module=numpy_module,
         )

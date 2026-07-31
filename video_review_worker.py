@@ -80,6 +80,7 @@ def run_video_review_worker(
     model_path = str(config.get("model_path") or "")
     video_path = str(config.get("video_path") or "")
     workflow = str(config.get("workflow") or "pose")
+    layer_id = str(config.get("layer_id") or workflow)
     device = str(config.get("device") or "cpu")
     start = max(0, int(config.get("start") or 0))
     end = max(start, int(config.get("end") if config.get("end") is not None else start))
@@ -176,6 +177,7 @@ def run_video_review_worker(
                         payload = serialize_prediction_result(
                             result,
                             workflow=workflow,
+                            layer_id=layer_id,
                             cv2_module=cv2,
                             numpy_module=numpy_module,
                         )

@@ -115,6 +115,20 @@ class BoxItem(QGraphicsRectItem):
         self._label_bg.setRect(x, y, bg_w, bg_h)
         self._label.setPos(x + self._label_pad_x, y + self._label_pad_y)
 
+    def set_reference_style(
+        self, color: QColor, *, show_label: bool = False
+    ) -> None:
+        """Render a saved box as quiet, non-editable layer context."""
+        pen = QPen(color)
+        pen.setWidthF(1.5)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self.setPen(pen)
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._label_bg.setBrush(QBrush(color))
+        self._label_bg.setVisible(show_label)
+        self._label.setVisible(show_label)
+
     # --- only outline is clickable/selectable ---
     def shape(self) -> QPainterPath:
         path = QPainterPath()
@@ -308,6 +322,24 @@ class KeypointItem(QGraphicsEllipseItem):
             # optional: keep labels hidden for invisible to reduce clutter
             self.text_item.setVisible(False)
 
+    def set_reference_style(
+        self, color: QColor, *, show_label: bool = False
+    ) -> None:
+        """Render a saved keypoint as quiet, non-editable layer context."""
+        pen = QPen(color)
+        pen.setWidthF(1.5)
+        pen.setCosmetic(True)
+        if self.visibility <= 0:
+            pen.setStyle(Qt.PenStyle.DashLine)
+            self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        elif self.visibility == 1:
+            self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        else:
+            self.setBrush(QBrush(color))
+        self.setPen(pen)
+        self.text_item.setBrush(QBrush(color))
+        self.text_item.setVisible(show_label and self.visibility > 0)
+
     def toggle_visibility(self):
         # Cycle: 2 (visible) -> 1 (occluded) -> 0 (invisible) -> 2 ...
         if self.visibility == 2:
@@ -413,8 +445,11 @@ class LabelView(QGraphicsView):
         """Ensure crosshairs exist and update them to intersect at scene_pos."""
         if not self.scene():
             return
-        self._ensure_crosshairs()
         img_bounds = self.scene().sceneRect()
+        if not img_bounds.contains(scene_pos):
+            self._remove_crosshairs()
+            return
+        self._ensure_crosshairs()
         self._crosshair_v.setLine(scene_pos.x(), img_bounds.top(), scene_pos.x(), img_bounds.bottom())
         self._crosshair_h.setLine(img_bounds.left(), scene_pos.y(), img_bounds.right(), scene_pos.y())
 
@@ -573,6 +608,7 @@ class LabelView(QGraphicsView):
 
     def leaveEvent(self, event):
         self._hide_seg_brush_cursor()
+        self._remove_crosshairs()
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):

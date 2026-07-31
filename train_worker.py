@@ -9,6 +9,7 @@ import sys
 from typing import Any, Callable, Optional
 
 from squeakpose_core import model_task_mismatch_message
+from layer_ops import normalize_layer_id
 from squeakpose.workers.protocol import read_config, write_event
 
 _CANCEL_REQUESTED = False
@@ -39,6 +40,9 @@ def run_training_worker(
     _CANCEL_REQUESTED = False
 
     model_cfg = str(config.get("model_cfg") or "")
+    layer_id = normalize_layer_id(
+        config.get("layer_id") or dict(config.get("params") or {}).get("task")
+    )
     params = dict(config.get("params") or {})
     if not model_cfg:
         _emit_event(event_writer, {"event": "error", "error_message": "model_cfg is required"})
@@ -53,7 +57,10 @@ def run_training_worker(
             return 1
         model_factory = YOLO
 
-    _emit_event(event_writer, {"event": "started", "model_cfg": model_cfg})
+    _emit_event(
+        event_writer,
+        {"event": "started", "model_cfg": model_cfg, "layer_id": layer_id},
+    )
     try:
         with contextlib.redirect_stdout(sys.stderr):
             model = model_factory(model_cfg)

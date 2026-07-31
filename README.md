@@ -2,8 +2,9 @@
 
 SqueakPose Studio is a desktop application for small-animal image annotation,
 YOLO dataset creation, model training, prediction review, and video inference.
-It supports pose labels (bounding boxes and keypoints) and SAM-assisted
-segmentation labels from the same project-based interface.
+It uses independent **Keypoints** and **Segmentation** layers. Each layer keeps
+its own labels, classes, model, dataset/training defaults, inference outputs,
+and analysis context while sharing the same project images.
 
 The application is built with PyQt6, PyTorch, and Ultralytics YOLO. Model-heavy
 operations run in child processes so training, prediction, and inference do not
@@ -18,9 +19,9 @@ block the main interface.
   visibility states, and model-assisted predictions.
 - Segmentation annotation with positive and negative SAM prompts, mask previews,
   and add/erase brush editing.
-- YOLO pose, detection, and segmentation dataset export with reproducible
+- YOLO keypoint/pose and segmentation dataset export with reproducible
   train/validation splits.
-- YOLOv26 training for detection, pose, and segmentation.
+- Layer-aware YOLOv26 training for keypoints/pose and segmentation.
 - Support for standard YOLO models, existing checkpoints, exact run resume, and
   optional DINO-distilled backbones.
 - Single-image prediction and a video reviewer for finding and exporting useful
@@ -35,7 +36,7 @@ block the main interface.
 - Python 3.12 or newer
 - A desktop environment supported by PyQt6
 - Optional CUDA or Apple Silicon acceleration
-- Optional SAM-compatible weights for the segmentation workflow
+- Optional SAM-compatible weights for the Segmentation layer
 
 PyTorch package sources are configured in `pyproject.toml`: macOS uses the
 PyTorch CPU index, while Linux and Windows use the configured CUDA index. The
@@ -69,8 +70,9 @@ launcher starts in:
 ```
 
 A project stores its own images, labels, datasets, training runs, templates,
-inference outputs, and UI state. The active labeling workflow and the most
-recent SAM weights path are restored from project metadata.
+inference outputs, and UI state. The active editing layer, the YOLO model
+selected for each layer, and the most recent SAM weights path are restored from
+project metadata.
 
 New projects receive a default `mouse` pose class with six keypoints. Classes
 and keypoints can be changed through the application before labeling begins.
@@ -85,11 +87,19 @@ project/
 ├── images_all/            # images that have been saved or validated
 ├── labels_all/            # YOLO pose labels
 ├── labels_seg_all/        # YOLO segmentation labels
-├── annotations/           # rendered annotation previews
+├── annotations/
+│   ├── keypoints/         # rendered keypoint previews
+│   └── segmentation/      # rendered segmentation previews
 ├── datasets/              # exported YOLO datasets
 ├── runs/                  # training output
 ├── templates/             # pose annotation templates
-├── inference outputs/     # video inference CSV files
+├── inference outputs/
+│   ├── keypoints/         # keypoint-layer video inference CSV files
+│   ├── segmentation/      # segmentation-layer video inference CSV files
+│   └── runs/              # manifests linking multi-layer inference passes
+├── analysis outputs/
+│   ├── keypoints/         # keypoint-layer analysis runs
+│   └── segmentation/      # segmentation-layer analysis runs
 ├── logs/
 ├── classes.txt
 ├── keypoints.txt
@@ -104,7 +114,14 @@ to return to the launcher.
 ## Labeling
 
 Add source images to the project's `images_to_label/` directory, then select
-**Pose** or **Segmentation (SAM)** from the workflow selector.
+**Keypoints Layer** or **Segmentation Layer** from the layer selector.
+
+Switching layers changes what is editable without replacing the other layer's
+data. The active layer determines which label directory, class schema, YOLO
+model, dataset export, training task, inference destination, and analysis
+validation rules are used. Saved annotations from the other layer can remain
+visible as a dimmed, read-only reference and can be toggled with the **Show**
+checkboxes.
 
 Image filenames must have unique stems, including across extensions and letter
 case. For example, `frame.jpg`, `frame.png`, and `Frame.jpg` cannot coexist in
@@ -119,11 +136,11 @@ The main window is organized into four control areas:
 - Bottom right: model loading, prediction, and inference
 
 The image browser can show all, labeled, or unlabeled images. Saving an image
-writes its active-workflow labels, copies the image into `images_all/`, and
+writes its active-layer labels, copies the image into `images_all/`, and
 renders an overlay into `annotations/`. These outputs are staged and committed
 together, so a failed save does not replace an existing annotation.
 
-### Pose Workflow
+### Keypoints Layer
 
 For each active class:
 
@@ -132,7 +149,7 @@ For each active class:
 3. Set keypoint visibility when a point is occluded or not visible.
 4. Save the completed annotation.
 
-Pose labels use the YOLO pose format and are written to
+Keypoint labels use the YOLO pose format and are written to
 `labels_all/<image-stem>.txt`. Visibility values are:
 
 - `2`: visible
@@ -144,7 +161,7 @@ labels, the existing class/keypoint schema is protected from removal, renaming,
 or reordering because those changes would invalidate saved rows. New entries
 can still be added.
 
-### Segmentation Workflow
+### Segmentation Layer
 
 Segmentation classes are stored in `classes_seg.txt`. SAM weights are not
 included in this repository.
@@ -193,7 +210,7 @@ In mask edit mode, left-drag adds to a mask and right-drag erases from it.
 
 ## Dataset Validation and Export
 
-Use **Validate Labels** before export to normalize the active workflow's label
+Use **Validate Labels** before export to normalize the active layer's label
 files. Validation:
 
 - creates a backup before the first rewrite;
@@ -206,7 +223,7 @@ files. Validation:
   image exists.
 
 Use **Export Dataset** to choose a training ratio and deterministic shuffle
-seed. Only images with usable labels for the selected workflow and format are
+seed. Only images with usable labels for the selected layer are
 included; images without matching labels are skipped and reported in the export
 summary. Pose and segmentation rows are normalized again while the staged
 dataset is built, so exported files match the current class/keypoint schema.
@@ -214,13 +231,11 @@ Exports are written under:
 
 ```text
 datasets/pose/
-datasets/detect/
 datasets/segment/
 ```
 
-The pose workflow can export either full pose labels or bounding-box-only
-detection labels. The segmentation workflow exports polygon labels. Each
-dataset contains YOLO `images/train`, `images/val`, `labels/train`,
+The Keypoints layer exports YOLO pose labels, and the Segmentation layer exports
+polygon labels. Each dataset contains YOLO `images/train`, `images/val`, `labels/train`,
 `labels/val`, and `dataset.yaml` entries.
 
 Pose dataset YAML files include class names, keypoint names, keypoint shape, and
@@ -237,12 +252,13 @@ paths; it does not delete images, labels, or worker configs.
 
 ## Training
 
-Open **Train Model** after exporting a dataset. The training dialog supports:
+Open **Train Model** after exporting a dataset. Training is locked to the active
+layer so a segmentation dataset cannot accidentally be launched as pose
+training, or vice versa. The dialog supports:
 
-- automatic, detection, pose, or segmentation task selection;
 - YOLOv26 `n`, `s`, `m`, `l`, and `x` model sizes;
 - standard YOLO initialization;
-- DINO distillation exports;
+- task-compatible DINO distillation exports for Keypoints and Segmentation;
 - fine-tuning from an existing YOLO checkpoint; and
 - exact resume from a run containing `weights/last.pt`.
 
@@ -260,11 +276,16 @@ unlabeled image corpus from project videos and launch DINO distillation. Images
 default to `<project>/distillation/unlabeled_images/`, and outputs are stored
 under `<project>/runs/distillation/<run-name>/`. The GUI requires confirmation
 before extracting frames and supports sampling intervals and per-video limits.
-The project-aware command-line entry point is `distillation/distiller.py`.
+Choose **Keypoints** or **Segmentation** before starting a run; the matching
+YOLO pose or segmentation student is selected automatically, and the resulting
+export appears only in the compatible layer's Train Model dialog. The
+project-aware command-line entry point is `distillation/distiller.py`.
 
 ## Prediction and Video Review
 
-Use **Load Model** to select a `.pt`, `.yaml`, or `.onnx` model.
+Use **Project Models…** to assign `.pt`, `.yaml`, or `.onnx` prediction models
+to the Keypoints and Segmentation layers. The selections are remembered with
+the project. SAM remains a separate prompt-based labeling assistant.
 
 Single-image prediction applies the best prediction for each class to the
 current image. Pose predictions populate boxes and keypoints; segmentation
@@ -273,12 +294,18 @@ predictions populate boxes and masks.
 The **Video Reviewer** supports `.mp4`, `.mov`, `.avi`, and `.mkv` files. It
 can:
 
-- predict a selected frame range with configurable stride, batch size, and
-  confidence thresholds;
+- run every configured project prediction model sequentially over the same
+  selected frame range, with configurable stride, batch size, and confidence
+  thresholds;
 - cache predictions beside the video in `<video-name>.sqp_preds.json`;
-- display prediction overlays on the timeline; and
+- display Keypoints and Segmentation predictions together, with independent
+  overlay visibility controls; and
 - export the current, random, low-confidence, or high-confidence frames into
   the active project's labeling queue.
+
+When both model passes are available, low/high-confidence export first asks
+which prediction layer to rank, then asks for a class or balanced-by-class
+selection within that layer.
 
 Exported frame names include a short identifier derived from the source video
 path, preventing same-named videos from being mistaken for one another.
@@ -297,8 +324,9 @@ Video Reviewer shortcuts include:
 
 ## Video Inference
 
-Video inference processes the selected video in batches and writes a CSV into
-the project's `inference outputs/` directory.
+Video inference runs every configured project prediction model sequentially.
+Each layer writes its own compatible CSV, and a run manifest links the passes.
+If one pass fails, completed output from the other layer is retained.
 
 Pose output includes frame/time metadata, class and confidence, bounding boxes,
 tracking IDs when available, speed values, and absolute/normalized keypoint
@@ -313,7 +341,9 @@ already-written CSV rows and reports the output as partial.
 ## Analysis
 
 Use **Analysis** in the right-hand panel to run the repeatable parts of
-`analysis_toolset/analysis_toolkit.ipynb` from a GUI. The dialog loads a source
+`analysis_toolset/analysis_toolkit.ipynb` from a GUI. The dialog opens in the
+active layer's context, prefers that layer's inference directory, and rejects a
+CSV whose schema belongs to the other layer. It loads a source
 frame when a video is available, lets you click two scale points, draw named
 rectangular ROIs, and then runs the workflow on an inference CSV with the
 selected smoothing and output options.
@@ -344,7 +374,7 @@ squeakpose/ui/main_window.py  Main annotation window
 squeakpose/ui/video_reviewer.py  Video review and frame export
 squeakpose/ui/training_dialog.py  YOLO training configuration
 squeakpose/ui/distillation_dialog.py  DINO corpus and training workflow
-squeakpose_core.py         Qt-free project and workflow logic
+squeakpose_core.py         Qt-free project and layer compatibility logic
 label_io.py                Label parsing and normalization
 dataset_builder.py         YOLO pose dataset YAML generation
 dataset_ops.py             Dataset validation and export helpers

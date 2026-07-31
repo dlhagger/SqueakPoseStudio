@@ -12,6 +12,7 @@ from inference_ops import (
     run_segmentation_video_inference,
 )
 from squeakpose_core import model_task_mismatch_message
+from layer_ops import normalize_layer_id
 from squeakpose.workers.protocol import read_config, write_event
 
 _CANCEL_REQUESTED = False
@@ -47,6 +48,7 @@ def run_inference_worker(
     _CANCEL_REQUESTED = False
 
     mode = str(config.get("mode", "pose")).lower()
+    layer_id = normalize_layer_id(config.get("layer_id") or mode)
     model_path = str(config.get("model_path") or "")
     video_path = str(config.get("video_path") or "")
     csv_path = str(config.get("csv_path") or "")
@@ -82,7 +84,15 @@ def run_inference_worker(
             _emit_event(event_writer, {"event": "error", "error_message": f"Could not import OpenCV: {exc}"})
             return 1
 
-    _emit_event(event_writer, {"event": "started", "csv_path": csv_path, "mode": mode})
+    _emit_event(
+        event_writer,
+        {
+            "event": "started",
+            "csv_path": csv_path,
+            "mode": mode,
+            "layer_id": layer_id,
+        },
+    )
     try:
         model = model_factory(model_path)
     except Exception as exc:
@@ -148,6 +158,7 @@ def run_inference_worker(
             "had_error": bool(result.had_error),
             "error_message": str(result.error_message or ""),
             "mode": mode,
+            "layer_id": layer_id,
         },
     )
     return 1 if result.had_error else 0

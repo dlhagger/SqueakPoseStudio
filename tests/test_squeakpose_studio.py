@@ -203,6 +203,91 @@ class StudioVideoReviewTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(sorted(dummy.preds.keys()), [2, 5])
 
+    def test_cache_validation_accepts_matching_project_models(self):
+        with TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "sample.mp4")
+            with open(video_path, "wb") as f:
+                f.write(b"fake-video-bytes")
+
+            dummy = _CacheDummy(
+                video_path=video_path,
+                model_path="seg.pt",
+                workflow=WORKFLOW_SEG,
+            )
+            dummy.layer_id = "segmentation"
+            dummy.review_layers = ["segmentation", "keypoints"]
+            dummy.model_paths = {
+                "segmentation": "seg.pt",
+                "keypoints": "pose.pt",
+            }
+            dummy.preds_by_layer = {
+                "segmentation": {},
+                "keypoints": {},
+            }
+            payload = {
+                "meta": {
+                    "video": dummy._video_signature(),
+                    "model_paths": dict(dummy.model_paths),
+                },
+                "preds_by_layer": {
+                    "segmentation": {"2": {"ok": True}},
+                    "keypoints": {"5": {"ok": True}},
+                },
+            }
+            with open(dummy._cache_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+            ok = VideoReviewDialog._load_cache_if_valid(dummy)
+
+            self.assertTrue(ok)
+            self.assertEqual(
+                sorted(dummy.preds_by_layer["segmentation"]), [2]
+            )
+            self.assertEqual(
+                sorted(dummy.preds_by_layer["keypoints"]), [5]
+            )
+
+    def test_cache_validation_rejects_changed_project_model(self):
+        with TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "sample.mp4")
+            with open(video_path, "wb") as f:
+                f.write(b"fake-video-bytes")
+
+            dummy = _CacheDummy(
+                video_path=video_path,
+                model_path="seg-new.pt",
+                workflow=WORKFLOW_SEG,
+            )
+            dummy.layer_id = "segmentation"
+            dummy.review_layers = ["segmentation", "keypoints"]
+            dummy.model_paths = {
+                "segmentation": "seg-new.pt",
+                "keypoints": "pose.pt",
+            }
+            dummy.preds_by_layer = {
+                "segmentation": {},
+                "keypoints": {},
+            }
+            payload = {
+                "meta": {
+                    "video": dummy._video_signature(),
+                    "model_paths": {
+                        "segmentation": "seg-old.pt",
+                        "keypoints": "pose.pt",
+                    },
+                },
+                "preds_by_layer": {
+                    "segmentation": {"2": {"ok": True}},
+                    "keypoints": {"5": {"ok": True}},
+                },
+            }
+            with open(dummy._cache_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+            ok = VideoReviewDialog._load_cache_if_valid(dummy)
+
+            self.assertFalse(ok)
+
     def test_segmentation_rows_include_no_detection_frames(self):
         app = LabelingApp.__new__(LabelingApp)
         app.classes = ["mouse"]

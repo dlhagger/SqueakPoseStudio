@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 
 import pandas as pd
 
-from analysis_ops import AnalysisConfig, run_analysis_workflow
+from analysis_ops import AnalysisConfig, AnalysisError, run_analysis_workflow
 from analysis_worker import run_analysis_worker
 
 
@@ -124,6 +124,23 @@ def _write_demo_segmentation(path: str) -> None:
 
 
 class AnalysisOpsTests(unittest.TestCase):
+    def test_analysis_rejects_results_from_a_different_layer(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "segmentation.csv")
+            _write_demo_segmentation(csv_path)
+
+            with self.assertRaisesRegex(
+                AnalysisError, "contains segmentation layer results"
+            ):
+                run_analysis_workflow(
+                    AnalysisConfig(
+                        detections_csv=csv_path,
+                        output_dir=os.path.join(tmp, "analysis"),
+                        layer_id="keypoints",
+                        make_plots=False,
+                    )
+                )
+
     def test_run_analysis_workflow_writes_features_and_summary(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "detections.csv")

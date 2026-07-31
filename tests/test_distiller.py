@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -72,6 +73,28 @@ class DistillerTests(unittest.TestCase):
             self.assertEqual(calls[0]["batch_size"], 8)
             self.assertEqual(calls[0]["precision"], "16-mixed")
             self.assertTrue(calls[0]["overwrite"])
+            with open(
+                os.path.join(out_dir, self.distiller.DISTILLATION_MANIFEST_FILENAME),
+                "r",
+                encoding="utf-8",
+            ) as fh:
+                manifest = json.load(fh)
+            self.assertEqual(manifest["task"], "pose")
+
+    def test_segmentation_task_selects_segmentation_student_and_run_name(self):
+        with TemporaryDirectory() as tmp:
+            config = self.distiller.build_run_config(
+                project_root=tmp,
+                task="segmentation",
+            )
+
+            self.assertEqual(config["task"], "segment")
+            self.assertEqual(config["model"], "ultralytics/yolo26s-seg.pt")
+            self.assertEqual(config["run_name"], "dinov3-segmentation")
+            self.assertEqual(
+                config["out"],
+                os.path.join(tmp, "runs", "distillation", "dinov3-segmentation"),
+            )
 
     def test_run_distillation_requires_existing_image_directory(self):
         with TemporaryDirectory() as tmp:

@@ -8,6 +8,7 @@ from squeakpose.annotation.models import (
 )
 from squeakpose.annotation.documents import (
     AnnotationDocument,
+    KeypointAnnotationDocument,
     PoseAnnotationDocument,
     SegmentationAnnotationDocument,
 )
@@ -17,6 +18,7 @@ from squeakpose.annotation.graphics import BoxItem, KeypointItem, LabelView
 __all__ = [
     "Annotation",
     "AnnotationDocument",
+    "KeypointAnnotationDocument",
     "BoundingBox",
     "BoxItem",
     "Keypoint",

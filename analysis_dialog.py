@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import csv
 import json
 import math
 import os
@@ -51,6 +52,7 @@ from PyQt6.QtWidgets import (
 from squeakpose.workers.process import remove_file_quietly, shutdown_qprocess
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from ui_style import analysis_dialog_stylesheet
+from layer_ops import layer_definition, normalize_layer_id
 
 
 def _remove_file_quietly(path: Optional[str]) -> None:
@@ -257,9 +259,18 @@ class FrameAnnotationView(QWidget):
 class AnalysisDialog(QDialog):
     """Dialog for configuring and running the analysis notebook workflow."""
 
-    def __init__(self, parent, *, project_root: str, app_base_dir: str):
+    def __init__(
+        self,
+        parent,
+        *,
+        project_root: str,
+        app_base_dir: str,
+        layer_id: str = "",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Analysis")
+        self.layer_id = normalize_layer_id(layer_id)
+        self.layer = layer_definition(self.layer_id)
+        self.setWindowTitle(f"Analysis — {self.layer.display_name} Layer")
         self.resize(1240, 900)
         self.setMinimumSize(1040, 680)
         self.project_root = os.path.abspath(project_root)
@@ -309,14 +320,16 @@ class AnalysisDialog(QDialog):
         input_form.setVerticalSpacing(7)
 
         self.csv_edit = QLineEdit()
-        self.csv_edit.setPlaceholderText("Select an inference CSV")
+        self.csv_edit.setPlaceholderText(
+            f"Select a {self.layer.display_name.lower()} inference CSV"
+        )
         self.csv_edit.textChanged.connect(self._refresh_default_output_dir)
         csv_browse = QPushButton("Browse...")
         csv_browse.clicked.connect(self._browse_csv)
         csv_row = QHBoxLayout()
         csv_row.addWidget(self.csv_edit, 1)
         csv_row.addWidget(csv_browse)
-        input_form.addRow("Detections CSV:", csv_row)
+        input_form.addRow(f"{self.layer.display_name} CSV:", csv_row)
 
         self.video_edit = QLineEdit()
         self.video_edit.setPlaceholderText("Optional; auto-detected from CSV when available")
@@ -623,6 +636,9 @@ class AnalysisDialog(QDialog):
 
     def _candidate_csv_dirs(self) -> list[str]:
         return [
+            os.path.join(
+                self.project_root, "inference outputs", self.layer_id
+            ),
             os.path.join(self.project_root, "inference outputs"),
             os.path.join(self.app_base_dir, "analysis_toolset", "inference outputs"),
         ]
@@ -633,14 +649,32 @@ class AnalysisDialog(QDialog):
             if os.path.isdir(folder):
                 for name in os.listdir(folder):
                     if name.lower().endswith(".csv"):
-                        candidates.append(os.path.join(folder, name))
+                        path = os.path.join(folder, name)
+                        if self._csv_matches_active_layer(path):
+                            candidates.append(path)
         if candidates:
             newest = max(candidates, key=lambda path: os.path.getmtime(path))
             self.csv_edit.setText(newest)
 
+    def _csv_matches_active_layer(self, path: str) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as handle:
+                fieldnames = set(next(csv.reader(handle), []))
+        except (OSError, csv.Error):
+            return False
+        is_segmentation = {"frame", "det", "mask_polygon"}.issubset(
+            fieldnames
+        )
+        return is_segmentation == (self.layer_id == "segmentation")
+
     def _default_output_dir_for_csv(self, csv_path: str) -> str:
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        return os.path.join(self.project_root, "analysis outputs", f"{_safe_stem(csv_path)}_{timestamp}")
+        return os.path.join(
+            self.project_root,
+            "analysis outputs",
+            self.layer_id,
+            f"{_safe_stem(csv_path)}_{timestamp}",
+        )
 
     def _refresh_default_output_dir(self) -> None:
         if self.output_edit.text().strip():
@@ -866,6 +900,7 @@ class AnalysisDialog(QDialog):
 
     def _config_payload(self) -> dict[str, Any]:
         return {
+            "layer_id": self.layer_id,
             "detections_csv": self.csv_edit.text().strip(),
             "video_path": self.video_edit.text().strip(),
             "output_dir": self.output_edit.text().strip(),
@@ -932,6 +967,7 @@ class AnalysisDialog(QDialog):
         self.log_view.clear()
         self.summary_view.clear()
         self._append_log(f"Detections: {payload['detections_csv']}")
+        self._append_log(f"Layer: {self.layer.display_name}")
         self._append_log(f"Output: {payload['output_dir']}")
         self._append_log(f"ROIs: {len(self.rois)}")
 

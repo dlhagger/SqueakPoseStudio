@@ -2,7 +2,50 @@
 
 from __future__ import annotations
 
+import json
 import os
+
+
+DISTILLATION_MANIFEST_FILENAME = "squeakpose_distillation.json"
+
+
+def normalize_distillation_task(task: str | None) -> str:
+    normalized = str(task or "").strip().lower()
+    aliases = {
+        "keypoint": "pose",
+        "keypoints": "pose",
+        "pose": "pose",
+        "seg": "segment",
+        "segmentation": "segment",
+        "segment": "segment",
+    }
+    return aliases.get(normalized, "")
+
+
+def distillation_run_task(run_dir: str) -> str:
+    """Return a run's declared task, with legacy-name fallback."""
+
+    normalized_run_dir = os.path.abspath(run_dir)
+    manifest_path = os.path.join(
+        normalized_run_dir,
+        DISTILLATION_MANIFEST_FILENAME,
+    )
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        task = normalize_distillation_task(payload.get("task"))
+        if task:
+            return task
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+    # Runs created before task manifests used the default ``dinov3-pose`` name.
+    run_name = os.path.basename(normalized_run_dir).lower()
+    if "pose" in run_name or "keypoint" in run_name:
+        return "pose"
+    if "segment" in run_name or run_name.endswith(("-seg", "_seg")):
+        return "segment"
+    return ""
 
 
 def distillation_export_search_roots(
@@ -37,7 +80,10 @@ def preferred_distillation_export(run_dir: str) -> str:
 
 def discover_distillation_exports(
     search_roots: list[tuple[str, str]],
+    *,
+    task: str | None = None,
 ) -> list[tuple[str, str]]:
+    expected_task = normalize_distillation_task(task)
     exports: list[tuple[str, str]] = []
     seen_paths: set[str] = set()
     for source_label, root in search_roots:
@@ -59,6 +105,8 @@ def discover_distillation_exports(
             seen_run_dirs.add(normalized_run_dir)
             checkpoint_path = preferred_distillation_export(normalized_run_dir)
             if not checkpoint_path:
+                continue
+            if expected_task and distillation_run_task(normalized_run_dir) != expected_task:
                 continue
             normalized_checkpoint = os.path.abspath(checkpoint_path)
             if normalized_checkpoint in seen_paths:

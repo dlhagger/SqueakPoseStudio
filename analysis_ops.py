@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 import pandas as pd
 
+from layer_ops import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
@@ -24,6 +25,7 @@ class AnalysisError(RuntimeError):
 class AnalysisConfig:
     detections_csv: str
     output_dir: str
+    layer_id: str = ""
     video_path: str = ""
     fps: float = 0.0
     pixel_distance: float = 1.0
@@ -48,6 +50,11 @@ class AnalysisConfig:
         return cls(
             detections_csv=str(raw.get("detections_csv") or ""),
             output_dir=str(raw.get("output_dir") or ""),
+            layer_id=(
+                normalize_layer_id(raw.get("layer_id"))
+                if raw.get("layer_id")
+                else ""
+            ),
             video_path=str(raw.get("video_path") or ""),
             fps=float(raw.get("fps") or 0.0),
             pixel_distance=float(raw.get("pixel_distance") or 1.0),
@@ -871,8 +878,24 @@ def run_analysis_workflow(config: AnalysisConfig, progress_callback: ProgressCal
     raw = pd.read_csv(config.detections_csv).dropna(axis=1, how="all")
     from segmentation_analysis_ops import is_segmentation_inference_csv, run_segmentation_analysis_workflow
 
-    if is_segmentation_inference_csv(raw):
-        return run_segmentation_analysis_workflow(config, progress_callback=progress_callback, raw=raw)
+    detected_layer = (
+        LAYER_SEGMENTATION
+        if is_segmentation_inference_csv(raw)
+        else LAYER_KEYPOINTS
+    )
+    if config.layer_id and config.layer_id != detected_layer:
+        raise AnalysisError(
+            f"The selected CSV contains {detected_layer} layer results, "
+            f"but this analysis was opened for the {config.layer_id} layer."
+        )
+    if detected_layer == LAYER_SEGMENTATION:
+        result = run_segmentation_analysis_workflow(
+            config, progress_callback=progress_callback, raw=raw
+        )
+        result["layer_id"] = detected_layer
+        if isinstance(result.get("summary"), dict):
+            result["summary"]["layer_id"] = detected_layer
+        return result
 
     _require_columns(raw, ["frame_index", "bbox_center_x", "bbox_center_y"])
 
@@ -893,6 +916,7 @@ def run_analysis_workflow(config: AnalysisConfig, progress_callback: ProgressCal
     else:
         _progress(progress_callback, 4, total_steps, "No ROI annotations selected")
     summary = summarize_features(features, fps, scale)
+    summary["layer_id"] = LAYER_KEYPOINTS
     summary["detections_csv"] = os.path.abspath(config.detections_csv)
     summary["video_path"] = os.path.abspath(video_path) if video_path else ""
     summary["roi_count"] = len(rois)
@@ -949,6 +973,7 @@ def run_analysis_workflow(config: AnalysisConfig, progress_callback: ProgressCal
         _progress(progress_callback, 8, total_steps, "Analysis complete")
 
     return {
+        "layer_id": LAYER_KEYPOINTS,
         "feature_csv": str(feature_csv),
         "summary_json": str(summary_json),
         "summary": summary,

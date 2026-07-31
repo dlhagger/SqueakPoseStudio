@@ -79,6 +79,18 @@ class DistillationDialog(QDialog):
 
     ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
     IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+    TASK_DEFAULTS = {
+        "pose": {
+            "label": "Keypoints",
+            "student": "ultralytics/yolo26s-pose.pt",
+            "run_name": "dinov3-pose",
+        },
+        "segment": {
+            "label": "Segmentation",
+            "student": "ultralytics/yolo26s-seg.pt",
+            "run_name": "dinov3-segmentation",
+        },
+    }
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -94,6 +106,7 @@ class DistillationDialog(QDialog):
         self.video_paths: list[str] = []
         self.process: Optional[QProcess] = None
         self.cancel_requested = False
+        self._current_task = "pose"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -224,11 +237,17 @@ class DistillationDialog(QDialog):
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        self.run_name_edit = QLineEdit("dinov3-pose")
+        self.task_combo = ThemedComboBox()
+        self.task_combo.addItem("Keypoints", "pose")
+        self.task_combo.addItem("Segmentation", "segment")
+        style_combo_popup(self.task_combo.view())
+        form.addRow("Task:", self.task_combo)
+
+        self.run_name_edit = QLineEdit(self.TASK_DEFAULTS["pose"]["run_name"])
         self.run_name_edit.textChanged.connect(self._update_output_path)
         form.addRow("Run name:", self.run_name_edit)
 
-        self.student_edit = QLineEdit("ultralytics/yolo26s-pose.pt")
+        self.student_edit = QLineEdit(self.TASK_DEFAULTS["pose"]["student"])
         form.addRow("Student model:", self.student_edit)
 
         self.teacher_edit = QLineEdit("dinov3/vitb16")
@@ -271,7 +290,30 @@ class DistillationDialog(QDialog):
         terminal_font.setPointSize(10)
         self.log_view.setFont(terminal_font)
         layout.addWidget(self.log_view, 1)
+        self.task_combo.currentIndexChanged.connect(self._on_task_changed)
         return tab
+
+    def _selected_task(self) -> str:
+        task = self.task_combo.currentData()
+        return task if task in self.TASK_DEFAULTS else "pose"
+
+    def _on_task_changed(self, _index: int) -> None:
+        old_defaults = self.TASK_DEFAULTS[self._current_task]
+        new_task = self._selected_task()
+        new_defaults = self.TASK_DEFAULTS[new_task]
+        if not self.run_name_edit.text().strip() or self.run_name_edit.text() == old_defaults["run_name"]:
+            self.run_name_edit.setText(new_defaults["run_name"])
+        if not self.student_edit.text().strip() or self.student_edit.text() == old_defaults["student"]:
+            self.student_edit.setText(new_defaults["student"])
+        self._current_task = new_task
+        self._update_output_path()
+
+    @staticmethod
+    def _student_task_mismatch(student: str, task: str) -> bool:
+        model_name = os.path.basename(student).lower()
+        if task == "segment":
+            return "-pose" in model_name
+        return "-seg" in model_name or "segment" in model_name
 
     def _set_status(self, text: str, tone: str = "idle") -> None:
         self.status_label.setText(text)
@@ -500,6 +542,7 @@ class DistillationDialog(QDialog):
         run_name = self._run_name()
         student = self.student_edit.text().strip()
         teacher = self.teacher_edit.text().strip()
+        task = self._selected_task()
         script_path = os.path.join(self.app_base_dir, "distillation", "distiller.py")
 
         if not data_dir or not os.path.isdir(data_dir) or self._image_count(data_dir) == 0:
@@ -518,6 +561,15 @@ class DistillationDialog(QDialog):
             return
         if not student or not teacher:
             QMessageBox.warning(self, "Model required", "Both student and teacher model values are required.")
+            return
+        if self._student_task_mismatch(student, task):
+            task_label = self.TASK_DEFAULTS[task]["label"]
+            QMessageBox.warning(
+                self,
+                "Student model task mismatch",
+                f"The selected task is {task_label}, but the student model appears to use a different head.\n\n"
+                f"Choose a compatible model or switch the task.",
+            )
             return
         if not os.path.isfile(script_path):
             QMessageBox.critical(self, "Distiller missing", f"Could not find:\n{script_path}")
@@ -544,6 +596,8 @@ class DistillationDialog(QDialog):
             run_name,
             "--model",
             student,
+            "--task",
+            task,
             "--teacher",
             teacher,
             "--epochs",
@@ -560,6 +614,8 @@ class DistillationDialog(QDialog):
         self._append_log(
             f"Project: {self.project_root}\n"
             f"Images: {data_dir} ({self._image_count(data_dir):,} files)\n"
+            f"Task: {self.TASK_DEFAULTS[task]['label']}\n"
+            f"Student: {student}\n"
             f"Output: {out_dir}\n\n"
         )
 

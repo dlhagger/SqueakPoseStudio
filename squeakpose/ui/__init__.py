@@ -3,5 +3,11 @@
 from squeakpose.ui.video_reviewer import VideoReviewDialog
 from squeakpose.ui.distillation_dialog import DistillationDialog
 from squeakpose.ui.training_dialog import TrainDialog
+from squeakpose.ui.project_models_dialog import ProjectModelsDialog
 
-__all__ = ["DistillationDialog", "TrainDialog", "VideoReviewDialog"]
+__all__ = [
+    "DistillationDialog",
+    "ProjectModelsDialog",
+    "TrainDialog",
+    "VideoReviewDialog",
+]

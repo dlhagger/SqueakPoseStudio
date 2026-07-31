@@ -29,6 +29,8 @@ class ProjectPaths(Mapping[str, str]):
     labels_all: str
     labels_seg_all: str
     annotations: str
+    annotations_keypoints: str
+    annotations_segmentation: str
     datasets: str
     runs: str
     distillation: str
@@ -36,7 +38,11 @@ class ProjectPaths(Mapping[str, str]):
     distillation_runs: str
     templates: str
     inference_outputs: str
+    inference_keypoints: str
+    inference_segmentation: str
     analysis_outputs: str
+    analysis_keypoints: str
+    analysis_segmentation: str
     logs: str
     classes_file: str
     keypoints_file: str
@@ -54,6 +60,12 @@ class ProjectPaths(Mapping[str, str]):
             labels_all=os.path.join(root, "labels_all"),
             labels_seg_all=os.path.join(root, "labels_seg_all"),
             annotations=os.path.join(root, "annotations"),
+            annotations_keypoints=os.path.join(
+                root, "annotations", "keypoints"
+            ),
+            annotations_segmentation=os.path.join(
+                root, "annotations", "segmentation"
+            ),
             datasets=os.path.join(root, "datasets"),
             runs=os.path.join(root, "runs"),
             distillation=os.path.join(root, "distillation"),
@@ -61,7 +73,19 @@ class ProjectPaths(Mapping[str, str]):
             distillation_runs=os.path.join(root, "runs", "distillation"),
             templates=os.path.join(root, "templates"),
             inference_outputs=os.path.join(root, "inference outputs"),
+            inference_keypoints=os.path.join(
+                root, "inference outputs", "keypoints"
+            ),
+            inference_segmentation=os.path.join(
+                root, "inference outputs", "segmentation"
+            ),
             analysis_outputs=os.path.join(root, "analysis outputs"),
+            analysis_keypoints=os.path.join(
+                root, "analysis outputs", "keypoints"
+            ),
+            analysis_segmentation=os.path.join(
+                root, "analysis outputs", "segmentation"
+            ),
             logs=os.path.join(root, "logs"),
             classes_file=os.path.join(root, "classes.txt"),
             keypoints_file=os.path.join(root, "keypoints.txt"),
@@ -95,6 +119,8 @@ PROJECT_DIRECTORY_FIELDS = (
     "labels_all",
     "labels_seg_all",
     "annotations",
+    "annotations_keypoints",
+    "annotations_segmentation",
     "datasets",
     "runs",
     "distillation",
@@ -102,7 +128,11 @@ PROJECT_DIRECTORY_FIELDS = (
     "distillation_runs",
     "templates",
     "inference_outputs",
+    "inference_keypoints",
+    "inference_segmentation",
     "analysis_outputs",
+    "analysis_keypoints",
+    "analysis_segmentation",
     "logs",
 )
 

@@ -15,7 +15,14 @@ import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any, Optional
 
-CURRENT_PROJECT_SCHEMA_VERSION = 2
+from layer_ops import (
+    layer_worker_mode,
+    normalize_layer_id,
+    normalize_layer_settings,
+)
+
+
+CURRENT_PROJECT_SCHEMA_VERSION = 3
 
 
 def normalize_yolo_task(value: Any) -> Optional[str]:
@@ -102,6 +109,25 @@ def migrate_project_metadata(
     }.get(workflow)
     if normalized_workflow and normalized_workflow != migrated.get("active_workflow"):
         migrated["active_workflow"] = normalized_workflow
+        changed = True
+
+    active_layer = normalize_layer_id(
+        migrated.get("active_layer") or migrated.get("active_workflow")
+    )
+    if migrated.get("active_layer") != active_layer:
+        migrated["active_layer"] = active_layer
+        changed = True
+
+    # Keep the old field as a compatibility mirror for older SqueakPose builds
+    # and third-party project tooling while the application uses active_layer.
+    compatibility_workflow = layer_worker_mode(active_layer)
+    if migrated.get("active_workflow") != compatibility_workflow:
+        migrated["active_workflow"] = compatibility_workflow
+        changed = True
+
+    layer_settings = normalize_layer_settings(migrated.get("layers"))
+    if migrated.get("layers") != layer_settings:
+        migrated["layers"] = layer_settings
         changed = True
 
     if not migrated.get("created_at") and created_at:

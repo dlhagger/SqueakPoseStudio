@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
     QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QListView,
-    QScrollArea, QCheckBox
+    QScrollArea
 )
 from PyQt6.QtGui import (
     QPixmap, QPen, QBrush, QKeySequence, QFont, QPainter, QShortcut,
@@ -34,9 +34,7 @@ from squeakpose_core import (
     effective_prediction_batch,
     filter_image_stem_collisions,
     find_duplicate_names,
-    infer_dataset_task,
     remove_path,
-    resolve_default_training_dataset_path,
     stable_path_id,
     staging_path_for,
 )
@@ -86,6 +84,16 @@ from squeakpose.annotation.documents import (
 from squeakpose.annotation.graphics import BoxItem, KeypointItem, LabelView
 from squeakpose.annotation.video_view import VideoView
 from squeakpose.project.metadata import ProjectMetadataStore
+from squeakpose.project.layers import (
+    LAYER_DEFINITIONS,
+    LAYER_KEYPOINTS,
+    LAYER_SEGMENTATION,
+    layer_definition,
+    layer_model_paths,
+    layer_worker_mode,
+    normalize_layer_id,
+    normalize_layer_settings,
+)
 from squeakpose.project.distillation import (
     discover_distillation_exports,
     distillation_export_search_roots,
@@ -117,6 +125,7 @@ from squeakpose.ui.project_launcher import (
     choose_project_root,
     create_project_root,
 )
+from squeakpose.ui.project_models_dialog import ProjectModelsDialog
 from squeakpose.workers.process import (
     remove_file_quietly,
     request_qprocess_stop,
@@ -135,6 +144,7 @@ from ui_style import (
 DEFAULT_CLASS_NAMES = ["mouse"]
 DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
 DEFAULT_SAM3_WEIGHTS = "sam3.pt"
+# Worker-facing compatibility values. Project and UI state use layer ids.
 WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
 
@@ -450,14 +460,35 @@ class CongratsPopup(QDialog):
 
 class LabelingApp(QMainWindow):
 
+    @property
+    def active_workflow(self) -> str:
+        """Compatibility view of the active layer for existing workers/dialogs."""
+
+        return layer_worker_mode(getattr(self, "active_layer", LAYER_KEYPOINTS))
+
+    @active_workflow.setter
+    def active_workflow(self, value: str) -> None:
+        self.active_layer = normalize_layer_id(value)
+
+    def _active_layer_definition(self):
+        return layer_definition(getattr(self, "active_layer", LAYER_KEYPOINTS))
+
+    def _is_keypoints_layer(self) -> bool:
+        return getattr(self, "active_layer", LAYER_KEYPOINTS) == LAYER_KEYPOINTS
+
+    def _is_segmentation_layer(self) -> bool:
+        return getattr(self, "active_layer", LAYER_KEYPOINTS) == LAYER_SEGMENTATION
+
+    # Compatibility helpers for code paths and integrations using the former
+    # workflow terminology.
     def _is_pose_workflow(self) -> bool:
-        return getattr(self, "active_workflow", WORKFLOW_POSE) == WORKFLOW_POSE
+        return self._is_keypoints_layer()
 
     def _is_seg_workflow(self) -> bool:
-        return getattr(self, "active_workflow", WORKFLOW_POSE) == WORKFLOW_SEG
+        return self._is_segmentation_layer()
 
     def _workflow_label(self) -> str:
-        return "Pose" if self._is_pose_workflow() else "Segmentation"
+        return self._active_layer_definition().display_name
 
     def _ensure_classes_file(self, class_file: str, defaults: list[str]) -> tuple[list[str], bool]:
         created_any = False
@@ -552,20 +583,74 @@ class LabelingApp(QMainWindow):
 
     def _load_project_preferences(self):
         meta = self._read_project_meta()
-        workflow = str(meta.get("active_workflow", "")).strip().lower()
-        if workflow in {WORKFLOW_POSE, WORKFLOW_SEG}:
-            self.active_workflow = workflow
+        self.active_layer = normalize_layer_id(
+            meta.get("active_layer") or meta.get("active_workflow")
+        )
+        self.layer_settings = normalize_layer_settings(meta.get("layers"))
+        self.layer_model_paths = layer_model_paths(
+            self.layer_settings,
+            resolve_path=self._meta_normalize_path,
+        )
+        self.layer_model_paths = {
+            layer_id: path if path and os.path.isfile(path) else ""
+            for layer_id, path in self.layer_model_paths.items()
+        }
+        raw_visibility = meta.get("layer_visibility")
+        if isinstance(raw_visibility, dict):
+            for layer_id in LAYER_DEFINITIONS:
+                if layer_id in raw_visibility:
+                    self.layer_visibility[layer_id] = bool(
+                        raw_visibility[layer_id]
+                    )
         sam_path = self._meta_normalize_path(str(meta.get("sam_model_path", "") or ""))
+        if not sam_path:
+            sam_path = self._meta_normalize_path(
+                str(
+                    self.layer_settings[LAYER_SEGMENTATION].get(
+                        "assistant_model_path"
+                    )
+                    or ""
+                )
+            )
         if sam_path and os.path.isfile(sam_path):
             self.sam_model_path = sam_path
 
     def _save_project_preferences(self):
-        workflow = WORKFLOW_POSE if self._is_pose_workflow() else WORKFLOW_SEG
-        payload = {"active_workflow": workflow}
+        active_layer = normalize_layer_id(
+            getattr(self, "active_layer", LAYER_KEYPOINTS)
+        )
+        if hasattr(self, "layer_model_paths"):
+            self.layer_model_paths[active_layer] = str(
+                getattr(self, "predict_model_path", "") or ""
+            )
+        layer_settings = normalize_layer_settings(
+            getattr(self, "layer_settings", {})
+        )
+        for layer_id in LAYER_DEFINITIONS:
+            model_path = str(
+                getattr(self, "layer_model_paths", {}).get(layer_id) or ""
+            )
+            if model_path:
+                layer_settings[layer_id]["model_path"] = self._meta_store_path(
+                    model_path
+                )
+            else:
+                layer_settings[layer_id].pop("model_path", None)
+        payload = {
+            "active_layer": active_layer,
+            "active_workflow": layer_worker_mode(active_layer),
+            "layers": layer_settings,
+            "layer_visibility": dict(self.layer_visibility),
+        }
         if self.sam_model_path and os.path.isfile(self.sam_model_path):
             payload["sam_model_path"] = self._meta_store_path(self.sam_model_path)
+            layer_settings[LAYER_SEGMENTATION][
+                "assistant_model_path"
+            ] = self._meta_store_path(self.sam_model_path)
         else:
             payload["sam_model_path"] = None
+            layer_settings[LAYER_SEGMENTATION].pop("assistant_model_path", None)
+        self.layer_settings = layer_settings
         self._write_project_meta(payload)
 
     def _safe_remove_scene_item(self, item: Optional[QGraphicsItem]):
@@ -582,17 +667,25 @@ class LabelingApp(QMainWindow):
         except Exception:
             pass
 
-    def _persist_active_workflow_state(self):
-        if self._is_pose_workflow():
+    def _persist_active_layer_state(self):
+        if self._is_keypoints_layer():
             self.pose_classes = self.classes[:]
             self.pose_kp_names = self.kp_names[:]
             self.pose_class_keypoints = {name: self.class_keypoints.get(name, [])[:] for name in self.classes}
         else:
             self.seg_classes = self.classes[:]
+        if hasattr(self, "layer_model_paths"):
+            self.layer_model_paths[self.active_layer] = str(
+                getattr(self, "predict_model_path", "") or ""
+            )
 
-    def _bind_workflow_state(self, workflow: str):
-        if workflow == WORKFLOW_POSE:
-            self.active_workflow = WORKFLOW_POSE
+    def _persist_active_workflow_state(self):
+        self._persist_active_layer_state()
+
+    def _bind_layer_state(self, layer_id: str):
+        layer_id = normalize_layer_id(layer_id)
+        if layer_id == LAYER_KEYPOINTS:
+            self.active_layer = LAYER_KEYPOINTS
             self.label_dir = self.pose_label_dir
             self.class_file = self.pose_class_file
             self.keypoint_file = self.pose_keypoint_file
@@ -604,7 +697,7 @@ class LabelingApp(QMainWindow):
                 self.pose_kp_names = self.kp_names[:]
             self._schema_locked = self._detect_schema_locked()
         else:
-            self.active_workflow = WORKFLOW_SEG
+            self.active_layer = LAYER_SEGMENTATION
             self.label_dir = self.seg_label_dir
             self.class_file = self.seg_class_file
             self.keypoint_file = ""
@@ -614,7 +707,13 @@ class LabelingApp(QMainWindow):
             self.class_keypoints = {}
             self._schema_locked = self._detect_schema_locked()
 
+        self.predict_model_path = (
+            getattr(self, "layer_model_paths", {}).get(layer_id) or None
+        )
         self._refresh_kp_index_lookup()
+
+    def _bind_workflow_state(self, workflow: str):
+        self._bind_layer_state(workflow)
 
     def _refresh_class_selector_for_workflow(self):
         current = self.class_selector.currentText() if hasattr(self, "class_selector") else ""
@@ -637,12 +736,12 @@ class LabelingApp(QMainWindow):
             longest = max(longest, min(len(str(class_name)), 36))
         self.class_selector.setMinimumContentsLength(longest)
 
-    def _ensure_workflow_selector_items(self):
+    def _ensure_layer_selector_items(self):
         if not hasattr(self, "workflow_selector"):
             return
         expected = [
-            ("Pose Workflow (BBox + Keypoints)", WORKFLOW_POSE),
-            ("Segmentation Workflow (SAM)", WORKFLOW_SEG),
+            ("Keypoints Layer", LAYER_KEYPOINTS),
+            ("Segmentation Layer", LAYER_SEGMENTATION),
         ]
         needs_reset = self.workflow_selector.count() != len(expected)
         if not needs_reset:
@@ -656,13 +755,16 @@ class LabelingApp(QMainWindow):
         if not needs_reset:
             return
 
-        current_workflow = getattr(self, "active_workflow", WORKFLOW_POSE)
+        current_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
         self.workflow_selector.blockSignals(True)
         self.workflow_selector.clear()
         for text, data in expected:
             self.workflow_selector.addItem(text, data)
-        self.workflow_selector.setCurrentIndex(0 if current_workflow == WORKFLOW_POSE else 1)
+        self.workflow_selector.setCurrentIndex(0 if current_layer == LAYER_KEYPOINTS else 1)
         self.workflow_selector.blockSignals(False)
+
+    def _ensure_workflow_selector_items(self):
+        self._ensure_layer_selector_items()
 
     def _segmentation_labels_exist(self) -> bool:
         labels_dir = getattr(self, "seg_label_dir", "")
@@ -697,7 +799,7 @@ class LabelingApp(QMainWindow):
         decision = QMessageBox.question(
             self,
             "Define Segmentation Classes",
-            "Before labeling in Segmentation workflow, define what objects/classes you want to segment.\n\n"
+            "Before labeling in the Segmentation layer, define what objects/classes you want to segment.\n\n"
             "Open Segmentation Classes now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
@@ -729,9 +831,85 @@ class LabelingApp(QMainWindow):
             self.mode_grid.addWidget(self.bbox_btn, 2, 0)
             self.mode_grid.addWidget(self.keypoint_btn, 2, 1)
 
-    def _update_workflow_ui_state(self):
-        is_pose = self._is_pose_workflow()
-        self._ensure_workflow_selector_items()
+    def _sync_layer_visibility_controls(self) -> None:
+        checks = {
+            LAYER_KEYPOINTS: getattr(
+                self, "keypoints_visibility_check", None
+            ),
+            LAYER_SEGMENTATION: getattr(
+                self, "segmentation_visibility_check", None
+            ),
+        }
+        active_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
+        self.layer_visibility[active_layer] = True
+        for layer_id, check in checks.items():
+            if check is None:
+                continue
+            is_active = layer_id == active_layer
+            is_visible = bool(self.layer_visibility.get(layer_id, True))
+            check.blockSignals(True)
+            check.setChecked(is_visible)
+            check.setEnabled(not is_active)
+            check.setProperty("activeLayer", is_active)
+            check.setText(
+                f"{layer_definition(layer_id).display_name} · Edit"
+                if is_active
+                else (
+                    f"● {layer_definition(layer_id).display_name}"
+                    if is_visible
+                    else f"○ {layer_definition(layer_id).display_name}"
+                )
+            )
+            check.setToolTip(
+                "The layer being edited is always visible."
+                if is_active
+                else f"Show the saved {layer_definition(layer_id).display_name} layer as a read-only reference."
+            )
+            _refresh_qt_style(check)
+            check.blockSignals(False)
+        self._refresh_layer_context_hud()
+
+    def _refresh_layer_context_hud(self) -> None:
+        if not hasattr(self, "layer_editing_label"):
+            return
+        active_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
+        reference_layer = (
+            LAYER_SEGMENTATION
+            if active_layer == LAYER_KEYPOINTS
+            else LAYER_KEYPOINTS
+        )
+        active_name = layer_definition(active_layer).display_name
+        reference_name = layer_definition(reference_layer).display_name
+        reference_visible = bool(
+            self.layer_visibility.get(reference_layer, True)
+        )
+        self.layer_editing_label.setText(
+            f"{active_name.upper()} · EDITING"
+        )
+        self.layer_reference_label.setText(
+            f"{'●' if reference_visible else '○'} "
+            f"{reference_name} reference "
+            f"{'visible' if reference_visible else 'hidden'}"
+        )
+        self.layer_context_frame.adjustSize()
+        self._layout_hot_corners()
+
+    def _on_layer_visibility_changed(
+        self, layer_id: str, visible: bool
+    ) -> None:
+        layer_id = normalize_layer_id(layer_id)
+        if layer_id == getattr(self, "active_layer", LAYER_KEYPOINTS):
+            self.layer_visibility[layer_id] = True
+            self._sync_layer_visibility_controls()
+            return
+        self.layer_visibility[layer_id] = bool(visible)
+        self._save_project_preferences()
+        if hasattr(self, "scene"):
+            self._refresh_reference_layer_overlay()
+
+    def _update_layer_ui_state(self):
+        is_pose = self._is_keypoints_layer()
+        self._ensure_layer_selector_items()
 
         self.save_btn.setEnabled(True)
         self.complete_btn.setEnabled(True)
@@ -750,11 +928,39 @@ class LabelingApp(QMainWindow):
         self.normalize_btn.setEnabled(True)
         self.export_dataset_btn.setEnabled(True)
         self.train_btn.setEnabled(True)
+        self.distillation_btn.setEnabled(is_pose)
         if hasattr(self, "analysis_btn"):
             self.analysis_btn.setEnabled(True)
         if hasattr(self, "delete_image_btn"):
             self.delete_image_btn.setEnabled(True)
         self.load_model_btn.setEnabled(True)
+        active_layer = self._active_layer_definition()
+        self.load_model_btn.setText("Project Models…")
+        self.load_model_btn.setToolTip(
+            "Configure the Keypoints and Segmentation prediction models for this project"
+        )
+        self.inference_btn.setText("Run Inference")
+        self.train_btn.setText("Train Model")
+        if hasattr(self, "model_inference_title"):
+            self.model_inference_title.setText("Project Models & Inference")
+        if hasattr(self, "model_status_label"):
+            configured = []
+            for layer_id in (LAYER_KEYPOINTS, LAYER_SEGMENTATION):
+                path = self.layer_model_paths.get(layer_id) or ""
+                state = os.path.basename(path) if path else "not configured"
+                configured.append(
+                    f"{layer_definition(layer_id).display_name}: {state}"
+                )
+            self.model_status_label.setText("  ·  ".join(configured))
+            self.model_status_label.setToolTip("\n".join(configured))
+        if hasattr(self, "dataset_training_title"):
+            self.dataset_training_title.setText(
+                f"{active_layer.display_name} Dataset & Training"
+            )
+        if hasattr(self, "analysis_title"):
+            self.analysis_title.setText(f"{active_layer.display_name} Analysis")
+        if hasattr(self, "analysis_btn"):
+            self.analysis_btn.setText("Run Analysis")
 
         self.manage_classes_btn.setToolTip(
             "Manage classes and per-class keypoints" if is_pose else "Manage segmentation classes"
@@ -769,9 +975,9 @@ class LabelingApp(QMainWindow):
         if hasattr(self, "predict_btn"):
             self.predict_btn.setVisible(True)
             self.predict_btn.setToolTip(
-                "Run YOLO pose prediction on the current image"
+                "Run the Keypoints layer model on the current image"
                 if is_pose else
-                "Run YOLO segmentation prediction on the current image"
+                "Run the Segmentation layer model on the current image"
             )
         if hasattr(self, "segment_btn"):
             self.segment_btn.setVisible(not is_pose)
@@ -798,53 +1004,71 @@ class LabelingApp(QMainWindow):
         self._update_status()
         self._update_progress_label()
         self._refresh_sam_controls()
+        self._sync_layer_visibility_controls()
         self._layout_hot_corners()
         self._layout_overlays()
 
-    def _switch_workflow(self, workflow: str):
-        workflow = WORKFLOW_POSE if workflow == WORKFLOW_POSE else WORKFLOW_SEG
-        if workflow == getattr(self, "active_workflow", WORKFLOW_POSE):
+    def _update_workflow_ui_state(self):
+        self._update_layer_ui_state()
+
+    def _switch_layer(self, layer_id: str):
+        layer_id = normalize_layer_id(layer_id)
+        if layer_id == getattr(self, "active_layer", LAYER_KEYPOINTS):
             return
-        self._ensure_workflow_selector_items()
+        if getattr(self, "_predict_busy", False):
+            self._cancel_prediction_process()
+            self._predict_busy = False
+            self._prediction_pending_request = None
+            self._prediction_current_request_id = None
+            self._prediction_image_path = None
+        self._ensure_layer_selector_items()
         if hasattr(self, "workflow_selector"):
-            idx = 0 if workflow == WORKFLOW_POSE else 1
+            idx = 0 if layer_id == LAYER_KEYPOINTS else 1
             if self.workflow_selector.currentIndex() != idx:
                 self.workflow_selector.blockSignals(True)
                 self.workflow_selector.setCurrentIndex(idx)
                 self.workflow_selector.blockSignals(False)
-        self._persist_active_workflow_state()
-        self._bind_workflow_state(workflow)
+        self._persist_active_layer_state()
+        self._bind_layer_state(layer_id)
         self._save_project_preferences()
-        if workflow == WORKFLOW_SEG:
+        if layer_id == LAYER_SEGMENTATION:
             self.mode = "segment"
         elif self.mode == "segment":
             self.mode = "panzoom"
         self._refresh_class_selector_for_workflow()
         self.annotation_cache.clear()
         self._clear_seg_prompt_state()
-        self._update_workflow_ui_state()
+        self._update_layer_ui_state()
         self.load_image()
-        if self._is_seg_workflow():
+        if self._is_segmentation_layer():
             loaded_now, loaded_path = self._try_autoload_sam_model_from_project_root()
             self._refresh_sam_controls()
             if loaded_now:
                 self.update_status_bar(
-                    f"Segmentation workflow enabled. Auto-loaded SAM model: {os.path.basename(loaded_path)}"
+                    f"Segmentation layer selected. Auto-loaded SAM model: {os.path.basename(loaded_path)}"
                 )
             elif self.sam_model is not None:
-                self.update_status_bar("Segmentation workflow enabled. SAM model ready.")
+                self.update_status_bar("Segmentation layer selected. SAM model ready.")
             else:
-                self.update_status_bar("Segmentation workflow enabled. Use Segment mode and SAM prompts.")
+                self.update_status_bar("Segmentation layer selected. Use Segment mode and SAM prompts.")
             QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
         else:
-            self.update_status_bar("Pose workflow enabled.")
+            self.update_status_bar("Keypoints layer selected.")
         if self.predict_model_path:
             self._restart_prediction_worker(warm=True)
+        else:
+            self._restart_prediction_worker(warm=False)
 
-    def _on_workflow_changed(self, _index: int):
-        self._ensure_workflow_selector_items()
-        workflow = self.workflow_selector.currentData()
-        self._switch_workflow(str(workflow))
+    def _switch_workflow(self, workflow: str):
+        self._switch_layer(workflow)
+
+    def _on_layer_changed(self, _index: int):
+        self._ensure_layer_selector_items()
+        layer_id = self.workflow_selector.currentData()
+        self._switch_layer(str(layer_id))
+
+    def _on_workflow_changed(self, index: int):
+        self._on_layer_changed(index)
 
     def _ensure_label_files(self, class_file: str, keypoint_file: str) -> tuple[list[str], list[str], bool]:
         """
@@ -1024,8 +1248,12 @@ class LabelingApp(QMainWindow):
 
     def _label_file_is_usable(self, label_file: str) -> bool:
         state = getattr(self, "__dict__", {})
-        workflow = state.get("active_workflow", WORKFLOW_POSE)
-        mode = DATASET_SEGMENT if workflow == WORKFLOW_SEG else DATASET_POSE
+        layer_id = normalize_layer_id(state.get("active_layer"))
+        mode = (
+            DATASET_SEGMENT
+            if layer_id == LAYER_SEGMENTATION
+            else DATASET_POSE
+        )
         return label_file_has_usable_rows(
             label_file,
             mode=mode,
@@ -1170,6 +1398,168 @@ class LabelingApp(QMainWindow):
         except ValueError:
             pass
 
+    def _is_reference_layer_item(self, item: QGraphicsItem) -> bool:
+        return bool(getattr(item, "reference_layer_id", ""))
+
+    def _clear_reference_layer_items(self) -> None:
+        for item in list(getattr(self, "_reference_layer_items", [])):
+            self._safe_remove_scene_item(item)
+        self._reference_layer_items = []
+
+    def _add_reference_item(
+        self, item: QGraphicsItem, *, layer_id: str, opacity: float
+    ) -> None:
+        item.reference_layer_id = normalize_layer_id(layer_id)
+        item.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False
+        )
+        item.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False
+        )
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        item.setAcceptHoverEvents(False)
+        item.setOpacity(opacity)
+        item.setZValue(1.0)
+        self.scene.addItem(item)
+        self._reference_layer_items.append(item)
+
+    def _refresh_reference_layer_overlay(self) -> None:
+        self._clear_reference_layer_items()
+        if not getattr(self, "images", None):
+            return
+        active_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
+        reference_layer = (
+            LAYER_SEGMENTATION
+            if active_layer == LAYER_KEYPOINTS
+            else LAYER_KEYPOINTS
+        )
+        if not self.layer_visibility.get(reference_layer, True):
+            return
+
+        reference_color = QColor(104, 164, 207)
+        base = os.path.splitext(self.images[self.current_idx])[0]
+        if reference_layer == LAYER_SEGMENTATION:
+            label_file = os.path.join(
+                self.seg_label_dir, f"{base}.txt"
+            )
+            if not os.path.isfile(label_file):
+                return
+            entries = load_segmentation_annotations_from_file(
+                label_file,
+                classes_count=len(self.seg_classes),
+                img_w=self.img_w,
+                img_h=self.img_h,
+            )
+            for cid, entry in entries.items():
+                points = []
+                for pair in entry.get("segments", []):
+                    try:
+                        points.append((float(pair[0]), float(pair[1])))
+                    except Exception:
+                        continue
+                path = self._polygon_path(points)
+                if path is None:
+                    continue
+                color = reference_color
+                item = QGraphicsPathItem(path)
+                pen = QPen(color)
+                pen.setCosmetic(True)
+                pen.setWidth(2)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                item.setPen(pen)
+                item.setBrush(
+                    QBrush(QColor(104, 164, 207, 48))
+                )
+                item.seg_class_id = int(cid)
+                item.seg_points = points
+                item.seg_preview = False
+                label = (
+                    self.seg_classes[cid]
+                    if 0 <= cid < len(self.seg_classes)
+                    else f"class_{cid}"
+                )
+                label_item = QGraphicsSimpleTextItem(
+                    f"{label} · Segmentation", item
+                )
+                label_item.setBrush(QBrush(color))
+                label_item.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                    True,
+                )
+                label_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                label_item.setPos(
+                    path.boundingRect().left() + 4.0,
+                    path.boundingRect().top() + 4.0,
+                )
+                label_item.setVisible(False)
+                item.seg_label_item = label_item
+                self._add_reference_item(
+                    item,
+                    layer_id=reference_layer,
+                    opacity=0.50,
+                )
+            return
+
+        label_file = os.path.join(self.pose_label_dir, f"{base}.txt")
+        if not os.path.isfile(label_file):
+            return
+        class_lookup = [
+            self.pose_class_keypoints.get(name, self.pose_kp_names)
+            for name in self.pose_classes
+        ]
+        entries, _extra_rows = load_pose_annotations_from_file(
+            label_file,
+            classes_count=len(self.pose_classes),
+            canonical_names=self.pose_kp_names,
+            class_keypoint_lookup=class_lookup,
+            img_w=self.img_w,
+            img_h=self.img_h,
+        )
+        for cid, entry in entries.items():
+            bbox_data = entry.get("bbox", {})
+            bbox = BoundingBox(
+                bbox_data.get("x", 0.0),
+                bbox_data.get("y", 0.0),
+                bbox_data.get("w", 0.0),
+                bbox_data.get("h", 0.0),
+                cid,
+            )
+            class_name = (
+                self.pose_classes[cid]
+                if 0 <= cid < len(self.pose_classes)
+                else str(cid)
+            )
+            box_item = BoxItem(bbox, f"{class_name} · Keypoints")
+            box_item.set_reference_style(
+                reference_color, show_label=False
+            )
+            self._add_reference_item(
+                box_item,
+                layer_id=reference_layer,
+                opacity=0.52,
+            )
+            for kp_info in entry.get("keypoints", []):
+                name = str(kp_info.get("name") or "")
+                kp = Keypoint(
+                    kp_info.get("x", 0.0),
+                    kp_info.get("y", 0.0),
+                    cid,
+                    name,
+                )
+                kp_item = KeypointItem(
+                    kp, self.kp_pixel_radius, self.kp_font_px
+                )
+                kp_item.visibility = int(kp_info.get("vis", 2))
+                kp_item.update_appearance()
+                kp_item.set_reference_style(
+                    reference_color, show_label=False
+                )
+                self._add_reference_item(
+                    kp_item,
+                    layer_id=reference_layer,
+                    opacity=0.52,
+                )
+
     # ---------- Annotation helpers ----------
 
     def _seg_class_color(self, class_id: int, alpha: int = 255) -> QColor:
@@ -1189,6 +1579,7 @@ class LabelingApp(QMainWindow):
         for item in self.scene.items():
             if (
                 self._is_seg_mask_item(item)
+                and not self._is_reference_layer_item(item)
                 and not bool(getattr(item, "seg_preview", False))
                 and int(getattr(item, "seg_class_id", -1)) == class_id
             ):
@@ -1353,6 +1744,81 @@ class LabelingApp(QMainWindow):
             return preview
         return self._class_seg_mask_item(cid)
 
+    def _position_seg_visual_frame(
+        self, item: QGraphicsPathItem, path: QPainterPath
+    ) -> None:
+        """Keep the segmentation frame and class badge aligned to its mask."""
+        frame_item = getattr(item, "seg_frame_item", None)
+        label_bg = getattr(item, "seg_label_bg", None)
+        label_item = getattr(item, "seg_label_item", None)
+        if frame_item is None or label_bg is None or label_item is None:
+            return
+
+        bbox = path.boundingRect()
+        frame_item.setRect(bbox)
+
+        pad_x = 4.0
+        pad_y = 1.0
+        margin = 2.0
+        text_rect = label_item.boundingRect()
+        badge_w = text_rect.width() + (pad_x * 2.0)
+        badge_h = text_rect.height() + (pad_y * 2.0)
+        badge_x = bbox.left() + margin
+        badge_y = bbox.top() - badge_h - margin
+        if (
+            hasattr(self, "scene")
+            and badge_y < self.scene.sceneRect().top()
+        ):
+            badge_y = bbox.bottom() + margin
+        label_bg.setRect(badge_x, badge_y, badge_w, badge_h)
+        label_item.setPos(
+            badge_x + pad_x,
+            badge_y + pad_y,
+        )
+
+    def _add_seg_visual_frame(
+        self,
+        item: QGraphicsPathItem,
+        path: QPainterPath,
+        label_text: str,
+        *,
+        preview: bool,
+    ) -> None:
+        """Add the same blue object frame/badge used by keypoint output."""
+        frame_color = QColor(32, 78, 255)
+
+        frame_item = QGraphicsRectItem(item)
+        frame_pen = QPen(frame_color)
+        frame_pen.setWidth(2)
+        frame_pen.setCosmetic(True)
+        if preview:
+            frame_pen.setStyle(Qt.PenStyle.DashLine)
+        frame_item.setPen(frame_pen)
+        frame_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        frame_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        frame_item.setAcceptHoverEvents(False)
+        frame_item.setZValue(0.3)
+
+        label_bg = QGraphicsRectItem(item)
+        label_bg.setBrush(QBrush(frame_color))
+        label_bg.setPen(QPen(Qt.PenStyle.NoPen))
+        label_bg.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        label_bg.setAcceptHoverEvents(False)
+        label_bg.setZValue(0.4)
+
+        label_item = QGraphicsSimpleTextItem(label_text, item)
+        label_font = QFont()
+        label_font.setPixelSize(12)
+        label_item.setFont(label_font)
+        label_item.setBrush(QBrush(Qt.GlobalColor.white))
+        label_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        label_item.setZValue(0.5)
+
+        item.seg_frame_item = frame_item
+        item.seg_label_bg = label_bg
+        item.seg_label_item = label_item
+        self._position_seg_visual_frame(item, path)
+
     def _seg_update_item_geometry(self, item: Optional[QGraphicsPathItem], points: list[tuple[float, float]]) -> bool:
         if item is None:
             return False
@@ -1362,10 +1828,7 @@ class LabelingApp(QMainWindow):
             return False
         item.seg_points = normalized
         item.setPath(path)
-        label_item = getattr(item, "seg_label_item", None)
-        if label_item is not None:
-            bbox = path.boundingRect()
-            label_item.setPos(bbox.left() + 4.0, bbox.top() + 4.0)
+        self._position_seg_visual_frame(item, path)
         return True
 
     def _clear_seg_edit_handles(self):
@@ -1506,7 +1969,7 @@ class LabelingApp(QMainWindow):
         if preview:
             pen.setStyle(Qt.PenStyle.DashLine)
         item.setPen(pen)
-        fill_alpha = 60 if preview else 105
+        fill_alpha = 52 if preview else 76
         item.setBrush(QBrush(self._seg_class_color(class_id, alpha=fill_alpha)))
         item.setZValue(4.5 if preview else 4.0)
         item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
@@ -1518,15 +1981,12 @@ class LabelingApp(QMainWindow):
         label_text = self._seg_class_name(class_id)
         if preview:
             label_text += " (preview)"
-        label_item = QGraphicsSimpleTextItem(label_text, item)
-        label_item.setBrush(QBrush(color))
-        label_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
-        label_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-        label_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        bbox = path.boundingRect()
-        label_item.setPos(bbox.left() + 4.0, bbox.top() + 4.0)
-        label_item.setZValue(0.2)
-        item.seg_label_item = label_item
+        self._add_seg_visual_frame(
+            item,
+            path,
+            label_text,
+            preview=preview,
+        )
 
         self.scene.addItem(item)
         self._track_scene_item(item)
@@ -1904,19 +2364,29 @@ class LabelingApp(QMainWindow):
 
     def _class_box_item(self, class_id: int) -> Optional[BoxItem]:
         for item in self.scene.items():
-            if isinstance(item, BoxItem) and item.bbox.class_id == class_id:
+            if (
+                isinstance(item, BoxItem)
+                and not self._is_reference_layer_item(item)
+                and item.bbox.class_id == class_id
+            ):
                 return item
         return None
 
     def _class_keypoint_items(self, class_id: int) -> list[KeypointItem]:
         return [
             item for item in self.scene.items()
-            if isinstance(item, KeypointItem) and item.kp.class_id == class_id
+            if (
+                isinstance(item, KeypointItem)
+                and not self._is_reference_layer_item(item)
+                and item.kp.class_id == class_id
+            )
         ]
 
     def _clear_class_items(self, class_id: int, drop_cache: bool = False):
         removed = False
         for item in list(self.scene.items()):
+            if self._is_reference_layer_item(item):
+                continue
             if isinstance(item, BoxItem) and item.bbox.class_id == class_id:
                 self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
@@ -1943,6 +2413,8 @@ class LabelingApp(QMainWindow):
     def _clear_all_annotation_items(self):
         self._clear_seg_edit_handles()
         for item in list(self.scene.items()):
+            if self._is_reference_layer_item(item):
+                continue
             if isinstance(item, (BoxItem, KeypointItem)) or self._is_seg_mask_item(item):
                 self._safe_remove_scene_item(item)
                 self._untrack_scene_item(item)
@@ -1966,6 +2438,14 @@ class LabelingApp(QMainWindow):
     def _update_item_editability(self):
         active_cid = self.class_selector.currentIndex()
         for item in self.scene.items():
+            if self._is_reference_layer_item(item):
+                item.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False
+                )
+                item.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False
+                )
+                continue
             if isinstance(item, BoxItem):
                 editable = (item.bbox.class_id == active_cid)
                 item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, editable)
@@ -2115,7 +2595,7 @@ class LabelingApp(QMainWindow):
         self.current_idx = 0
         self._queue_current_idx = 0
 
-        # Pose workflow resources
+        # Keypoints layer resources
         self.pose_classes, self.pose_kp_names, self._created_label_files = self._ensure_label_files(
             self.pose_class_file, self.pose_keypoint_file
         )
@@ -2128,12 +2608,12 @@ class LabelingApp(QMainWindow):
         self._save_class_keypoints()
         self.pose_class_keypoints = {name: self.class_keypoints.get(name, [])[:] for name in self.pose_classes}
 
-        # Segmentation workflow resources
+        # Segmentation layer resources
         self.seg_classes, self._created_seg_class_file = self._ensure_classes_file(
             self.seg_class_file, DEFAULT_CLASS_NAMES
         )
 
-        self.active_workflow = WORKFLOW_POSE
+        self.active_layer = LAYER_KEYPOINTS
         self.classes = self.pose_classes[:]
         self.kp_names = self.pose_kp_names[:]
         self.class_keypoints = {name: self.pose_class_keypoints.get(name, [])[:] for name in self.pose_classes}
@@ -2152,6 +2632,14 @@ class LabelingApp(QMainWindow):
         self.kps: List[Keypoint] = []
         self.current_kp_idx = 0
         self._item_refs: list[QGraphicsItem] = []
+        self._reference_layer_items: list[QGraphicsItem] = []
+        self.layer_settings = normalize_layer_settings({})
+        self.layer_model_paths: dict[str, str] = {
+            layer_id: "" for layer_id in LAYER_DEFINITIONS
+        }
+        self.layer_visibility: dict[str, bool] = {
+            layer_id: True for layer_id in LAYER_DEFINITIONS
+        }
         self.predict_model_path: Optional[str] = None
         self.sam_model_path = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
         self.sam_model: Optional[SAM] = None
@@ -2170,7 +2658,7 @@ class LabelingApp(QMainWindow):
 
         self._project_meta_recovery: Optional[tuple[str, str]] = None
         self._load_project_preferences()
-        self._bind_workflow_state(self.active_workflow)
+        self._bind_layer_state(self.active_layer)
         self._save_project_preferences()
 
         # keypoint display (screen-space)
@@ -2190,6 +2678,13 @@ class LabelingApp(QMainWindow):
         self._inference_csv_path: Optional[str] = None
         self._inference_mode: str = WORKFLOW_POSE
         self._inference_cancel_requested = False
+        self._inference_job_queue: list[dict] = []
+        self._inference_active_job: Optional[dict] = None
+        self._inference_run_results: list[dict] = []
+        self._inference_run_total = 0
+        self._inference_run_canceled = False
+        self._inference_run_manifest_path = ""
+        self._inference_run_video_path = ""
         self._prediction_process: Optional[QProcess] = None
         self._prediction_stdout_buffer = ""
         self._prediction_stderr = ""
@@ -2207,7 +2702,7 @@ class LabelingApp(QMainWindow):
         print(f"🧠 Inference device: {self._device}")
         # Build UI and load first image
         self._setup_ui()
-        self._update_workflow_ui_state()
+        self._update_layer_ui_state()
         self.load_image()
         self._update_progress_label()
         if self._queue_stem_collisions:
@@ -2219,6 +2714,8 @@ class LabelingApp(QMainWindow):
         else:
             QTimer.singleShot(0, self._maybe_prompt_class_manager)
     def closeEvent(self, event):
+        self._inference_run_canceled = True
+        self._inference_job_queue.clear()
         _shutdown_qprocess(self._inference_process)
         self._prediction_expected_stop = True
         _shutdown_qprocess(self._prediction_process)
@@ -2384,8 +2881,8 @@ class LabelingApp(QMainWindow):
         self._active_class_id = self.class_selector.currentIndex()
         self.workflow_selector = ThemedComboBox()
         self.workflow_selector.setObjectName("workflowSelector")
-        self.workflow_selector.addItem("Pose Workflow (BBox + Keypoints)", WORKFLOW_POSE)
-        self.workflow_selector.addItem("Segmentation Workflow (SAM)", WORKFLOW_SEG)
+        self.workflow_selector.addItem("Keypoints Layer", LAYER_KEYPOINTS)
+        self.workflow_selector.addItem("Segmentation Layer", LAYER_SEGMENTATION)
         self.workflow_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.workflow_selector.setMinimumContentsLength(18)
         self.workflow_selector.setMinimumWidth(0)
@@ -2400,9 +2897,9 @@ class LabelingApp(QMainWindow):
         style_combo_popup(workflow_popup)
         self.workflow_selector.setView(workflow_popup)
         self.workflow_selector.setToolTip(
-            "Choose labeling workflow: Pose for boxes/keypoints, or Segmentation for SAM masks."
+            "Choose the annotation layer to edit. Each layer keeps its own labels, model, dataset, and analysis context."
         )
-        self.workflow_selector.currentIndexChanged.connect(self._on_workflow_changed)
+        self.workflow_selector.currentIndexChanged.connect(self._on_layer_changed)
 
         # -----------------------------
         # Top-left: navigation + labeling
@@ -2448,11 +2945,47 @@ class LabelingApp(QMainWindow):
 
         workflow_row = QHBoxLayout()
         workflow_row.setSpacing(6)
-        workflow_label = QLabel("Workflow")
-        workflow_label.setObjectName("fieldLabel")
-        workflow_row.addWidget(workflow_label)
+        layer_label = QLabel("Layer")
+        layer_label.setObjectName("fieldLabel")
+        workflow_row.addWidget(layer_label)
         workflow_row.addWidget(self.workflow_selector, 1)
         top_left_layout.addLayout(workflow_row)
+
+        visibility_row = QHBoxLayout()
+        visibility_row.setSpacing(8)
+        visibility_label = QLabel("Layers")
+        visibility_label.setObjectName("fieldLabel")
+        visibility_row.addWidget(visibility_label)
+        self.keypoints_visibility_check = QPushButton("● Keypoints")
+        self.segmentation_visibility_check = QPushButton(
+            "● Segmentation"
+        )
+        for layer_button in (
+            self.keypoints_visibility_check,
+            self.segmentation_visibility_check,
+        ):
+            layer_button.setCheckable(True)
+            layer_button.setProperty("layerVisibilityPill", True)
+            layer_button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+        self.keypoints_visibility_check.setChecked(True)
+        self.segmentation_visibility_check.setChecked(True)
+        self.keypoints_visibility_check.toggled.connect(
+            lambda checked: self._on_layer_visibility_changed(
+                LAYER_KEYPOINTS, checked
+            )
+        )
+        self.segmentation_visibility_check.toggled.connect(
+            lambda checked: self._on_layer_visibility_changed(
+                LAYER_SEGMENTATION, checked
+            )
+        )
+        visibility_row.addWidget(self.keypoints_visibility_check)
+        visibility_row.addWidget(self.segmentation_visibility_check)
+        visibility_row.addStretch(1)
+        top_left_layout.addLayout(visibility_row)
 
         nav_grid = QGridLayout()
         nav_grid.setHorizontalSpacing(6)
@@ -2568,7 +3101,9 @@ class LabelingApp(QMainWindow):
         top_right_title.setObjectName("panelTitle")
         top_right_layout.addWidget(top_right_title)
         btn_video = QPushButton("Video Reviewer")
-        btn_video.setToolTip("Predict an entire video, then review frames with overlays")
+        btn_video.setToolTip(
+            "Run the configured project models over a video and review their overlays together"
+        )
         btn_video.setMinimumHeight(34)
         btn_video.clicked.connect(self.open_video_reviewer)
         top_right_layout.addWidget(btn_video)
@@ -2576,7 +3111,7 @@ class LabelingApp(QMainWindow):
         self.right_sidebar_layout.addWidget(self.top_right_frame)
 
         # -----------------------------
-        # Right: analysis workflow
+        # Right: layer-aware analysis
         # -----------------------------
         self.analysis_frame = QFrame(self.right_sidebar_content)
         self.analysis_frame.setObjectName("ToolPanel")
@@ -2585,11 +3120,11 @@ class LabelingApp(QMainWindow):
         analysis_layout = QVBoxLayout(self.analysis_frame)
         analysis_layout.setContentsMargins(12, 11, 12, 14)
         analysis_layout.setSpacing(8)
-        analysis_title = QLabel("Analysis")
-        analysis_title.setObjectName("panelTitle")
-        analysis_layout.addWidget(analysis_title)
+        self.analysis_title = QLabel("Analysis")
+        self.analysis_title.setObjectName("panelTitle")
+        analysis_layout.addWidget(self.analysis_title)
         self.analysis_btn = QPushButton("Analysis")
-        self.analysis_btn.setToolTip("Run the inference analysis workflow from a GUI")
+        self.analysis_btn.setToolTip("Analyze inference results for the active layer")
         self.analysis_btn.clicked.connect(self.open_analysis_dialog)
         prepare_panel_button(self.analysis_btn, min_height=34)
         analysis_layout.addWidget(self.analysis_btn)
@@ -2604,9 +3139,9 @@ class LabelingApp(QMainWindow):
         bottom_left_layout = QVBoxLayout(self.bottom_left_frame)
         bottom_left_layout.setContentsMargins(12, 11, 12, 11)
         bottom_left_layout.setSpacing(8)
-        bottom_left_title = QLabel("Dataset & Training")
-        bottom_left_title.setObjectName("panelTitle")
-        bottom_left_layout.addWidget(bottom_left_title)
+        self.dataset_training_title = QLabel("Dataset & Training")
+        self.dataset_training_title.setObjectName("panelTitle")
+        bottom_left_layout.addWidget(self.dataset_training_title)
         training_grid = QGridLayout()
         training_grid.setHorizontalSpacing(6)
         training_grid.setVerticalSpacing(6)
@@ -2655,13 +3190,17 @@ class LabelingApp(QMainWindow):
         bottom_right_layout = QVBoxLayout(self.bottom_right_frame)
         bottom_right_layout.setContentsMargins(12, 11, 12, 11)
         bottom_right_layout.setSpacing(8)
-        bottom_right_title = QLabel("Model & Inference")
-        bottom_right_title.setObjectName("panelTitle")
-        bottom_right_layout.addWidget(bottom_right_title)
+        self.model_inference_title = QLabel("Project Models & Inference")
+        self.model_inference_title.setObjectName("panelTitle")
+        bottom_right_layout.addWidget(self.model_inference_title)
+        self.model_status_label = QLabel("")
+        self.model_status_label.setObjectName("fieldLabel")
+        self.model_status_label.setWordWrap(True)
+        bottom_right_layout.addWidget(self.model_status_label)
         inference_grid = QGridLayout()
         inference_grid.setHorizontalSpacing(6)
         inference_grid.setVerticalSpacing(6)
-        self.load_model_btn = QPushButton("Load Model")
+        self.load_model_btn = QPushButton("Project Models…")
         self.load_model_btn.clicked.connect(self.load_model)
         inference_grid.addWidget(self.load_model_btn, 0, 0)
 
@@ -2676,7 +3215,9 @@ class LabelingApp(QMainWindow):
         inference_grid.addWidget(self.template_save_btn, 1, 1)
 
         self.inference_btn = QPushButton("Inference")
-        self.inference_btn.setToolTip("Select a video, run YOLO, and export per-frame metrics to CSV")
+        self.inference_btn.setToolTip(
+            "Select a video and run every configured project prediction model into layer-specific CSV outputs"
+        )
         self.inference_btn.clicked.connect(self.run_video_inference)
         inference_grid.addWidget(self.inference_btn, 0, 1)
         for btn in (self.load_model_btn, self.template_apply_btn, self.template_save_btn, self.inference_btn):
@@ -2760,6 +3301,24 @@ class LabelingApp(QMainWindow):
         self._layout_hot_corners()
 
         hud_style = hud_stylesheet()
+
+        # Active/reference layer context (top-left).
+        self.layer_context_frame = QFrame(self.view)
+        self.layer_context_frame.setStyleSheet(hud_style)
+        apply_panel_shadow(
+            self.layer_context_frame, blur=14, y_offset=2, alpha=75
+        )
+        layer_context_layout = QVBoxLayout(self.layer_context_frame)
+        layer_context_layout.setContentsMargins(10, 7, 10, 7)
+        layer_context_layout.setSpacing(1)
+        self.layer_editing_label = QLabel("")
+        self.layer_editing_label.setObjectName("layerEditing")
+        self.layer_reference_label = QLabel("")
+        self.layer_reference_label.setObjectName("layerReference")
+        layer_context_layout.addWidget(self.layer_editing_label)
+        layer_context_layout.addWidget(self.layer_reference_label)
+        self.layer_context_frame.show()
+        self._refresh_layer_context_hud()
 
         # --- legend (bottom-left) ---
         self.legend_frame = QFrame(self.view)
@@ -3255,6 +3814,18 @@ class LabelingApp(QMainWindow):
             (getattr(self, "pose_label_dir", ""), label_name),
             (getattr(self, "seg_label_dir", ""), label_name),
             (os.path.join(self.project_root, "annotations"), f"{base}_annotated.png"),
+            (
+                os.path.join(
+                    self.project_root, "annotations", LAYER_KEYPOINTS
+                ),
+                f"{base}_annotated.png",
+            ),
+            (
+                os.path.join(
+                    self.project_root, "annotations", LAYER_SEGMENTATION
+                ),
+                f"{base}_annotated.png",
+            ),
         ):
             if directory:
                 paths.append(os.path.join(directory, target_name))
@@ -3304,6 +3875,7 @@ class LabelingApp(QMainWindow):
         self.current_kp_idx = 0
         self.scene.clear()
         self._item_refs.clear()
+        self._reference_layer_items.clear()
 
     def _reload_after_current_image_delete(self):
         self._queue_current_idx = self.current_idx
@@ -3389,18 +3961,35 @@ class LabelingApp(QMainWindow):
     # ---------- Prediction ----------
 
     def load_model(self):
-        model_file, _ = QFileDialog.getOpenFileName(
-            self, "Select YOLO model file", "", "Model Files (*.pt *.yaml *.onnx)"
+        dialog = ProjectModelsDialog(
+            self,
+            self.layer_model_paths,
+            active_layer=self.active_layer,
         )
-        if not model_file:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.predict_model_path = model_file
+            self.layer_model_paths.update(dialog.model_paths)
+            self.predict_model_path = (
+                self.layer_model_paths.get(self.active_layer) or None
+            )
+            self._save_project_preferences()
             # Re-detect device in case hardware/availability changed
             self._device = _auto_device()
             print(f"🧠 Inference device: {self._device}")
-            self._restart_prediction_worker(warm=True)
-            QMessageBox.information(self, "Model Selected", f"Selected model:\n{os.path.basename(model_file)}")
+            self._restart_prediction_worker(
+                warm=bool(self.predict_model_path)
+            )
+            self._update_layer_ui_state()
+            configured = [
+                layer_definition(layer_id).display_name
+                for layer_id, path in self.layer_model_paths.items()
+                if path
+            ]
+            summary = ", ".join(configured) if configured else "none"
+            self.update_status_bar(
+                f"Project prediction models configured: {summary}."
+            )
         except Exception as e:
             QMessageBox.warning(self, "Model Load Error", f"Could not load model:\n{e}")
 
@@ -3408,12 +3997,31 @@ class LabelingApp(QMainWindow):
         if _cv2 is None:
             QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
-        if not getattr(self, "predict_model_path", None):
-            QMessageBox.information(self, "No Model", "Load a model before running inference.")
-            return
         if self._inference_process is not None and self._inference_process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.information(self, "Inference Running", "An inference process is already running.")
             return
+
+        configured_layers = [
+            layer_id
+            for layer_id in (self.active_layer, LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+            if self.layer_model_paths.get(layer_id)
+        ]
+        configured_layers = list(dict.fromkeys(configured_layers))
+        if not configured_layers:
+            QMessageBox.information(
+                self,
+                "No Project Models",
+                "Configure a Keypoints or Segmentation prediction model first.",
+            )
+            self.load_model()
+            configured_layers = [
+                layer_id
+                for layer_id in (self.active_layer, LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+                if self.layer_model_paths.get(layer_id)
+            ]
+            configured_layers = list(dict.fromkeys(configured_layers))
+            if not configured_layers:
+                return
 
         video_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -3442,46 +4050,118 @@ class LabelingApp(QMainWindow):
         if not ok:
             return
 
-        output_root = os.path.join(self.project_root, "inference outputs")
-        try:
-            os.makedirs(output_root, exist_ok=True)
-        except Exception as e:
-            QMessageBox.warning(self, "Output Error", f"Could not create output directory:\n{output_root}\n\n{e}")
-            return
-
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-        workflow = WORKFLOW_SEG if self._is_seg_workflow() else WORKFLOW_POSE
-        suffix = "_segmentation.csv" if workflow == WORKFLOW_SEG else ".csv"
-        csv_name = f"{base_name}_{timestamp}{suffix}"
-        csv_path = os.path.join(output_root, csv_name)
+        jobs: list[dict] = []
+        for layer_id in configured_layers:
+            layer = layer_definition(layer_id)
+            output_root = os.path.join(
+                self.project_root, "inference outputs", layer.id
+            )
+            try:
+                os.makedirs(output_root, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Output Error",
+                    f"Could not create output directory:\n{output_root}\n\n{e}",
+                )
+                return
+            csv_name = (
+                f"{base_name}_{timestamp}{layer.inference_suffix}"
+            )
+            if layer_id == LAYER_KEYPOINTS:
+                classes = self.pose_classes[:]
+                kp_names = self.pose_kp_names[:]
+            else:
+                classes = self.seg_classes[:]
+                kp_names = []
+            jobs.append(
+                {
+                    "layer_id": layer_id,
+                    "workflow": layer.worker_mode,
+                    "model_path": self.layer_model_paths.get(layer_id) or "",
+                    "video_path": video_path,
+                    "csv_path": os.path.join(output_root, csv_name),
+                    "classes": classes,
+                    "kp_names": kp_names,
+                    "batch_size": batch_size,
+                    "total_frames": metadata.total_frames,
+                    "fps": metadata.fps,
+                }
+            )
+
+        run_dir = os.path.join(
+            self.project_root, "inference outputs", "runs"
+        )
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Output Error",
+                f"Could not create inference run directory:\n{run_dir}\n\n{e}",
+            )
+            return
+        self._inference_run_manifest_path = os.path.join(
+            run_dir, f"{base_name}_{timestamp}.json"
+        )
+        self._inference_run_video_path = video_path
+        self._inference_job_queue = jobs
+        self._inference_run_results = []
+        self._inference_run_total = len(jobs)
+        self._inference_run_canceled = False
+        self._start_next_inference_job()
+
+    def _start_next_inference_job(self) -> None:
+        if not self._inference_job_queue:
+            self._finish_project_inference_run()
+            return
+        job = self._inference_job_queue.pop(0)
+        self._inference_active_job = job
+        job_index = self._inference_run_total - len(
+            self._inference_job_queue
+        )
         self._start_inference_process(
-            workflow=workflow,
-            video_path=video_path,
-            csv_path=csv_path,
-            batch_size=batch_size,
-            total_frames=metadata.total_frames,
-            fps=metadata.fps,
+            layer_id=job["layer_id"],
+            workflow=job["workflow"],
+            model_path=job["model_path"],
+            video_path=job["video_path"],
+            csv_path=job["csv_path"],
+            classes=job["classes"],
+            kp_names=job["kp_names"],
+            batch_size=job["batch_size"],
+            total_frames=job["total_frames"],
+            fps=job["fps"],
+            job_index=job_index,
+            job_total=self._inference_run_total,
         )
 
     def _start_inference_process(
         self,
         *,
+        layer_id: str,
         workflow: str,
+        model_path: str,
         video_path: str,
         csv_path: str,
+        classes: list[str],
+        kp_names: list[str],
         batch_size: int,
         total_frames: int,
         fps: float,
+        job_index: int = 1,
+        job_total: int = 1,
     ) -> None:
         output_root = os.path.dirname(csv_path)
         config = {
+            "layer_id": normalize_layer_id(layer_id),
             "mode": workflow,
-            "model_path": self.predict_model_path,
+            "model_path": model_path,
             "video_path": video_path,
             "csv_path": csv_path,
-            "classes": self.classes,
-            "kp_names": self.kp_names,
+            "classes": classes,
+            "kp_names": kp_names,
             "device": self._device,
             "batch_size": int(batch_size),
             "total_frames": int(total_frames),
@@ -3491,11 +4171,26 @@ class LabelingApp(QMainWindow):
         try:
             atomic_write_text(config_path, json.dumps(config, indent=2))
         except Exception as e:
-            QMessageBox.warning(self, "Output Error", f"Could not write inference config:\n{config_path}\n\n{e}")
+            self._inference_run_results.append(
+                {
+                    "layer_id": normalize_layer_id(layer_id),
+                    "workflow": workflow,
+                    "model_path": model_path,
+                    "csv_path": csv_path,
+                    "rows_written": 0,
+                    "processed_frames": 0,
+                    "canceled": False,
+                    "had_error": True,
+                    "error_message": f"Could not write worker config: {e}",
+                }
+            )
+            self._inference_active_job = None
+            QTimer.singleShot(0, self._start_next_inference_job)
             return
 
-        title = "Segmentation Video Inference" if workflow == WORKFLOW_SEG else "Video Inference"
-        label = "Running segmentation inference…" if workflow == WORKFLOW_SEG else "Running inference…"
+        layer_name = layer_definition(layer_id).display_name
+        title = "Project Video Inference"
+        label = f"Pass {job_index}/{job_total}: running {layer_name} inference…"
         prog = QProgressDialog(label, "Cancel", 0, 0 if total_frames <= 0 else total_frames, self)
         prog.setWindowTitle(title)
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -3503,8 +4198,10 @@ class LabelingApp(QMainWindow):
         if total_frames <= 0:
             prog.setRange(0, 0)  # busy indicator for unknown length
 
-        was_busy = getattr(self, "_predict_busy", False)
-        self._inference_previous_busy = was_busy
+        if job_index == 1:
+            self._inference_previous_busy = getattr(
+                self, "_predict_busy", False
+            )
         self._predict_busy = True
         if hasattr(self, "predict_btn"):
             self.predict_btn.setEnabled(False)
@@ -3529,6 +4226,9 @@ class LabelingApp(QMainWindow):
         self._inference_config_path = config_path
         self._inference_csv_path = csv_path
         self._inference_mode = workflow
+        self._inference_layer_id = normalize_layer_id(layer_id)
+        self._inference_job_index = int(job_index)
+        self._inference_job_total = int(job_total)
         self._inference_cancel_requested = False
 
         prog.show()
@@ -3577,7 +4277,18 @@ class LabelingApp(QMainWindow):
                 total = int(event.get("total_frames") or 0)
                 if total > 0:
                     progress.setValue(min(processed, total))
-                progress.setLabelText(str(event.get("message") or f"Inferencing frame {processed}"))
+                layer_name = layer_definition(
+                    getattr(self, "_inference_layer_id", LAYER_KEYPOINTS)
+                ).display_name
+                detail = str(
+                    event.get("message")
+                    or f"Inferencing frame {processed}"
+                )
+                progress.setLabelText(
+                    f"Pass {getattr(self, '_inference_job_index', 1)}/"
+                    f"{getattr(self, '_inference_job_total', 1)} · "
+                    f"{layer_name}\n{detail}"
+                )
             QApplication.processEvents()
         elif event_type == "result":
             self._inference_result_event = event
@@ -3595,7 +4306,14 @@ class LabelingApp(QMainWindow):
         elif event_type == "started":
             progress = self._inference_progress
             if progress is not None:
-                progress.setLabelText("Loading model in inference process…")
+                layer_name = layer_definition(
+                    getattr(self, "_inference_layer_id", LAYER_KEYPOINTS)
+                ).display_name
+                progress.setLabelText(
+                    f"Pass {getattr(self, '_inference_job_index', 1)}/"
+                    f"{getattr(self, '_inference_job_total', 1)} · "
+                    f"Loading {layer_name} model…"
+                )
 
     def _cancel_inference_process(self) -> None:
         process = self._inference_process
@@ -3633,19 +4351,13 @@ class LabelingApp(QMainWindow):
         if progress is not None:
             progress.close()
 
-        if hasattr(self, "_inference_previous_busy"):
-            self._predict_busy = self._inference_previous_busy
-        else:
-            self._predict_busy = False
-        if hasattr(self, "predict_btn"):
-            self.predict_btn.setEnabled(True)
-        if hasattr(self, "inference_btn"):
-            self.inference_btn.setEnabled(True)
-
         event = self._inference_result_event
         csv_path = self._inference_csv_path or ""
         config_path = self._inference_config_path
         mode = self._inference_mode
+        layer_id = getattr(
+            self, "_inference_layer_id", normalize_layer_id(mode)
+        )
         cancel_requested = self._inference_cancel_requested
         stderr_text = self._inference_stderr.strip()
 
@@ -3660,61 +4372,133 @@ class LabelingApp(QMainWindow):
         self._inference_stderr = ""
         self._inference_cancel_requested = False
 
-        if cancel_requested and event is None:
-            QMessageBox.information(
-                self,
-                "Inference Canceled",
-                f"Inference process was canceled.\n\nPartial CSV may remain at:\n{csv_path}",
-            )
-            return
-
         if event is None:
-            detail = stderr_text or f"Process exited with code {exit_code}."
-            QMessageBox.critical(self, "Inference Error", f"Inference process failed:\n{detail}")
-            return
+            event = {
+                "rows_written": 0,
+                "processed_frames": 0,
+                "canceled": bool(cancel_requested),
+                "had_error": not bool(cancel_requested),
+                "error_message": stderr_text
+                or f"Process exited with code {exit_code}.",
+                "csv_path": csv_path,
+            }
 
         rows_written = int(event.get("rows_written") or 0)
-        had_error = bool(event.get("had_error"))
-        canceled = bool(event.get("canceled"))
-        error_message = str(event.get("error_message") or stderr_text or "Unknown inference error")
+        canceled = bool(event.get("canceled")) or cancel_requested
+        had_error = bool(event.get("had_error")) or (
+            not canceled
+            and (
+                exit_status == QProcess.ExitStatus.CrashExit
+                or exit_code != 0
+            )
+        )
+        error_message = str(
+            event.get("error_message")
+            or stderr_text
+            or ("Unknown inference error" if had_error else "")
+        )
         csv_path = str(event.get("csv_path") or csv_path)
-        label = "segmentation row(s)" if mode == WORKFLOW_SEG else "row(s)"
 
-        if had_error or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
-            if rows_written == 0:
-                try:
-                    if csv_path and os.path.exists(csv_path):
-                        os.remove(csv_path)
-                except Exception:
-                    pass
-                QMessageBox.critical(self, "Inference Error", f"An error occurred during inference:\n{error_message}")
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Inference Error",
-                    "An error occurred during inference.\n\n"
-                    f"{error_message}\n\n"
-                    f"Partial CSV saved ({rows_written} {label}):\n{csv_path}",
-                )
-            return
-
-        if canceled and rows_written == 0:
+        if rows_written == 0 and (had_error or canceled):
             try:
                 if csv_path and os.path.exists(csv_path):
                     os.remove(csv_path)
             except Exception:
                 pass
-            QMessageBox.information(self, "Inference Canceled", "Inference canceled before any results were generated.")
-            return
 
-        if rows_written == 0:
-            QMessageBox.information(self, "Inference Complete", "Inference completed without writing result rows.")
-            return
+        job = self._inference_active_job or {}
+        self._inference_run_results.append(
+            {
+                "layer_id": layer_id,
+                "workflow": mode,
+                "model_path": str(job.get("model_path") or ""),
+                "csv_path": csv_path,
+                "rows_written": rows_written,
+                "processed_frames": int(
+                    event.get("processed_frames") or 0
+                ),
+                "canceled": canceled,
+                "had_error": had_error,
+                "error_message": error_message,
+            }
+        )
+        self._inference_active_job = None
 
-        message = f"Saved {rows_written} {label} to:\n{csv_path}"
         if canceled:
-            message = "Inference canceled early.\n" + message
-        QMessageBox.information(self, "Inference Complete", message)
+            self._inference_run_canceled = True
+            self._inference_job_queue.clear()
+
+        if self._inference_job_queue:
+            QTimer.singleShot(0, self._start_next_inference_job)
+            return
+        self._finish_project_inference_run()
+
+    def _finish_project_inference_run(self) -> None:
+        if hasattr(self, "_inference_previous_busy"):
+            self._predict_busy = self._inference_previous_busy
+        else:
+            self._predict_busy = False
+        if hasattr(self, "predict_btn"):
+            self.predict_btn.setEnabled(True)
+        if hasattr(self, "inference_btn"):
+            self.inference_btn.setEnabled(True)
+
+        results = list(self._inference_run_results)
+        manifest_path = self._inference_run_manifest_path
+        manifest = {
+            "schema_version": 1,
+            "created_at": datetime.datetime.now().isoformat(),
+            "video_path": self._inference_run_video_path,
+            "canceled": bool(self._inference_run_canceled),
+            "passes": results,
+        }
+        if manifest_path:
+            try:
+                atomic_write_text(
+                    manifest_path, json.dumps(manifest, indent=2)
+                )
+            except Exception:
+                manifest_path = ""
+
+        self._inference_job_queue = []
+        self._inference_active_job = None
+        self._inference_run_results = []
+        self._inference_run_total = 0
+        self._inference_run_manifest_path = ""
+        self._inference_run_video_path = ""
+
+        if not results:
+            return
+        lines = []
+        failures = 0
+        for result in results:
+            name = layer_definition(result["layer_id"]).display_name
+            rows = int(result.get("rows_written") or 0)
+            if result.get("had_error"):
+                failures += 1
+                detail = result.get("error_message") or "failed"
+                lines.append(f"{name}: failed — {detail}")
+            elif result.get("canceled"):
+                lines.append(f"{name}: canceled ({rows} rows retained)")
+            else:
+                lines.append(
+                    f"{name}: {rows} rows → {result.get('csv_path', '')}"
+                )
+        if manifest_path:
+            lines.append(f"Run manifest: {manifest_path}")
+        message = "\n\n".join(lines)
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Project Inference Finished",
+                message,
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Project Inference Complete",
+                message,
+            )
 
     def _segmentation_rows_from_result(
         self,
@@ -3733,16 +4517,20 @@ class LabelingApp(QMainWindow):
 
     def set_mode(self, mode: str):
         if self._is_seg_workflow() and mode in {"bbox", "keypoint"}:
-            self.update_status_bar("Segmentation workflow uses Segment Prompt (2), Edit Mask (E), and Predict (4) modes.")
+            self.update_status_bar("The Segmentation layer uses Segment Prompt (2), Edit Mask (E), and Predict (4) modes.")
             return
         if self._is_pose_workflow() and mode in {"segment", "segedit"}:
-            self.update_status_bar("Segment Prompt/Edit Mask modes are only available in Segmentation workflow.")
+            self.update_status_bar("Segment Prompt/Edit Mask modes are only available in the Segmentation layer.")
             return
 
         if mode == 'predict':
             if not self.predict_model_path:
-                QMessageBox.information(self, "No Model", "Please click 'Load Model' first.")
-                return
+                self.load_model()
+                if not self.predict_model_path:
+                    self.update_status_bar(
+                        f"No {self._workflow_label()} prediction model configured."
+                    )
+                    return
             if not self.images:
                 self.update_status_bar("No images to predict.")
                 return
@@ -3801,6 +4589,7 @@ class LabelingApp(QMainWindow):
         request = {
             "command": "predict",
             "request_id": request_id,
+            "layer_id": self.active_layer,
             "model_path": self.predict_model_path,
             "image_path": img_path,
             "workflow": self.active_workflow,
@@ -3872,6 +4661,7 @@ class LabelingApp(QMainWindow):
             {
                 "command": "load",
                 "request_id": self._prediction_request_counter,
+                "layer_id": self.active_layer,
                 "model_path": self.predict_model_path,
                 "workflow": self.active_workflow,
                 "device": self._device,
@@ -4505,7 +5295,7 @@ class LabelingApp(QMainWindow):
 
     def save_template_for_current_class(self):
         if self._is_seg_workflow():
-            self.update_status_bar("Templates are only available in Pose workflow.")
+            self.update_status_bar("Templates are only available in the Keypoints layer.")
             return
         if not self._cache_active_annotation():
             QMessageBox.warning(self, "Template error", "Complete the current class annotation before saving a template.")
@@ -4545,7 +5335,7 @@ class LabelingApp(QMainWindow):
 
     def apply_template_for_current_class(self):
         if self._is_seg_workflow():
-            self.update_status_bar("Templates are only available in Pose workflow.")
+            self.update_status_bar("Templates are only available in the Keypoints layer.")
             return
         if not self.images:
             QMessageBox.warning(self, "Template error", "Load an image before applying templates.")
@@ -4672,6 +5462,7 @@ class LabelingApp(QMainWindow):
             self._clear_seg_edit_handles()
             if hasattr(self.view, "refresh_seg_brush_cursor"):
                 self.view.refresh_seg_brush_cursor()
+            self._refresh_reference_layer_overlay()
             scene_center = self.scene.sceneRect().center()
             self.view.centerOn(scene_center)
             return
@@ -4691,6 +5482,7 @@ class LabelingApp(QMainWindow):
         self._update_status()
         if hasattr(self.view, "refresh_seg_brush_cursor"):
             self.view.refresh_seg_brush_cursor()
+        self._refresh_reference_layer_overlay()
         scene_center = self.scene.sceneRect().center()
         self.view.centerOn(scene_center)
 
@@ -4874,7 +5666,12 @@ class LabelingApp(QMainWindow):
         self.zoom_label.setText(f"Zoom: {zoom}%")
 
     def _layout_hot_corners(self):
-        return
+        if not hasattr(self, "view"):
+            return
+        if hasattr(self, "layer_context_frame"):
+            self.layer_context_frame.adjustSize()
+            self.layer_context_frame.move(10, 10)
+            self.layer_context_frame.raise_()
 
     def _layout_overlays(self):
         """Dynamically position and size legend / zoom overlays."""
@@ -4975,7 +5772,11 @@ class LabelingApp(QMainWindow):
         project_root = self.project_root
         images_all_dir = os.path.join(project_root, "images_all")
         labels_all_dir = self.label_dir
-        annotations_dir = os.path.join(project_root, "annotations")
+        annotations_dir = os.path.join(
+            project_root,
+            "annotations",
+            normalize_layer_id(getattr(self, "active_layer", WORKFLOW_POSE)),
+        )
         os.makedirs(images_all_dir, exist_ok=True)
         os.makedirs(labels_all_dir, exist_ok=True)
         os.makedirs(annotations_dir, exist_ok=True)
@@ -5126,24 +5927,10 @@ class LabelingApp(QMainWindow):
         if not ok_seed:
             return
 
-        pose_mode = False
-        if not seg_mode:
-            dataset_choice, ok_choice = QInputDialog.getItem(
-                self,
-                "Dataset Type",
-                "Choose dataset format:",
-                ["Pose (keypoints)", "Detection (bbox only)"],
-                0,
-                False
-            )
-            if not ok_choice:
-                return
-            pose_mode = dataset_choice.startswith("Pose")
-
         if seg_mode:
             dataset_mode = DATASET_SEGMENT
         else:
-            dataset_mode = DATASET_POSE if pose_mode else DATASET_DETECT
+            dataset_mode = DATASET_POSE
 
         images, skipped_images = partition_images_by_usable_labels(
             images,
@@ -5153,12 +5940,12 @@ class LabelingApp(QMainWindow):
             keypoint_count=len(self.kp_names),
         )
         if not images:
-            label_kind = "segmentation" if seg_mode else "pose"
+            label_kind = "segmentation" if seg_mode else "keypoint"
             QMessageBox.information(
                 self,
                 "No labeled images",
                 f"No images in images_all have usable {label_kind} labels for this export.\n\n"
-                "Validate labels or switch to the workflow containing the labels you want to export.",
+                "Validate labels or select the layer containing the labels you want to export.",
             )
             return
 
@@ -5358,14 +6145,29 @@ class LabelingApp(QMainWindow):
         self.update_status_bar(status)
 
     def open_train_dialog(self):
-        if self._is_seg_workflow():
+        layer = self._active_layer_definition()
+        if self._is_segmentation_layer():
             default_dataset = os.path.join(self.project_root, "datasets", "segment")
             if not os.path.isdir(default_dataset):
                 default_dataset = os.path.join(self.project_root, "datasets")
-            dlg = TrainDialog(self, default_dataset=default_dataset, default_task="segment")
+            dlg = TrainDialog(
+                self,
+                default_dataset=default_dataset,
+                default_task="segment",
+                layer_id=layer.id,
+            )
         else:
-            default_dataset = resolve_default_training_dataset_path(self.project_root)
-            dlg = TrainDialog(self, default_dataset=default_dataset, default_task=None)
+            default_dataset = os.path.join(
+                self.project_root, "datasets", "pose"
+            )
+            if not os.path.isdir(default_dataset):
+                default_dataset = os.path.join(self.project_root, "datasets")
+            dlg = TrainDialog(
+                self,
+                default_dataset=default_dataset,
+                default_task="pose",
+                layer_id=layer.id,
+            )
         dlg.exec()
 
     def open_distillation_dialog(self):
@@ -5377,6 +6179,7 @@ class LabelingApp(QMainWindow):
             self,
             project_root=self.project_root,
             app_base_dir=self.app_base_dir,
+            layer_id=self.active_layer,
         )
         dlg.exec()
 
@@ -5384,7 +6187,25 @@ class LabelingApp(QMainWindow):
         if _cv2 is None:
             QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
-        # It’s okay if no model is loaded yet; dialog will warn before predicting
+        if not any(self.layer_model_paths.values()):
+            self.load_model()
+            if not any(self.layer_model_paths.values()):
+                return
+        layer_schemas = {
+            LAYER_KEYPOINTS: {
+                "classes": self.pose_classes[:],
+                "kp_names": self.pose_kp_names[:],
+                "class_keypoints": {
+                    name: self.pose_class_keypoints.get(name, [])[:]
+                    for name in self.pose_classes
+                },
+            },
+            LAYER_SEGMENTATION: {
+                "classes": self.seg_classes[:],
+                "kp_names": [],
+                "class_keypoints": {},
+            },
+        }
         dlg = VideoReviewDialog(
             self,
             self._device,
@@ -5392,6 +6213,9 @@ class LabelingApp(QMainWindow):
             self.classes,
             class_keypoints=self.class_keypoints,
             workflow=self.active_workflow,
+            layer_id=self.active_layer,
+            model_paths=self.layer_model_paths,
+            layer_schemas=layer_schemas,
         )
         dlg.exec()
 

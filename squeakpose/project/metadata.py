@@ -13,6 +13,7 @@ from squeakpose_core import (
     atomic_write_text,
     migrate_project_metadata,
 )
+from layer_ops import layer_worker_mode, normalize_layer_id
 
 from .paths import PROJECT_META_FILE
 
@@ -67,7 +68,22 @@ class ProjectMetadataStore:
                 "schema_version": CURRENT_PROJECT_SCHEMA_VERSION,
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
             }
-        for key, value in updates.items():
+        normalized_updates = dict(updates)
+        if (
+            "active_workflow" in normalized_updates
+            and "active_layer" not in normalized_updates
+        ):
+            normalized_updates["active_layer"] = normalize_layer_id(
+                normalized_updates["active_workflow"]
+            )
+        if "active_layer" in normalized_updates:
+            normalized_updates["active_layer"] = normalize_layer_id(
+                normalized_updates["active_layer"]
+            )
+            normalized_updates["active_workflow"] = layer_worker_mode(
+                normalized_updates["active_layer"]
+            )
+        for key, value in normalized_updates.items():
             if value is None:
                 payload.pop(str(key), None)
             else:

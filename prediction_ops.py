@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from layer_ops import normalize_layer_id
 
 def _to_list(value: Any) -> list:
     if value is None:
@@ -48,12 +49,14 @@ def serialize_prediction_result(
     result: Any,
     *,
     workflow: str,
+    layer_id: str = "",
     cv2_module: Any = None,
     numpy_module: Any = None,
 ) -> dict[str, Any]:
     """Convert one Ultralytics result to JSON-compatible detection data."""
     payload: dict[str, Any] = {
         "ok": True,
+        "layer_id": normalize_layer_id(layer_id or workflow),
         "workflow": workflow,
         "detections": [],
     }

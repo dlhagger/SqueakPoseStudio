@@ -3,6 +3,12 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
+from squeakpose.project.distillation import (
+    DISTILLATION_MANIFEST_FILENAME,
+    discover_distillation_exports,
+    distillation_export_search_roots,
+    distillation_run_task,
+)
 from squeakpose.project.metadata import ProjectMetadataStore
 from squeakpose.project.paths import (
     ProjectPaths,
@@ -33,6 +39,12 @@ class ProjectPathTests(unittest.TestCase):
 
             self.assertTrue(os.path.isdir(paths.distillation_unlabeled_images))
             self.assertTrue(os.path.isdir(paths.analysis_outputs))
+            self.assertTrue(os.path.isdir(paths.analysis_keypoints))
+            self.assertTrue(os.path.isdir(paths.analysis_segmentation))
+            self.assertTrue(os.path.isdir(paths.inference_keypoints))
+            self.assertTrue(os.path.isdir(paths.inference_segmentation))
+            self.assertTrue(os.path.isdir(paths.annotations_keypoints))
+            self.assertTrue(os.path.isdir(paths.annotations_segmentation))
             with open(paths.classes_seg_file, "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "mouse\nrat\n")
             with open(os.path.join(tmp, "squeakpose_project.json"), "r", encoding="utf-8") as fh:
@@ -55,6 +67,33 @@ class ProjectPathTests(unittest.TestCase):
             project_window_title("/tmp/example-project"),
             "SqueakPose Studio — example-project",
         )
+
+    def test_distillation_exports_are_filtered_by_declared_task(self):
+        with TemporaryDirectory() as tmp:
+            runs_root = os.path.join(tmp, "runs", "distillation")
+            pose_run = os.path.join(runs_root, "custom-pose-run")
+            segment_run = os.path.join(runs_root, "custom-mask-run")
+            for run_dir, task in ((pose_run, "pose"), (segment_run, "segment")):
+                exported_dir = os.path.join(run_dir, "exported_models")
+                os.makedirs(exported_dir, exist_ok=True)
+                with open(os.path.join(exported_dir, "exported_last.pt"), "wb") as fh:
+                    fh.write(b"weights")
+                with open(
+                    os.path.join(run_dir, DISTILLATION_MANIFEST_FILENAME),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    json.dump({"task": task}, fh)
+
+            roots = distillation_export_search_roots(tmp)
+            pose_exports = discover_distillation_exports(roots, task="keypoints")
+            segment_exports = discover_distillation_exports(roots, task="segmentation")
+
+            self.assertEqual(len(pose_exports), 1)
+            self.assertIn("custom-pose-run", pose_exports[0][0])
+            self.assertEqual(len(segment_exports), 1)
+            self.assertIn("custom-mask-run", segment_exports[0][0])
+            self.assertEqual(distillation_run_task(segment_run), "segment")
 
 
 class ProjectMetadataStoreTests(unittest.TestCase):
@@ -83,6 +122,7 @@ class ProjectMetadataStoreTests(unittest.TestCase):
             self.assertEqual(result.data["unknown"], {"keep": True})
             self.assertNotIn("sam_model_path", result.data)
             self.assertEqual(result.data["active_workflow"], "segmentation")
+            self.assertEqual(result.data["active_layer"], "segmentation")
 
     def test_corrupt_metadata_is_preserved_and_reported(self):
         with TemporaryDirectory() as tmp:

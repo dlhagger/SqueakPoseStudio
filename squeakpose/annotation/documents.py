@@ -1,4 +1,4 @@
-"""Workflow-specific annotation state independent of Qt rendering."""
+"""Layer-specific annotation state independent of Qt rendering."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from typing import Any
 class AnnotationDocument(MutableMapping[int, dict[str, Any]]):
     """Mutable per-class annotation state with explicit replacement semantics."""
 
-    workflow = "unknown"
+    layer_id = "unknown"
+    workflow = "unknown"  # Compatibility identifier used by existing workers.
 
     def __init__(self, entries: Mapping[int, dict[str, Any]] | None = None):
         self._entries: dict[int, dict[str, Any]] = {}
@@ -52,7 +53,8 @@ class AnnotationDocument(MutableMapping[int, dict[str, Any]]):
         return int(class_id) in self._entries
 
 
-class PoseAnnotationDocument(AnnotationDocument):
+class KeypointAnnotationDocument(AnnotationDocument):
+    layer_id = "keypoints"
     workflow = "pose"
 
     def is_complete(
@@ -82,6 +84,7 @@ class PoseAnnotationDocument(AnnotationDocument):
 
 
 class SegmentationAnnotationDocument(AnnotationDocument):
+    layer_id = "segmentation"
     workflow = "segmentation"
 
     def is_complete(self, class_id: int, **_requirements: Any) -> bool:
@@ -90,3 +93,7 @@ class SegmentationAnnotationDocument(AnnotationDocument):
             return False
         points = entry.get("segments")
         return isinstance(points, list) and len(points) >= 3
+
+
+# Public compatibility name for integrations using the pre-layer terminology.
+PoseAnnotationDocument = KeypointAnnotationDocument

@@ -35,6 +35,7 @@ from squeakpose.project.distillation import (
     distillation_export_search_roots as _distillation_export_search_roots,
 )
 from squeakpose_core import atomic_write_text, infer_dataset_task
+from layer_ops import layer_definition, normalize_layer_id
 from squeakpose.workers.process import (
     remove_file_quietly as _remove_file_quietly,
     request_qprocess_stop,
@@ -93,9 +94,17 @@ class TrainDialog(QDialog):
         "YOLOv26x (xlarge)": "yolo26x.yaml",
     }
 
-    def __init__(self, parent, default_dataset: str, default_task: Optional[str] = None):
+    def __init__(
+        self,
+        parent,
+        default_dataset: str,
+        default_task: Optional[str] = None,
+        layer_id: str = "",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Train Model")
+        self.layer_id = normalize_layer_id(layer_id or default_task)
+        self.layer = layer_definition(self.layer_id)
+        self.setWindowTitle(f"Train {self.layer.display_name} Layer Model")
         self.resize(1100, 720)
         self.setMinimumSize(760, 520)
 
@@ -162,12 +171,13 @@ class TrainDialog(QDialog):
 
         # Backbone source selection
         self.source_combo = ThemedComboBox()
-        self.source_combo.addItems([
-            "Standard YOLO backbone",
-            "DINO distillation export",
-            "Continue from YOLO checkpoint",
-            "Resume YOLO run (exact)",
-        ])
+        self.source_combo.addItem("Standard YOLO backbone")
+        self.dino_source_index = self.source_combo.count()
+        self.source_combo.addItem("DINO distillation export")
+        self.checkpoint_source_index = self.source_combo.count()
+        self.source_combo.addItem("Continue from YOLO checkpoint")
+        self.resume_source_index = self.source_combo.count()
+        self.source_combo.addItem("Resume YOLO run (exact)")
         self.source_combo.currentIndexChanged.connect(self._update_source_controls)
         form.addRow("Backbone source:", self.source_combo)
 
@@ -237,18 +247,14 @@ class TrainDialog(QDialog):
 
         # Task selection
         self.task_combo = ThemedComboBox()
-        self.task_combo.addItems([
-            "Auto (from dataset)",
-            "Detection",
-            "Pose",
-            "Segmentation",
-        ])
-        if self.default_task == "segment":
-            self.task_combo.setCurrentText("Segmentation")
-        elif self.default_task == "pose":
-            self.task_combo.setCurrentText("Pose")
-        elif self.default_task == "detect":
-            self.task_combo.setCurrentText("Detection")
+        if self.layer.id == "segmentation":
+            self.task_combo.addItem("Segmentation")
+        else:
+            self.task_combo.addItem("Keypoints (YOLO Pose)")
+        self.task_combo.setEnabled(False)
+        self.task_combo.setToolTip(
+            "Training task is determined by the active project layer."
+        )
         form.addRow("Training task:", self.task_combo)
         train_combos = (
             self.source_combo,
@@ -333,9 +339,9 @@ class TrainDialog(QDialog):
 
     def _update_source_controls(self):
         idx = self.source_combo.currentIndex()
-        use_dino = idx == 1
-        use_checkpoint_continue = idx == 2
-        use_exact_resume = idx == 3
+        use_dino = idx == self.dino_source_index
+        use_checkpoint_continue = idx == self.checkpoint_source_index
+        use_exact_resume = idx == self.resume_source_index
         use_resume = use_checkpoint_continue or use_exact_resume
         self.model_row.setVisible(idx == 0)
         self.model_form_label.setVisible(idx == 0)
@@ -356,10 +362,13 @@ class TrainDialog(QDialog):
         self.dino_combo.blockSignals(True)
         self.dino_combo.clear()
         self.dino_combo.blockSignals(False)
-        self.dino_exports = _discover_distillation_exports(getattr(self, "distillation_search_roots", []))
+        self.dino_exports = _discover_distillation_exports(
+            getattr(self, "distillation_search_roots", []),
+            task=self.layer.model_task,
+        )
         exports = self.dino_exports
         if not exports:
-            self.dino_combo.addItem("No exports found", "")
+            self.dino_combo.addItem(f"No {self.layer.display_name} exports found", "")
             self.dino_combo.setEnabled(False)
         else:
             self.dino_combo.setEnabled(True)
@@ -576,9 +585,9 @@ class TrainDialog(QDialog):
             return
 
         source_idx = self.source_combo.currentIndex()
-        use_dino = source_idx == 1
-        use_checkpoint_continue = source_idx == 2
-        use_exact_resume = source_idx == 3
+        use_dino = source_idx == self.dino_source_index
+        use_checkpoint_continue = source_idx == self.checkpoint_source_index
+        use_exact_resume = source_idx == self.resume_source_index
 
         resolved: Optional[str] = None
         if not use_exact_resume:
@@ -648,13 +657,7 @@ class TrainDialog(QDialog):
 
         task_selection = self.task_combo.currentText()
         if use_dino:
-            if not task_selection.lower().startswith("pose"):
-                QMessageBox.information(
-                    self,
-                    "Pose task enforced",
-                    "DINO distillation exports are pose heads. Training task set to Pose."
-                )
-            task_value = "pose"
+            task_value = self.layer.model_task
         elif use_exact_resume:
             task_value = None
         elif task_selection.startswith("Auto"):
@@ -764,6 +767,7 @@ class TrainDialog(QDialog):
             return
 
         config = {
+            "layer_id": self.layer_id,
             "model_cfg": model_cfg,
             "params": params,
         }

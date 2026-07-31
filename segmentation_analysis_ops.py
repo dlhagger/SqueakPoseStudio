@@ -632,6 +632,7 @@ def run_segmentation_analysis_workflow(
         _progress(progress_callback, 4, total_steps, "No ROI annotations selected")
 
     summary = summarize_segmentation_features(primary, detections, raw, fps, scale)
+    summary["layer_id"] = "segmentation"
     summary["detections_csv"] = os.path.abspath(config.detections_csv)
     summary["video_path"] = os.path.abspath(video_path) if video_path else ""
     summary["roi_count"] = len(rois)

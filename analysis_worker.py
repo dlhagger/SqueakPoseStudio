@@ -52,6 +52,7 @@ def run_analysis_worker(
         event_writer,
         {
             "event": "started",
+            "layer_id": analysis_config.layer_id,
             "detections_csv": analysis_config.detections_csv,
             "output_dir": analysis_config.output_dir,
         },

@@ -46,3 +46,9 @@ jobs:
           MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
           QT_QPA_PLATFORM: offscreen
         run: uv run --locked --only-group test python -m unittest discover -s tests -q
+
+      - name: Construct and render the application UI
+        env:
+          MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --locked --only-group test python tests/render_ui_screenshots.py --output-dir "${{ runner.temp }}/squeakpose-ui"

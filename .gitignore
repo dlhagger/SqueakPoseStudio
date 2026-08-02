@@ -6,7 +6,6 @@ dist/
 wheels/
 *.egg-info
 .DS_Store
-uv.lock
 
 # Virtual environments
 .venv

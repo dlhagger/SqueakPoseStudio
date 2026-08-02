@@ -103,6 +103,45 @@ class AnnotationSaveServiceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 save_annotation_transaction(invalid, render_overlay=lambda _path: True)
 
+    def test_missing_image_is_rejected_when_source_and_output_are_same(self):
+        with TemporaryDirectory() as tmp:
+            missing_image = os.path.join(tmp, "images", "missing.jpg")
+            request = AnnotationSaveRequest(
+                source_image_path=missing_image,
+                image_output_path=missing_image,
+                label_output_path=os.path.join(tmp, "labels", "missing.txt"),
+                overlay_output_path=os.path.join(tmp, "overlays", "missing.png"),
+                label_text="0 0.5 0.5 0.2 0.2\n",
+            )
+
+            with self.assertRaises(FileNotFoundError):
+                save_annotation_transaction(
+                    request,
+                    render_overlay=lambda _path: True,
+                )
+
+            self.assertFalse(os.path.exists(request.label_output_path))
+            self.assertFalse(os.path.exists(request.overlay_output_path))
+
+    def test_existing_output_image_is_used_when_source_is_unavailable(self):
+        with TemporaryDirectory() as tmp:
+            request = self._request(tmp)
+            os.makedirs(os.path.dirname(request.image_output_path), exist_ok=True)
+            with open(request.image_output_path, "wb") as fh:
+                fh.write(b"existing image")
+
+            def render(path: str) -> bool:
+                with open(path, "wb") as fh:
+                    fh.write(b"overlay")
+                return True
+
+            result = save_annotation_transaction(request, render_overlay=render)
+
+            with open(result.image_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"existing image")
+            self.assertTrue(os.path.isfile(result.label_path))
+            self.assertTrue(os.path.isfile(result.overlay_path))
+
 
 if __name__ == "__main__":
     unittest.main()

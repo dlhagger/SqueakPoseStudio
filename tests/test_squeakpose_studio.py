@@ -125,6 +125,127 @@ class StudioVideoReviewTests(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertIsNotNone(app._project_meta_recovery)
 
+    def test_unreadable_text_schema_is_preserved_before_defaults_are_written(self):
+        with TemporaryDirectory() as tmp:
+            classes_path = os.path.join(tmp, "classes.txt")
+            keypoints_path = os.path.join(tmp, "keypoints.txt")
+            with open(classes_path, "wb") as fh:
+                fh.write(b"mouse\n\xff")
+            with open(keypoints_path, "w", encoding="utf-8") as fh:
+                fh.write("nose\ntail\n")
+
+            app = LabelingApp.__new__(LabelingApp)
+            app._schema_recoveries = []
+            classes, keypoints, created = LabelingApp._ensure_label_files(
+                app,
+                classes_path,
+                keypoints_path,
+            )
+
+            self.assertTrue(created)
+            self.assertEqual(classes, ["mouse"])
+            self.assertEqual(keypoints, ["nose", "tail"])
+            self.assertEqual(len(app._schema_recoveries), 1)
+            original, backup, error = app._schema_recoveries[0]
+            self.assertEqual(original, classes_path)
+            self.assertTrue(os.path.isfile(backup))
+            self.assertIn("decode", error.lower())
+            with open(backup, "rb") as fh:
+                self.assertEqual(fh.read(), b"mouse\n\xff")
+            with open(classes_path, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "mouse\n")
+
+    def test_invalid_class_keypoint_map_is_preserved_before_recovery(self):
+        with TemporaryDirectory() as tmp:
+            mapping_path = os.path.join(tmp, "class_keypoints.json")
+            with open(mapping_path, "w", encoding="utf-8") as fh:
+                fh.write("{not valid json")
+
+            app = LabelingApp.__new__(LabelingApp)
+            app._schema_recoveries = []
+            app.class_keypoints_path = mapping_path
+            app.classes = ["mouse"]
+            app.kp_names = ["nose", "tail"]
+
+            recovered = LabelingApp._load_class_keypoints(app)
+            app.class_keypoints = recovered
+            LabelingApp._save_class_keypoints(app)
+
+            self.assertEqual(recovered, {"mouse": ["nose", "tail"]})
+            self.assertEqual(len(app._schema_recoveries), 1)
+            _, backup, _ = app._schema_recoveries[0]
+            with open(backup, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "{not valid json")
+            with open(mapping_path, "r", encoding="utf-8") as fh:
+                self.assertEqual(
+                    json.load(fh),
+                    {"mouse": ["nose", "tail"]},
+                )
+
+    def test_prediction_result_for_previous_image_is_discarded(self):
+        with TemporaryDirectory() as tmp:
+            app = type("PredictionDummy", (), {})()
+            app.images = ["second.png"]
+            app.current_idx = 0
+            app.active_image_dir = tmp
+            app._prediction_current_request_id = 7
+            app._prediction_image_path = os.path.join(tmp, "first.png")
+            app._predict_busy = True
+            applied = []
+            statuses = []
+            app._apply_prediction_payload = applied.append
+            app.update_status_bar = statuses.append
+            app._displayed_image_path = lambda: LabelingApp._displayed_image_path(app)
+
+            LabelingApp._handle_prediction_event_line(
+                app,
+                json.dumps(
+                    {
+                        "event": "result",
+                        "request_id": 7,
+                        "canceled": False,
+                        "had_error": False,
+                        "prediction": {"detections": []},
+                    }
+                ),
+            )
+
+            self.assertEqual(applied, [])
+            self.assertFalse(app._predict_busy)
+            self.assertIsNone(app._prediction_current_request_id)
+            self.assertIn("discarded", statuses[-1].lower())
+
+    def test_prediction_result_for_displayed_image_is_applied(self):
+        with TemporaryDirectory() as tmp:
+            current_path = os.path.join(tmp, "current.png")
+            app = type("PredictionDummy", (), {})()
+            app.images = ["current.png"]
+            app.current_idx = 0
+            app.active_image_dir = tmp
+            app._prediction_current_request_id = 8
+            app._prediction_image_path = current_path
+            app._predict_busy = True
+            applied = []
+            app._apply_prediction_payload = applied.append
+            app.update_status_bar = lambda _message: None
+            app._displayed_image_path = lambda: LabelingApp._displayed_image_path(app)
+            prediction = {"detections": []}
+
+            LabelingApp._handle_prediction_event_line(
+                app,
+                json.dumps(
+                    {
+                        "event": "result",
+                        "request_id": 8,
+                        "canceled": False,
+                        "had_error": False,
+                        "prediction": prediction,
+                    }
+                ),
+            )
+
+            self.assertEqual(applied, [prediction])
+
     def test_sync_canonical_keypoints_appends_class_map_names(self):
         with TemporaryDirectory() as tmp:
             keypoint_file = os.path.join(tmp, "keypoints.txt")

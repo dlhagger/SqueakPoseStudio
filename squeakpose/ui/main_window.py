@@ -490,41 +490,74 @@ class LabelingApp(QMainWindow):
     def _workflow_label(self) -> str:
         return self._active_layer_definition().display_name
 
+    def _preserve_invalid_schema_file(self, path: str, error: Exception) -> str:
+        """Move an unreadable schema aside before creating safe defaults."""
+        if not os.path.exists(path):
+            raise RuntimeError(f"Project schema file disappeared while reading: {path}") from error
+
+        stem, extension = os.path.splitext(path)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{stem}.corrupt-{timestamp}{extension}"
+        suffix = 1
+        while os.path.exists(backup_path):
+            backup_path = f"{stem}.corrupt-{timestamp}-{suffix}{extension}"
+            suffix += 1
+        try:
+            os.replace(path, backup_path)
+        except OSError as backup_error:
+            raise RuntimeError(
+                f"Could not read or preserve project schema file '{path}': {error}"
+            ) from backup_error
+
+        recoveries = getattr(self, "_schema_recoveries", None)
+        if recoveries is None:
+            recoveries = []
+            self._schema_recoveries = recoveries
+        recoveries.append((path, backup_path, str(error)))
+        return backup_path
+
+    def _read_schema_lines(self, path: str) -> list[str]:
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return [line.strip() for line in handle if line.strip()]
+        except (OSError, UnicodeError) as error:
+            self._preserve_invalid_schema_file(path, error)
+            return []
+
+    def _show_schema_recoveries(self) -> None:
+        recoveries = list(getattr(self, "_schema_recoveries", []) or [])
+        if not recoveries:
+            return
+        self._schema_recoveries = []
+        details = []
+        for original, backup, error in recoveries:
+            details.append(f"{original}\nPreserved at: {backup}\n{error}")
+        QMessageBox.warning(
+            self,
+            "Project Schema Recovered",
+            "One or more project schema files could not be read. The originals "
+            "were preserved and replacement defaults were created. Review the "
+            "recovered schema before editing existing labels.\n\n" + "\n\n".join(details),
+        )
+
     def _ensure_classes_file(self, class_file: str, defaults: list[str]) -> tuple[list[str], bool]:
         created_any = False
         project_root = os.path.dirname(class_file) if class_file else os.getcwd()
         if not class_file:
             class_file = os.path.join(project_root, "classes.txt")
 
-        try:
-            cf_dir = os.path.dirname(class_file)
-            if cf_dir:
-                os.makedirs(cf_dir, exist_ok=True)
-        except Exception:
-            pass
+        cf_dir = os.path.dirname(class_file)
+        if cf_dir:
+            os.makedirs(cf_dir, exist_ok=True)
 
-        if not os.path.exists(class_file):
-            try:
-                with open(class_file, "a", encoding="utf-8"):
-                    pass
-                created_any = True
-            except Exception:
-                pass
-
-        classes: list[str] = []
-        try:
-            with open(class_file, "r", encoding="utf-8") as f:
-                classes = [ln.strip() for ln in f if ln.strip()]
-        except Exception:
-            classes = []
+        classes = self._read_schema_lines(class_file)
 
         if not classes:
             classes = defaults[:] or DEFAULT_CLASS_NAMES[:]
-            try:
-                atomic_write_text(class_file, "".join(f"{name}\n" for name in classes))
-                created_any = True
-            except Exception:
-                pass
+            atomic_write_text(class_file, "".join(f"{name}\n" for name in classes))
+            created_any = True
 
         return classes, created_any
 
@@ -1093,61 +1126,24 @@ class LabelingApp(QMainWindow):
         if not keypoint_file:
             keypoint_file = os.path.join(project_root, "keypoints.txt")
 
-        # Ensure parent dirs exist
-        try:
-            cf_dir = os.path.dirname(class_file)
-            kf_dir = os.path.dirname(keypoint_file)
-            if cf_dir:
-                os.makedirs(cf_dir, exist_ok=True)
-            if kf_dir and kf_dir != cf_dir:
-                os.makedirs(kf_dir, exist_ok=True)
-        except Exception:
-            pass
+        cf_dir = os.path.dirname(class_file)
+        kf_dir = os.path.dirname(keypoint_file)
+        if cf_dir:
+            os.makedirs(cf_dir, exist_ok=True)
+        if kf_dir and kf_dir != cf_dir:
+            os.makedirs(kf_dir, exist_ok=True)
 
-        # Helper to write a list to file
-        def _write_lines(path: str, items: list[str]):
-            try:
-                atomic_write_text(path, "".join(f"{s}\n" for s in items))
-            except Exception:
-                pass
-
-        # Create files if missing
-        def _touch(path: str) -> bool:
-            try:
-                with open(path, "a", encoding="utf-8"):
-                    return True
-            except Exception:
-                return False
-
-        if not os.path.exists(class_file):
-            if _touch(class_file):
-                created_any = True
-        if not os.path.exists(keypoint_file):
-            if _touch(keypoint_file):
-                created_any = True
-
-        # Read current values.
-        def _read_nonempty_lines(path: str) -> list[str]:
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    lines = [l.strip() for l in f if l.strip()]
-                if not lines:
-                    return []
-                return lines
-            except Exception:
-                return []
-
-        classes = _read_nonempty_lines(class_file)
-        kp_names = _read_nonempty_lines(keypoint_file)
+        classes = self._read_schema_lines(class_file)
+        kp_names = self._read_schema_lines(keypoint_file)
 
         # Backfill defaults so the app is always usable even if initial setup is skipped.
         if not classes:
             classes = DEFAULT_CLASS_NAMES[:]
-            _write_lines(class_file, classes)
+            atomic_write_text(class_file, "".join(f"{name}\n" for name in classes))
             created_any = True
         if not kp_names:
             kp_names = DEFAULT_KEYPOINT_NAMES[:]
-            _write_lines(keypoint_file, kp_names)
+            atomic_write_text(keypoint_file, "".join(f"{name}\n" for name in kp_names))
             created_any = True
 
         return classes, kp_names, created_any
@@ -1158,13 +1154,16 @@ class LabelingApp(QMainWindow):
             try:
                 with open(self.class_keypoints_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
-                if isinstance(raw, dict):
-                    for name, lst in raw.items():
-                        if isinstance(name, str) and isinstance(lst, list):
-                            cleaned = [str(item) for item in lst if isinstance(item, str)]
-                            if cleaned:
-                                data[name] = cleaned
-            except Exception:
+                if not isinstance(raw, dict):
+                    raise ValueError("class_keypoints.json must contain a JSON object")
+                for name, lst in raw.items():
+                    if not isinstance(name, str) or not isinstance(lst, list):
+                        raise ValueError("class_keypoints.json contains an invalid class entry")
+                    cleaned = [str(item) for item in lst if isinstance(item, str)]
+                    if cleaned:
+                        data[name] = cleaned
+            except (OSError, UnicodeError, ValueError, TypeError) as error:
+                self._preserve_invalid_schema_file(self.class_keypoints_path, error)
                 data = {}
         # ensure each known class has an entry
         known_classes = getattr(self, "classes", None)
@@ -2569,6 +2568,7 @@ class LabelingApp(QMainWindow):
         inferred_root = project_root or os.path.dirname(image_dir or "") or os.getcwd()
         self.project_root = os.path.abspath(inferred_root)
         self._force_initial_setup = bool(force_initial_setup)
+        self._schema_recoveries: list[tuple[str, str, str]] = []
 
         self.image_dir_queue = image_dir or os.path.join(self.project_root, "images_to_label")
         # Backward-compatible alias used by some dialogs/tools.
@@ -2709,6 +2709,8 @@ class LabelingApp(QMainWindow):
             QTimer.singleShot(0, self._warn_image_stem_collisions)
         if self._project_meta_recovery:
             QTimer.singleShot(0, self._show_project_meta_recovery)
+        if self._schema_recoveries:
+            QTimer.singleShot(0, self._show_schema_recoveries)
         if self._is_seg_workflow():
             QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
         else:
@@ -4604,6 +4606,15 @@ class LabelingApp(QMainWindow):
         self.update_status_bar("Running prediction...")
         self._send_prediction_request(request)
 
+    def _displayed_image_path(self) -> str:
+        images = getattr(self, "images", []) or []
+        current_idx = int(getattr(self, "current_idx", 0) or 0)
+        if current_idx < 0 or current_idx >= len(images):
+            return ""
+        return os.path.abspath(
+            os.path.join(getattr(self, "active_image_dir", ""), images[current_idx])
+        )
+
     def _start_prediction_worker(self) -> None:
         process = self._prediction_process
         if process is not None and process.state() != QProcess.ProcessState.NotRunning:
@@ -4726,6 +4737,8 @@ class LabelingApp(QMainWindow):
         elif event_type == "result":
             if request_id != self._prediction_current_request_id:
                 return
+            requested_image_path = self._prediction_image_path
+            displayed_image_path = self._displayed_image_path()
             self._prediction_current_request_id = None
             self._prediction_image_path = None
             self._predict_busy = False
@@ -4740,6 +4753,15 @@ class LabelingApp(QMainWindow):
             prediction = event.get("prediction")
             if not isinstance(prediction, dict):
                 self._on_predict_error("Prediction worker returned no prediction payload.")
+                return
+            if (
+                not requested_image_path
+                or os.path.normcase(os.path.abspath(requested_image_path))
+                != os.path.normcase(displayed_image_path)
+            ):
+                self.update_status_bar(
+                    "Prediction finished for a different image and was discarded."
+                )
                 return
             self._apply_prediction_payload(prediction)
 

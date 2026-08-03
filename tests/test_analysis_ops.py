@@ -5,7 +5,12 @@ from tempfile import TemporaryDirectory
 
 import pandas as pd
 
-from analysis_ops import AnalysisConfig, AnalysisError, run_analysis_workflow
+from analysis_ops import (
+    AnalysisConfig,
+    AnalysisError,
+    _open_h264_video_writer,
+    run_analysis_workflow,
+)
 from analysis_worker import run_analysis_worker
 
 
@@ -124,6 +129,45 @@ def _write_demo_segmentation(path: str) -> None:
 
 
 class AnalysisOpsTests(unittest.TestCase):
+    def test_h264_writer_prefers_avc1_and_requires_open_encoder(self):
+        class Writer:
+            def __init__(self, opened):
+                self.opened = opened
+                self.released = False
+
+            def isOpened(self):
+                return self.opened
+
+            def release(self):
+                self.released = True
+
+        class Cv2:
+            def __init__(self, opened_codecs):
+                self.opened_codecs = opened_codecs
+                self.calls = []
+                self.writers = []
+
+            @staticmethod
+            def VideoWriter_fourcc(*codec):
+                return "".join(codec)
+
+            def VideoWriter(self, path, codec, fps, size):
+                self.calls.append((path, codec, fps, size))
+                writer = Writer(codec in self.opened_codecs)
+                self.writers.append(writer)
+                return writer
+
+        cv2 = Cv2({"avc1"})
+        writer = _open_h264_video_writer(cv2, "output.mp4", 8.0, 320, 240)
+        self.assertTrue(writer.isOpened())
+        self.assertEqual([call[1] for call in cv2.calls], ["avc1"])
+
+        unavailable = Cv2(set())
+        with self.assertRaisesRegex(AnalysisError, "H.264 video encoder"):
+            _open_h264_video_writer(unavailable, "output.mp4", 8.0, 320, 240)
+        self.assertEqual([call[1] for call in unavailable.calls], ["avc1", "H264"])
+        self.assertTrue(all(writer.released for writer in unavailable.writers))
+
     def test_analysis_rejects_results_from_a_different_layer(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "segmentation.csv")

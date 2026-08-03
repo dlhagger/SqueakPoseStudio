@@ -337,6 +337,7 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertEqual([event["event"] for event in events], ["started", "result"])
         self.assertEqual(model.calls[0]["source"], "image.png")
         self.assertEqual(model.calls[0]["device"], "cpu")
+        self.assertFalse(model.calls[0]["end2end"])
         self.assertFalse(events[-1]["had_error"])
         self.assertEqual(events[-1]["prediction"]["detections"][0]["xyxy"], [1.0, 2.0, 11.0, 12.0])
 
@@ -498,6 +499,7 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertEqual(model.calls[0]["source"], ["frame0"])
         self.assertEqual(model.calls[1]["source"], ["frame2"])
         self.assertEqual(model.calls[0]["batch"], 1)
+        self.assertFalse(model.calls[0]["end2end"])
         result = events[-1]
         self.assertEqual(result["event"], "result")
         self.assertFalse(result["had_error"])

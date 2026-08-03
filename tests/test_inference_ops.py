@@ -199,6 +199,7 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(result.processed_frames, 2)
             self.assertEqual(len(model.calls), 2)
             self.assertEqual(model.calls[0]["batch"], 1)
+            self.assertFalse(model.calls[0]["end2end"])
             with open(csv_path, "r", encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(rows[0]["detection_index"], "-1")
@@ -290,6 +291,7 @@ class InferenceOpsTests(unittest.TestCase):
 
             self.assertFalse(result.had_error)
             self.assertEqual(result.rows_written, 1)
+            self.assertFalse(model.calls[0][1]["end2end"])
             with open(csv_path, "r", encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(rows[0]["class_name"], "mouse")

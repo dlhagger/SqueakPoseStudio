@@ -19,6 +19,7 @@ from analysis_ops import (
     _first_video_frame,
     _infer_fps,
     _mm_per_pixel,
+    _open_h264_video_writer,
     _progress,
     _records_for_json,
     _setup_plotting,
@@ -537,8 +538,7 @@ def render_segmentation_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, video_fps, (width, height))
+    writer = _open_h264_video_writer(cv2, output_path, video_fps, width, height)
     rows_by_frame = {int(row["frame_index"]): row for _, row in primary.iterrows() if not pd.isna(row.get("frame_index"))}
     normalized_rois = normalize_rois(rois or [])
 

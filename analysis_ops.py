@@ -359,6 +359,31 @@ def _first_video_frame(video_path: str):
         cap.release()
 
 
+def _open_h264_video_writer(cv2_module: Any, output_path: Path, fps: float, width: int, height: int):
+    """Open a QuickTime-compatible H.264 MP4 writer or fail clearly."""
+    if width <= 0 or height <= 0:
+        raise AnalysisError(f"Cannot export video with invalid frame size {width}x{height}.")
+
+    attempted: list[str] = []
+    for codec in ("avc1", "H264"):
+        attempted.append(codec)
+        writer = cv2_module.VideoWriter(
+            str(output_path),
+            cv2_module.VideoWriter_fourcc(*codec),
+            float(fps or 30.0),
+            (int(width), int(height)),
+        )
+        if writer is not None and writer.isOpened():
+            return writer
+        if writer is not None:
+            writer.release()
+
+    raise AnalysisError(
+        "Could not open an H.264 video encoder "
+        f"({', '.join(attempted)}) for {output_path}."
+    )
+
+
 def _plot_if_column(df: pd.DataFrame, x_col: str, y_col: str, path: Path, ylabel: str, title: str) -> Optional[str]:
     if y_col not in df.columns or x_col not in df.columns:
         return None
@@ -641,8 +666,7 @@ def render_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, video_fps, (width, height))
+    writer = _open_h264_video_writer(cv2, output_path, video_fps, width, height)
     rows_by_frame = {int(row["frame_index"]): row for _, row in df.iterrows() if not pd.isna(row.get("frame_index"))}
     normalized_rois = normalize_rois(rois or [])
 
@@ -835,7 +859,6 @@ def export_cluster_clips(
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
     frames_per_clip = max(1, int(round(clip_length_sec * video_fps)))
     frame_count = int(df["frame_index"].max() + 1)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     paths: list[str] = []
     try:
         clusters = sorted(c for c in df["behavior_cluster"].dropna().astype(int).unique() if c != -1)
@@ -849,7 +872,7 @@ def export_cluster_clips(
                 end_frame = min(start_frame + frames_per_clip, frame_count)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
                 clip_path = clip_dir / f"cluster_{cluster_id:02d}_sample_{clip_idx:02d}.mp4"
-                writer = cv2.VideoWriter(str(clip_path), fourcc, video_fps, (width, height))
+                writer = _open_h264_video_writer(cv2, clip_path, video_fps, width, height)
                 try:
                     while cap.get(cv2.CAP_PROP_POS_FRAMES) < end_frame:
                         ok, frame = cap.read()

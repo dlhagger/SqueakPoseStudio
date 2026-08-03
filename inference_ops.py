@@ -484,6 +484,11 @@ def run_pose_video_inference(
                     "imgsz": 640,
                     "conf": 0.25,
                     "iou": 0.5,
+                    # YOLO26 checkpoints default to end-to-end prediction, which
+                    # only applies the confidence threshold and bypasses NMS.
+                    # This workflow tracks instances, so overlapping duplicate
+                    # predictions must pass through standard NMS.
+                    "end2end": False,
                     "device": device,
                     "verbose": False,
                 }
@@ -604,6 +609,10 @@ def run_segmentation_video_inference(
             imgsz=640,
             conf=0.25,
             iou=0.5,
+            # YOLO26 end-to-end output bypasses NMS and can emit multiple,
+            # strongly overlapping masks for the same animal. Use the
+            # one-to-many head plus standard NMS for instance tracking.
+            end2end=False,
             device=device,
             verbose=False,
         )

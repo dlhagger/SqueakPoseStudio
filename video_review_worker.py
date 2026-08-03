@@ -163,6 +163,7 @@ def run_video_review_worker(
                             imgsz=imgsz,
                             conf=conf,
                             iou=iou,
+                            end2end=False,
                             device=device,
                             batch=chunk_size,
                             verbose=False,

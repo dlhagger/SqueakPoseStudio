@@ -139,6 +139,7 @@ def run_predict_server(
                     imgsz=640,
                     conf=0.25,
                     iou=0.5,
+                    end2end=False,
                     device=device,
                     verbose=False,
                 )
@@ -220,6 +221,7 @@ def run_predict_worker(
                 imgsz=640,
                 conf=0.25,
                 iou=0.5,
+                end2end=False,
                 device=device,
                 verbose=False,
             )

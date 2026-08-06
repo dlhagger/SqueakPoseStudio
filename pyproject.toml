@@ -12,6 +12,7 @@ authors = [
 ]
 
 dependencies = [
+    "av>=18.0.0",
     "clip",
     "hdbscan>=0.8.44",
     "iprogress>=0.4",
@@ -32,7 +33,7 @@ dependencies = [
     "torch>=2.13.0",
     "torchvision>=0.28.0",
     "tqdm>=4.70.0",
-    "ultralytics>=8.4.114",
+    "ultralytics>=8.4.115",
     "umap-learn>=0.5.12",
 ]
 

@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QLabel, QMessageBox,
     QDialog, QFrame, QStatusBar, QGraphicsDropShadowEffect, QSizePolicy,
     QProgressDialog, QDialogButtonBox, QTabWidget, QSlider, QSpinBox, QDoubleSpinBox, QProgressBar,
-    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QListView,
+    QInputDialog, QFileDialog, QFormLayout, QLineEdit, QMenu, QTextEdit, QPlainTextEdit, QListWidget, QListView,
     QScrollArea
 )
 from PyQt6.QtGui import (
@@ -39,6 +39,7 @@ from squeakpose_core import (
     staging_path_for,
 )
 from prediction_ops import rank_prediction_frames
+from depth_ops import DepthMapError, keypoint_depth_label, sample_depth_map
 from dataset_ops import (
     DATASET_DETECT,
     DATASET_POSE,
@@ -86,6 +87,7 @@ from squeakpose.annotation.video_view import VideoView
 from squeakpose.project.metadata import ProjectMetadataStore
 from squeakpose.project.layers import (
     LAYER_DEFINITIONS,
+    LAYER_DEPTH,
     LAYER_KEYPOINTS,
     LAYER_SEGMENTATION,
     layer_definition,
@@ -147,6 +149,7 @@ DEFAULT_SAM3_WEIGHTS = "sam3.pt"
 # Worker-facing compatibility values. Project and UI state use layer ids.
 WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
+WORKFLOW_DEPTH = "depth"
 
 
 def _remove_file_quietly(path: Optional[str]) -> None:
@@ -479,6 +482,10 @@ class LabelingApp(QMainWindow):
     def _is_segmentation_layer(self) -> bool:
         return getattr(self, "active_layer", LAYER_KEYPOINTS) == LAYER_SEGMENTATION
 
+    def _is_depth_layer(self) -> bool:
+        state = getattr(self, "__dict__", {})
+        return state.get("active_layer", LAYER_KEYPOINTS) == LAYER_DEPTH
+
     # Compatibility helpers for code paths and integrations using the former
     # workflow terminology.
     def _is_pose_workflow(self) -> bool:
@@ -487,8 +494,186 @@ class LabelingApp(QMainWindow):
     def _is_seg_workflow(self) -> bool:
         return self._is_segmentation_layer()
 
+    def _is_depth_workflow(self) -> bool:
+        return self._is_depth_layer()
+
     def _workflow_label(self) -> str:
         return self._active_layer_definition().display_name
+
+    def _depth_view_mode(self) -> str:
+        combo = getattr(self, "depth_display_combo", None)
+        if combo is not None:
+            value = str(combo.currentData() or "").strip().lower()
+            if value in {"original", "depth", "overlay"}:
+                return value
+        settings = getattr(self, "layer_settings", {}).get(LAYER_DEPTH, {})
+        value = str(settings.get("display_mode") or "depth").strip().lower()
+        return value if value in {"original", "depth", "overlay"} else "depth"
+
+    def _on_depth_view_changed(self, _index: int) -> None:
+        mode = self._depth_view_mode()
+        self.layer_settings = normalize_layer_settings(
+            getattr(self, "layer_settings", {})
+        )
+        self.layer_settings[LAYER_DEPTH]["display_mode"] = mode
+        self._save_project_preferences()
+        if self._is_depth_layer() and getattr(self, "images", None):
+            self.load_image()
+
+    def _update_depth_range_label(self, image_stem: str) -> None:
+        label = getattr(self, "depth_range_label", None)
+        if label is None:
+            return
+        metadata_path = os.path.join(
+            self.depth_image_dir, f"{image_stem}_depth.json"
+        )
+        if not os.path.isfile(metadata_path):
+            label.setText("No saved depth range · Near = bright")
+            return
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            low = float(metadata["p02_depth"])
+            high = float(metadata["p98_depth"])
+            median = float(metadata["median_depth"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            label.setText("Depth range unavailable · Near = bright")
+            return
+        label.setText(
+            f"Range (2–98%): {low:.3f}–{high:.3f} m · "
+            f"median {median:.3f} m · Near = bright"
+        )
+
+    def _refresh_depth_probe_label(self) -> None:
+        label = getattr(self, "depth_probe_label", None)
+        if label is None:
+            return
+        probes = list(getattr(self, "_depth_probes", []))
+        if not probes:
+            error = str(getattr(self, "_depth_probe_error", "") or "")
+            label.setText(
+                error
+                if error
+                else "Right-click the image to sample raw depth."
+            )
+        else:
+            lines = ["Pixel probes:"]
+            for index, probe in enumerate(probes, start=1):
+                value = probe.get("depth")
+                value_text = (
+                    f"{float(value):.3f} m"
+                    if value is not None
+                    else "invalid"
+                )
+                lines.append(
+                    f"{index}. ({probe['x']}, {probe['y']}): {value_text}"
+                )
+            valid = [
+                float(probe["depth"])
+                for probe in probes[-2:]
+                if probe.get("depth") is not None
+            ]
+            if len(valid) == 2:
+                lines.append(f"Δ last two: {abs(valid[1] - valid[0]):.3f} m")
+            label.setText("\n".join(lines))
+        button = getattr(self, "depth_clear_probes_btn", None)
+        if button is not None:
+            button.setEnabled(bool(probes))
+
+    def _clear_depth_probe_items(self) -> None:
+        for item in list(getattr(self, "_depth_probe_items", [])):
+            self._safe_remove_scene_item(item)
+        self._depth_probe_items = []
+
+    def _clear_depth_probes(self, _checked: bool = False) -> None:
+        self._clear_depth_probe_items()
+        self._depth_probes = []
+        self._refresh_depth_probe_label()
+
+    def _render_depth_probes(self) -> None:
+        self._clear_depth_probe_items()
+        if not self._is_depth_layer() or not hasattr(self, "scene"):
+            return
+        colors = (
+            QColor("#73d7ff"),
+            QColor("#ffd166"),
+            QColor("#82e0aa"),
+            QColor("#ff8fab"),
+            QColor("#c7a0ff"),
+            QColor("#f6bd60"),
+        )
+        for index, probe in enumerate(self._depth_probes, start=1):
+            color = colors[(index - 1) % len(colors)]
+            marker = QGraphicsEllipseItem(-5.0, -5.0, 10.0, 10.0)
+            marker.setPos(float(probe["x"]) + 0.5, float(probe["y"]) + 0.5)
+            marker.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                True,
+            )
+            marker.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            marker.setAcceptHoverEvents(False)
+            pen = QPen(color)
+            pen.setCosmetic(True)
+            pen.setWidth(2)
+            marker.setPen(pen)
+            marker.setBrush(QBrush(QColor(10, 15, 18, 190)))
+            marker.setZValue(20.0)
+            value = probe.get("depth")
+            value_text = (
+                f"{float(value):.3f} m" if value is not None else "invalid"
+            )
+            text_item = QGraphicsSimpleTextItem(
+                f"{index} · {value_text}"
+            )
+            text_item.setBrush(QBrush(color))
+            text_item.setPos(
+                float(probe["x"]) + 8.5,
+                float(probe["y"]) - 10.5,
+            )
+            text_item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                True,
+            )
+            text_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            text_item.setAcceptHoverEvents(False)
+            text_item.setZValue(20.0)
+            self.scene.addItem(marker)
+            self.scene.addItem(text_item)
+            self._depth_probe_items.extend((marker, text_item))
+
+    def _probe_depth_at(self, scene_pos: QPointF) -> bool:
+        if not self._is_depth_layer():
+            return False
+        depth_map = getattr(self, "_active_depth_map", None)
+        if depth_map is None or _np is None:
+            self.update_status_bar(
+                "No aligned raw depth map is available for pixel sampling."
+            )
+            return True
+        try:
+            probe = sample_depth_map(
+                depth_map,
+                x=float(scene_pos.x()),
+                y=float(scene_pos.y()),
+                numpy_module=_np,
+            )
+        except DepthMapError as exc:
+            self.update_status_bar(str(exc))
+            return True
+        self._depth_probes.append(probe)
+        self._depth_probes = self._depth_probes[-6:]
+        self._render_depth_probes()
+        self._refresh_depth_probe_label()
+        if probe["valid"]:
+            self.update_status_bar(
+                f"Depth at ({probe['x']}, {probe['y']}): "
+                f"{float(probe['depth']):.3f} m"
+            )
+        else:
+            self.update_status_bar(
+                f"Depth at ({probe['x']}, {probe['y']}): invalid"
+            )
+        return True
 
     def _preserve_invalid_schema_file(self, path: str, error: Exception) -> str:
         """Move an unreadable schema aside before creating safe defaults."""
@@ -614,6 +799,22 @@ class LabelingApp(QMainWindow):
     def _meta_store_path(self, path: str) -> str:
         return ProjectMetadataStore(self.project_root).store_path(path)
 
+    @staticmethod
+    def _is_builtin_model_reference(path: str) -> bool:
+        return str(path or "").lower() in {
+            f"yolo26{size}-depth.pt" for size in "nslmx"
+        }
+
+    def _resolve_model_reference(self, path: str) -> str:
+        if self._is_builtin_model_reference(path):
+            return str(path)
+        return self._meta_normalize_path(path)
+
+    def _store_model_reference(self, path: str) -> str:
+        if self._is_builtin_model_reference(path):
+            return str(path)
+        return self._meta_store_path(path)
+
     def _load_project_preferences(self):
         meta = self._read_project_meta()
         self.active_layer = normalize_layer_id(
@@ -622,10 +823,18 @@ class LabelingApp(QMainWindow):
         self.layer_settings = normalize_layer_settings(meta.get("layers"))
         self.layer_model_paths = layer_model_paths(
             self.layer_settings,
-            resolve_path=self._meta_normalize_path,
+            resolve_path=self._resolve_model_reference,
         )
         self.layer_model_paths = {
-            layer_id: path if path and os.path.isfile(path) else ""
+            layer_id: (
+                path
+                if path
+                and (
+                    os.path.isfile(path)
+                    or self._is_builtin_model_reference(path)
+                )
+                else ""
+            )
             for layer_id, path in self.layer_model_paths.items()
         }
         raw_visibility = meta.get("layer_visibility")
@@ -664,7 +873,7 @@ class LabelingApp(QMainWindow):
                 getattr(self, "layer_model_paths", {}).get(layer_id) or ""
             )
             if model_path:
-                layer_settings[layer_id]["model_path"] = self._meta_store_path(
+                layer_settings[layer_id]["model_path"] = self._store_model_reference(
                     model_path
                 )
             else:
@@ -705,7 +914,7 @@ class LabelingApp(QMainWindow):
             self.pose_classes = self.classes[:]
             self.pose_kp_names = self.kp_names[:]
             self.pose_class_keypoints = {name: self.class_keypoints.get(name, [])[:] for name in self.classes}
-        else:
+        elif self._is_segmentation_layer():
             self.seg_classes = self.classes[:]
         if hasattr(self, "layer_model_paths"):
             self.layer_model_paths[self.active_layer] = str(
@@ -729,7 +938,7 @@ class LabelingApp(QMainWindow):
             if self._sync_canonical_keypoints_from_class_map():
                 self.pose_kp_names = self.kp_names[:]
             self._schema_locked = self._detect_schema_locked()
-        else:
+        elif layer_id == LAYER_SEGMENTATION:
             self.active_layer = LAYER_SEGMENTATION
             self.label_dir = self.seg_label_dir
             self.class_file = self.seg_class_file
@@ -739,6 +948,16 @@ class LabelingApp(QMainWindow):
             self.kp_names = []
             self.class_keypoints = {}
             self._schema_locked = self._detect_schema_locked()
+        else:
+            self.active_layer = LAYER_DEPTH
+            self.label_dir = self.depth_image_dir
+            self.class_file = ""
+            self.keypoint_file = ""
+            self.class_keypoints_path = ""
+            self.classes = []
+            self.kp_names = []
+            self.class_keypoints = {}
+            self._schema_locked = True
 
         self.predict_model_path = (
             getattr(self, "layer_model_paths", {}).get(layer_id) or None
@@ -775,6 +994,7 @@ class LabelingApp(QMainWindow):
         expected = [
             ("Keypoints Layer", LAYER_KEYPOINTS),
             ("Segmentation Layer", LAYER_SEGMENTATION),
+            ("Depth Layer", LAYER_DEPTH),
         ]
         needs_reset = self.workflow_selector.count() != len(expected)
         if not needs_reset:
@@ -793,7 +1013,8 @@ class LabelingApp(QMainWindow):
         self.workflow_selector.clear()
         for text, data in expected:
             self.workflow_selector.addItem(text, data)
-        self.workflow_selector.setCurrentIndex(0 if current_layer == LAYER_KEYPOINTS else 1)
+        layer_index = [item[1] for item in expected].index(current_layer)
+        self.workflow_selector.setCurrentIndex(layer_index)
         self.workflow_selector.blockSignals(False)
 
     def _ensure_workflow_selector_items(self):
@@ -872,6 +1093,7 @@ class LabelingApp(QMainWindow):
             LAYER_SEGMENTATION: getattr(
                 self, "segmentation_visibility_check", None
             ),
+            LAYER_DEPTH: getattr(self, "depth_visibility_check", None),
         }
         active_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
         self.layer_visibility[active_layer] = True
@@ -885,7 +1107,8 @@ class LabelingApp(QMainWindow):
             check.setEnabled(not is_active)
             check.setProperty("activeLayer", is_active)
             check.setText(
-                f"{layer_definition(layer_id).display_name} · Edit"
+                f"{layer_definition(layer_id).display_name} · "
+                f"{'View' if layer_id == LAYER_DEPTH else 'Edit'}"
                 if is_active
                 else (
                     f"● {layer_definition(layer_id).display_name}"
@@ -906,23 +1129,21 @@ class LabelingApp(QMainWindow):
         if not hasattr(self, "layer_editing_label"):
             return
         active_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
-        reference_layer = (
-            LAYER_SEGMENTATION
-            if active_layer == LAYER_KEYPOINTS
-            else LAYER_KEYPOINTS
-        )
         active_name = layer_definition(active_layer).display_name
-        reference_name = layer_definition(reference_layer).display_name
-        reference_visible = bool(
-            self.layer_visibility.get(reference_layer, True)
-        )
+        visible_references = [
+            layer_definition(layer_id).display_name
+            for layer_id in LAYER_DEFINITIONS
+            if layer_id != active_layer
+            and self.layer_visibility.get(layer_id, True)
+        ]
         self.layer_editing_label.setText(
-            f"{active_name.upper()} · EDITING"
+            f"{active_name.upper()} · "
+            f"{'VIEW' if active_layer == LAYER_DEPTH else 'EDITING'}"
         )
         self.layer_reference_label.setText(
-            f"{'●' if reference_visible else '○'} "
-            f"{reference_name} reference "
-            f"{'visible' if reference_visible else 'hidden'}"
+            "● " + " + ".join(visible_references) + " references visible"
+            if visible_references
+            else "○ Reference layers hidden"
         )
         self.layer_context_frame.adjustSize()
         self._layout_hot_corners()
@@ -937,33 +1158,50 @@ class LabelingApp(QMainWindow):
             return
         self.layer_visibility[layer_id] = bool(visible)
         self._save_project_preferences()
+        self._sync_layer_visibility_controls()
         if hasattr(self, "scene"):
             self._refresh_reference_layer_overlay()
 
     def _update_layer_ui_state(self):
         is_pose = self._is_keypoints_layer()
+        is_segmentation = self._is_segmentation_layer()
+        is_depth = self._is_depth_layer()
         self._ensure_layer_selector_items()
 
-        self.save_btn.setEnabled(True)
-        self.complete_btn.setEnabled(True)
+        self.save_btn.setEnabled(not is_depth)
+        self.complete_btn.setEnabled(not is_depth)
         self.bbox_btn.setEnabled(is_pose)
-        self.segment_btn.setEnabled(not is_pose)
+        self.segment_btn.setEnabled(is_segmentation)
         self.keypoint_btn.setEnabled(is_pose)
         self.predict_btn.setEnabled(True)
-        self.seg_edit_btn.setEnabled(not is_pose)
-        self.sam_load_btn.setEnabled(not is_pose)
-        self.sam_run_btn.setEnabled(not is_pose)
-        self.sam_accept_btn.setEnabled(not is_pose)
-        self.sam_clear_btn.setEnabled(not is_pose)
+        self.seg_edit_btn.setEnabled(is_segmentation)
+        self.sam_load_btn.setEnabled(is_segmentation)
+        self.sam_run_btn.setEnabled(is_segmentation)
+        self.sam_accept_btn.setEnabled(is_segmentation)
+        self.sam_clear_btn.setEnabled(is_segmentation)
         self.template_apply_btn.setEnabled(is_pose)
         self.template_save_btn.setEnabled(is_pose)
         self.inference_btn.setEnabled(True)
-        self.normalize_btn.setEnabled(True)
-        self.export_dataset_btn.setEnabled(True)
-        self.train_btn.setEnabled(True)
+        self.normalize_btn.setEnabled(not is_depth)
+        self.export_dataset_btn.setEnabled(not is_depth)
+        self.train_btn.setEnabled(not is_depth)
         self.distillation_btn.setEnabled(is_pose)
+        self.normalize_btn.setVisible(not is_depth)
+        self.export_dataset_btn.setVisible(not is_depth)
+        self.train_btn.setVisible(not is_depth)
+        self.distillation_btn.setVisible(not is_depth)
+        if hasattr(self, "training_grid"):
+            self.training_grid.addWidget(
+                self.project_health_btn,
+                0 if is_depth else 1,
+                0,
+                1,
+                2 if is_depth else 1,
+            )
         if hasattr(self, "analysis_btn"):
-            self.analysis_btn.setEnabled(True)
+            self.analysis_btn.setEnabled(not is_depth)
+        if hasattr(self, "analysis_frame"):
+            self.analysis_frame.setVisible(not is_depth)
         if hasattr(self, "delete_image_btn"):
             self.delete_image_btn.setEnabled(True)
         self.load_model_btn.setEnabled(True)
@@ -975,7 +1213,9 @@ class LabelingApp(QMainWindow):
         self.inference_btn.setText("Run Inference")
         self.train_btn.setText("Train Model")
         if hasattr(self, "model_inference_title"):
-            self.model_inference_title.setText("Project Models & Inference")
+            self.model_inference_title.setText(
+                "Project Inference" if is_depth else "Project Models & Inference"
+            )
         if hasattr(self, "model_status_label"):
             configured = []
             for layer_id in (LAYER_KEYPOINTS, LAYER_SEGMENTATION):
@@ -986,19 +1226,42 @@ class LabelingApp(QMainWindow):
                 )
             self.model_status_label.setText("  ·  ".join(configured))
             self.model_status_label.setToolTip("\n".join(configured))
+            self.model_status_label.setVisible(not is_depth)
+        self.load_model_btn.setVisible(not is_depth)
+        self.template_apply_btn.setVisible(is_pose)
+        self.template_save_btn.setVisible(is_pose)
+        if hasattr(self, "inference_grid"):
+            self.inference_grid.addWidget(
+                self.inference_btn,
+                0,
+                0 if is_depth else 1,
+                1,
+                2 if is_depth else 1,
+            )
         if hasattr(self, "dataset_training_title"):
             self.dataset_training_title.setText(
-                f"{active_layer.display_name} Dataset & Training"
+                "Project Tools"
+                if is_depth
+                else f"{active_layer.display_name} Dataset & Training"
             )
         if hasattr(self, "analysis_title"):
             self.analysis_title.setText(f"{active_layer.display_name} Analysis")
         if hasattr(self, "analysis_btn"):
             self.analysis_btn.setText("Run Analysis")
 
+        self.manage_classes_btn.setEnabled(not is_depth)
         self.manage_classes_btn.setToolTip(
-            "Manage classes and per-class keypoints" if is_pose else "Manage segmentation classes"
+            "Depth maps do not use classes"
+            if is_depth
+            else (
+                "Manage classes and per-class keypoints"
+                if is_pose
+                else "Manage segmentation classes"
+            )
         )
         self.manage_classes_btn.setText("Classes…")
+        if hasattr(self, "class_controls_frame"):
+            self.class_controls_frame.setVisible(not is_depth)
         if hasattr(self, "class_label_widget"):
             self.class_label_widget.setText("Class")
         if hasattr(self, "bbox_btn"):
@@ -1009,16 +1272,30 @@ class LabelingApp(QMainWindow):
             self.predict_btn.setVisible(True)
             self.predict_btn.setToolTip(
                 "Run the Keypoints layer model on the current image"
-                if is_pose else
-                "Run the Segmentation layer model on the current image"
+                if is_pose
+                else (
+                    "Run the Segmentation layer model on the current image"
+                    if is_segmentation
+                    else "Estimate and save a dense depth map for the current image"
+                )
             )
         if hasattr(self, "segment_btn"):
-            self.segment_btn.setVisible(not is_pose)
+            self.segment_btn.setVisible(is_segmentation)
         if hasattr(self, "seg_edit_btn"):
-            self.seg_edit_btn.setVisible(not is_pose)
+            self.seg_edit_btn.setVisible(is_segmentation)
         if hasattr(self, "seg_tools_frame"):
-            self.seg_tools_frame.setVisible(not is_pose)
+            self.seg_tools_frame.setVisible(is_segmentation)
+        if hasattr(self, "depth_display_frame"):
+            self.depth_display_frame.setVisible(is_depth)
+        if hasattr(self, "depth_range_frame"):
+            self.depth_range_frame.setVisible(is_depth)
+        if hasattr(self, "depth_assistant_frame"):
+            self.depth_assistant_frame.setVisible(is_depth)
+            self._refresh_depth_assistant_controls()
         self._reflow_mode_grid(is_pose=is_pose)
+        if is_depth:
+            self.mode_grid.addWidget(self.panzoom_btn, 0, 0)
+            self.mode_grid.addWidget(self.predict_btn, 0, 1)
         self.save_btn.setText("Save")
         self.save_btn.setToolTip(
             "Save labels for current frame" if is_pose else "Save segmentation masks for current frame"
@@ -1026,8 +1303,10 @@ class LabelingApp(QMainWindow):
 
         if is_pose and self.mode in {"segment", "segedit"}:
             self.mode = "panzoom"
-        if not is_pose and self.mode not in {"panzoom", "segment", "segedit"}:
+        if is_segmentation and self.mode not in {"panzoom", "segment", "segedit"}:
             self.mode = "segment"
+        if is_depth:
+            self.mode = "panzoom"
 
         self._clear_seg_edit_handles()
         self._refresh_seg_brush_size_badge()
@@ -1056,7 +1335,7 @@ class LabelingApp(QMainWindow):
             self._prediction_image_path = None
         self._ensure_layer_selector_items()
         if hasattr(self, "workflow_selector"):
-            idx = 0 if layer_id == LAYER_KEYPOINTS else 1
+            idx = list(LAYER_DEFINITIONS).index(layer_id)
             if self.workflow_selector.currentIndex() != idx:
                 self.workflow_selector.blockSignals(True)
                 self.workflow_selector.setCurrentIndex(idx)
@@ -1085,8 +1364,12 @@ class LabelingApp(QMainWindow):
             else:
                 self.update_status_bar("Segmentation layer selected. Use Segment mode and SAM prompts.")
             QTimer.singleShot(0, self._maybe_prompt_seg_class_manager_initial)
-        else:
+        elif self._is_keypoints_layer():
             self.update_status_bar("Keypoints layer selected.")
+        else:
+            self.update_status_bar(
+                "Depth layer selected. Predict to create a saved depth map."
+            )
         if self.predict_model_path:
             self._restart_prediction_worker(warm=True)
         else:
@@ -1248,6 +1531,9 @@ class LabelingApp(QMainWindow):
     def _label_file_is_usable(self, label_file: str) -> bool:
         state = getattr(self, "__dict__", {})
         layer_id = normalize_layer_id(state.get("active_layer"))
+        if layer_id == LAYER_DEPTH:
+            map_path = os.path.splitext(label_file)[0] + ".npy"
+            return os.path.isfile(map_path) and os.path.getsize(map_path) > 0
         mode = (
             DATASET_SEGMENT
             if layer_id == LAYER_SEGMENTATION
@@ -1330,7 +1616,12 @@ class LabelingApp(QMainWindow):
         if not hasattr(self, "progress_label"):
             return
         queue_labeled, queue_total = self._count_labeled_frames()
-        self.progress_label.setText(f"Queue: {queue_labeled}/{queue_total} labeled")
+        noun = (
+            "depth maps"
+            if LabelingApp._is_depth_layer(self)
+            else "labeled"
+        )
+        self.progress_label.setText(f"Queue: {queue_labeled}/{queue_total} {noun}")
 
     def _maybe_prompt_class_manager(self):
         if getattr(self, "_prompted_class_manager", False):
@@ -1406,7 +1697,12 @@ class LabelingApp(QMainWindow):
         self._reference_layer_items = []
 
     def _add_reference_item(
-        self, item: QGraphicsItem, *, layer_id: str, opacity: float
+        self,
+        item: QGraphicsItem,
+        *,
+        layer_id: str,
+        opacity: float,
+        z_value: float = 1.0,
     ) -> None:
         item.reference_layer_id = normalize_layer_id(layer_id)
         item.setFlag(
@@ -1418,7 +1714,7 @@ class LabelingApp(QMainWindow):
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         item.setAcceptHoverEvents(False)
         item.setOpacity(opacity)
-        item.setZValue(1.0)
+        item.setZValue(z_value)
         self.scene.addItem(item)
         self._reference_layer_items.append(item)
 
@@ -1427,78 +1723,110 @@ class LabelingApp(QMainWindow):
         if not getattr(self, "images", None):
             return
         active_layer = getattr(self, "active_layer", LAYER_KEYPOINTS)
-        reference_layer = (
-            LAYER_SEGMENTATION
-            if active_layer == LAYER_KEYPOINTS
-            else LAYER_KEYPOINTS
-        )
-        if not self.layer_visibility.get(reference_layer, True):
-            return
-
-        reference_color = QColor(104, 164, 207)
         base = os.path.splitext(self.images[self.current_idx])[0]
-        if reference_layer == LAYER_SEGMENTATION:
-            label_file = os.path.join(
-                self.seg_label_dir, f"{base}.txt"
-            )
-            if not os.path.isfile(label_file):
-                return
-            entries = load_segmentation_annotations_from_file(
-                label_file,
-                classes_count=len(self.seg_classes),
-                img_w=self.img_w,
-                img_h=self.img_h,
-            )
-            for cid, entry in entries.items():
-                points = []
-                for pair in entry.get("segments", []):
-                    try:
-                        points.append((float(pair[0]), float(pair[1])))
-                    except Exception:
-                        continue
-                path = self._polygon_path(points)
-                if path is None:
-                    continue
-                color = reference_color
-                item = QGraphicsPathItem(path)
-                pen = QPen(color)
-                pen.setCosmetic(True)
-                pen.setWidth(2)
-                pen.setStyle(Qt.PenStyle.DashLine)
-                item.setPen(pen)
-                item.setBrush(
-                    QBrush(QColor(104, 164, 207, 48))
-                )
-                item.seg_class_id = int(cid)
-                item.seg_points = points
-                item.seg_preview = False
-                label = (
-                    self.seg_classes[cid]
-                    if 0 <= cid < len(self.seg_classes)
-                    else f"class_{cid}"
-                )
-                label_item = QGraphicsSimpleTextItem(
-                    f"{label} · Segmentation", item
-                )
-                label_item.setBrush(QBrush(color))
-                label_item.setFlag(
-                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
-                    True,
-                )
-                label_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                label_item.setPos(
-                    path.boundingRect().left() + 4.0,
-                    path.boundingRect().top() + 4.0,
-                )
-                label_item.setVisible(False)
-                item.seg_label_item = label_item
-                self._add_reference_item(
-                    item,
-                    layer_id=reference_layer,
-                    opacity=0.50,
-                )
-            return
+        for reference_layer in LAYER_DEFINITIONS:
+            if reference_layer == active_layer:
+                continue
+            if not self.layer_visibility.get(reference_layer, True):
+                continue
+            if reference_layer == LAYER_DEPTH:
+                self._add_depth_reference_overlay(base)
+            elif reference_layer == LAYER_SEGMENTATION:
+                self._add_segmentation_reference_overlay(base)
+            else:
+                self._add_keypoints_reference_overlay(base)
 
+    def _add_depth_reference_overlay(self, base: str) -> None:
+        preview_path = os.path.join(
+            self.depth_preview_dir, f"{base}_depth.png"
+        )
+        if not os.path.isfile(preview_path):
+            return
+        depth_pixmap = QPixmap(preview_path)
+        if depth_pixmap.isNull():
+            return
+        if (
+            depth_pixmap.width() != self.img_w
+            or depth_pixmap.height() != self.img_h
+        ):
+            depth_pixmap = depth_pixmap.scaled(
+                self.img_w,
+                self.img_h,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        depth_item = QGraphicsPixmapItem(depth_pixmap)
+        self._add_reference_item(
+            depth_item,
+            layer_id=LAYER_DEPTH,
+            opacity=0.42,
+            z_value=0.5,
+        )
+
+    def _add_segmentation_reference_overlay(self, base: str) -> None:
+        reference_color = QColor(104, 164, 207)
+        label_file = os.path.join(self.seg_label_dir, f"{base}.txt")
+        if not os.path.isfile(label_file):
+            return
+        entries = load_segmentation_annotations_from_file(
+            label_file,
+            classes_count=len(self.seg_classes),
+            img_w=self.img_w,
+            img_h=self.img_h,
+        )
+        for cid, entry in entries.items():
+            points = []
+            for pair in entry.get("segments", []):
+                try:
+                    points.append((float(pair[0]), float(pair[1])))
+                except Exception:
+                    continue
+            path = self._polygon_path(points)
+            if path is None:
+                continue
+            color = reference_color
+            item = QGraphicsPathItem(path)
+            pen = QPen(color)
+            pen.setCosmetic(True)
+            pen.setWidth(2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            item.setPen(pen)
+            item.setBrush(QBrush(QColor(104, 164, 207, 48)))
+            item.seg_class_id = int(cid)
+            item.seg_points = points
+            item.seg_preview = False
+            label = (
+                self.seg_classes[cid]
+                if 0 <= cid < len(self.seg_classes)
+                else f"class_{cid}"
+            )
+            label_item = QGraphicsSimpleTextItem(
+                f"{label} · Segmentation", item
+            )
+            label_item.setBrush(QBrush(color))
+            label_item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                True,
+            )
+            label_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            label_item.setPos(
+                path.boundingRect().left() + 4.0,
+                path.boundingRect().top() + 4.0,
+            )
+            label_item.setVisible(False)
+            item.seg_label_item = label_item
+            self._add_reference_item(
+                item,
+                layer_id=LAYER_SEGMENTATION,
+                opacity=0.50,
+            )
+
+    def _add_keypoints_reference_overlay(self, base: str) -> None:
+        reference_color = QColor(104, 164, 207)
+        depth_map = getattr(self, "_active_depth_map", None)
+        show_depth_labels = (
+            self._is_depth_layer() and depth_map is not None and _np is not None
+        )
         label_file = os.path.join(self.pose_label_dir, f"{base}.txt")
         if not os.path.isfile(label_file):
             return
@@ -1534,7 +1862,7 @@ class LabelingApp(QMainWindow):
             )
             self._add_reference_item(
                 box_item,
-                layer_id=reference_layer,
+                layer_id=LAYER_KEYPOINTS,
                 opacity=0.52,
             )
             for kp_info in entry.get("keypoints", []):
@@ -1550,13 +1878,26 @@ class LabelingApp(QMainWindow):
                 )
                 kp_item.visibility = int(kp_info.get("vis", 2))
                 kp_item.update_appearance()
+                if show_depth_labels and kp_item.visibility > 0:
+                    try:
+                        display_name = keypoint_depth_label(
+                            name,
+                            depth_map,
+                            x=kp.x,
+                            y=kp.y,
+                            numpy_module=_np,
+                        )
+                    except DepthMapError:
+                        display_name = f"{name} · unavailable"
+                    kp_item.text_item.setText(display_name)
                 kp_item.set_reference_style(
-                    reference_color, show_label=False
+                    reference_color,
+                    show_label=show_depth_labels,
                 )
                 self._add_reference_item(
                     kp_item,
-                    layer_id=reference_layer,
-                    opacity=0.52,
+                    layer_id=LAYER_KEYPOINTS,
+                    opacity=0.90 if show_depth_labels else 0.52,
                 )
 
     # ---------- Annotation helpers ----------
@@ -2576,10 +2917,15 @@ class LabelingApp(QMainWindow):
         self.image_dir_all = os.path.join(self.project_root, "images_all")
         self.pose_label_dir = label_dir or os.path.join(self.project_root, "labels_all")
         self.seg_label_dir = os.path.join(self.project_root, "labels_seg_all")
+        self.depth_map_dir = os.path.join(self.project_root, "depth maps")
+        self.depth_image_dir = os.path.join(self.depth_map_dir, "images")
+        self.depth_preview_dir = os.path.join(self.depth_map_dir, "previews")
         os.makedirs(self.image_dir_queue, exist_ok=True)
         os.makedirs(self.pose_label_dir, exist_ok=True)
         os.makedirs(self.seg_label_dir, exist_ok=True)
         os.makedirs(self.image_dir_all, exist_ok=True)
+        os.makedirs(self.depth_image_dir, exist_ok=True)
+        os.makedirs(self.depth_preview_dir, exist_ok=True)
         self.pose_class_file = class_file or os.path.join(self.project_root, "classes.txt")
         self.pose_keypoint_file = keypoint_file or os.path.join(self.project_root, "keypoints.txt")
         self.pose_class_keypoints_path = os.path.join(self.project_root, "class_keypoints.json")
@@ -2697,6 +3043,12 @@ class LabelingApp(QMainWindow):
         self._prediction_request_counter = 0
         self._prediction_current_request_id: Optional[int] = None
         self._prediction_expected_stop = False
+        self._prediction_depth_targets: Optional[dict[str, str]] = None
+        self._active_depth_map = None
+        self._depth_probes: list[dict] = []
+        self._depth_probe_items: list[QGraphicsItem] = []
+        self._depth_probe_image_name = ""
+        self._depth_probe_error = ""
         # Auto-select device once at startup
         self._device = _auto_device()
         print(f"🧠 Inference device: {self._device}")
@@ -2723,6 +3075,7 @@ class LabelingApp(QMainWindow):
         _shutdown_qprocess(self._prediction_process)
         _remove_file_quietly(self._inference_config_path)
         _remove_file_quietly(self._prediction_config_path)
+        self._cleanup_prediction_depth_staging()
         self._inference_process = None
         self._prediction_process = None
         self._inference_config_path = None
@@ -2885,6 +3238,7 @@ class LabelingApp(QMainWindow):
         self.workflow_selector.setObjectName("workflowSelector")
         self.workflow_selector.addItem("Keypoints Layer", LAYER_KEYPOINTS)
         self.workflow_selector.addItem("Segmentation Layer", LAYER_SEGMENTATION)
+        self.workflow_selector.addItem("Depth Layer", LAYER_DEPTH)
         self.workflow_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.workflow_selector.setMinimumContentsLength(18)
         self.workflow_selector.setMinimumWidth(0)
@@ -2962,9 +3316,11 @@ class LabelingApp(QMainWindow):
         self.segmentation_visibility_check = QPushButton(
             "● Segmentation"
         )
+        self.depth_visibility_check = QPushButton("● Depth")
         for layer_button in (
             self.keypoints_visibility_check,
             self.segmentation_visibility_check,
+            self.depth_visibility_check,
         ):
             layer_button.setCheckable(True)
             layer_button.setProperty("layerVisibilityPill", True)
@@ -2974,6 +3330,7 @@ class LabelingApp(QMainWindow):
             )
         self.keypoints_visibility_check.setChecked(True)
         self.segmentation_visibility_check.setChecked(True)
+        self.depth_visibility_check.setChecked(True)
         self.keypoints_visibility_check.toggled.connect(
             lambda checked: self._on_layer_visibility_changed(
                 LAYER_KEYPOINTS, checked
@@ -2984,8 +3341,14 @@ class LabelingApp(QMainWindow):
                 LAYER_SEGMENTATION, checked
             )
         )
+        self.depth_visibility_check.toggled.connect(
+            lambda checked: self._on_layer_visibility_changed(
+                LAYER_DEPTH, checked
+            )
+        )
         visibility_row.addWidget(self.keypoints_visibility_check)
         visibility_row.addWidget(self.segmentation_visibility_check)
+        visibility_row.addWidget(self.depth_visibility_check)
         visibility_row.addStretch(1)
         top_left_layout.addLayout(visibility_row)
 
@@ -3067,7 +3430,9 @@ class LabelingApp(QMainWindow):
         top_left_layout.addLayout(mode_grid)
         self._reflow_mode_grid(is_pose=self._is_pose_workflow())
 
-        class_controls = QVBoxLayout()
+        self.class_controls_frame = QFrame()
+        class_controls = QVBoxLayout(self.class_controls_frame)
+        class_controls.setContentsMargins(0, 0, 0, 0)
         class_controls.setSpacing(5)
         self.class_label_widget = QLabel("Class")
         self.class_label_widget.setObjectName("fieldLabel")
@@ -3078,7 +3443,7 @@ class LabelingApp(QMainWindow):
         self.manage_classes_btn.clicked.connect(self.open_class_manager)
         prepare_panel_button(self.manage_classes_btn, min_height=30)
         class_controls.addWidget(self.manage_classes_btn)
-        top_left_layout.addLayout(class_controls)
+        top_left_layout.addWidget(self.class_controls_frame)
 
         progress_row = QHBoxLayout()
         progress_row.setSpacing(6)
@@ -3088,6 +3453,142 @@ class LabelingApp(QMainWindow):
         progress_row.addStretch(1)
         top_left_layout.addLayout(progress_row)
         self.left_sidebar_layout.addWidget(self.top_left_frame)
+
+        self.depth_display_frame = QFrame(self.left_sidebar_content)
+        self.depth_display_frame.setObjectName("ToolPanel")
+        self.depth_display_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.depth_display_frame)
+        depth_display_layout = QVBoxLayout(self.depth_display_frame)
+        depth_display_layout.setContentsMargins(10, 9, 10, 9)
+        depth_display_layout.setSpacing(6)
+        depth_display_title = QLabel("Depth Display")
+        depth_display_title.setObjectName("panelTitle")
+        depth_display_layout.addWidget(depth_display_title)
+        self.depth_display_combo = ThemedComboBox()
+        self.depth_display_combo.addItem("Original", "original")
+        self.depth_display_combo.addItem("Depth", "depth")
+        self.depth_display_combo.addItem("Overlay", "overlay")
+        self.depth_display_combo.setToolTip(
+            "Compare the source image, standalone depth map, or a blended overlay"
+        )
+        self.depth_display_combo.setMinimumHeight(32)
+        initial_depth_mode = str(
+            getattr(self, "layer_settings", {})
+            .get(LAYER_DEPTH, {})
+            .get("display_mode", "depth")
+        ).strip().lower()
+        if initial_depth_mode not in {"original", "depth", "overlay"}:
+            initial_depth_mode = "depth"
+        self.depth_display_combo.setCurrentIndex(
+            max(0, self.depth_display_combo.findData(initial_depth_mode))
+        )
+        self.depth_display_combo.currentIndexChanged.connect(
+            self._on_depth_view_changed
+        )
+        depth_display_layout.addWidget(self.depth_display_combo)
+        self.left_sidebar_layout.addWidget(self.depth_display_frame)
+
+        self.depth_range_frame = QFrame(self.left_sidebar_content)
+        self.depth_range_frame.setObjectName("ToolPanel")
+        self.depth_range_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.depth_range_frame)
+        depth_range_layout = QVBoxLayout(self.depth_range_frame)
+        depth_range_layout.setContentsMargins(10, 9, 10, 9)
+        depth_range_layout.setSpacing(6)
+        depth_range_title = QLabel("Depth Range")
+        depth_range_title.setObjectName("panelTitle")
+        depth_range_layout.addWidget(depth_range_title)
+        self.depth_range_label = QLabel(
+            "No saved depth range · Near = bright"
+        )
+        self.depth_range_label.setWordWrap(True)
+        self.depth_range_label.setStyleSheet(
+            "color: #9fb0bd; font-size: 9pt;"
+        )
+        self.depth_range_label.setToolTip(
+            "Depth values are estimated meters. The preview uses inverse depth, "
+            "so brighter colors indicate surfaces closer to the camera."
+        )
+        depth_range_layout.addWidget(self.depth_range_label)
+        self.depth_probe_label = QLabel(
+            "Right-click the image to sample raw depth."
+        )
+        self.depth_probe_label.setWordWrap(True)
+        self.depth_probe_label.setStyleSheet(
+            "color: #c8d4dc; font-size: 9pt;"
+        )
+        depth_range_layout.addWidget(self.depth_probe_label)
+        self.depth_clear_probes_btn = QPushButton("Clear Probes")
+        self.depth_clear_probes_btn.setToolTip(
+            "Remove depth sample markers from the current image"
+        )
+        self.depth_clear_probes_btn.clicked.connect(
+            self._clear_depth_probes
+        )
+        self.depth_clear_probes_btn.setEnabled(False)
+        prepare_panel_button(self.depth_clear_probes_btn, min_height=28)
+        depth_range_layout.addWidget(self.depth_clear_probes_btn)
+        self.left_sidebar_layout.addWidget(self.depth_range_frame)
+
+        self.depth_assistant_frame = QFrame(self.left_sidebar_content)
+        self.depth_assistant_frame.setObjectName("ToolPanel")
+        self.depth_assistant_frame.setStyleSheet(panel_style)
+        apply_panel_shadow(self.depth_assistant_frame)
+        depth_assistant_layout = QVBoxLayout(self.depth_assistant_frame)
+        depth_assistant_layout.setContentsMargins(10, 9, 10, 9)
+        depth_assistant_layout.setSpacing(6)
+        depth_assistant_title = QLabel("Depth Assistant")
+        depth_assistant_title.setObjectName("panelTitle")
+        depth_assistant_layout.addWidget(depth_assistant_title)
+        self.depth_model_status_label = QLabel("")
+        self.depth_model_status_label.setWordWrap(True)
+        self.depth_model_status_label.setObjectName("fieldLabel")
+        depth_assistant_layout.addWidget(self.depth_model_status_label)
+        depth_model_grid = QGridLayout()
+        depth_model_grid.setHorizontalSpacing(6)
+        depth_model_grid.setVerticalSpacing(6)
+        self.depth_official_model_btn = QPushButton("YOLO26 Depth ▾")
+        self.depth_official_model_btn.setToolTip(
+            "Choose an official depth model; Ultralytics downloads it on first use"
+        )
+        depth_model_menu = QMenu(self.depth_official_model_btn)
+        for size, description in (
+            ("n", "Nano — fastest"),
+            ("s", "Small"),
+            ("m", "Medium"),
+            ("l", "Large"),
+            ("x", "Extra large — most accurate"),
+        ):
+            action = depth_model_menu.addAction(description)
+            action.triggered.connect(
+                lambda _checked=False, model_size=size: self._set_depth_model_path(
+                    f"yolo26{model_size}-depth.pt"
+                )
+            )
+        self.depth_official_model_btn.setMenu(depth_model_menu)
+        depth_model_grid.addWidget(self.depth_official_model_btn, 0, 0)
+        self.depth_choose_model_btn = QPushButton("Choose…")
+        self.depth_choose_model_btn.setToolTip(
+            "Choose a custom Ultralytics depth checkpoint"
+        )
+        self.depth_choose_model_btn.clicked.connect(
+            self._choose_depth_model_interactive
+        )
+        depth_model_grid.addWidget(self.depth_choose_model_btn, 0, 1)
+        self.depth_clear_model_btn = QPushButton("Clear Model")
+        self.depth_clear_model_btn.clicked.connect(
+            lambda: self._set_depth_model_path("")
+        )
+        depth_model_grid.addWidget(self.depth_clear_model_btn, 1, 0, 1, 2)
+        for button in (
+            self.depth_official_model_btn,
+            self.depth_choose_model_btn,
+            self.depth_clear_model_btn,
+        ):
+            prepare_panel_button(button, min_height=30)
+        depth_assistant_layout.addLayout(depth_model_grid)
+        self.left_sidebar_layout.addWidget(self.depth_assistant_frame)
+        self._refresh_depth_assistant_controls()
 
         # -----------------------------
         # Top-right: video tools
@@ -3145,6 +3646,7 @@ class LabelingApp(QMainWindow):
         self.dataset_training_title.setObjectName("panelTitle")
         bottom_left_layout.addWidget(self.dataset_training_title)
         training_grid = QGridLayout()
+        self.training_grid = training_grid
         training_grid.setHorizontalSpacing(6)
         training_grid.setVerticalSpacing(6)
         self.normalize_btn = QPushButton("Validate Labels")
@@ -3200,6 +3702,7 @@ class LabelingApp(QMainWindow):
         self.model_status_label.setWordWrap(True)
         bottom_right_layout.addWidget(self.model_status_label)
         inference_grid = QGridLayout()
+        self.inference_grid = inference_grid
         inference_grid.setHorizontalSpacing(6)
         inference_grid.setVerticalSpacing(6)
         self.load_model_btn = QPushButton("Project Models…")
@@ -3298,7 +3801,9 @@ class LabelingApp(QMainWindow):
             self.filter_combo.setCurrentIndex(mapping.get(self.nav_filter, 0))
         except Exception:
             pass
-        self.workflow_selector.setCurrentIndex(0 if self._is_pose_workflow() else 1)
+        self.workflow_selector.setCurrentIndex(
+            list(LAYER_DEFINITIONS).index(self.active_layer)
+        )
 
         self._layout_hot_corners()
 
@@ -3730,7 +4235,11 @@ class LabelingApp(QMainWindow):
         else:
             pos = fi.index(self.current_idx)
             self.current_idx = fi[(pos - 1) % len(fi)]
-        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
+        self.mode = (
+            "segment"
+            if self._is_seg_workflow()
+            else ("panzoom" if self._is_depth_layer() else "bbox")
+        )
         self.load_image()
         self._queue_current_idx = self.current_idx
 
@@ -3744,11 +4253,25 @@ class LabelingApp(QMainWindow):
         else:
             pos = fi.index(self.current_idx)
             self.current_idx = fi[(pos + 1) % len(fi)]
-        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
+        self.mode = (
+            "segment"
+            if self._is_seg_workflow()
+            else ("panzoom" if self._is_depth_layer() else "bbox")
+        )
         self.load_image()
         self._queue_current_idx = self.current_idx
 
     def complete_and_next_unlabeled(self):
+        if LabelingApp._is_depth_layer(self):
+            if not self._is_fully_labeled():
+                QMessageBox.information(
+                    self,
+                    "No Depth Map",
+                    "Run Depth prediction before moving to the next image without a map.",
+                )
+                return
+            self.skip_to_next_unlabeled()
+            return
         if self._is_seg_workflow():
             self._cache_active_annotation()
             has_any_mask = any(len(entry.get("segments", [])) >= 3 for entry in self.annotation_cache.values())
@@ -3789,7 +4312,11 @@ class LabelingApp(QMainWindow):
             return
         self.current_idx = next_idx
         self._queue_current_idx = self.current_idx
-        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
+        self.mode = (
+            "segment"
+            if self._is_seg_workflow()
+            else ("panzoom" if self._is_depth_layer() else "bbox")
+        )
         self.load_image()
 
     def skip_to_next_unlabeled(self):
@@ -3799,7 +4326,11 @@ class LabelingApp(QMainWindow):
             return
         self.current_idx = next_idx
         self._queue_current_idx = self.current_idx
-        self.mode = 'segment' if self._is_seg_workflow() else 'bbox'
+        self.mode = (
+            "segment"
+            if self._is_seg_workflow()
+            else ("panzoom" if self._is_depth_layer() else "bbox")
+        )
         self.load_image()
 
     def _image_delete_paths(self, image_name: str) -> list[str]:
@@ -3808,6 +4339,7 @@ class LabelingApp(QMainWindow):
             return []
         base = os.path.splitext(file_name)[0]
         label_name = f"{base}.txt"
+        state = getattr(self, "__dict__", {})
         paths: list[str] = []
         for directory, target_name in (
             (getattr(self, "active_image_dir", ""), file_name),
@@ -3815,6 +4347,9 @@ class LabelingApp(QMainWindow):
             (getattr(self, "image_dir_all", ""), file_name),
             (getattr(self, "pose_label_dir", ""), label_name),
             (getattr(self, "seg_label_dir", ""), label_name),
+            (state.get("depth_image_dir", ""), f"{base}.npy"),
+            (state.get("depth_image_dir", ""), f"{base}_depth.json"),
+            (state.get("depth_preview_dir", ""), f"{base}_depth.png"),
             (os.path.join(self.project_root, "annotations"), f"{base}_annotated.png"),
             (
                 os.path.join(
@@ -3962,6 +4497,63 @@ class LabelingApp(QMainWindow):
 
     # ---------- Prediction ----------
 
+    def _refresh_depth_assistant_controls(self) -> None:
+        label = getattr(self, "depth_model_status_label", None)
+        if label is None:
+            return
+        path = str(
+            getattr(self, "layer_model_paths", {}).get(LAYER_DEPTH) or ""
+        )
+        if not path:
+            label.setText("No depth model selected.")
+            label.setToolTip("")
+        elif self._is_builtin_model_reference(path):
+            label.setText(
+                f"{os.path.basename(path)} · official model; downloads on first use"
+            )
+            label.setToolTip(path)
+        else:
+            label.setText(f"Custom model · {os.path.basename(path)}")
+            label.setToolTip(path)
+        clear_button = getattr(self, "depth_clear_model_btn", None)
+        if clear_button is not None:
+            clear_button.setEnabled(bool(path))
+
+    def _set_depth_model_path(self, path: str) -> None:
+        normalized = str(path or "")
+        if normalized and not self._is_builtin_model_reference(normalized):
+            normalized = os.path.abspath(normalized)
+        self.layer_model_paths[LAYER_DEPTH] = normalized
+        if self._is_depth_layer():
+            self.predict_model_path = normalized or None
+        self._save_project_preferences()
+        self._device = _auto_device()
+        if self._is_depth_layer():
+            self._restart_prediction_worker(warm=bool(normalized))
+        self._refresh_depth_assistant_controls()
+        if normalized:
+            self.update_status_bar(
+                f"Depth assistant model selected: {os.path.basename(normalized)}"
+            )
+        else:
+            self.update_status_bar("Depth assistant model cleared.")
+
+    def _choose_depth_model_interactive(self) -> None:
+        current = str(self.layer_model_paths.get(LAYER_DEPTH) or "")
+        start_dir = (
+            os.path.dirname(current)
+            if current and not self._is_builtin_model_reference(current)
+            else self.project_root
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select depth assistant model",
+            start_dir,
+            "Depth Model Files (*.pt *.yaml *.onnx)",
+        )
+        if path:
+            self._set_depth_model_path(path)
+
     def load_model(self):
         dialog = ProjectModelsDialog(
             self,
@@ -3985,8 +4577,8 @@ class LabelingApp(QMainWindow):
             self._update_layer_ui_state()
             configured = [
                 layer_definition(layer_id).display_name
-                for layer_id, path in self.layer_model_paths.items()
-                if path
+                for layer_id in (LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+                if self.layer_model_paths.get(layer_id)
             ]
             summary = ", ".join(configured) if configured else "none"
             self.update_status_bar(
@@ -4005,11 +4597,21 @@ class LabelingApp(QMainWindow):
 
         configured_layers = [
             layer_id
-            for layer_id in (self.active_layer, LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+            for layer_id in (self.active_layer, *LAYER_DEFINITIONS)
             if self.layer_model_paths.get(layer_id)
         ]
         configured_layers = list(dict.fromkeys(configured_layers))
         if not configured_layers:
+            if self._is_depth_layer():
+                QMessageBox.information(
+                    self,
+                    "No Depth Assistant Model",
+                    "Select an official or custom model in the Depth Assistant panel first.",
+                )
+                self.update_status_bar(
+                    "Select a model in the Depth Assistant panel first."
+                )
+                return
             QMessageBox.information(
                 self,
                 "No Project Models",
@@ -4018,7 +4620,7 @@ class LabelingApp(QMainWindow):
             self.load_model()
             configured_layers = [
                 layer_id
-                for layer_id in (self.active_layer, LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+                for layer_id in (self.active_layer, *LAYER_DEFINITIONS)
                 if self.layer_model_paths.get(layer_id)
             ]
             configured_layers = list(dict.fromkeys(configured_layers))
@@ -4075,16 +4677,25 @@ class LabelingApp(QMainWindow):
             if layer_id == LAYER_KEYPOINTS:
                 classes = self.pose_classes[:]
                 kp_names = self.pose_kp_names[:]
-            else:
+            elif layer_id == LAYER_SEGMENTATION:
                 classes = self.seg_classes[:]
                 kp_names = []
+            else:
+                classes = []
+                kp_names = []
+            csv_path = os.path.join(output_root, csv_name)
             jobs.append(
                 {
                     "layer_id": layer_id,
                     "workflow": layer.worker_mode,
                     "model_path": self.layer_model_paths.get(layer_id) or "",
                     "video_path": video_path,
-                    "csv_path": os.path.join(output_root, csv_name),
+                    "csv_path": csv_path,
+                    "preview_path": (
+                        os.path.splitext(csv_path)[0] + "_preview.mp4"
+                        if layer_id == LAYER_DEPTH
+                        else ""
+                    ),
                     "classes": classes,
                     "kp_names": kp_names,
                     "batch_size": batch_size,
@@ -4162,6 +4773,9 @@ class LabelingApp(QMainWindow):
             "model_path": model_path,
             "video_path": video_path,
             "csv_path": csv_path,
+            "preview_path": str(
+                (self._inference_active_job or {}).get("preview_path") or ""
+            ),
             "classes": classes,
             "kp_names": kp_names,
             "device": self._device,
@@ -4399,7 +5013,9 @@ class LabelingApp(QMainWindow):
             or stderr_text
             or ("Unknown inference error" if had_error else "")
         )
+        job = self._inference_active_job or {}
         csv_path = str(event.get("csv_path") or csv_path)
+        preview_path = str(event.get("preview_path") or job.get("preview_path") or "")
 
         if rows_written == 0 and (had_error or canceled):
             try:
@@ -4407,14 +5023,19 @@ class LabelingApp(QMainWindow):
                     os.remove(csv_path)
             except Exception:
                 pass
+            try:
+                if preview_path and os.path.exists(preview_path):
+                    os.remove(preview_path)
+            except Exception:
+                pass
 
-        job = self._inference_active_job or {}
         self._inference_run_results.append(
             {
                 "layer_id": layer_id,
                 "workflow": mode,
                 "model_path": str(job.get("model_path") or ""),
                 "csv_path": csv_path,
+                "preview_path": preview_path,
                 "rows_written": rows_written,
                 "processed_frames": int(
                     event.get("processed_frames") or 0
@@ -4483,9 +5104,10 @@ class LabelingApp(QMainWindow):
             elif result.get("canceled"):
                 lines.append(f"{name}: canceled ({rows} rows retained)")
             else:
-                lines.append(
-                    f"{name}: {rows} rows → {result.get('csv_path', '')}"
-                )
+                detail = f"{name}: {rows} rows → {result.get('csv_path', '')}"
+                if result.get("preview_path"):
+                    detail += f"\nPreview → {result.get('preview_path')}"
+                lines.append(detail)
         if manifest_path:
             lines.append(f"Run manifest: {manifest_path}")
         message = "\n\n".join(lines)
@@ -4518,6 +5140,11 @@ class LabelingApp(QMainWindow):
         )
 
     def set_mode(self, mode: str):
+        if self._is_depth_layer() and mode not in {"panzoom", "predict"}:
+            self.update_status_bar(
+                "The Depth layer supports Pan/Zoom and Predict modes."
+            )
+            return
         if self._is_seg_workflow() and mode in {"bbox", "keypoint"}:
             self.update_status_bar("The Segmentation layer uses Segment Prompt (2), Edit Mask (E), and Predict (4) modes.")
             return
@@ -4527,6 +5154,11 @@ class LabelingApp(QMainWindow):
 
         if mode == 'predict':
             if not self.predict_model_path:
+                if self._is_depth_layer():
+                    self.update_status_bar(
+                        "Select a model in the Depth Assistant panel first."
+                    )
+                    return
                 self.load_model()
                 if not self.predict_model_path:
                     self.update_status_bar(
@@ -4597,6 +5229,43 @@ class LabelingApp(QMainWindow):
             "workflow": self.active_workflow,
             "device": self._device,
         }
+        self._cleanup_prediction_depth_staging()
+        if self._is_depth_layer():
+            base = os.path.splitext(os.path.basename(img_path))[0]
+            final_targets = {
+                "map": os.path.join(self.depth_image_dir, f"{base}.npy"),
+                "preview": os.path.join(
+                    self.depth_preview_dir, f"{base}_depth.png"
+                ),
+                "metadata": os.path.join(
+                    self.depth_image_dir, f"{base}_depth.json"
+                ),
+            }
+            staged_targets: dict[str, str] = {}
+            try:
+                for key, path in final_targets.items():
+                    staged_targets[key] = staging_path_for(path)
+            except Exception as exc:
+                for path in staged_targets.values():
+                    try:
+                        remove_path(path)
+                    except OSError:
+                        pass
+                self._on_predict_error(
+                    f"Could not prepare depth-map output files: {exc}"
+                )
+                return
+            self._prediction_depth_targets = {
+                **{f"final_{key}": path for key, path in final_targets.items()},
+                **{f"staged_{key}": path for key, path in staged_targets.items()},
+            }
+            request.update(
+                {
+                    "depth_map_path": staged_targets["map"],
+                    "depth_preview_path": staged_targets["preview"],
+                    "depth_metadata_path": staged_targets["metadata"],
+                }
+            )
 
         self._predict_busy = True
         self._prediction_current_request_id = request_id
@@ -4605,6 +5274,16 @@ class LabelingApp(QMainWindow):
             self.predict_btn.setEnabled(False)
         self.update_status_bar("Running prediction...")
         self._send_prediction_request(request)
+
+    def _cleanup_prediction_depth_staging(self) -> None:
+        targets = getattr(self, "_prediction_depth_targets", None) or {}
+        for key, path in targets.items():
+            if key.startswith("staged_") and path:
+                try:
+                    remove_path(path)
+                except OSError:
+                    pass
+        self._prediction_depth_targets = None
 
     def _displayed_image_path(self) -> str:
         images = getattr(self, "images", []) or []
@@ -4665,6 +5344,7 @@ class LabelingApp(QMainWindow):
         self._prediction_worker_ready = False
         self._prediction_pending_request = None
         self._prediction_current_request_id = None
+        self._cleanup_prediction_depth_staging()
         if not warm or not self.predict_model_path:
             return
         self._prediction_request_counter += 1
@@ -4729,6 +5409,7 @@ class LabelingApp(QMainWindow):
                 self._prediction_current_request_id = None
                 self._prediction_image_path = None
                 self._predict_busy = False
+                LabelingApp._cleanup_prediction_depth_staging(self)
                 if hasattr(self, "predict_btn"):
                     self.predict_btn.setEnabled(True)
                 self._on_predict_error(error_text)
@@ -4745,13 +5426,16 @@ class LabelingApp(QMainWindow):
             if hasattr(self, "predict_btn"):
                 self.predict_btn.setEnabled(True)
             if bool(event.get("canceled")):
+                LabelingApp._cleanup_prediction_depth_staging(self)
                 self.update_status_bar("Prediction canceled.")
                 return
             if bool(event.get("had_error")):
+                LabelingApp._cleanup_prediction_depth_staging(self)
                 self._on_predict_error(str(event.get("error_message") or "Unknown prediction error"))
                 return
             prediction = event.get("prediction")
             if not isinstance(prediction, dict):
+                LabelingApp._cleanup_prediction_depth_staging(self)
                 self._on_predict_error("Prediction worker returned no prediction payload.")
                 return
             if (
@@ -4759,6 +5443,7 @@ class LabelingApp(QMainWindow):
                 or os.path.normcase(os.path.abspath(requested_image_path))
                 != os.path.normcase(displayed_image_path)
             ):
+                LabelingApp._cleanup_prediction_depth_staging(self)
                 self.update_status_bar(
                     "Prediction finished for a different image and was discarded."
                 )
@@ -4811,6 +5496,7 @@ class LabelingApp(QMainWindow):
             self._prediction_current_request_id = None
             self._prediction_image_path = None
             self._predict_busy = False
+            self._cleanup_prediction_depth_staging()
             if hasattr(self, "predict_btn"):
                 self.predict_btn.setEnabled(True)
             self.update_status_bar("Prediction canceled.")
@@ -4822,6 +5508,7 @@ class LabelingApp(QMainWindow):
             self._prediction_current_request_id = None
             self._prediction_image_path = None
             self._predict_busy = False
+            self._cleanup_prediction_depth_staging()
             if hasattr(self, "predict_btn"):
                 self.predict_btn.setEnabled(True)
             self._on_predict_error(stderr_text or f"Prediction worker exited with code {exit_code}.")
@@ -4830,6 +5517,37 @@ class LabelingApp(QMainWindow):
 
     def _apply_prediction_payload(self, prediction: dict):
         try:
+            if str(prediction.get("workflow") or "") == WORKFLOW_DEPTH:
+                targets = self._prediction_depth_targets or {}
+                replacements = [
+                    (targets.get("staged_map", ""), targets.get("final_map", "")),
+                    (
+                        targets.get("staged_preview", ""),
+                        targets.get("final_preview", ""),
+                    ),
+                    (
+                        targets.get("staged_metadata", ""),
+                        targets.get("final_metadata", ""),
+                    ),
+                ]
+                if not all(stage and target for stage, target in replacements):
+                    raise RuntimeError("Depth prediction output transaction is incomplete.")
+                commit_staged_paths(replacements)
+                self._prediction_depth_targets = None
+                self._clear_depth_probes()
+                self.load_image()
+                self._update_progress_label()
+                metadata = prediction.get("depth_metadata") or {}
+                median = metadata.get("median_depth")
+                suffix = (
+                    f" Median estimated depth: {float(median):.3f} m."
+                    if median is not None
+                    else ""
+                )
+                self.update_status_bar(
+                    "Depth map saved and displayed (model-default scale)." + suffix
+                )
+                return
             self._cache_active_annotation()
 
             active_cid = self.class_selector.currentIndex()
@@ -4965,6 +5683,7 @@ class LabelingApp(QMainWindow):
             self._update_status()
             self.update_status_bar("Prediction applied.")
         except Exception as e:
+            self._cleanup_prediction_depth_staging()
             import traceback, datetime
             tb = traceback.format_exc()
             try:
@@ -5446,10 +6165,19 @@ class LabelingApp(QMainWindow):
 
         self.scene.clear()
         self._item_refs.clear()
+        self._depth_probe_items = []
+        self._active_depth_map = None
         if not self.images:
             return
 
-        img_path = os.path.join(self.active_image_dir, self.images[self.current_idx])
+        current_image_name = self.images[self.current_idx]
+        if current_image_name != self._depth_probe_image_name:
+            self._depth_probe_image_name = current_image_name
+            self._depth_probes = []
+            self._depth_probe_error = ""
+        self._refresh_depth_probe_label()
+
+        img_path = os.path.join(self.active_image_dir, current_image_name)
         self.current_image_path = img_path
         pix = QPixmap(img_path)
         if pix.isNull():
@@ -5465,6 +6193,77 @@ class LabelingApp(QMainWindow):
         self.kps.clear()
         self.current_kp_idx = 0
         base = os.path.splitext(self.images[self.current_idx])[0]
+        if LabelingApp._is_depth_layer(self):
+            self.annotation_cache.clear()
+            map_path = os.path.join(self.depth_image_dir, f"{base}.npy")
+            if _np is None:
+                self._depth_probe_error = "NumPy is unavailable; pixel sampling is disabled."
+            elif not os.path.isfile(map_path):
+                self._depth_probe_error = "No raw depth map is available for pixel sampling."
+            else:
+                try:
+                    depth_map = _np.load(
+                        map_path, mmap_mode="r", allow_pickle=False
+                    )
+                    if depth_map.ndim != 2:
+                        raise ValueError(
+                            f"expected 2 dimensions, received {depth_map.ndim}"
+                        )
+                    if tuple(depth_map.shape) != (self.img_h, self.img_w):
+                        raise ValueError(
+                            f"map {tuple(depth_map.shape)} does not match "
+                            f"image {(self.img_h, self.img_w)}"
+                        )
+                    self._active_depth_map = depth_map
+                    self._depth_probe_error = ""
+                except (OSError, ValueError) as exc:
+                    self._depth_probe_error = (
+                        f"Pixel sampling unavailable: {exc}"
+                    )
+            self._refresh_depth_probe_label()
+            self._update_depth_range_label(base)
+            display_mode = self._depth_view_mode()
+            preview_path = os.path.join(
+                self.depth_preview_dir, f"{base}_depth.png"
+            )
+            if display_mode != "original" and os.path.isfile(preview_path):
+                depth_pixmap = QPixmap(preview_path)
+                if not depth_pixmap.isNull():
+                    if (
+                        depth_pixmap.width() != self.img_w
+                        or depth_pixmap.height() != self.img_h
+                    ):
+                        depth_pixmap = depth_pixmap.scaled(
+                            self.img_w,
+                            self.img_h,
+                            Qt.AspectRatioMode.IgnoreAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    depth_item = QGraphicsPixmapItem(depth_pixmap)
+                    depth_item.setZValue(1.0)
+                    depth_item.setOpacity(
+                        0.55 if display_mode == "overlay" else 1.0
+                    )
+                    self.scene.addItem(depth_item)
+                    self._track_scene_item(depth_item)
+                    self.update_status_bar(
+                        "Saved depth overlay displayed."
+                        if display_mode == "overlay"
+                        else "Saved depth map displayed (near = bright)."
+                    )
+            elif display_mode == "original":
+                self.update_status_bar(
+                    "Original image displayed; a saved depth map remains available."
+                )
+            else:
+                self.update_status_bar(
+                    "No saved depth map for this image. Select Predict to create one."
+                )
+            self._refresh_reference_layer_overlay()
+            self._render_depth_probes()
+            self._update_status()
+            self.view.centerOn(self.scene.sceneRect().center())
+            return
         label_file = os.path.join(self.label_dir, f"{base}.txt")
 
         if self._is_seg_workflow():
@@ -5630,6 +6429,13 @@ class LabelingApp(QMainWindow):
             self._update_item_editability()
 
     def _is_fully_labeled(self) -> bool:
+        if self._is_depth_layer():
+            if not self.images:
+                return False
+            base = os.path.splitext(self.images[self.current_idx])[0]
+            return os.path.isfile(
+                os.path.join(self.depth_image_dir, f"{base}.npy")
+            )
         self._cache_active_annotation()
         if not self.classes:
             return False
@@ -5773,6 +6579,13 @@ class LabelingApp(QMainWindow):
     def save_labels(self) -> bool:
         if not self.images:
             return False
+        if LabelingApp._is_depth_layer(self):
+            QMessageBox.information(
+                self,
+                "Depth Maps Save Automatically",
+                "Depth predictions are saved automatically when inference completes.",
+            )
+            return False
 
         if self._is_seg_workflow() and self.seg_preview_points:
             QMessageBox.information(
@@ -5896,6 +6709,11 @@ class LabelingApp(QMainWindow):
     # ---------- Video ----------
     def export_dataset(self):
         """Split images_all/labels_all into train/val sets and regenerate dataset.yaml."""
+        if self._is_depth_layer():
+            QMessageBox.information(
+                self, "Depth MVP", "Depth dataset export is not included in the inference-only MVP."
+            )
+            return
         seg_mode = self._is_seg_workflow()
         project_root = self.project_root
         images_all_dir = self.image_dir_all
@@ -6112,6 +6930,11 @@ class LabelingApp(QMainWindow):
         self.update_status_bar("Project health cleanup complete.")
 
     def normalize_labels_all(self):
+        if self._is_depth_layer():
+            QMessageBox.information(
+                self, "Depth MVP", "Saved depth maps do not use editable YOLO label files."
+            )
+            return
         labels_dir = self.label_dir
         images_all_dir = self.image_dir_all
         images_to_label_dir = self.image_dir_queue
@@ -6168,6 +6991,11 @@ class LabelingApp(QMainWindow):
 
     def open_train_dialog(self):
         layer = self._active_layer_definition()
+        if self._is_depth_layer():
+            QMessageBox.information(
+                self, "Depth MVP", "Depth training is not included in the inference-only MVP."
+            )
+            return
         if self._is_segmentation_layer():
             default_dataset = os.path.join(self.project_root, "datasets", "segment")
             if not os.path.isdir(default_dataset):
@@ -6193,10 +7021,20 @@ class LabelingApp(QMainWindow):
         dlg.exec()
 
     def open_distillation_dialog(self):
+        if self._is_depth_layer():
+            QMessageBox.information(
+                self, "Depth MVP", "Depth distillation is not included in the inference-only MVP."
+            )
+            return
         dlg = DistillationDialog(self)
         dlg.exec()
 
     def open_analysis_dialog(self):
+        if self._is_depth_layer():
+            QMessageBox.information(
+                self, "Depth MVP", "Depth analysis tools are not included in the MVP yet."
+            )
+            return
         dlg = AnalysisDialog(
             self,
             project_root=self.project_root,
@@ -6209,10 +7047,18 @@ class LabelingApp(QMainWindow):
         if _cv2 is None:
             QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
             return
-        if not any(self.layer_model_paths.values()):
-            self.load_model()
-            if not any(self.layer_model_paths.values()):
-                return
+        review_model_paths = {
+            layer_id: self.layer_model_paths.get(layer_id) or ""
+            for layer_id in (LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+        }
+        reviewer_layer = self.active_layer
+        if reviewer_layer == LAYER_DEPTH:
+            reviewer_layer = (
+                LAYER_KEYPOINTS
+                if review_model_paths[LAYER_KEYPOINTS]
+                or not review_model_paths[LAYER_SEGMENTATION]
+                else LAYER_SEGMENTATION
+            )
         layer_schemas = {
             LAYER_KEYPOINTS: {
                 "classes": self.pose_classes[:],
@@ -6228,15 +7074,16 @@ class LabelingApp(QMainWindow):
                 "class_keypoints": {},
             },
         }
+        reviewer_schema = layer_schemas[reviewer_layer]
         dlg = VideoReviewDialog(
             self,
             self._device,
-            self.kp_names,
-            self.classes,
-            class_keypoints=self.class_keypoints,
-            workflow=self.active_workflow,
-            layer_id=self.active_layer,
-            model_paths=self.layer_model_paths,
+            reviewer_schema["kp_names"],
+            reviewer_schema["classes"],
+            class_keypoints=reviewer_schema["class_keypoints"],
+            workflow=layer_worker_mode(reviewer_layer),
+            layer_id=reviewer_layer,
+            model_paths=review_model_paths,
             layer_schemas=layer_schemas,
         )
         dlg.exec()

@@ -12,6 +12,7 @@ wheels/
 
 # Local model artifacts
 sam3.pt
+yolo26*-depth.pt
 
 # App runtime data
 annotations/

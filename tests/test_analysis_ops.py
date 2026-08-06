@@ -3,15 +3,19 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
+import cv2
+import numpy as np
 import pandas as pd
 
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
     _open_h264_video_writer,
+    render_annotated_video,
     run_analysis_workflow,
 )
 from analysis_worker import run_analysis_worker
+from segmentation_analysis_ops import render_segmentation_annotated_video
 
 
 def _write_demo_detections(path: str) -> None:
@@ -129,44 +133,122 @@ def _write_demo_segmentation(path: str) -> None:
 
 
 class AnalysisOpsTests(unittest.TestCase):
-    def test_h264_writer_prefers_avc1_and_requires_open_encoder(self):
-        class Writer:
-            def __init__(self, opened):
-                self.opened = opened
-                self.released = False
+    def test_pyav_h264_writer_encodes_mp4_and_pads_odd_dimensions(self):
+        with TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "output.mp4")
+            frame = np.zeros((81, 101, 3), dtype=np.uint8)
+            frame[:, :, 1] = 180
 
-            def isOpened(self):
-                return self.opened
+            with _open_h264_video_writer(output_path, 8.0, 101, 81) as writer:
+                writer.write(frame)
+                writer.write(frame)
 
-            def release(self):
-                self.released = True
+            capture = cv2.VideoCapture(output_path)
+            try:
+                self.assertTrue(capture.isOpened())
+                self.assertEqual(
+                    (
+                        int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                        int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                    ),
+                    (102, 82),
+                )
+                decoded = 0
+                while capture.read()[0]:
+                    decoded += 1
+                self.assertEqual(decoded, 2)
+            finally:
+                capture.release()
 
-        class Cv2:
-            def __init__(self, opened_codecs):
-                self.opened_codecs = opened_codecs
-                self.calls = []
-                self.writers = []
+    def test_pyav_h264_writer_preserves_existing_file_after_failure(self):
+        with TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "output.mp4")
+            with open(output_path, "wb") as fh:
+                fh.write(b"previous export")
 
-            @staticmethod
-            def VideoWriter_fourcc(*codec):
-                return "".join(codec)
+            with self.assertRaisesRegex(RuntimeError, "stop export"):
+                with _open_h264_video_writer(output_path, 8.0, 100, 80) as writer:
+                    writer.write(np.zeros((80, 100, 3), dtype=np.uint8))
+                    raise RuntimeError("stop export")
 
-            def VideoWriter(self, path, codec, fps, size):
-                self.calls.append((path, codec, fps, size))
-                writer = Writer(codec in self.opened_codecs)
-                self.writers.append(writer)
-                return writer
+            with open(output_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"previous export")
+            self.assertEqual(os.listdir(tmp), ["output.mp4"])
 
-        cv2 = Cv2({"avc1"})
-        writer = _open_h264_video_writer(cv2, "output.mp4", 8.0, 320, 240)
-        self.assertTrue(writer.isOpened())
-        self.assertEqual([call[1] for call in cv2.calls], ["avc1"])
+    def test_pyav_h264_writer_rejects_invalid_metadata(self):
+        with self.assertRaisesRegex(AnalysisError, "invalid frame size"):
+            _open_h264_video_writer("output.mp4", 8.0, 0, 80)
+        with self.assertRaisesRegex(AnalysisError, "invalid frame rate"):
+            _open_h264_video_writer("output.mp4", 0.0, 100, 80)
 
-        unavailable = Cv2(set())
-        with self.assertRaisesRegex(AnalysisError, "H.264 video encoder"):
-            _open_h264_video_writer(unavailable, "output.mp4", 8.0, 320, 240)
-        self.assertEqual([call[1] for call in unavailable.calls], ["avc1", "H264"])
-        self.assertTrue(all(writer.released for writer in unavailable.writers))
+    def test_annotated_video_renderers_export_decodable_h264(self):
+        with TemporaryDirectory() as tmp:
+            source_path = os.path.join(tmp, "source.mp4")
+            frame = np.zeros((80, 100, 3), dtype=np.uint8)
+            with _open_h264_video_writer(source_path, 10.0, 100, 80) as writer:
+                for _ in range(3):
+                    writer.write(frame)
+
+            pose_path = os.path.join(tmp, "pose.mp4")
+            pose_rows = pd.DataFrame(
+                [
+                    {
+                        "frame_index": 0,
+                        "bbox_x1": 10,
+                        "bbox_y1": 10,
+                        "bbox_x2": 30,
+                        "bbox_y2": 30,
+                        "bbox_center_x_euro": 20,
+                        "bbox_center_y_euro": 20,
+                        "cumulative_distance_mm": 0.0,
+                        "speed_mm_per_sec": 0.0,
+                        "roi_label": "",
+                    }
+                ]
+            )
+            self.assertEqual(
+                render_annotated_video(pose_rows, source_path, pose_path, 10.0),
+                pose_path,
+            )
+
+            segmentation_path = os.path.join(tmp, "segmentation.mp4")
+            segmentation_rows = pd.DataFrame(
+                [
+                    {
+                        "frame_index": 0,
+                        "bbox_x1": 10,
+                        "bbox_y1": 10,
+                        "bbox_x2": 30,
+                        "bbox_y2": 30,
+                        "bbox_center_x_euro": 20,
+                        "bbox_center_y_euro": 20,
+                        "mask_polygon": json.dumps([[10, 10], [30, 10], [30, 30]]),
+                        "mask_area_px2": 200,
+                        "speed_mm_per_sec": 0.0,
+                        "roi_label": "",
+                    }
+                ]
+            )
+            self.assertEqual(
+                render_segmentation_annotated_video(
+                    segmentation_rows,
+                    source_path,
+                    segmentation_path,
+                    10.0,
+                ),
+                segmentation_path,
+            )
+
+            for output_path in (pose_path, segmentation_path):
+                capture = cv2.VideoCapture(output_path)
+                try:
+                    self.assertTrue(capture.isOpened())
+                    decoded = 0
+                    while capture.read()[0]:
+                        decoded += 1
+                    self.assertEqual(decoded, 3)
+                finally:
+                    capture.release()
 
     def test_analysis_rejects_results_from_a_different_layer(self):
         with TemporaryDirectory() as tmp:

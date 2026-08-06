@@ -37,10 +37,8 @@ class ProjectModelsDialog(QDialog):
         self.setWindowTitle("Project Models")
         self.setMinimumWidth(760)
         self._paths = {
-            LAYER_KEYPOINTS: str(model_paths.get(LAYER_KEYPOINTS) or ""),
-            LAYER_SEGMENTATION: str(
-                model_paths.get(LAYER_SEGMENTATION) or ""
-            ),
+            layer_id: str(model_paths.get(layer_id) or "")
+            for layer_id in (LAYER_KEYPOINTS, LAYER_SEGMENTATION)
         }
         self._path_edits: dict[str, QLineEdit] = {}
         self._status_labels: dict[str, QLabel] = {}
@@ -54,9 +52,9 @@ class ProjectModelsDialog(QDialog):
         root.addWidget(title)
 
         hint = QLabel(
-            "Assign one trained model to each layer. Predict, video inference, "
-            "and Video Reviewer will automatically use the matching model. "
-            "SAM remains a separate labeling assistant."
+            "Assign trained models to the Keypoints and Segmentation layers. "
+            "Predict, video inference, and Video Reviewer automatically use the "
+            "matching model. SAM and Depth remain separate labeling assistants."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #aeb9c4;")
@@ -111,9 +109,9 @@ class ProjectModelsDialog(QDialog):
         root.addLayout(grid)
 
         validation_note = QLabel(
-            "The model task is verified when prediction starts. A pose model "
-            "cannot run the Segmentation layer, and a segmentation model cannot "
-            "run the Keypoints layer."
+            "The model task is verified when prediction starts. Pose and segmentation "
+            "models can only run their matching project layer. Depth uses its separate "
+            "assistant controls in the main window."
         )
         validation_note.setWordWrap(True)
         validation_note.setStyleSheet("color: #84909b; font-size: 9pt;")
@@ -148,7 +146,9 @@ class ProjectModelsDialog(QDialog):
             self._set_path(layer_id, path)
 
     def _set_path(self, layer_id: str, path: str) -> None:
-        normalized = os.path.abspath(path) if path else ""
+        normalized = str(path or "")
+        if normalized:
+            normalized = os.path.abspath(normalized)
         self._paths[layer_id] = normalized
         edit = self._path_edits[layer_id]
         edit.setText(normalized)

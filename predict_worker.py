@@ -9,6 +9,7 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
+from depth_ops import serialize_depth_prediction_result
 from prediction_ops import serialize_prediction_result
 from squeakpose_core import model_task_mismatch_message
 from squeakpose.workers.protocol import read_config, write_event
@@ -94,6 +95,9 @@ def run_predict_server(
         layer_id = str(request.get("layer_id") or workflow)
         device = str(request.get("device") or "cpu")
         image_path = str(request.get("image_path") or "")
+        depth_map_path = str(request.get("depth_map_path") or "")
+        depth_preview_path = str(request.get("depth_preview_path") or "")
+        depth_metadata_path = str(request.get("depth_metadata_path") or "")
         if not model_path:
             event_writer({"event": "error", "request_id": request_id, "error_message": "model_path is required"})
             continue
@@ -133,26 +137,38 @@ def run_predict_server(
                 continue
 
             event_writer({"event": "started", "request_id": request_id, "image_path": image_path})
+            predict_kwargs = {
+                "source": image_path,
+                "imgsz": 768 if workflow == "depth" else 640,
+                "device": device,
+                "verbose": False,
+            }
+            if workflow != "depth":
+                predict_kwargs.update({"conf": 0.25, "iou": 0.5, "end2end": False})
             with contextlib.redirect_stdout(sys.stderr):
-                results_list = cached_model.predict(
-                    source=image_path,
-                    imgsz=640,
-                    conf=0.25,
-                    iou=0.5,
-                    end2end=False,
-                    device=device,
-                    verbose=False,
-                )
+                results_list = cached_model.predict(**predict_kwargs)
             results = list(results_list or [])
             if not results:
                 raise RuntimeError("Prediction returned no results.")
-            prediction = serialize_prediction_result(
-                results[0],
-                workflow=workflow,
-                layer_id=layer_id,
-                cv2_module=cv2_module,
-                numpy_module=numpy_module,
-            )
+            if workflow == "depth":
+                prediction = serialize_depth_prediction_result(
+                    results[0],
+                    map_path=depth_map_path,
+                    preview_path=depth_preview_path,
+                    metadata_path=depth_metadata_path,
+                    model_path=model_path,
+                    image_path=image_path,
+                    cv2_module=cv2_module,
+                    numpy_module=numpy_module,
+                )
+            else:
+                prediction = serialize_prediction_result(
+                    results[0],
+                    workflow=workflow,
+                    layer_id=layer_id,
+                    cv2_module=cv2_module,
+                    numpy_module=numpy_module,
+                )
             event_writer(
                 {
                     "event": "result",
@@ -191,6 +207,9 @@ def run_predict_worker(
     workflow = str(config.get("workflow") or "pose")
     layer_id = str(config.get("layer_id") or workflow)
     device = str(config.get("device") or "cpu")
+    depth_map_path = str(config.get("depth_map_path") or "")
+    depth_preview_path = str(config.get("depth_preview_path") or "")
+    depth_metadata_path = str(config.get("depth_metadata_path") or "")
 
     if not model_path:
         event_writer({"event": "error", "error_message": "model_path is required"})
@@ -216,15 +235,15 @@ def run_predict_worker(
             if task_error:
                 event_writer({"event": "error", "error_message": task_error})
                 return 1
-            results_list = model.predict(
-                source=image_path,
-                imgsz=640,
-                conf=0.25,
-                iou=0.5,
-                end2end=False,
-                device=device,
-                verbose=False,
-            )
+            predict_kwargs = {
+                "source": image_path,
+                "imgsz": 768 if workflow == "depth" else 640,
+                "device": device,
+                "verbose": False,
+            }
+            if workflow != "depth":
+                predict_kwargs.update({"conf": 0.25, "iou": 0.5, "end2end": False})
+            results_list = model.predict(**predict_kwargs)
         if _CANCEL_REQUESTED:
             event_writer({"event": "result", "canceled": True, "had_error": False, "prediction": None})
             return 0
@@ -240,13 +259,25 @@ def run_predict_worker(
                 }
             )
             return 1
-        prediction = serialize_prediction_result(
-            results[0],
-            workflow=workflow,
-            layer_id=layer_id,
-            cv2_module=cv2_module,
-            numpy_module=numpy_module,
-        )
+        if workflow == "depth":
+            prediction = serialize_depth_prediction_result(
+                results[0],
+                map_path=depth_map_path,
+                preview_path=depth_preview_path,
+                metadata_path=depth_metadata_path,
+                model_path=model_path,
+                image_path=image_path,
+                cv2_module=cv2_module,
+                numpy_module=numpy_module,
+            )
+        else:
+            prediction = serialize_prediction_result(
+                results[0],
+                workflow=workflow,
+                layer_id=layer_id,
+                cv2_module=cv2_module,
+                numpy_module=numpy_module,
+            )
         event_writer(
             {
                 "event": "result",

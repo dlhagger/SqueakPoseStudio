@@ -8,6 +8,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -21,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import PyQt6
+import numpy as np
 
 QT_PLUGINS = Path(PyQt6.__file__).resolve().parent / "Qt6" / "plugins"
 QT_PLATFORMS = QT_PLUGINS / "platforms"
@@ -29,6 +31,7 @@ if QT_PLUGINS.is_dir():
 if QT_PLATFORMS.is_dir():
     os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(QT_PLATFORMS))
 
+from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QColor, QFontDatabase, QImage, QPainter, QPen
 from PyQt6.QtWidgets import QApplication
 
@@ -69,6 +72,24 @@ def _write_demo_image(path: Path) -> None:
         raise RuntimeError(f"Could not write demo image: {path}")
 
 
+def _write_demo_depth_preview(path: Path) -> None:
+    image = QImage(960, 540, QImage.Format.Format_RGB32)
+    painter = QPainter(image)
+    for x in range(image.width()):
+        fraction = x / max(1, image.width() - 1)
+        painter.setPen(
+            QColor(
+                int(35 + 220 * fraction),
+                int(8 + 145 * fraction),
+                int(95 - 75 * fraction),
+            )
+        )
+        painter.drawLine(x, 0, x, image.height())
+    painter.end()
+    if not image.save(str(path)):
+        raise RuntimeError(f"Could not write depth preview: {path}")
+
+
 def _build_demo_project(root: Path) -> dict[str, str]:
     paths = studio._ensure_project_structure(str(root))
     Path(paths["classes_file"]).write_text("mouse\n", encoding="utf-8")
@@ -87,6 +108,25 @@ def _build_demo_project(root: Path) -> dict[str, str]:
     Path(paths["labels_seg_all"], "frame001.txt").write_text(
         "0 0.340 0.405 0.485 0.365 0.610 0.395 0.655 0.485 "
         "0.625 0.590 0.445 0.625 0.335 0.535\n",
+        encoding="utf-8",
+    )
+    _write_demo_depth_preview(
+        Path(paths["depth_previews"]) / "frame001_depth.png"
+    )
+    demo_depth = np.linspace(
+        0.42, 4.81, num=540 * 960, dtype=np.float32
+    ).reshape(540, 960)
+    np.save(Path(paths["depth_images"]) / "frame001.npy", demo_depth)
+    Path(paths["depth_images"], "frame001_depth.json").write_text(
+        json.dumps(
+            {
+                "p02_depth": 0.42,
+                "p98_depth": 4.81,
+                "median_depth": 1.73,
+                "units": "estimated_meters",
+                "display_mode": "disparity",
+            }
+        ),
         encoding="utf-8",
     )
     return paths
@@ -141,6 +181,14 @@ def render_screenshots(output_dir: Path) -> list[Path]:
     _save_widget(window, pose_path, app)
     screenshots.append(pose_path)
 
+    window.depth_visibility_check.setChecked(False)
+    _flush_events(app, rounds=6)
+    pose_depth_hidden_path = output_dir / "main_pose_depth_hidden.png"
+    _save_widget(window, pose_depth_hidden_path, app)
+    screenshots.append(pose_depth_hidden_path)
+    window.depth_visibility_check.setChecked(True)
+    _flush_events(app, rounds=4)
+
     window.workflow_selector.setCurrentIndex(1)
     window._seg_setup_prompted = True
     window.set_mode("segment")
@@ -148,6 +196,35 @@ def render_screenshots(output_dir: Path) -> list[Path]:
     seg_path = output_dir / "main_segmentation.png"
     _save_widget(window, seg_path, app)
     screenshots.append(seg_path)
+
+    window.workflow_selector.setCurrentIndex(2)
+    _flush_events(app, rounds=8)
+    depth_path = output_dir / "main_depth.png"
+    _save_widget(window, depth_path, app)
+    screenshots.append(depth_path)
+
+    window._probe_depth_at(QPointF(420.0, 250.0))
+    window._probe_depth_at(QPointF(100.0, 100.0))
+    _flush_events(app, rounds=4)
+    depth_probes_path = output_dir / "main_depth_probes.png"
+    _save_widget(window, depth_probes_path, app)
+    screenshots.append(depth_probes_path)
+
+    window.depth_display_combo.setCurrentIndex(
+        window.depth_display_combo.findData("overlay")
+    )
+    _flush_events(app, rounds=6)
+    depth_overlay_path = output_dir / "main_depth_overlay.png"
+    _save_widget(window, depth_overlay_path, app)
+    screenshots.append(depth_overlay_path)
+
+    window.depth_display_combo.setCurrentIndex(
+        window.depth_display_combo.findData("original")
+    )
+    _flush_events(app, rounds=6)
+    depth_original_path = output_dir / "main_depth_original.png"
+    _save_widget(window, depth_original_path, app)
+    screenshots.append(depth_original_path)
 
     models_dir = project_dir / "models"
     models_dir.mkdir(exist_ok=True)
@@ -224,6 +301,30 @@ def render_screenshots(output_dir: Path) -> list[Path]:
     _save_widget(reviewer, reviewer_path, app)
     screenshots.append(reviewer_path)
     reviewer.close()
+
+    reviewer_no_models = studio.VideoReviewDialog(
+        window,
+        "cpu",
+        ["nose", "head", "left_ear", "right_ear", "back", "tail_base"],
+        ["mouse"],
+        class_keypoints={"mouse": ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]},
+        workflow="pose",
+        layer_id="keypoints",
+        model_paths={"keypoints": "", "segmentation": ""},
+        layer_schemas={
+            "keypoints": {
+                "classes": ["mouse"],
+                "kp_names": ["nose", "head", "left_ear", "right_ear", "back", "tail_base"],
+                "class_keypoints": {"mouse": ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]},
+            },
+            "segmentation": {"classes": ["mouse"], "kp_names": [], "class_keypoints": {}},
+        },
+    )
+    reviewer_no_models.resize(1180, 780)
+    reviewer_no_models_path = output_dir / "video_reviewer_no_models.png"
+    _save_widget(reviewer_no_models, reviewer_no_models_path, app)
+    screenshots.append(reviewer_no_models_path)
+    reviewer_no_models.close()
 
     train = studio.TrainDialog(window, str(Path(paths["datasets"]) / "demo_dataset"), default_task="pose")
     train.resize(1100, 720)

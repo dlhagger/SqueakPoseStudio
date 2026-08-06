@@ -270,7 +270,11 @@ class VideoReviewDialog(QDialog):
         controls_row_1.addStretch(1)
         self.btn_predict = QPushButton("Predict Range")
         self.btn_predict.setEnabled(False)
-        if len(self.review_layers) > 1:
+        if not self.review_layers:
+            self.btn_predict.setToolTip(
+                "Configure a Keypoints or Segmentation project model to enable predictions."
+            )
+        elif len(self.review_layers) > 1:
             self.btn_predict.setText("Predict Both Layers")
             self.btn_predict.setToolTip(
                 "Run the configured Keypoints and Segmentation models sequentially over the selected frame range."
@@ -355,8 +359,16 @@ class VideoReviewDialog(QDialog):
                 f"{layer_definition(configured_layer).display_name}: "
                 f"{os.path.basename(self.model_paths[configured_layer])}"
             )
-        self.model_summary_label = QLabel("  ·  ".join(configured_text))
-        self.model_summary_label.setToolTip("\n".join(configured_text))
+        self.model_summary_label = QLabel(
+            "  ·  ".join(configured_text)
+            if configured_text
+            else "No models · browse/export only"
+        )
+        self.model_summary_label.setToolTip(
+            "\n".join(configured_text)
+            if configured_text
+            else "Configure project models later to enable prediction overlays."
+        )
         overlay_row.addWidget(self.model_summary_label)
         top.addLayout(overlay_row)
 
@@ -622,7 +634,7 @@ class VideoReviewDialog(QDialog):
         self.spin_start.setRange(0, max(0, self.total - 1)); self.spin_start.setValue(0)
         self.spin_end.setRange(0, max(0, self.total - 1)); self.spin_end.setValue(max(0, self.total - 1))
         self.slider.setRange(0, max(0, self.total - 1))
-        self.btn_predict.setEnabled(True)
+        self.btn_predict.setEnabled(bool(self.review_layers))
         if hasattr(self, "btn_send"):
             self.btn_send.setEnabled(True)
         if hasattr(self, "btn_send_low"):
@@ -1054,7 +1066,9 @@ class VideoReviewDialog(QDialog):
         self._review_progress = None
         self._review_process = None
         self._review_config_path = None
-        self.btn_predict.setEnabled(self.cap is not None)
+        self.btn_predict.setEnabled(
+            self.cap is not None and bool(self.review_layers)
+        )
 
         self.preds = self.preds_by_layer.get(self.layer_id, {})
         has_predictions = any(self.preds_by_layer.values())

@@ -37,11 +37,13 @@ class CoreHelpersTests(unittest.TestCase):
     def test_task_helpers_normalize_and_detect_mismatch(self):
         self.assertEqual(normalize_yolo_task("segmentation"), "segment")
         self.assertEqual(normalize_yolo_task("keypoints"), "pose")
+        self.assertEqual(normalize_yolo_task("depth"), "depth")
         self.assertEqual(infer_dataset_task({"task": "seg", "train": "images/train"}), "segment")
         self.assertEqual(infer_dataset_task({"kpt_shape": [6, 3]}), "pose")
         self.assertEqual(infer_dataset_task({"train": "images/train"}), "detect")
         self.assertIsNone(model_task_mismatch_message("pose", "keypoints"))
         self.assertIn("requires 'segment'", model_task_mismatch_message("detect", "segment"))
+        self.assertIn("requires 'depth'", model_task_mismatch_message("pose", "depth"))
 
     def test_project_metadata_migration_preserves_unknown_fields(self):
         migrated, changed = migrate_project_metadata(

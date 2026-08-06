@@ -246,6 +246,35 @@ class StudioVideoReviewTests(unittest.TestCase):
 
             self.assertEqual(applied, [prediction])
 
+    def test_video_reviewer_opens_from_depth_without_models(self):
+        app = type("ReviewerDummy", (), {})()
+        app.active_layer = "depth"
+        app.layer_model_paths = {
+            "keypoints": "",
+            "segmentation": "",
+            "depth": "yolo26n-depth.pt",
+        }
+        app.pose_classes = ["mouse"]
+        app.pose_kp_names = ["nose"]
+        app.pose_class_keypoints = {"mouse": ["nose"]}
+        app.seg_classes = ["mouse"]
+        app._device = "cpu"
+
+        with (
+            patch("squeakpose.ui.main_window._cv2", object()),
+            patch("squeakpose.ui.main_window.VideoReviewDialog") as dialog_cls,
+        ):
+            LabelingApp.open_video_reviewer(app)
+
+        dialog_cls.assert_called_once()
+        _args, kwargs = dialog_cls.call_args
+        self.assertEqual(kwargs["layer_id"], "keypoints")
+        self.assertEqual(
+            kwargs["model_paths"],
+            {"keypoints": "", "segmentation": ""},
+        )
+        dialog_cls.return_value.exec.assert_called_once()
+
     def test_sync_canonical_keypoints_appends_class_map_names(self):
         with TemporaryDirectory() as tmp:
             keypoint_file = os.path.join(tmp, "keypoints.txt")

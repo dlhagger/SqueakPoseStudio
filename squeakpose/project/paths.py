@@ -31,6 +31,9 @@ class ProjectPaths(Mapping[str, str]):
     annotations: str
     annotations_keypoints: str
     annotations_segmentation: str
+    depth_maps: str
+    depth_images: str
+    depth_previews: str
     datasets: str
     runs: str
     distillation: str
@@ -40,9 +43,11 @@ class ProjectPaths(Mapping[str, str]):
     inference_outputs: str
     inference_keypoints: str
     inference_segmentation: str
+    inference_depth: str
     analysis_outputs: str
     analysis_keypoints: str
     analysis_segmentation: str
+    analysis_depth: str
     logs: str
     classes_file: str
     keypoints_file: str
@@ -66,6 +71,9 @@ class ProjectPaths(Mapping[str, str]):
             annotations_segmentation=os.path.join(
                 root, "annotations", "segmentation"
             ),
+            depth_maps=os.path.join(root, "depth maps"),
+            depth_images=os.path.join(root, "depth maps", "images"),
+            depth_previews=os.path.join(root, "depth maps", "previews"),
             datasets=os.path.join(root, "datasets"),
             runs=os.path.join(root, "runs"),
             distillation=os.path.join(root, "distillation"),
@@ -79,6 +87,7 @@ class ProjectPaths(Mapping[str, str]):
             inference_segmentation=os.path.join(
                 root, "inference outputs", "segmentation"
             ),
+            inference_depth=os.path.join(root, "inference outputs", "depth"),
             analysis_outputs=os.path.join(root, "analysis outputs"),
             analysis_keypoints=os.path.join(
                 root, "analysis outputs", "keypoints"
@@ -86,6 +95,7 @@ class ProjectPaths(Mapping[str, str]):
             analysis_segmentation=os.path.join(
                 root, "analysis outputs", "segmentation"
             ),
+            analysis_depth=os.path.join(root, "analysis outputs", "depth"),
             logs=os.path.join(root, "logs"),
             classes_file=os.path.join(root, "classes.txt"),
             keypoints_file=os.path.join(root, "keypoints.txt"),
@@ -121,6 +131,9 @@ PROJECT_DIRECTORY_FIELDS = (
     "annotations",
     "annotations_keypoints",
     "annotations_segmentation",
+    "depth_maps",
+    "depth_images",
+    "depth_previews",
     "datasets",
     "runs",
     "distillation",
@@ -130,9 +143,11 @@ PROJECT_DIRECTORY_FIELDS = (
     "inference_outputs",
     "inference_keypoints",
     "inference_segmentation",
+    "inference_depth",
     "analysis_outputs",
     "analysis_keypoints",
     "analysis_segmentation",
+    "analysis_depth",
     "logs",
 )
 

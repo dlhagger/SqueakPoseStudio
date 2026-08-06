@@ -2,6 +2,7 @@
 
 from layer_ops import (
     LAYER_DEFINITIONS,
+    LAYER_DEPTH,
     LAYER_KEYPOINTS,
     LAYER_SEGMENTATION,
     LayerDefinition,
@@ -16,6 +17,7 @@ from layer_ops import (
 __all__ = [
     "LayerDefinition",
     "LAYER_DEFINITIONS",
+    "LAYER_DEPTH",
     "LAYER_KEYPOINTS",
     "LAYER_SEGMENTATION",
     "layer_definition",

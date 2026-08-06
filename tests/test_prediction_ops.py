@@ -1,5 +1,9 @@
 import json
+import os
 import unittest
+from tempfile import TemporaryDirectory
+
+import numpy as np
 
 from prediction_ops import (
     best_predictions_by_class_from_payload,
@@ -59,6 +63,16 @@ class _Result:
         self.boxes = boxes
         self.keypoints = keypoints
         self.masks = masks
+
+
+class _Depth:
+    def __init__(self, data):
+        self.data = _Tensor(data)
+
+
+class _DepthResult:
+    def __init__(self, data):
+        self.depth = _Depth(data)
 
 
 class _PredictModel:
@@ -151,6 +165,8 @@ class _FakeCv2:
     def imwrite(self, path, frame):
         self.staged_frames[path] = frame
         self.written_frames.append(frame)
+        with open(path, "wb") as handle:
+            handle.write(b"image")
         return True
 
 
@@ -163,6 +179,35 @@ def _streamed_predictions(events):
 
 
 class PredictionOpsTests(unittest.TestCase):
+    def test_predict_worker_writes_depth_outputs_without_json_array(self):
+        with TemporaryDirectory() as tmp:
+            model = _PredictModel([_DepthResult([[1.0, 2.0], [3.0, 4.0]])])
+            model.task = "depth"
+            events = []
+            config = {
+                "model_path": "yolo26n-depth.pt",
+                "image_path": "image.png",
+                "workflow": "depth",
+                "layer_id": "depth",
+                "depth_map_path": os.path.join(tmp, "depth.npy"),
+                "depth_preview_path": os.path.join(tmp, "depth.png"),
+                "depth_metadata_path": os.path.join(tmp, "depth.json"),
+            }
+
+            exit_code = run_predict_worker(
+                config,
+                model_factory=lambda _path: model,
+                event_writer=events.append,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(model.calls[0]["imgsz"], 768)
+            self.assertNotIn("conf", model.calls[0])
+            prediction = events[-1]["prediction"]
+            self.assertEqual(prediction["workflow"], "depth")
+            self.assertNotIn("depth_map", prediction)
+            self.assertTrue(os.path.isfile(config["depth_map_path"]))
+
     def test_serialize_prediction_result_keeps_all_pose_detections(self):
         result = _Result(
             boxes=_Boxes(

@@ -20,6 +20,7 @@ from squeakpose.project.paths import (
 )
 from squeakpose.project.layers import (
     LAYER_DEFINITIONS,
+    LAYER_DEPTH,
     LAYER_KEYPOINTS,
     LAYER_SEGMENTATION,
     LayerDefinition,
@@ -33,6 +34,7 @@ __all__ = [
     "ProjectPaths",
     "LayerDefinition",
     "LAYER_DEFINITIONS",
+    "LAYER_DEPTH",
     "LAYER_KEYPOINTS",
     "LAYER_SEGMENTATION",
     "DISTILLATION_MANIFEST_FILENAME",

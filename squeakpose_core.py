@@ -22,7 +22,7 @@ from layer_ops import (
 )
 
 
-CURRENT_PROJECT_SCHEMA_VERSION = 3
+CURRENT_PROJECT_SCHEMA_VERSION = 4
 
 
 def normalize_yolo_task(value: Any) -> Optional[str]:
@@ -38,6 +38,8 @@ def normalize_yolo_task(value: Any) -> Optional[str]:
         "detect": "detect",
         "detection": "detect",
         "bbox": "detect",
+        "depth": "depth",
+        "monocular-depth": "depth",
     }
     return aliases.get(raw)
 
@@ -106,6 +108,7 @@ def migrate_project_metadata(
         "segment": "segmentation",
         "seg": "segmentation",
         "segmentation": "segmentation",
+        "depth": "depth",
     }.get(workflow)
     if normalized_workflow and normalized_workflow != migrated.get("active_workflow"):
         migrated["active_workflow"] = normalized_workflow

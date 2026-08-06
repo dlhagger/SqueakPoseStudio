@@ -540,6 +540,13 @@ class LabelView(QGraphicsView):
 
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.position().toPoint())
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self.app._is_depth_layer()
+        ):
+            self.app._probe_depth_at(scene_pos)
+            event.accept()
+            return
         if self.app.mode == "segedit":
             if event.button() == Qt.MouseButton.LeftButton and self.app._start_seg_brush(scene_pos, add=True):
                 self._seg_brush_active = True

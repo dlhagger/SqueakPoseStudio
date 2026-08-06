@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -13,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from layer_ops import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
+from squeakpose_core import commit_staged_paths, remove_path, staging_path_for
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
@@ -359,29 +363,166 @@ def _first_video_frame(video_path: str):
         cap.release()
 
 
-def _open_h264_video_writer(cv2_module: Any, output_path: Path, fps: float, width: int, height: int):
-    """Open a QuickTime-compatible H.264 MP4 writer or fail clearly."""
+class _PyAVH264VideoWriter:
+    """Stream BGR frames to an isolated, atomic PyAV H.264 export."""
+
+    def __init__(
+        self,
+        output_path: Path,
+        fps: float,
+        width: int,
+        height: int,
+    ) -> None:
+        self.output_path = os.path.abspath(os.fspath(output_path))
+        self.source_width = int(width)
+        self.source_height = int(height)
+        self.encoded_width = self.source_width + self.source_width % 2
+        self.encoded_height = self.source_height + self.source_height % 2
+        self.staged_path = staging_path_for(self.output_path)
+        self.process = None
+        self.stderr_file = tempfile.TemporaryFile(mode="w+b")
+        self.closed = False
+
+        try:
+            worker_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "squeakpose",
+                "workers",
+                "video_encoder.py",
+            )
+            command = [
+                sys.executable,
+                worker_path,
+                "--output",
+                self.staged_path,
+                "--fps",
+                repr(float(fps)),
+                "--width",
+                str(self.source_width),
+                "--height",
+                str(self.source_height),
+            ]
+            popen_kwargs: dict[str, Any] = {}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.stderr_file,
+                bufsize=0,
+                **popen_kwargs,
+            )
+            ready = self.process.stdout.readline() if self.process.stdout is not None else b""
+            if ready != b"READY\n":
+                self.process.wait()
+                raise AnalysisError(self._worker_error("PyAV encoder failed to start"))
+        except Exception as exc:
+            self._discard()
+            if isinstance(exc, AnalysisError):
+                raise
+            raise AnalysisError(
+                f"Could not open the PyAV H.264 encoder for {output_path}: {exc}"
+            ) from exc
+
+    def __enter__(self) -> "_PyAVH264VideoWriter":
+        return self
+
+    def __exit__(self, exc_type, _exc, _traceback) -> bool:
+        if exc_type is None:
+            self.close()
+        else:
+            self._discard()
+        return False
+
+    def write(self, frame: Any) -> None:
+        if self.closed or self.process is None or self.process.stdin is None:
+            raise AnalysisError("Cannot write to a closed video export.")
+        array = np.asarray(frame)
+        expected_shape = (self.source_height, self.source_width, 3)
+        if array.shape != expected_shape or array.dtype != np.uint8:
+            raise AnalysisError(
+                "Video frame does not match the export format: "
+                f"expected uint8 BGR {expected_shape}, got {array.dtype} {array.shape}."
+            )
+        try:
+            self.process.stdin.write(array.tobytes(order="C"))
+        except (BrokenPipeError, OSError) as exc:
+            self.process.wait()
+            raise AnalysisError(self._worker_error(f"Could not encode video frame: {exc}")) from exc
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            if self.process is None or self.process.stdin is None:
+                raise AnalysisError("The video encoder was not initialized.")
+            self.process.stdin.close()
+            return_code = self.process.wait()
+            if return_code != 0:
+                raise AnalysisError(self._worker_error("PyAV could not finalize the video export"))
+            self._close_process_handles()
+            commit_staged_paths([(self.staged_path, self.output_path)])
+            self.closed = True
+        except Exception as exc:
+            self._discard()
+            if isinstance(exc, AnalysisError):
+                raise
+            raise AnalysisError(f"Could not finalize video export {self.output_path}: {exc}") from exc
+
+    def _discard(self) -> None:
+        if self.closed:
+            return
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+                except Exception:
+                    pass
+        self._close_process_handles()
+        try:
+            remove_path(self.staged_path)
+        except Exception:
+            pass
+        self.closed = True
+
+    def _worker_error(self, fallback: str) -> str:
+        try:
+            self.stderr_file.flush()
+            self.stderr_file.seek(0)
+            detail = self.stderr_file.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            detail = ""
+        return detail or fallback
+
+    def _close_process_handles(self) -> None:
+        if self.process is not None:
+            for handle in (self.process.stdin, self.process.stdout):
+                if handle is not None and not handle.closed:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+        if not self.stderr_file.closed:
+            self.stderr_file.close()
+
+
+def _open_h264_video_writer(
+    output_path: Path,
+    fps: float,
+    width: int,
+    height: int,
+) -> _PyAVH264VideoWriter:
+    """Open the bundled PyAV/libx264 encoder or fail with an actionable error."""
     if width <= 0 or height <= 0:
         raise AnalysisError(f"Cannot export video with invalid frame size {width}x{height}.")
-
-    attempted: list[str] = []
-    for codec in ("avc1", "H264"):
-        attempted.append(codec)
-        writer = cv2_module.VideoWriter(
-            str(output_path),
-            cv2_module.VideoWriter_fourcc(*codec),
-            float(fps or 30.0),
-            (int(width), int(height)),
-        )
-        if writer is not None and writer.isOpened():
-            return writer
-        if writer is not None:
-            writer.release()
-
-    raise AnalysisError(
-        "Could not open an H.264 video encoder "
-        f"({', '.join(attempted)}) for {output_path}."
-    )
+    if not math.isfinite(float(fps)) or float(fps) <= 0:
+        raise AnalysisError(f"Cannot export video with invalid frame rate {fps}.")
+    return _PyAVH264VideoWriter(output_path, fps, width, height)
 
 
 def _plot_if_column(df: pd.DataFrame, x_col: str, y_col: str, path: Path, ylabel: str, title: str) -> Optional[str]:
@@ -666,69 +807,68 @@ def render_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-    writer = _open_h264_video_writer(cv2, output_path, video_fps, width, height)
     rows_by_frame = {int(row["frame_index"]): row for _, row in df.iterrows() if not pd.isna(row.get("frame_index"))}
     normalized_rois = normalize_rois(rois or [])
 
     frame_idx = 0
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            for roi in normalized_rois:
-                x1, y1, x2, y2 = [int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
-                cv2.putText(
-                    frame,
-                    str(roi["name"]),
-                    (x1 + 4, max(y1 + 18, 18)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (66, 191, 245),
-                    2,
-                )
-            row = rows_by_frame.get(frame_idx)
-            if row is not None:
-                bbox_vals = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
-                if not any(pd.isna(v) for v in bbox_vals):
-                    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cx = row.get("bbox_center_x_euro")
-                cy = row.get("bbox_center_y_euro")
-                if not pd.isna(cx) and not pd.isna(cy):
-                    cv2.circle(frame, (int(round(float(cx))), int(round(float(cy)))), 4, (0, 0, 255), -1)
-                text = f"Frame: {frame_idx}"
-                if not pd.isna(row.get("cumulative_distance_mm")):
-                    text += f" | Distance: {float(row['cumulative_distance_mm']):.1f} mm"
-                cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                speed_val = row.get("speed_mm_per_sec")
-                if not pd.isna(speed_val):
+        with _open_h264_video_writer(output_path, video_fps, width, height) as writer:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                for roi in normalized_rois:
+                    x1, y1, x2, y2 = [int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
                     cv2.putText(
                         frame,
-                        f"Speed: {float(speed_val):.1f} mm/s",
-                        (10, 60),
+                        str(roi["name"]),
+                        (x1 + 4, max(y1 + 18, 18)),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
+                        0.55,
+                        (66, 191, 245),
                         2,
                     )
-                roi_label = row.get("roi_label")
-                if isinstance(roi_label, str) and roi_label:
-                    cv2.putText(
-                        frame,
-                        f"ROI: {roi_label}",
-                        (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
-            writer.write(frame)
-            frame_idx += 1
+                row = rows_by_frame.get(frame_idx)
+                if row is not None:
+                    bbox_vals = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
+                    if not any(pd.isna(v) for v in bbox_vals):
+                        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    cx = row.get("bbox_center_x_euro")
+                    cy = row.get("bbox_center_y_euro")
+                    if not pd.isna(cx) and not pd.isna(cy):
+                        cv2.circle(frame, (int(round(float(cx))), int(round(float(cy)))), 4, (0, 0, 255), -1)
+                    text = f"Frame: {frame_idx}"
+                    if not pd.isna(row.get("cumulative_distance_mm")):
+                        text += f" | Distance: {float(row['cumulative_distance_mm']):.1f} mm"
+                    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    speed_val = row.get("speed_mm_per_sec")
+                    if not pd.isna(speed_val):
+                        cv2.putText(
+                            frame,
+                            f"Speed: {float(speed_val):.1f} mm/s",
+                            (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                        )
+                    roi_label = row.get("roi_label")
+                    if isinstance(roi_label, str) and roi_label:
+                        cv2.putText(
+                            frame,
+                            f"ROI: {roi_label}",
+                            (10, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                        )
+                writer.write(frame)
+                frame_idx += 1
     finally:
         cap.release()
-        writer.release()
     return str(output_path)
 
 
@@ -872,15 +1012,12 @@ def export_cluster_clips(
                 end_frame = min(start_frame + frames_per_clip, frame_count)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
                 clip_path = clip_dir / f"cluster_{cluster_id:02d}_sample_{clip_idx:02d}.mp4"
-                writer = _open_h264_video_writer(cv2, clip_path, video_fps, width, height)
-                try:
+                with _open_h264_video_writer(clip_path, video_fps, width, height) as writer:
                     while cap.get(cv2.CAP_PROP_POS_FRAMES) < end_frame:
                         ok, frame = cap.read()
                         if not ok:
                             break
                         writer.write(frame)
-                finally:
-                    writer.release()
                 paths.append(str(clip_path))
     finally:
         cap.release()

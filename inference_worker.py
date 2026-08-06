@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 from typing import Any, Callable, Optional
 
 from inference_ops import (
+    run_depth_video_inference,
     run_pose_video_inference,
     run_segmentation_video_inference,
 )
@@ -77,7 +79,7 @@ def run_inference_worker(
             return 1
         model_factory = YOLO
 
-    if cv2_module is None and mode == "pose":
+    if cv2_module is None and mode in {"pose", "depth"}:
         try:
             import cv2 as cv2_module
         except Exception as exc:
@@ -119,7 +121,31 @@ def run_inference_worker(
             },
         )
 
-    if mode in {"segment", "segmentation"}:
+    if mode == "depth":
+        try:
+            import numpy as np
+        except Exception as exc:
+            _emit_event(event_writer, {"event": "error", "error_message": f"Could not import NumPy: {exc}"})
+            return 1
+        preview_path = str(config.get("preview_path") or "")
+        if not preview_path:
+            root, _ext = os.path.splitext(csv_path)
+            preview_path = root + "_preview.mp4"
+        result = run_depth_video_inference(
+            model=model,
+            cv2_module=cv2_module,
+            numpy_module=np,
+            video_path=video_path,
+            csv_path=csv_path,
+            preview_path=preview_path,
+            model_path=model_path,
+            device=device,
+            total_frames=total_frames,
+            fps=fps,
+            progress_callback=progress,
+            cancel_requested=_cancel_requested,
+        )
+    elif mode in {"segment", "segmentation"}:
         result = run_segmentation_video_inference(
             model=model,
             video_path=video_path,
@@ -152,6 +178,7 @@ def run_inference_worker(
         {
             "event": "result",
             "csv_path": result.csv_path,
+            "preview_path": result.preview_path,
             "rows_written": int(result.rows_written),
             "processed_frames": int(result.processed_frames),
             "canceled": bool(result.canceled),

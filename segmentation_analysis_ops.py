@@ -538,58 +538,57 @@ def render_segmentation_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-    writer = _open_h264_video_writer(cv2, output_path, video_fps, width, height)
     rows_by_frame = {int(row["frame_index"]): row for _, row in primary.iterrows() if not pd.isna(row.get("frame_index"))}
     normalized_rois = normalize_rois(rois or [])
 
     frame_idx = 0
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        with _open_h264_video_writer(output_path, video_fps, width, height) as writer:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
 
-            for roi in normalized_rois:
-                x1, y1, x2, y2 = [int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
-                cv2.putText(frame, str(roi["name"]), (x1 + 4, max(y1 + 18, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (66, 191, 245), 2)
+                for roi in normalized_rois:
+                    x1, y1, x2, y2 = [int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
+                    cv2.putText(frame, str(roi["name"]), (x1 + 4, max(y1 + 18, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (66, 191, 245), 2)
 
-            row = rows_by_frame.get(frame_idx)
-            if row is not None:
-                bbox_vals = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
-                if not any(pd.isna(v) for v in bbox_vals):
-                    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                row = rows_by_frame.get(frame_idx)
+                if row is not None:
+                    bbox_vals = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
+                    if not any(pd.isna(v) for v in bbox_vals):
+                        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-                points = _parse_polygon(row.get("mask_polygon"))
-                if len(points) >= 3:
-                    contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(frame, [contour], isClosed=True, color=(0, 255, 255), thickness=2)
+                    points = _parse_polygon(row.get("mask_polygon"))
+                    if len(points) >= 3:
+                        contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(frame, [contour], isClosed=True, color=(0, 255, 255), thickness=2)
 
-                cx = row.get("bbox_center_x_euro")
-                cy = row.get("bbox_center_y_euro")
-                if not pd.isna(cx) and not pd.isna(cy):
-                    cv2.circle(frame, (int(round(float(cx))), int(round(float(cy)))), 4, (0, 0, 255), -1)
+                    cx = row.get("bbox_center_x_euro")
+                    cy = row.get("bbox_center_y_euro")
+                    if not pd.isna(cx) and not pd.isna(cy):
+                        cv2.circle(frame, (int(round(float(cx))), int(round(float(cy)))), 4, (0, 0, 255), -1)
 
-                text = f"Frame: {frame_idx}"
-                speed_val = row.get("speed_mm_per_sec")
-                if not pd.isna(speed_val):
-                    text += f" | Speed: {float(speed_val):.1f} mm/s"
-                cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    text = f"Frame: {frame_idx}"
+                    speed_val = row.get("speed_mm_per_sec")
+                    if not pd.isna(speed_val):
+                        text += f" | Speed: {float(speed_val):.1f} mm/s"
+                    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                area_val = row.get("mask_area_px2")
-                if not pd.isna(area_val):
-                    cv2.putText(frame, f"Mask area: {float(area_val):.0f} px^2", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    area_val = row.get("mask_area_px2")
+                    if not pd.isna(area_val):
+                        cv2.putText(frame, f"Mask area: {float(area_val):.0f} px^2", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                roi_label = row.get("roi_label")
-                if isinstance(roi_label, str) and roi_label:
-                    cv2.putText(frame, f"ROI: {roi_label}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    roi_label = row.get("roi_label")
+                    if isinstance(roi_label, str) and roi_label:
+                        cv2.putText(frame, f"ROI: {roi_label}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            writer.write(frame)
-            frame_idx += 1
+                writer.write(frame)
+                frame_idx += 1
     finally:
         cap.release()
-        writer.release()
     return str(output_path)
 
 

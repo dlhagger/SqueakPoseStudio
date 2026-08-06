@@ -2,9 +2,10 @@
 
 SqueakPose Studio is a desktop application for small-animal image annotation,
 YOLO dataset creation, model training, prediction review, and video inference.
-It uses independent **Keypoints** and **Segmentation** layers. Each layer keeps
-its own labels, classes, model, dataset/training defaults, inference outputs,
-and analysis context while sharing the same project images.
+It uses independent **Keypoints**, **Segmentation**, and **Depth** layers. The
+editable layers keep separate labels, classes, dataset/training defaults, and
+analysis context; every layer keeps its own model and inference outputs while
+sharing the same project images.
 
 The application is built with PyQt6, PyTorch, and Ultralytics YOLO. Model-heavy
 operations run in child processes so training, prediction, and inference do not
@@ -19,6 +20,8 @@ block the main interface.
   visibility states, and model-assisted predictions.
 - Segmentation annotation with positive and negative SAM prompts, mask previews,
   and add/erase brush editing.
+- Inference-only depth maps for images, with raw NumPy data, color previews,
+  and compact metadata saved together.
 - YOLO keypoint/pose and segmentation dataset export with reproducible
   train/validation splits.
 - Layer-aware YOLOv26 training for keypoints/pose and segmentation.
@@ -26,7 +29,8 @@ block the main interface.
   optional DINO-distilled backbones.
 - Single-image prediction and a video reviewer for finding and exporting useful
   frames back into the labeling queue.
-- Batched video inference with per-frame CSV output.
+- Video inference with per-frame CSV output; depth passes also save a colorized
+  MP4 preview.
 - Qt-free helper modules with unit tests for label, dataset, prediction,
   inference, and training logic.
 
@@ -90,16 +94,21 @@ project/
 ├── annotations/
 │   ├── keypoints/         # rendered keypoint previews
 │   └── segmentation/      # rendered segmentation previews
+├── depth maps/
+│   ├── images/            # raw float32 .npy maps and JSON metadata
+│   └── previews/          # colorized depth-map PNG files
 ├── datasets/              # exported YOLO datasets
 ├── runs/                  # training output
 ├── templates/             # pose annotation templates
 ├── inference outputs/
 │   ├── keypoints/         # keypoint-layer video inference CSV files
 │   ├── segmentation/      # segmentation-layer video inference CSV files
+│   ├── depth/             # depth CSV summaries and preview videos
 │   └── runs/              # manifests linking multi-layer inference passes
 ├── analysis outputs/
 │   ├── keypoints/         # keypoint-layer analysis runs
-│   └── segmentation/      # segmentation-layer analysis runs
+│   ├── segmentation/      # segmentation-layer analysis runs
+│   └── depth/             # reserved for future depth analysis
 ├── logs/
 ├── classes.txt
 ├── keypoints.txt
@@ -114,14 +123,20 @@ to return to the launcher.
 ## Labeling
 
 Add source images to the project's `images_to_label/` directory, then select
-**Keypoints Layer** or **Segmentation Layer** from the layer selector.
+**Keypoints Layer**, **Segmentation Layer**, or **Depth Layer** from the layer selector.
 
 Switching layers changes what is editable without replacing the other layer's
 data. The active layer determines which label directory, class schema, YOLO
 model, dataset export, training task, inference destination, and analysis
 validation rules are used. Saved annotations from the other layer can remain
-visible as a dimmed, read-only reference and can be toggled with the **Show**
-checkboxes.
+visible as dimmed, read-only references and can be toggled with the layer
+visibility pills.
+
+The **Keypoints**, **Segmentation**, and **Depth** pills are independent
+visibility toggles. For example, while editing Keypoints you can switch the
+saved Depth preview on as a translucent image overlay without changing the
+active editing layer. Multiple non-active layers can be visible together, and
+their visibility choices are saved with the project.
 
 Image filenames must have unique stems, including across extensions and letter
 case. For example, `frame.jpg`, `frame.png`, and `Frame.jpg` cannot coexist in
@@ -181,6 +196,40 @@ prioritizes `sam3.pt`. Accepted polygons are written in YOLO segmentation
 format to `labels_seg_all/<image-stem>.txt`.
 
 In mask edit mode, left-drag adds to a mask and right-drag erases from it.
+
+### Depth Layer
+
+The Depth layer is an inference-only, model-assisted labeling tool in the MVP,
+similar to SAM for Segmentation. In the left-side **Depth Assistant** panel,
+choose a compatible checkpoint or use the YOLO26 Depth menu to choose `n`,
+`s`, `m`, `l`, or `x`. Built-in models are
+downloaded by Ultralytics the first time they are used if not already cached;
+larger variants trade additional compute for better benchmark accuracy.
+
+Select an image and run **Predict**. A successful prediction saves:
+
+- `depth maps/images/<image-stem>.npy`, the raw float32 depth map;
+- `depth maps/images/<image-stem>_depth.json`, model and range metadata; and
+- `depth maps/previews/<image-stem>_depth.png`, the colorized display image.
+
+The displayed colors use inverse depth so nearer regions appear brighter. The
+stored numeric values remain unchanged and are labeled `model_default`; the
+MVP does not perform scene-specific scale calibration or depth-map editing.
+The separate **Depth Display** panel switches between the original image,
+standalone depth map, and a blended overlay. **Depth Range** reports the saved
+2nd–98th percentile range and median in meters so unusually compressed or
+extreme predictions are easier to spot.
+
+While viewing the Depth layer, right-click any image pixel to sample its raw
+`.npy` depth value. Numbered markers remain visible for up to six probes, and
+the Depth Range panel lists their pixel coordinates, values in meters, and the
+absolute difference between the two most recent valid samples. This supports
+quick comparisons between an animal mask and nearby background; **Clear
+Probes** removes the current markers.
+
+When saved keypoints are toggled on in the Depth layer, each visible keypoint
+label also includes the aligned raw depth (for example, `nose · 0.842 m`).
+This is a display-only spot check and does not modify the keypoint annotations.
 
 ### Main Shortcuts
 
@@ -285,11 +334,13 @@ project-aware command-line entry point is `distillation/distiller.py`.
 
 Use **Project Models…** to assign `.pt`, `.yaml`, or `.onnx` prediction models
 to the Keypoints and Segmentation layers. The selections are remembered with
-the project. SAM remains a separate prompt-based labeling assistant.
+the project. SAM and Depth use their dedicated model-assistant panels on the
+left side of the labeling window.
 
 Single-image prediction applies the best prediction for each class to the
 current image. Pose predictions populate boxes and keypoints; segmentation
-predictions populate boxes and masks.
+predictions populate boxes and masks; depth prediction saves and displays a
+dense map.
 
 The **Video Reviewer** supports `.mp4`, `.mov`, `.avi`, and `.mkv` files. It
 can:
@@ -326,7 +377,8 @@ Video Reviewer shortcuts include:
 
 Video inference runs every configured project prediction model sequentially.
 Each layer writes its own compatible CSV, and a run manifest links the passes.
-If one pass fails, completed output from the other layer is retained.
+Depth inference writes one summary row per frame and a colorized preview MP4.
+If one pass fails, completed output from the other layers is retained.
 
 Pose output includes frame/time metadata, class and confidence, bounding boxes,
 tracking IDs when available, speed values, and absolute/normalized keypoint
@@ -340,7 +392,8 @@ already-written CSV rows and reports the output as partial.
 
 ## Analysis
 
-Use **Analysis** in the right-hand panel to run the repeatable parts of
+For the Keypoints and Segmentation layers, use **Analysis** in the right-hand
+panel to run the repeatable parts of
 `analysis_toolset/analysis_toolkit.ipynb` from a GUI. The dialog opens in the
 active layer's context, prefers that layer's inference directory, and rejects a
 CSV whose schema belongs to the other layer. It loads a source

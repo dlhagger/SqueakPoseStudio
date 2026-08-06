@@ -9,6 +9,7 @@ from typing import Any
 
 LAYER_KEYPOINTS = "keypoints"
 LAYER_SEGMENTATION = "segmentation"
+LAYER_DEPTH = "depth"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,10 @@ class LayerDefinition:
     dataset_task: str
     dataset_directory: str
     inference_suffix: str
+    editable_annotations: bool = True
+    uses_classes: bool = True
+    supports_training: bool = True
+    dense_output: bool = False
 
     @property
     def supports_keypoints(self) -> bool:
@@ -34,6 +39,10 @@ class LayerDefinition:
     @property
     def supports_masks(self) -> bool:
         return self.id == LAYER_SEGMENTATION
+
+    @property
+    def supports_depth(self) -> bool:
+        return self.id == LAYER_DEPTH
 
 
 LAYER_DEFINITIONS: dict[str, LayerDefinition] = {
@@ -63,6 +72,23 @@ LAYER_DEFINITIONS: dict[str, LayerDefinition] = {
         dataset_directory="segment",
         inference_suffix="_segmentation.csv",
     ),
+    LAYER_DEPTH: LayerDefinition(
+        id=LAYER_DEPTH,
+        display_name="Depth",
+        annotation_name="dense depth maps",
+        model_task="depth",
+        worker_mode="depth",
+        label_directory="",
+        class_file="",
+        keypoint_file="",
+        dataset_task="depth",
+        dataset_directory="depth",
+        inference_suffix="_depth.csv",
+        editable_annotations=False,
+        uses_classes=False,
+        supports_training=False,
+        dense_output=True,
+    ),
 }
 
 
@@ -76,6 +102,9 @@ _LAYER_ALIASES = {
     "seg": LAYER_SEGMENTATION,
     "mask": LAYER_SEGMENTATION,
     "masks": LAYER_SEGMENTATION,
+    LAYER_DEPTH: LAYER_DEPTH,
+    "depths": LAYER_DEPTH,
+    "monocular-depth": LAYER_DEPTH,
 }
 
 

@@ -4,8 +4,11 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
+
 from inference_ops import (
     probe_video_metadata,
+    run_depth_video_inference,
     run_pose_video_inference,
     run_segmentation_video_inference,
     segmentation_rows_from_result,
@@ -103,11 +106,44 @@ class _FakeCv2:
         self.opened = opened
         self.fps = fps
         self.captures = []
+        self.writers = []
 
     def VideoCapture(self, _path):
         cap = _FakeCapture(self.frames, opened=self.opened, fps=self.fps)
         self.captures.append(cap)
         return cap
+
+    @staticmethod
+    def VideoWriter_fourcc(*_args):
+        return 1234
+
+    def VideoWriter(self, path, _fourcc, fps, size):
+        writer = _FakeWriter(path, fps, size)
+        self.writers.append(writer)
+        return writer
+
+    @staticmethod
+    def resize(array, size):
+        width, height = size
+        return np.resize(array, (height, width, array.shape[2]))
+
+
+class _FakeWriter:
+    def __init__(self, path, fps, size):
+        self.path = path
+        self.fps = fps
+        self.size = size
+        self.frames = []
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def write(self, frame):
+        self.frames.append(np.asarray(frame).copy())
+
+    def release(self):
+        self.released = True
 
 
 class _PoseModel:
@@ -131,6 +167,23 @@ class _SegModel:
     def predict(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return iter(self.results)
+
+
+class _DepthResult:
+    def __init__(self, data):
+        self.depth = type("Depth", (), {"data": np.asarray(data, dtype=np.float32)})()
+
+
+class _DepthModel:
+    task = "depth"
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def predict(self, **kwargs):
+        self.calls.append(kwargs)
+        return [self.results.pop(0)]
 
 
 class InferenceOpsTests(unittest.TestCase):
@@ -298,6 +351,39 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(rows[0]["binary_mask"], "")
             self.assertEqual(rows[0]["mask_polygon"], "[[1, 2], [11, 2], [11, 12]]")
 
+    def test_run_depth_video_inference_writes_summary_and_preview(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "depth.csv")
+            preview_path = os.path.join(tmp, "depth_preview.mp4")
+            cv2 = _FakeCv2(
+                [np.zeros((2, 3, 3), dtype=np.uint8)], fps=10.0
+            )
+            model = _DepthModel([_DepthResult([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]])])
+
+            result = run_depth_video_inference(
+                model=model,
+                cv2_module=cv2,
+                numpy_module=np,
+                video_path="video.mp4",
+                csv_path=csv_path,
+                preview_path=preview_path,
+                model_path="yolo26n-depth.pt",
+                device="cpu",
+                total_frames=1,
+                fps=10.0,
+            )
+
+            self.assertFalse(result.had_error)
+            self.assertEqual(result.rows_written, 1)
+            self.assertEqual(result.preview_path, preview_path)
+            self.assertEqual(len(cv2.writers[0].frames), 1)
+            self.assertTrue(cv2.writers[0].released)
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["frame_index"], "0")
+            self.assertEqual(rows[0]["median_depth"], "2.5")
+            self.assertEqual(rows[0]["scale_status"], "model_default")
+
     def test_segmentation_inference_cancellation_preserves_completed_rows(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "seg.csv")
@@ -358,6 +444,36 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(result_event["rows_written"], 1)
             self.assertFalse(result_event["had_error"])
             self.assertTrue(Path(csv_path).exists())
+
+    def test_inference_worker_runs_depth_config_and_reports_preview(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "worker_depth.csv")
+            preview_path = os.path.join(tmp, "worker_depth_preview.mp4")
+            cv2 = _FakeCv2([np.zeros((2, 2, 3), dtype=np.uint8)], fps=5.0)
+            model = _DepthModel([_DepthResult([[1.0, 2.0], [3.0, 4.0]])])
+            events = []
+
+            exit_code = run_inference_worker(
+                {
+                    "mode": "depth",
+                    "layer_id": "depth",
+                    "model_path": "yolo26n-depth.pt",
+                    "video_path": "video.mp4",
+                    "csv_path": csv_path,
+                    "preview_path": preview_path,
+                    "device": "cpu",
+                    "total_frames": 1,
+                    "fps": 5.0,
+                },
+                model_factory=lambda _path: model,
+                cv2_module=cv2,
+                event_writer=events.append,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(events[-1]["event"], "result")
+            self.assertEqual(events[-1]["preview_path"], preview_path)
+            self.assertEqual(events[-1]["processed_frames"], 1)
 
     def test_inference_worker_rejects_missing_model_path(self):
         events = []

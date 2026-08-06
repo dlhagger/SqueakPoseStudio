@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from depth_ops import colorize_depth_map, depth_array_from_result, depth_map_summary
 from squeakpose_core import InferenceCsvWriter, build_segmentation_inference_rows
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -26,6 +27,7 @@ class VideoMetadata:
 @dataclass
 class InferenceRunResult:
     csv_path: str
+    preview_path: str = ""
     rows_written: int = 0
     processed_frames: int = 0
     canceled: bool = False
@@ -79,6 +81,25 @@ SEGMENTATION_FIELDNAMES = [
     "y2",
     "mask_polygon",
     "binary_mask",
+]
+
+DEPTH_FIELDNAMES = [
+    "video_path",
+    "model_path",
+    "frame_index",
+    "time_seconds",
+    "image_width",
+    "image_height",
+    "depth_width",
+    "depth_height",
+    "valid_pixels",
+    "min_depth",
+    "max_depth",
+    "median_depth",
+    "p02_depth",
+    "p98_depth",
+    "units",
+    "scale_status",
 ]
 
 
@@ -652,6 +673,147 @@ def run_segmentation_video_inference(
         result.had_error = True
         result.error_message = str(exc)
     finally:
+        if csv_handle is not None:
+            try:
+                csv_handle.flush()
+            except Exception:
+                pass
+            try:
+                csv_handle.close()
+            except Exception:
+                pass
+        gc.collect()
+    return result
+
+
+def run_depth_video_inference(
+    *,
+    model: Any,
+    cv2_module: Any,
+    numpy_module: Any,
+    video_path: str,
+    csv_path: str,
+    preview_path: str,
+    model_path: str,
+    device: str,
+    total_frames: int,
+    fps: float,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_requested: Optional[CancelCallback] = None,
+) -> InferenceRunResult:
+    """Save per-frame depth summaries plus a colorized preview video."""
+    result = InferenceRunResult(csv_path=csv_path, preview_path=preview_path)
+    csv_handle = None
+    cap = None
+    video_writer = None
+    try:
+        if cv2_module is None or numpy_module is None:
+            raise RuntimeError("OpenCV and NumPy are required for depth video inference.")
+        csv_handle = open(csv_path, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(csv_handle, fieldnames=DEPTH_FIELDNAMES)
+        writer.writeheader()
+
+        cap = cv2_module.VideoCapture(video_path)
+        if cap is None or not cap.isOpened():
+            raise RuntimeError(f"Unable to open video: {video_path}")
+
+        frame_index = 0
+        while True:
+            if cancel_requested and cancel_requested():
+                result.canceled = True
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            predictions = list(
+                model.predict(
+                    source=frame,
+                    imgsz=768,
+                    device=device,
+                    verbose=False,
+                )
+            )
+            if len(predictions) != 1:
+                raise RuntimeError(
+                    "Depth prediction returned "
+                    f"{len(predictions)} results for one input frame."
+                )
+            depth_map = depth_array_from_result(
+                predictions[0], numpy_module=numpy_module
+            )
+            summary = depth_map_summary(depth_map, numpy_module=numpy_module)
+            preview_rgb = colorize_depth_map(
+                depth_map, numpy_module=numpy_module, mode="disparity"
+            )
+
+            frame_height, frame_width = frame.shape[:2]
+            if preview_rgb.shape[:2] != (frame_height, frame_width):
+                raise RuntimeError(
+                    "Depth map is not aligned to its video frame: "
+                    f"map {preview_rgb.shape[:2]}, "
+                    f"frame {(frame_height, frame_width)}."
+                )
+            if video_writer is None:
+                os.makedirs(os.path.dirname(os.path.abspath(preview_path)), exist_ok=True)
+                fourcc = cv2_module.VideoWriter_fourcc(*"mp4v")
+                video_writer = cv2_module.VideoWriter(
+                    preview_path,
+                    fourcc,
+                    float(fps if fps > 0 else 30.0),
+                    (int(frame_width), int(frame_height)),
+                )
+                if not video_writer.isOpened():
+                    raise RuntimeError(
+                        f"Unable to create depth preview video: {preview_path}"
+                    )
+            video_writer.write(preview_rgb[..., ::-1])
+
+            writer.writerow(
+                {
+                    "video_path": video_path,
+                    "model_path": model_path,
+                    "frame_index": frame_index,
+                    "time_seconds": (frame_index / fps) if fps > 0 else "",
+                    "image_width": int(frame_width),
+                    "image_height": int(frame_height),
+                    "depth_width": summary["width"],
+                    "depth_height": summary["height"],
+                    "valid_pixels": summary["valid_pixels"],
+                    "min_depth": summary["min_depth"],
+                    "max_depth": summary["max_depth"],
+                    "median_depth": summary["median_depth"],
+                    "p02_depth": summary["p02_depth"],
+                    "p98_depth": summary["p98_depth"],
+                    "units": "estimated_meters",
+                    "scale_status": "model_default",
+                }
+            )
+            result.rows_written += 1
+            result.processed_frames += 1
+            frame_index += 1
+            if result.processed_frames % 100 == 0:
+                csv_handle.flush()
+            if progress_callback:
+                progress_callback(
+                    result.processed_frames,
+                    total_frames,
+                    _progress_message(result.processed_frames, total_frames),
+                )
+    except Exception as exc:
+        result.had_error = True
+        result.error_message = str(exc)
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        if video_writer is not None:
+            try:
+                video_writer.release()
+            except Exception:
+                pass
         if csv_handle is not None:
             try:
                 csv_handle.flush()

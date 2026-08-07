@@ -2,6 +2,7 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
+from squeakpose.project.safety import ProjectPathError
 from squeakpose.services.annotation_save import (
     AnnotationSaveRequest,
     save_annotation_transaction,
@@ -11,6 +12,7 @@ from squeakpose.services.annotation_save import (
 class AnnotationSaveServiceTests(unittest.TestCase):
     def _request(self, root: str) -> AnnotationSaveRequest:
         return AnnotationSaveRequest(
+            project_root=root,
             source_image_path=os.path.join(root, "queue", "frame.jpg"),
             image_output_path=os.path.join(root, "images", "frame.jpg"),
             label_output_path=os.path.join(root, "labels", "frame.txt"),
@@ -95,6 +97,7 @@ class AnnotationSaveServiceTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             request = self._request(tmp)
             invalid = AnnotationSaveRequest(
+                project_root=tmp,
                 source_image_path=request.source_image_path,
                 image_output_path=request.image_output_path,
                 label_output_path=request.label_output_path,
@@ -109,6 +112,7 @@ class AnnotationSaveServiceTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             missing_image = os.path.join(tmp, "images", "missing.jpg")
             request = AnnotationSaveRequest(
+                project_root=tmp,
                 source_image_path=missing_image,
                 image_output_path=missing_image,
                 label_output_path=os.path.join(tmp, "labels", "missing.txt"),
@@ -143,6 +147,23 @@ class AnnotationSaveServiceTests(unittest.TestCase):
                 self.assertEqual(fh.read(), b"existing image")
             self.assertTrue(os.path.isfile(result.label_path))
             self.assertTrue(os.path.isfile(result.overlay_path))
+
+    def test_transaction_rejects_output_outside_project(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as outside:
+            request = self._request(tmp)
+            escaped = AnnotationSaveRequest(
+                project_root=tmp,
+                source_image_path=request.source_image_path,
+                image_output_path=os.path.join(outside, "frame.jpg"),
+                label_output_path=request.label_output_path,
+                overlay_output_path=request.overlay_output_path,
+                label_text=request.label_text,
+            )
+
+            with self.assertRaises(ProjectPathError):
+                save_annotation_transaction(escaped, render_overlay=lambda _path: True)
+
+            self.assertFalse(os.path.exists(escaped.image_output_path))
 
 
 if __name__ == "__main__":

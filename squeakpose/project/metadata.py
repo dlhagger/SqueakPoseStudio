@@ -17,6 +17,7 @@ from squeakpose_core import (
 )
 
 from .paths import PROJECT_META_FILE
+from .safety import require_path_within_project
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,12 @@ class ProjectMetadataStore:
 
     def __init__(self, project_root: str):
         self.project_root = os.path.abspath(project_root)
-        self.path = os.path.join(self.project_root, PROJECT_META_FILE)
+        self.path = require_path_within_project(
+            self.project_root,
+            os.path.join(self.project_root, PROJECT_META_FILE),
+            purpose="project metadata path",
+            allow_root=False,
+        )
 
     def read(self) -> MetadataReadResult:
         if not os.path.isfile(self.path):
@@ -154,6 +160,12 @@ class ProjectMetadataStore:
         backup_path = os.path.join(
             self.project_root,
             f"squeakpose_project.corrupt-{timestamp}.json",
+        )
+        require_path_within_project(
+            self.project_root,
+            backup_path,
+            purpose="project metadata recovery path",
+            allow_root=False,
         )
         suffix = 1
         while os.path.exists(backup_path):

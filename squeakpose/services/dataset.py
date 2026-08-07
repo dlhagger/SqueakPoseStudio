@@ -14,6 +14,7 @@ from dataset_ops import (
     export_dataset_files,
     write_dataset_yaml_for_mode,
 )
+from squeakpose.project.safety import require_path_within_project
 from squeakpose_core import commit_staged_paths, remove_path
 
 ProgressCallback = Callable[[int, str], None]
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 def export_dataset_transaction(
     *,
+    project_root: str,
     images_all_dir: str,
     labels_all_dir: str,
     final_paths: DatasetExportPaths,
@@ -39,6 +41,18 @@ def export_dataset_transaction(
     committer: Committer = commit_staged_paths,
 ) -> DatasetExportResult:
     """Build an export in staging and install it only when complete."""
+    for purpose, path in (
+        ("dataset source images", images_all_dir),
+        ("dataset source labels", labels_all_dir),
+        ("dataset export", final_paths.base_dir),
+        ("dataset YAML", final_paths.dataset_yaml_path),
+    ):
+        require_path_within_project(
+            project_root,
+            path,
+            purpose=purpose,
+            allow_root=False,
+        )
     os.makedirs(os.path.dirname(final_paths.base_dir), exist_ok=True)
     staging_base = tempfile.mkdtemp(
         prefix=f".{mode}-export-",

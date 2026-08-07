@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from dataset_ops import DATASET_DETECT, dataset_export_paths
+from squeakpose.project.safety import ProjectPathError
 from squeakpose.services.dataset import export_dataset_transaction
 
 
@@ -25,6 +26,7 @@ class DatasetServiceTests(unittest.TestCase):
             paths = dataset_export_paths(tmp, DATASET_DETECT)
 
             result = export_dataset_transaction(
+                project_root=tmp,
                 images_all_dir=images,
                 labels_all_dir=labels,
                 final_paths=paths,
@@ -58,6 +60,7 @@ class DatasetServiceTests(unittest.TestCase):
             with self.assertLogs("squeakpose.services.dataset", level="ERROR") as logs:
                 with self.assertRaises(OSError):
                     export_dataset_transaction(
+                        project_root=tmp,
                         images_all_dir=images,
                         labels_all_dir=labels,
                         final_paths=paths,
@@ -93,6 +96,7 @@ class DatasetServiceTests(unittest.TestCase):
                 self.assertLogs("squeakpose.services.dataset", level="WARNING") as logs,
             ):
                 result = export_dataset_transaction(
+                    project_root=tmp,
                     images_all_dir=images,
                     labels_all_dir=labels,
                     final_paths=paths,
@@ -108,6 +112,25 @@ class DatasetServiceTests(unittest.TestCase):
             self.assertTrue(
                 any("Could not remove dataset staging directory" in line for line in logs.output)
             )
+
+    def test_transaction_rejects_export_outside_project(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as outside:
+            images, labels = self._source_project(tmp)
+            outside_paths = dataset_export_paths(outside, DATASET_DETECT)
+
+            with self.assertRaises(ProjectPathError):
+                export_dataset_transaction(
+                    project_root=tmp,
+                    images_all_dir=images,
+                    labels_all_dir=labels,
+                    final_paths=outside_paths,
+                    train_images=["frame.jpg"],
+                    val_images=[],
+                    mode=DATASET_DETECT,
+                    classes=["mouse"],
+                    keypoint_names=["nose"],
+                    split_seed=0,
+                )
 
 
 if __name__ == "__main__":

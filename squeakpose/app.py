@@ -7,7 +7,7 @@ import sys
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFontDatabase, QIcon, QPixmap
-from PyQt6.QtWidgets import QApplication, QDialog, QSplashScreen
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QSplashScreen
 
 from squeakpose.project.paths import (
     default_projects_root,
@@ -16,6 +16,7 @@ from squeakpose.project.paths import (
     project_window_title,
     save_last_project,
 )
+from squeakpose.project.safety import ProjectPathError
 from ui_style import app_stylesheet
 
 
@@ -27,6 +28,7 @@ def run(argv: list[str] | None = None) -> int:
         DEFAULT_CLASS_NAMES,
         LabelingApp,
         ProjectLauncherDialog,
+        _acquire_project_lock_for_ui,
         _ensure_qt_plugin_paths,
         _retain_main_window,
     )
@@ -49,10 +51,22 @@ def run(argv: list[str] | None = None) -> int:
     if not project_root:
         return 0
 
-    project_paths = ensure_project_structure(
-        project_root,
-        default_segmentation_classes=tuple(DEFAULT_CLASS_NAMES),
-    )
+    project_lock = _acquire_project_lock_for_ui(project_root, parent=launcher)
+    if project_lock is None:
+        return 1
+    try:
+        project_paths = ensure_project_structure(
+            project_root,
+            default_segmentation_classes=tuple(DEFAULT_CLASS_NAMES),
+        )
+    except (OSError, ProjectPathError) as exc:
+        project_lock.release()
+        QMessageBox.critical(
+            launcher,
+            "Invalid Project Structure",
+            f"The selected project contains an unsafe or unavailable managed path.\n\n{exc}",
+        )
+        return 1
     save_last_project(project_root)
     force_initial_setup = launcher.selection_mode == "create"
 
@@ -87,14 +101,26 @@ def run(argv: list[str] | None = None) -> int:
     app.setStyleSheet(app_stylesheet(preferred_family, system_family))
 
     def start_main_window() -> None:
-        window = LabelingApp(
-            project_paths.images_to_label,
-            project_paths.labels_all,
-            project_paths.classes_file,
-            project_paths.keypoints_file,
-            project_root=project_paths.root,
-            force_initial_setup=force_initial_setup,
-        )
+        try:
+            window = LabelingApp(
+                project_paths.images_to_label,
+                project_paths.labels_all,
+                project_paths.classes_file,
+                project_paths.keypoints_file,
+                project_root=project_paths.root,
+                force_initial_setup=force_initial_setup,
+                project_lock=project_lock,
+            )
+        except Exception as exc:
+            project_lock.release()
+            splash.close()
+            QMessageBox.critical(
+                launcher,
+                "Open Project Failed",
+                f"Could not initialize the selected project.\n\n{exc}",
+            )
+            app.quit()
+            return
         _retain_main_window(window)
         window.setWindowTitle(project_window_title(project_paths.root))
         splash.finish(window)

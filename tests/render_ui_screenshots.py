@@ -166,6 +166,9 @@ def render_screenshots(output_dir: Path) -> list[Path]:
         project_root=paths["root"],
         force_initial_setup=False,
     )
+    project_lock_path = project_dir / ".squeakpose.lock"
+    if not project_lock_path.is_file():
+        raise RuntimeError("Main window did not acquire the project writer lock")
     window._prompted_class_manager = True
     window._seg_setup_prompted = True
     window.resize(1500, 900)
@@ -339,6 +342,8 @@ def render_screenshots(output_dir: Path) -> list[Path]:
 
     window.close()
     _flush_events(app)
+    if project_lock_path.exists():
+        raise RuntimeError("Main window did not release the project writer lock")
     return screenshots
 
 

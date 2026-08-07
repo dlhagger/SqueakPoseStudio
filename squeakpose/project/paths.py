@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 
 from squeakpose_core import CURRENT_PROJECT_SCHEMA_VERSION, atomic_write_text
 
+from .safety import require_path_within_project
+
 PROJECT_META_FILE = "squeakpose_project.json"
 LAST_PROJECT_STATE_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -148,7 +150,26 @@ def ensure_project_structure(
     """Create missing project entries and return their canonical paths."""
     paths = ProjectPaths.from_root(project_root)
     for field_name in PROJECT_DIRECTORY_FIELDS:
-        os.makedirs(paths[field_name], exist_ok=True)
+        directory = require_path_within_project(
+            paths.root,
+            paths[field_name],
+            purpose=f"project directory '{field_name}'",
+            allow_root=False,
+        )
+        os.makedirs(directory, exist_ok=True)
+
+    for field_name in (
+        "classes_file",
+        "keypoints_file",
+        "class_keypoints_file",
+        "classes_seg_file",
+    ):
+        require_path_within_project(
+            paths.root,
+            paths[field_name],
+            purpose=f"project file '{field_name}'",
+            allow_root=False,
+        )
 
     if not os.path.exists(paths.classes_seg_file):
         atomic_write_text(

@@ -7,6 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from squeakpose.project.safety import require_path_within_project
 from squeakpose_core import (
     commit_staged_paths,
     remove_path,
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class AnnotationSaveRequest:
+    project_root: str
     source_image_path: str
     image_output_path: str
     label_output_path: str
@@ -45,6 +47,17 @@ def save_annotation_transaction(
     """Stage and atomically install an image, label, and rendered overlay."""
     if not request.label_text.strip():
         raise ValueError("annotation label text must not be empty")
+    for purpose, target in (
+        ("saved annotation image", request.image_output_path),
+        ("annotation label", request.label_output_path),
+        ("annotation preview", request.overlay_output_path),
+    ):
+        require_path_within_project(
+            request.project_root,
+            target,
+            purpose=purpose,
+            allow_root=False,
+        )
     source_exists = bool(request.source_image_path) and os.path.isfile(request.source_image_path)
     output_exists = os.path.isfile(request.image_output_path)
     if not source_exists and not output_exists:

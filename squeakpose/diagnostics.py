@@ -9,6 +9,8 @@ import logging.handlers
 import os
 from typing import Any
 
+from squeakpose.project.safety import require_path_within_project
+
 PROJECT_LOG_FILENAME = "squeakpose.jsonl"
 _HANDLER_MARKER = "_squeakpose_project_handler"
 _previous_root_level: int | None = None
@@ -48,7 +50,12 @@ class JsonLineFormatter(logging.Formatter):
 def project_log_path(project_root: str) -> str:
     """Return the canonical structured log path for a project."""
 
-    return os.path.join(os.path.abspath(project_root), "logs", PROJECT_LOG_FILENAME)
+    return require_path_within_project(
+        project_root,
+        os.path.join(os.path.abspath(project_root), "logs", PROJECT_LOG_FILENAME),
+        purpose="project log path",
+        allow_root=False,
+    )
 
 
 def reset_project_logging() -> None:

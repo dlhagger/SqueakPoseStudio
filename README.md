@@ -125,6 +125,14 @@ lines to `logs/squeakpose.jsonl` inside the active project. The log rotates at
 5 MiB and retains three backups. Opening a different project redirects new log
 events to that project's log directory.
 
+Projects use an ownership-token lock at `.squeakpose.lock` so two application
+windows cannot write the same project concurrently. A lock is removed during
+normal shutdown. If the owning process on the same computer is no longer
+running, the application asks before removing the proven stale lock; invalid or
+unverifiable locks are never removed automatically. Managed annotation,
+dataset, metadata, and log paths are resolved through symlinks and rejected if
+they escape the active project.
+
 ## Labeling
 
 Add source images to the project's `images_to_label/` directory, then select

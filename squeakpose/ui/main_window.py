@@ -112,6 +112,7 @@ from label_io import (
     segmentation_annotation_to_line,
 )
 from prediction_ops import rank_prediction_frames
+from squeakpose import __version__
 from squeakpose.annotation.documents import (
     PoseAnnotationDocument,
     SegmentationAnnotationDocument,
@@ -150,6 +151,13 @@ from squeakpose.project.paths import (
     load_last_project,
     project_window_title,
     save_last_project,
+)
+from squeakpose.project.safety import (
+    ProjectLock,
+    ProjectLockedError,
+    ProjectPathError,
+    break_stale_project_lock,
+    canonical_path,
 )
 from squeakpose.services.annotation_save import (
     AnnotationSaveRequest,
@@ -233,6 +241,54 @@ def _retain_main_window(window) -> None:
     app = _qt_app_instance()
     if app is not None:
         app._squeakpose_main_window = window
+
+
+def _acquire_project_lock_for_ui(
+    project_root: str,
+    *,
+    parent: Optional[QWidget] = None,
+) -> Optional[ProjectLock]:
+    """Acquire a project writer lock, prompting only for a proven stale lock."""
+
+    try:
+        lock = ProjectLock(project_root, version=__version__)
+        return lock.acquire()
+    except (OSError, ProjectPathError) as exc:
+        QMessageBox.critical(
+            parent,
+            "Project Lock Error",
+            f"Could not create a safe project writer lock.\n\n{exc}",
+        )
+        return None
+    except ProjectLockedError as exc:
+        if not exc.stale:
+            QMessageBox.warning(
+                parent,
+                "Project Already Open",
+                f"This project already has a writer lock and cannot be opened for editing.\n\n"
+                f"{exc}\n\nLock file:\n{exc.lock_path}",
+            )
+            return None
+        decision = QMessageBox.question(
+            parent,
+            "Stale Project Lock",
+            f"The previous SqueakPose Studio process is no longer running.\n\n{exc}\n\n"
+            "Remove the stale lock and open the project?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return None
+        try:
+            break_stale_project_lock(project_root)
+            return lock.acquire()
+        except (OSError, ProjectLockedError) as retry_error:
+            QMessageBox.critical(
+                parent,
+                "Project Lock Error",
+                f"Could not acquire the project writer lock.\n\n{retry_error}",
+            )
+            return None
 
 
 def _refresh_qt_style(widget: Optional[QWidget]) -> None:
@@ -2933,6 +2989,7 @@ class LabelingApp(QMainWindow):
         keypoint_file: Optional[str],
         project_root: Optional[str] = None,
         force_initial_setup: bool = False,
+        project_lock: Optional[ProjectLock] = None,
     ):
         super().__init__()
         self.resize(1400, 860)
@@ -2940,6 +2997,13 @@ class LabelingApp(QMainWindow):
         self.app_base_dir = APP_BASE_DIR
         inferred_root = project_root or os.path.dirname(image_dir or "") or os.getcwd()
         self.project_root = os.path.abspath(inferred_root)
+        if project_lock is None:
+            project_lock = ProjectLock(self.project_root, version=__version__).acquire()
+        elif canonical_path(project_lock.project_root) != canonical_path(self.project_root):
+            raise ValueError("project lock does not belong to the selected project")
+        elif not project_lock.acquired:
+            raise ValueError("project lock must be acquired before opening the project")
+        self._project_lock = project_lock
         self._log_path = project_log_path(self.project_root)
         try:
             self._log_path = configure_project_logging(self.project_root)
@@ -3132,6 +3196,7 @@ class LabelingApp(QMainWindow):
         self._prediction_process = None
         self._inference_config_path = None
         self._prediction_config_path = None
+        self._project_lock.release()
         super().closeEvent(event)
 
     def _setup_menu(self):
@@ -3167,17 +3232,56 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("That project is already open.")
             return
 
-        paths = _ensure_project_structure(target_root)
+        project_lock = _acquire_project_lock_for_ui(target_root, parent=self)
+        if project_lock is None:
+            self.update_status_bar("Project switch canceled because the project is locked.")
+            return
+        try:
+            paths = _ensure_project_structure(target_root)
+        except (OSError, ProjectPathError) as exc:
+            project_lock.release()
+            logger.exception(
+                "Selected project has an invalid managed path",
+                extra={
+                    "event": "project_structure_invalid",
+                    "operation": "switch_project",
+                    "project_root": target_root,
+                },
+            )
+            QMessageBox.critical(
+                self,
+                "Invalid Project Structure",
+                f"The selected project contains an unsafe or unavailable managed path.\n\n{exc}",
+            )
+            return
         _save_last_project(target_root)
 
-        new_window = LabelingApp(
-            paths["images_to_label"],
-            paths["labels_all"],
-            paths["classes_file"],
-            paths["keypoints_file"],
-            project_root=paths["root"],
-            force_initial_setup=force_initial_setup,
-        )
+        try:
+            new_window = LabelingApp(
+                paths["images_to_label"],
+                paths["labels_all"],
+                paths["classes_file"],
+                paths["keypoints_file"],
+                project_root=paths["root"],
+                force_initial_setup=force_initial_setup,
+                project_lock=project_lock,
+            )
+        except Exception as exc:
+            project_lock.release()
+            logger.exception(
+                "Could not initialize switched project",
+                extra={
+                    "event": "project_switch_failed",
+                    "operation": "switch_project",
+                    "project_root": paths.root,
+                },
+            )
+            QMessageBox.critical(
+                self,
+                "Open Project Failed",
+                f"Could not initialize the selected project.\n\n{exc}",
+            )
+            return
         _retain_main_window(new_window)
         new_window.setWindowTitle(_project_window_title(paths["root"]))
         new_window.setGeometry(self.geometry())
@@ -6756,6 +6860,7 @@ class LabelingApp(QMainWindow):
         try:
             save_annotation_transaction(
                 AnnotationSaveRequest(
+                    project_root=self.project_root,
                     source_image_path=src_path,
                     image_output_path=image_out_path,
                     label_output_path=label_out_path,
@@ -6917,6 +7022,7 @@ class LabelingApp(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             export_result = export_dataset_transaction(
+                project_root=self.project_root,
                 images_all_dir=images_all_dir,
                 labels_all_dir=labels_all_dir,
                 final_paths=paths,

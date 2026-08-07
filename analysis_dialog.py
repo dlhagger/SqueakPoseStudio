@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import csv
 import datetime
-import json
 import math
 import os
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -50,7 +48,11 @@ from PyQt6.QtWidgets import (
 )
 
 from layer_ops import layer_definition, normalize_layer_id
-from squeakpose.workers.process import remove_file_quietly, shutdown_qprocess
+from squeakpose.workers.process import (
+    create_worker_config,
+    remove_file_quietly,
+    shutdown_qprocess,
+)
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from ui_style import analysis_dialog_stylesheet
 
@@ -993,12 +995,20 @@ class AnalysisDialog(QDialog):
 
         payload = self._config_payload()
         os.makedirs(payload["output_dir"], exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            "w", suffix=".json", prefix="squeakpose_analysis_", delete=False
-        )
-        with handle:
-            json.dump(payload, handle, indent=2)
-        self.analysis_config_path = handle.name
+        try:
+            self.analysis_config_path = create_worker_config(
+                self.project_root,
+                os.path.join(self.project_root, "logs"),
+                "analysis",
+                payload,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.warning(
+                self,
+                "Analysis failed",
+                f"Could not create the analysis worker configuration.\n\n{exc}",
+            )
+            return
         self.last_output_dir = payload["output_dir"]
         self.open_output_btn.setEnabled(False)
         self.log_view.clear()

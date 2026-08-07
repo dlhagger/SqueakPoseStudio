@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import datetime
-import json
 import os
 import re
 import sys
@@ -38,16 +36,17 @@ from squeakpose.project.distillation import (
     distillation_export_search_roots as _distillation_export_search_roots,
 )
 from squeakpose.workers.process import (
-    remove_file_quietly as _remove_file_quietly,
+    create_worker_config,
+    request_qprocess_stop,
 )
 from squeakpose.workers.process import (
-    request_qprocess_stop,
+    remove_file_quietly as _remove_file_quietly,
 )
 from squeakpose.workers.process import (
     shutdown_qprocess as _shutdown_qprocess,
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
-from squeakpose_core import atomic_write_text, infer_dataset_task
+from squeakpose_core import infer_dataset_task
 from ui_style import (
     ThemedComboBox,
     style_combo_popup,
@@ -804,15 +803,18 @@ class TrainDialog(QDialog):
                 self, "Training setup error", f"Could not create training run directory:\n{e}"
             )
             return
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        config_path = os.path.join(run_root, f".train_config_{timestamp}.json")
         try:
-            atomic_write_text(config_path, json.dumps(config, indent=2))
+            config_path = create_worker_config(
+                self.project_root,
+                run_root,
+                "train",
+                config,
+            )
         except Exception as e:
             QMessageBox.warning(
                 self,
                 "Training setup error",
-                f"Could not write training config:\n{config_path}\n\n{e}",
+                f"Could not write the training worker configuration.\n\n{e}",
             )
             return
 

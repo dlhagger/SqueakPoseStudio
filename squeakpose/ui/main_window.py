@@ -183,6 +183,7 @@ from squeakpose.ui.project_models_dialog import ProjectModelsDialog
 from squeakpose.ui.training_dialog import TrainDialog
 from squeakpose.ui.video_reviewer import VideoReviewDialog
 from squeakpose.workers.process import (
+    create_worker_config,
     remove_file_quietly,
     request_qprocess_stop,
     shutdown_qprocess,
@@ -5011,11 +5012,13 @@ class LabelingApp(QMainWindow):
             "total_frames": int(total_frames),
             "fps": float(fps),
         }
-        config_path = os.path.join(
-            output_root, f".{os.path.splitext(os.path.basename(csv_path))[0]}_config.json"
-        )
         try:
-            atomic_write_text(config_path, json.dumps(config, indent=2))
+            config_path = create_worker_config(
+                self.project_root,
+                output_root,
+                "inference",
+                config,
+            )
         except Exception as e:
             self._inference_run_results.append(
                 {

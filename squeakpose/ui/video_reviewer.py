@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import random
@@ -56,10 +55,11 @@ from layer_ops import (
 from prediction_ops import rank_prediction_frames
 from squeakpose.annotation.video_view import VideoView
 from squeakpose.workers.process import (
-    remove_file_quietly as _remove_file_quietly,
+    create_worker_config,
+    request_qprocess_stop,
 )
 from squeakpose.workers.process import (
-    request_qprocess_stop,
+    remove_file_quietly as _remove_file_quietly,
 )
 from squeakpose.workers.process import (
     shutdown_qprocess as _shutdown_qprocess,
@@ -120,6 +120,7 @@ class VideoReviewDialog(QDialog):
         super().__init__(parent)
         self.layer_id = normalize_layer_id(layer_id or workflow)
         self.workflow = WORKFLOW_SEG if str(workflow).lower() == WORKFLOW_SEG else WORKFLOW_POSE
+        self.project_root = os.path.abspath(getattr(parent, "project_root", APP_BASE_DIR))
 
         self.device = device
         self.kp_names = kp_names
@@ -757,21 +758,14 @@ class VideoReviewDialog(QDialog):
             **self._review_settings,
         }
 
-        parent = self.parent()
-        parent_log_path = getattr(parent, "_log_path", "") if parent is not None else ""
-        config_dir = (
-            os.path.dirname(parent_log_path)
-            if parent_log_path
-            else os.path.join(APP_BASE_DIR, "logs")
-        )
+        config_dir = os.path.join(self.project_root, "logs")
         try:
-            os.makedirs(config_dir, exist_ok=True)
-            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            config_path = os.path.join(
+            config_path = create_worker_config(
+                self.project_root,
                 config_dir,
-                f".video_review_{layer_id}_{stamp}.json",
+                f"video_review_{layer_id}",
+                config,
             )
-            atomic_write_text(config_path, json.dumps(config, indent=2))
         except Exception as e:
             self._review_run_errors.append(f"{layer_definition(layer_id).display_name}: {e}")
             QTimer.singleShot(0, self._start_next_review_prediction_pass)

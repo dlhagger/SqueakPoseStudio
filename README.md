@@ -405,7 +405,10 @@ no-detection row.
 
 Closing a window with an active worker terminates the child process before the
 window exits and removes its temporary config file. Canceled inference keeps
-already-written CSV rows and reports the output as partial.
+already-written CSV rows and reports the output as partial. Worker configs use
+unique names inside the active project, are readable only by their owner on
+supported platforms, and are rejected if they are symlinks, non-files, or
+unexpectedly large.
 
 ## Analysis
 

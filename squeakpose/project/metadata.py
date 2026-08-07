@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from layer_ops import layer_worker_mode, normalize_layer_id
+from squeakpose.json_io import read_json_file
 from squeakpose_core import (
     CURRENT_PROJECT_SCHEMA_VERSION,
     atomic_write_text,
@@ -45,10 +46,7 @@ class ProjectMetadataStore:
         if not os.path.isfile(self.path):
             return MetadataReadResult({})
         try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
-                raise ValueError("project metadata must contain a JSON object")
+            data = read_json_file(self.path, max_bytes=4 * 1024 * 1024, require_object=True)
         except (OSError, UnicodeError, ValueError, TypeError, AttributeError) as exc:
             backup_path = self._corrupt_backup_path()
             try:

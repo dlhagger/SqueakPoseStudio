@@ -9,6 +9,7 @@ import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 
+from squeakpose.json_io import read_json_file
 from squeakpose_core import CURRENT_PROJECT_SCHEMA_VERSION, atomic_write_text
 
 from .safety import require_path_within_project
@@ -51,6 +52,8 @@ class ProjectPaths(Mapping[str, str]):
     analysis_segmentation: str
     analysis_depth: str
     logs: str
+    cache: str
+    video_prediction_cache: str
     classes_file: str
     keypoints_file: str
     class_keypoints_file: str
@@ -87,6 +90,8 @@ class ProjectPaths(Mapping[str, str]):
             analysis_segmentation=os.path.join(root, "analysis outputs", "segmentation"),
             analysis_depth=os.path.join(root, "analysis outputs", "depth"),
             logs=os.path.join(root, "logs"),
+            cache=os.path.join(root, "cache"),
+            video_prediction_cache=os.path.join(root, "cache", "video_predictions"),
             classes_file=os.path.join(root, "classes.txt"),
             keypoints_file=os.path.join(root, "keypoints.txt"),
             class_keypoints_file=os.path.join(root, "class_keypoints.json"),
@@ -139,6 +144,8 @@ PROJECT_DIRECTORY_FIELDS = (
     "analysis_segmentation",
     "analysis_depth",
     "logs",
+    "cache",
+    "video_prediction_cache",
 )
 
 
@@ -178,6 +185,12 @@ def ensure_project_structure(
         )
 
     metadata_path = os.path.join(paths.root, PROJECT_META_FILE)
+    metadata_path = require_path_within_project(
+        paths.root,
+        metadata_path,
+        purpose="project metadata path",
+        allow_root=False,
+    )
     if not os.path.exists(metadata_path):
         payload = {
             "schema_version": CURRENT_PROJECT_SCHEMA_VERSION,
@@ -212,8 +225,7 @@ def load_last_project(*, state_file: str = LAST_PROJECT_STATE_FILE) -> str | Non
     if not os.path.exists(state_file):
         return None
     try:
-        with open(state_file, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = read_json_file(state_file, max_bytes=64 * 1024, require_object=True)
         path = str(data.get("last_project", "")).strip()
         if path and os.path.isdir(path):
             return os.path.abspath(path)

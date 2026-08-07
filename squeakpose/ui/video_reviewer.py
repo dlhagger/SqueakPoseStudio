@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import sys
@@ -54,6 +55,9 @@ from layer_ops import (
 )
 from prediction_ops import rank_prediction_frames
 from squeakpose.annotation.video_view import VideoView
+from squeakpose.json_io import read_json_file
+from squeakpose.project.paths import ProjectPaths
+from squeakpose.project.safety import require_path_within_project
 from squeakpose.workers.process import (
     create_worker_config,
     request_qprocess_stop,
@@ -77,6 +81,8 @@ from squeakpose_core import (
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
+MAX_VIDEO_CACHE_BYTES = 128 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 try:
     import cv2 as _cv2
@@ -481,7 +487,14 @@ class VideoReviewDialog(QDialog):
     def _cache_path(self) -> Optional[str]:
         if not self.path:
             return None
-        return os.path.abspath(self.path) + ".sqp_preds.json"
+        cache_dir = ProjectPaths.from_root(self.project_root).video_prediction_cache
+        source_id = stable_path_id(self.path, length=16)
+        return require_path_within_project(
+            self.project_root,
+            os.path.join(cache_dir, f"{source_id}.json"),
+            purpose="video prediction cache",
+            allow_root=False,
+        )
 
     def _video_signature(self) -> dict:
         try:
@@ -502,12 +515,28 @@ class VideoReviewDialog(QDialog):
             }
 
     def _load_cache_if_valid(self) -> bool:
-        fp = self._cache_path()
+        try:
+            fp = self._cache_path()
+        except (OSError, ValueError):
+            logger.warning(
+                "Rejected unsafe video prediction cache path",
+                exc_info=True,
+                extra={
+                    "event": "video_cache_path_rejected",
+                    "operation": "load_video_cache",
+                    "project_root": self.project_root,
+                    "source_path": self.path,
+                },
+            )
+            return False
         if not fp or not os.path.exists(fp):
             return False
         try:
-            with open(fp, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = read_json_file(
+                fp,
+                max_bytes=MAX_VIDEO_CACHE_BYTES,
+                require_object=True,
+            )
             meta = data.get("meta", {})
             vid = meta.get("video", {})
             cur = self._video_signature()
@@ -526,10 +555,15 @@ class VideoReviewDialog(QDialog):
                 for layer in self.review_layers:
                     if str(saved_models.get(layer) or "") != str(self.model_paths.get(layer) or ""):
                         return False
+                loaded_by_layer: dict[str, dict[int, dict]] = {}
                 for layer in (LAYER_KEYPOINTS, LAYER_SEGMENTATION):
                     raw = cached_by_layer.get(layer) or {}
                     if isinstance(raw, dict):
-                        self.preds_by_layer[layer] = {int(k): v for k, v in raw.items()}
+                        loaded_by_layer[layer] = {
+                            int(k): v for k, v in raw.items() if isinstance(v, dict)
+                        }
+                for layer, predictions in loaded_by_layer.items():
+                    self.preds_by_layer[layer] = predictions
                 self.preds = self.preds_by_layer.get(self.layer_id, {})
                 return any(self.preds_by_layer.values())
 
@@ -541,7 +575,9 @@ class VideoReviewDialog(QDialog):
             if saved_workflow != self.workflow:
                 return False
             preds = data.get("preds", {})
-            legacy_predictions = {int(k): v for k, v in preds.items()}
+            if not isinstance(preds, dict):
+                return False
+            legacy_predictions = {int(k): v for k, v in preds.items() if isinstance(v, dict)}
             if hasattr(self, "preds_by_layer"):
                 legacy_layer = normalize_layer_id(getattr(self, "layer_id", saved_workflow))
                 self.preds_by_layer[legacy_layer] = legacy_predictions
@@ -549,11 +585,34 @@ class VideoReviewDialog(QDialog):
             else:
                 self.preds = legacy_predictions
             return bool(self.preds)
-        except Exception:
+        except (OSError, UnicodeError, TypeError, ValueError, AttributeError):
+            logger.warning(
+                "Ignored invalid video prediction cache",
+                exc_info=True,
+                extra={
+                    "event": "video_cache_invalid",
+                    "operation": "load_video_cache",
+                    "project_root": self.project_root,
+                    "source_path": fp,
+                },
+            )
             return False
 
     def _save_cache(self, meta: dict):
-        fp = self._cache_path()
+        try:
+            fp = self._cache_path()
+        except (OSError, ValueError):
+            logger.warning(
+                "Rejected unsafe video prediction cache path",
+                exc_info=True,
+                extra={
+                    "event": "video_cache_path_rejected",
+                    "operation": "save_video_cache",
+                    "project_root": self.project_root,
+                    "source_path": self.path,
+                },
+            )
+            return
         if not fp:
             return
         data = {
@@ -565,9 +624,32 @@ class VideoReviewDialog(QDialog):
             },
         }
         try:
-            atomic_write_text(fp, json.dumps(data))
-        except Exception:
-            pass
+            serialized = json.dumps(data)
+            if len(serialized.encode("utf-8")) > MAX_VIDEO_CACHE_BYTES:
+                logger.warning(
+                    "Skipped oversized video prediction cache",
+                    extra={
+                        "event": "video_cache_oversized",
+                        "operation": "save_video_cache",
+                        "project_root": self.project_root,
+                        "target_path": fp,
+                    },
+                )
+                return
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            atomic_write_text(fp, serialized)
+        except (OSError, TypeError, ValueError):
+            logger.warning(
+                "Could not save video prediction cache",
+                exc_info=True,
+                extra={
+                    "event": "video_cache_save_failed",
+                    "operation": "save_video_cache",
+                    "project_root": self.project_root,
+                    "target_path": fp,
+                },
+            )
+            return
 
     # ---------- video load ----------
     def _choose_video(self):

@@ -126,6 +126,7 @@ from squeakpose.annotation.models import (
 )
 from squeakpose.annotation.video_view import VideoView
 from squeakpose.diagnostics import configure_project_logging, project_log_path
+from squeakpose.json_io import read_json_file
 from squeakpose.project.distillation import (
     discover_distillation_exports,
     distillation_export_search_roots,
@@ -718,8 +719,11 @@ class LabelingApp(QMainWindow):
             label.setText("No saved depth range · Near = bright")
             return
         try:
-            with open(metadata_path, "r", encoding="utf-8") as handle:
-                metadata = json.load(handle)
+            metadata = read_json_file(
+                metadata_path,
+                max_bytes=1024 * 1024,
+                require_object=True,
+            )
             low = float(metadata["p02_depth"])
             high = float(metadata["p98_depth"])
             median = float(metadata["median_depth"])
@@ -1593,10 +1597,11 @@ class LabelingApp(QMainWindow):
         data: dict[str, list[str]] = {}
         if os.path.exists(self.class_keypoints_path):
             try:
-                with open(self.class_keypoints_path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                if not isinstance(raw, dict):
-                    raise ValueError("class_keypoints.json must contain a JSON object")
+                raw = read_json_file(
+                    self.class_keypoints_path,
+                    max_bytes=4 * 1024 * 1024,
+                    require_object=True,
+                )
                 for name, lst in raw.items():
                     if not isinstance(name, str) or not isinstance(lst, list):
                         raise ValueError("class_keypoints.json contains an invalid class entry")
@@ -6348,8 +6353,7 @@ class LabelingApp(QMainWindow):
             )
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = read_json_file(path, max_bytes=4 * 1024 * 1024, require_object=True)
         except Exception as e:
             QMessageBox.warning(self, "Template error", f"Failed to load template:\n{e}")
             return

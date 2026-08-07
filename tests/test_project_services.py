@@ -50,6 +50,8 @@ class ProjectPathTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(paths.depth_previews))
             self.assertTrue(os.path.isdir(paths.inference_depth))
             self.assertTrue(os.path.isdir(paths.analysis_depth))
+            self.assertTrue(os.path.isdir(paths.cache))
+            self.assertTrue(os.path.isdir(paths.video_prediction_cache))
             with open(paths.classes_seg_file, "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "mouse\nrat\n")
             with open(os.path.join(tmp, "squeakpose_project.json"), "r", encoding="utf-8") as fh:

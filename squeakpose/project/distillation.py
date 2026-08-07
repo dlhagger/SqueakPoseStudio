@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
+
+from squeakpose.json_io import read_json_file
 
 DISTILLATION_MANIFEST_FILENAME = "squeakpose_distillation.json"
 
@@ -30,8 +31,7 @@ def distillation_run_task(run_dir: str) -> str:
         DISTILLATION_MANIFEST_FILENAME,
     )
     try:
-        with open(manifest_path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        payload = read_json_file(manifest_path, max_bytes=1024 * 1024, require_object=True)
         task = normalize_distillation_task(payload.get("task"))
         if task:
             return task

@@ -109,6 +109,8 @@ project/
 │   ├── keypoints/         # keypoint-layer analysis runs
 │   ├── segmentation/      # segmentation-layer analysis runs
 │   └── depth/             # reserved for future depth analysis
+├── cache/
+│   └── video_predictions/ # project-contained Video Reviewer caches
 ├── logs/
 ├── classes.txt
 ├── keypoints.txt
@@ -131,7 +133,8 @@ normal shutdown. If the owning process on the same computer is no longer
 running, the application asks before removing the proven stale lock; invalid or
 unverifiable locks are never removed automatically. Managed annotation,
 dataset, metadata, and log paths are resolved through symlinks and rejected if
-they escape the active project.
+they escape the active project. Managed JSON inputs are size-bounded, must be
+regular non-symlink files, and are schema-checked as objects where required.
 
 ## Labeling
 
@@ -365,7 +368,7 @@ can:
 - run every configured project prediction model sequentially over the same
   selected frame range, with configurable stride, batch size, and confidence
   thresholds;
-- cache predictions beside the video in `<video-name>.sqp_preds.json`;
+- cache predictions inside the active project without modifying source-video folders;
 - display Keypoints and Segmentation predictions together, with independent
   overlay visibility controls; and
 - export the current, random, low-confidence, or high-confidence frames into

@@ -59,14 +59,24 @@ class _Results:
 
 
 class _CacheDummy:
-    def __init__(self, video_path: str, model_path: str, workflow: str):
+    def __init__(
+        self,
+        video_path: str,
+        model_path: str,
+        workflow: str,
+        *,
+        project_root: str | None = None,
+    ):
         self.path = video_path
+        self.project_root = os.path.abspath(project_root or os.path.dirname(video_path))
         self.model_path = model_path
         self.workflow = workflow
         self.preds = {}
 
     def _cache_path(self):
-        return os.path.abspath(self.path) + ".sqp_preds.json"
+        path = VideoReviewDialog._cache_path(self)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
 
     def _video_signature(self):
         return {
@@ -436,6 +446,74 @@ class StudioVideoReviewTests(unittest.TestCase):
             ok = VideoReviewDialog._load_cache_if_valid(dummy)
 
             self.assertFalse(ok)
+
+    def test_video_cache_is_written_inside_project_not_beside_external_video(self):
+        with TemporaryDirectory() as project, TemporaryDirectory() as outside:
+            video_path = os.path.join(outside, "sample.mp4")
+            with open(video_path, "wb") as handle:
+                handle.write(b"fake-video-bytes")
+            dummy = _CacheDummy(
+                video_path,
+                "model.pt",
+                WORKFLOW_SEG,
+                project_root=project,
+            )
+            dummy.preds_by_layer = {"segmentation": {2: {"ok": True}}}
+
+            VideoReviewDialog._save_cache(dummy, {"video": dummy._video_signature()})
+
+            cache_path = dummy._cache_path()
+            self.assertTrue(os.path.isfile(cache_path))
+            self.assertEqual(os.path.commonpath((project, cache_path)), project)
+            self.assertFalse(os.path.exists(video_path + ".sqp_preds.json"))
+
+    def test_invalid_multilayer_cache_does_not_partially_mutate_predictions(self):
+        with TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "sample.mp4")
+            with open(video_path, "wb") as handle:
+                handle.write(b"fake-video-bytes")
+            dummy = _CacheDummy(video_path, "seg.pt", WORKFLOW_SEG)
+            dummy.layer_id = "segmentation"
+            dummy.review_layers = ["segmentation", "keypoints"]
+            dummy.model_paths = {"segmentation": "seg.pt", "keypoints": "pose.pt"}
+            dummy.preds_by_layer = {"segmentation": {}, "keypoints": {}}
+            payload = {
+                "meta": {
+                    "video": dummy._video_signature(),
+                    "model_paths": dict(dummy.model_paths),
+                },
+                "preds_by_layer": {
+                    "segmentation": {"2": {"ok": True}},
+                    "keypoints": {"not-an-index": {"ok": True}},
+                },
+            }
+            with open(dummy._cache_path(), "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+
+            self.assertFalse(VideoReviewDialog._load_cache_if_valid(dummy))
+            self.assertEqual(dummy.preds_by_layer, {"segmentation": {}, "keypoints": {}})
+
+    def test_video_cache_rejects_project_cache_symlink_outside_project(self):
+        with TemporaryDirectory() as project, TemporaryDirectory() as outside:
+            video_path = os.path.join(outside, "sample.mp4")
+            with open(video_path, "wb") as handle:
+                handle.write(b"fake-video-bytes")
+            try:
+                os.symlink(outside, os.path.join(project, "cache"))
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            dummy = _CacheDummy(
+                video_path,
+                "model.pt",
+                WORKFLOW_SEG,
+                project_root=project,
+            )
+            dummy.preds_by_layer = {"segmentation": {2: {"ok": True}}}
+
+            with self.assertLogs("squeakpose.ui.video_reviewer", level="WARNING"):
+                VideoReviewDialog._save_cache(dummy, {"video": dummy._video_signature()})
+
+            self.assertEqual(os.listdir(outside), ["sample.mp4"])
 
     def test_segmentation_rows_include_no_detection_frames(self):
         app = LabelingApp.__new__(LabelingApp)

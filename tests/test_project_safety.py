@@ -48,6 +48,20 @@ class ProjectPathSafetyTests(unittest.TestCase):
             nested = os.path.join(tmp, "a", "..", "b")
             self.assertEqual(canonical_path(nested), canonical_path(os.path.join(tmp, "b")))
 
+    def test_project_structure_rejects_metadata_symlink_outside_project(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as outside:
+            outside_metadata = os.path.join(outside, "metadata.json")
+            with open(outside_metadata, "w", encoding="utf-8") as handle:
+                json.dump({"schema_version": 2}, handle)
+            link = os.path.join(tmp, "squeakpose_project.json")
+            try:
+                os.symlink(outside_metadata, link)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation is unavailable")
+
+            with self.assertRaises(ProjectPathError):
+                ensure_project_structure(tmp)
+
 
 class ProjectLockTests(unittest.TestCase):
     def test_second_writer_is_rejected_until_owner_releases(self):

@@ -10,6 +10,8 @@ import socket
 import uuid
 from dataclasses import asdict, dataclass
 
+from squeakpose.json_io import read_json_file
+
 PROJECT_LOCK_FILENAME = ".squeakpose.lock"
 logger = logging.getLogger(__name__)
 
@@ -86,10 +88,7 @@ def project_lock_path(project_root: str) -> str:
 
 def _read_lock_info(lock_path: str) -> ProjectLockInfo | None:
     try:
-        with open(lock_path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict):
-            return None
+        payload = read_json_file(lock_path, max_bytes=64 * 1024, require_object=True)
         return ProjectLockInfo(
             pid=int(payload["pid"]),
             hostname=str(payload["hostname"]),

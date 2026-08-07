@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from squeakpose_core import commit_staged_paths, remove_path
 ProgressCallback = Callable[[int, str], None]
 CancelCallback = Callable[[], bool]
 Committer = Callable[[list[tuple[str, str]]], None]
+logger = logging.getLogger(__name__)
 
 
 def export_dataset_transaction(
@@ -59,6 +61,15 @@ def export_dataset_transaction(
         result.split_seed = int(split_seed)
         result.skipped_images = list(skipped_images or [])
         if result.canceled or result.errors:
+            logger.warning(
+                "Dataset transaction did not reach installation",
+                extra={
+                    "event": "dataset_transaction_incomplete",
+                    "operation": "export_dataset",
+                    "source_path": images_all_dir,
+                    "target_path": final_paths.base_dir,
+                },
+            )
             return result
 
         result.dataset_yaml_path = write_dataset_yaml_for_mode(
@@ -83,6 +94,37 @@ def export_dataset_transaction(
             ]
         )
         result.dataset_yaml_path = final_paths.dataset_yaml_path
+        logger.info(
+            "Dataset transaction committed",
+            extra={
+                "event": "dataset_transaction_committed",
+                "operation": "export_dataset",
+                "source_path": images_all_dir,
+                "target_path": final_paths.base_dir,
+            },
+        )
         return result
+    except Exception:  # noqa: BLE001 - exporter and committer are injectable boundaries
+        logger.exception(
+            "Dataset transaction failed",
+            extra={
+                "event": "dataset_transaction_failed",
+                "operation": "export_dataset",
+                "source_path": images_all_dir,
+                "target_path": final_paths.base_dir,
+            },
+        )
+        raise
     finally:
-        remove_path(staging_base)
+        try:
+            remove_path(staging_base)
+        except OSError:
+            logger.warning(
+                "Could not remove dataset staging directory",
+                exc_info=True,
+                extra={
+                    "event": "dataset_cleanup_failed",
+                    "operation": "export_dataset_cleanup",
+                    "target_path": staging_base,
+                },
+            )

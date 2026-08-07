@@ -6,6 +6,7 @@ The repository-level ``squeakpose_studio.py`` remains a compatibility launcher.
 
 import datetime
 import json
+import logging
 import os
 import platform
 import random
@@ -123,6 +124,7 @@ from squeakpose.annotation.models import (
     KeypointEntry,
 )
 from squeakpose.annotation.video_view import VideoView
+from squeakpose.diagnostics import configure_project_logging, project_log_path
 from squeakpose.project.distillation import (
     discover_distillation_exports,
     distillation_export_search_roots,
@@ -194,6 +196,7 @@ from ui_style import (
 )
 
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+logger = logging.getLogger(__name__)
 
 DEFAULT_CLASS_NAMES = ["mouse"]
 DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
@@ -787,6 +790,16 @@ class LabelingApp(QMainWindow):
         try:
             result = ProjectMetadataStore(self.project_root).read()
         except OSError:
+            logger.warning(
+                "Could not read project metadata",
+                exc_info=True,
+                extra={
+                    "event": "metadata_read_failed",
+                    "operation": "read_metadata",
+                    "project_root": getattr(self, "project_root", ""),
+                    "source_path": self._project_meta_path(),
+                },
+            )
             return {}
         if result.recovery_error:
             self._project_meta_recovery = (
@@ -801,7 +814,16 @@ class LabelingApp(QMainWindow):
         try:
             result = ProjectMetadataStore(self.project_root).update(updates)
         except OSError:
-            pass
+            logger.warning(
+                "Could not update project metadata",
+                exc_info=True,
+                extra={
+                    "event": "metadata_update_failed",
+                    "operation": "update_metadata",
+                    "project_root": self.project_root,
+                    "target_path": self._project_meta_path(),
+                },
+            )
         else:
             if result.recovery_error:
                 self._project_meta_recovery = (
@@ -2885,7 +2907,17 @@ class LabelingApp(QMainWindow):
             self.images_queue, self._queue_stem_collisions = filter_image_stem_collisions(
                 candidates
             )
-        except Exception:
+        except OSError:
+            logger.warning(
+                "Could not refresh project image queue",
+                exc_info=True,
+                extra={
+                    "event": "image_queue_refresh_failed",
+                    "operation": "refresh_image_queue",
+                    "project_root": self.project_root,
+                    "source_path": self.image_dir_queue,
+                },
+            )
             self.images_queue = []
             self._queue_stem_collisions = {}
         if not self._queue_stem_collisions:
@@ -2908,6 +2940,27 @@ class LabelingApp(QMainWindow):
         self.app_base_dir = APP_BASE_DIR
         inferred_root = project_root or os.path.dirname(image_dir or "") or os.getcwd()
         self.project_root = os.path.abspath(inferred_root)
+        self._log_path = project_log_path(self.project_root)
+        try:
+            self._log_path = configure_project_logging(self.project_root)
+        except OSError:
+            logger.exception(
+                "Could not configure project logging",
+                extra={
+                    "event": "logging_configuration_failed",
+                    "operation": "configure_logging",
+                    "project_root": self.project_root,
+                    "target_path": self._log_path,
+                },
+            )
+        logger.info(
+            "Project window initializing",
+            extra={
+                "event": "project_window_initializing",
+                "operation": "open_project",
+                "project_root": self.project_root,
+            },
+        )
         self._force_initial_setup = bool(force_initial_setup)
         self._schema_recoveries: list[tuple[str, str, str]] = []
 
@@ -3012,8 +3065,6 @@ class LabelingApp(QMainWindow):
         self.kp_font_px = 10
         self._precision_active = False
 
-        self._log_path = os.path.join(self.project_root, "logs", "squeakpose_debug.log")
-        os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
         self._predict_busy = False
         self._inference_process: Optional[QProcess] = None
         self._inference_progress: Optional[QProgressDialog] = None
@@ -5673,18 +5724,17 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("Prediction applied.")
         except Exception as e:
             self._cleanup_prediction_depth_staging()
-            import datetime
-            import traceback
-
-            tb = traceback.format_exc()
-            try:
-                with open(self._log_path, "a", encoding="utf-8") as lf:
-                    lf.write(
-                        f"\n[{datetime.datetime.now().isoformat()}] Apply-prediction payload error on {self.images[self.current_idx] if self.images else 'N/A'}\n{tb}\n"
-                    )
-            except Exception:
-                pass
-            self._on_predict_error(str(e) or tb)
+            image_name = self.images[self.current_idx] if self.images else ""
+            logger.exception(
+                "Could not apply prediction payload",
+                extra={
+                    "event": "prediction_payload_failed",
+                    "operation": "apply_prediction",
+                    "project_root": self.project_root,
+                    "source_path": image_name,
+                },
+            )
+            self._on_predict_error(str(e) or "Could not apply the prediction payload")
 
     def _on_predict_error(self, error_text: str):
         # Reset busy state and re-enable button
@@ -5954,6 +6004,15 @@ class LabelingApp(QMainWindow):
                 }
             )
         except Exception as e:
+            logger.exception(
+                "Project schema save failed",
+                extra={
+                    "event": "schema_save_failed",
+                    "operation": "save_schema",
+                    "project_root": getattr(self, "project_root", ""),
+                    "target_path": self.class_keypoints_path,
+                },
+            )
             QMessageBox.warning(
                 self,
                 "Schema Save Error",
@@ -6707,6 +6766,16 @@ class LabelingApp(QMainWindow):
                 committer=commit_staged_paths,
             )
         except Exception as e:
+            logger.exception(
+                "Annotation save failed",
+                extra={
+                    "event": "annotation_save_failed",
+                    "operation": "save_annotation",
+                    "project_root": self.project_root,
+                    "source_path": src_path,
+                    "target_path": label_out_path,
+                },
+            )
             QMessageBox.warning(
                 self,
                 "Save Error",
@@ -6714,7 +6783,16 @@ class LabelingApp(QMainWindow):
             )
             return False
 
-        print(f"✅ Saved label to {label_out_path}")
+        logger.info(
+            "Annotation saved",
+            extra={
+                "event": "annotation_saved",
+                "operation": "save_annotation",
+                "project_root": self.project_root,
+                "source_path": src_path,
+                "target_path": label_out_path,
+            },
+        )
         self._schema_locked = True
         self._update_progress_label()
         return True
@@ -6854,6 +6932,16 @@ class LabelingApp(QMainWindow):
                 committer=commit_staged_paths,
             )
         except Exception as e:
+            logger.exception(
+                "Dataset export failed",
+                extra={
+                    "event": "dataset_export_failed",
+                    "operation": "export_dataset",
+                    "project_root": self.project_root,
+                    "source_path": images_all_dir,
+                    "target_path": paths.base_dir,
+                },
+            )
             QMessageBox.critical(
                 self,
                 "Dataset Export Error",

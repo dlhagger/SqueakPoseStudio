@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from squeakpose_core import (
 
 Committer = Callable[[list[tuple[str, str]]], None]
 OverlayRenderer = Callable[[str], bool]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +85,40 @@ def save_annotation_transaction(
             )
         )
         committer(staged)
-    except Exception:
+    except Exception:  # noqa: BLE001 - transaction callbacks may raise arbitrary failures
+        logger.exception(
+            "Annotation transaction failed",
+            extra={
+                "event": "annotation_transaction_failed",
+                "operation": "save_annotation",
+                "source_path": request.source_image_path,
+                "target_path": request.label_output_path,
+            },
+        )
         for staged_path, _ in staged:
             try:
                 remove_path(staged_path)
             except OSError:
-                pass
+                logger.warning(
+                    "Could not remove staged annotation artifact",
+                    exc_info=True,
+                    extra={
+                        "event": "annotation_cleanup_failed",
+                        "operation": "save_annotation_cleanup",
+                        "target_path": staged_path,
+                    },
+                )
         raise
+
+    logger.info(
+        "Annotation transaction committed",
+        extra={
+            "event": "annotation_transaction_committed",
+            "operation": "save_annotation",
+            "source_path": request.source_image_path,
+            "target_path": request.label_output_path,
+        },
+    )
 
     return AnnotationSaveResult(
         image_path=request.image_output_path,

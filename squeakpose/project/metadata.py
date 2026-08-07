@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,8 @@ from squeakpose_core import (
 )
 
 from .paths import PROJECT_META_FILE
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,12 +43,34 @@ class ProjectMetadataStore:
                 data = json.load(fh)
             if not isinstance(data, dict):
                 raise ValueError("project metadata must contain a JSON object")
-        except Exception as exc:
+        except (OSError, UnicodeError, ValueError, TypeError, AttributeError) as exc:
             backup_path = self._corrupt_backup_path()
             try:
                 os.replace(self.path, backup_path)
             except OSError:
+                logger.error(
+                    "Could not preserve invalid project metadata",
+                    exc_info=True,
+                    extra={
+                        "event": "metadata_recovery_backup_failed",
+                        "operation": "read_metadata",
+                        "project_root": self.project_root,
+                        "source_path": self.path,
+                        "recovery_path": backup_path,
+                    },
+                )
                 backup_path = ""
+            logger.warning(
+                "Invalid project metadata detected",
+                exc_info=(type(exc), exc, exc.__traceback__),
+                extra={
+                    "event": "metadata_recovery_started",
+                    "operation": "read_metadata",
+                    "project_root": self.project_root,
+                    "source_path": self.path,
+                    "recovery_path": backup_path,
+                },
+            )
             return MetadataReadResult(
                 {},
                 recovery_path=backup_path,
@@ -58,6 +83,15 @@ class ProjectMetadataStore:
         )
         if changed:
             atomic_write_text(self.path, json.dumps(migrated, indent=2))
+            logger.info(
+                "Project metadata migrated",
+                extra={
+                    "event": "metadata_migrated",
+                    "operation": "migrate_metadata",
+                    "project_root": self.project_root,
+                    "target_path": self.path,
+                },
+            )
         return MetadataReadResult(migrated)
 
     def update(self, updates: dict[str, Any]) -> MetadataReadResult:

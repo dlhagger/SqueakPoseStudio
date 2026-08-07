@@ -7,6 +7,7 @@ in isolation.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import shutil
@@ -22,6 +23,8 @@ from layer_ops import (
 )
 
 CURRENT_PROJECT_SCHEMA_VERSION = 4
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def normalize_yolo_task(value: Any) -> Optional[str]:
@@ -218,11 +221,27 @@ def atomic_write_text(path: str, text: str, *, encoding: str = "utf-8") -> None:
             fh.write(text)
             fh.flush()
         os.replace(tmp_path, abs_path)
-    except Exception:
+    except Exception:  # noqa: BLE001 - preserve the original write failure after cleanup
+        logger.exception(
+            "Atomic text write failed",
+            extra={
+                "event": "atomic_text_write_failed",
+                "operation": "atomic_write_text",
+                "target_path": abs_path,
+            },
+        )
         try:
             os.unlink(tmp_path)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove failed atomic-write staging file",
+                exc_info=True,
+                extra={
+                    "event": "atomic_text_cleanup_failed",
+                    "operation": "atomic_write_text_cleanup",
+                    "target_path": tmp_path,
+                },
+            )
         raise
 
 
@@ -284,11 +303,27 @@ def stage_text_file(target_path: str, text: str, *, encoding: str = "utf-8") -> 
             fh.write(text)
             fh.flush()
         return staged_path
-    except Exception:
+    except Exception:  # noqa: BLE001 - text encoders can raise non-OSError failures
+        logger.exception(
+            "Could not stage text file",
+            extra={
+                "event": "stage_text_failed",
+                "operation": "stage_text_file",
+                "target_path": target_path,
+            },
+        )
         try:
             os.unlink(staged_path)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove failed text staging file",
+                exc_info=True,
+                extra={
+                    "event": "stage_text_cleanup_failed",
+                    "operation": "stage_text_file_cleanup",
+                    "target_path": staged_path,
+                },
+            )
         raise
 
 
@@ -298,11 +333,28 @@ def stage_copy_file(source_path: str, target_path: str) -> str:
     try:
         shutil.copy2(source_path, staged_path)
         return staged_path
-    except Exception:
+    except OSError:
+        logger.exception(
+            "Could not stage copied file",
+            extra={
+                "event": "stage_copy_failed",
+                "operation": "stage_copy_file",
+                "source_path": source_path,
+                "target_path": target_path,
+            },
+        )
         try:
             os.unlink(staged_path)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove failed copy staging file",
+                exc_info=True,
+                extra={
+                    "event": "stage_copy_cleanup_failed",
+                    "operation": "stage_copy_file_cleanup",
+                    "target_path": staged_path,
+                },
+            )
         raise
 
 
@@ -351,7 +403,14 @@ def commit_staged_paths(replacements: Iterable[tuple[str, str]]) -> None:
             records.append(record)
             os.replace(staged_path, target_path)
             record["installed"] = True
-    except Exception as exc:
+    except OSError as exc:
+        logger.exception(
+            "Staged-path transaction failed; rolling back",
+            extra={
+                "event": "staged_transaction_failed",
+                "operation": "commit_staged_paths",
+            },
+        )
         rollback_errors: list[str] = []
         for record in reversed(records):
             target_path = str(record["target"])
@@ -361,13 +420,30 @@ def commit_staged_paths(replacements: Iterable[tuple[str, str]]) -> None:
                     remove_path(target_path)
                 if backup_path and os.path.lexists(str(backup_path)):
                     os.replace(str(backup_path), target_path)
-            except Exception as rollback_exc:
+            except OSError as rollback_exc:
+                logger.error(
+                    "Could not roll back transaction target",
+                    exc_info=True,
+                    extra={
+                        "event": "staged_transaction_rollback_failed",
+                        "operation": "commit_staged_paths_rollback",
+                        "target_path": target_path,
+                    },
+                )
                 rollback_errors.append(f"{target_path}: {rollback_exc}")
         for staged_path, _ in pairs:
             try:
                 remove_path(staged_path)
-            except Exception:
-                pass
+            except OSError:
+                logger.warning(
+                    "Could not remove uncommitted staging path",
+                    exc_info=True,
+                    extra={
+                        "event": "staged_transaction_cleanup_failed",
+                        "operation": "commit_staged_paths_cleanup",
+                        "target_path": staged_path,
+                    },
+                )
         if rollback_errors:
             detail = "; ".join(rollback_errors)
             raise RuntimeError(f"{exc}; rollback failed: {detail}") from exc
@@ -378,8 +454,16 @@ def commit_staged_paths(replacements: Iterable[tuple[str, str]]) -> None:
             if backup_path:
                 try:
                     remove_path(str(backup_path))
-                except Exception:
-                    pass
+                except OSError:
+                    logger.warning(
+                        "Could not remove committed transaction backup",
+                        exc_info=True,
+                        extra={
+                            "event": "staged_transaction_backup_cleanup_failed",
+                            "operation": "commit_staged_paths_cleanup",
+                            "target_path": str(backup_path),
+                        },
+                    )
 
 
 def atomic_write_text_files(files: Mapping[str, str], *, encoding: str = "utf-8") -> None:
@@ -389,12 +473,20 @@ def atomic_write_text_files(files: Mapping[str, str], *, encoding: str = "utf-8"
         for target_path, text in files.items():
             staged.append((stage_text_file(target_path, text, encoding=encoding), target_path))
         commit_staged_paths(staged)
-    except Exception:
+    except Exception:  # noqa: BLE001 - cleanup must cover all staging/commit failures
         for staged_path, _ in staged:
             try:
                 remove_path(staged_path)
-            except Exception:
-                pass
+            except OSError:
+                logger.warning(
+                    "Could not remove staged atomic-write path",
+                    exc_info=True,
+                    extra={
+                        "event": "atomic_files_cleanup_failed",
+                        "operation": "atomic_write_text_files_cleanup",
+                        "target_path": staged_path,
+                    },
+                )
         raise
 
 

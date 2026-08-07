@@ -1,6 +1,7 @@
 import os
 import unittest
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from dataset_ops import DATASET_DETECT, dataset_export_paths
 from squeakpose.services.dataset import export_dataset_transaction
@@ -54,19 +55,21 @@ class DatasetServiceTests(unittest.TestCase):
             def fail(_replacements):
                 raise OSError("injected install failure")
 
-            with self.assertRaises(OSError):
-                export_dataset_transaction(
-                    images_all_dir=images,
-                    labels_all_dir=labels,
-                    final_paths=paths,
-                    train_images=["frame.jpg"],
-                    val_images=[],
-                    mode=DATASET_DETECT,
-                    classes=["mouse"],
-                    keypoint_names=["nose"],
-                    split_seed=0,
-                    committer=fail,
-                )
+            with self.assertLogs("squeakpose.services.dataset", level="ERROR") as logs:
+                with self.assertRaises(OSError):
+                    export_dataset_transaction(
+                        images_all_dir=images,
+                        labels_all_dir=labels,
+                        final_paths=paths,
+                        train_images=["frame.jpg"],
+                        val_images=[],
+                        mode=DATASET_DETECT,
+                        classes=["mouse"],
+                        keypoint_names=["nose"],
+                        split_seed=0,
+                        committer=fail,
+                    )
+            self.assertTrue(any("Dataset transaction failed" in line for line in logs.output))
 
             with open(paths.dataset_yaml_path, "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "old yaml")
@@ -76,6 +79,35 @@ class DatasetServiceTests(unittest.TestCase):
                 if name.startswith(".detect-export-")
             ]
             self.assertEqual(staging, [])
+
+    def test_staging_cleanup_failure_is_logged_without_masking_success(self):
+        with TemporaryDirectory() as tmp:
+            images, labels = self._source_project(tmp)
+            paths = dataset_export_paths(tmp, DATASET_DETECT)
+
+            with (
+                patch(
+                    "squeakpose.services.dataset.remove_path",
+                    side_effect=OSError("injected cleanup failure"),
+                ),
+                self.assertLogs("squeakpose.services.dataset", level="WARNING") as logs,
+            ):
+                result = export_dataset_transaction(
+                    images_all_dir=images,
+                    labels_all_dir=labels,
+                    final_paths=paths,
+                    train_images=["frame.jpg"],
+                    val_images=[],
+                    mode=DATASET_DETECT,
+                    classes=["mouse"],
+                    keypoint_names=["nose"],
+                    split_seed=0,
+                )
+
+            self.assertEqual(result.dataset_yaml_path, paths.dataset_yaml_path)
+            self.assertTrue(
+                any("Could not remove dataset staging directory" in line for line in logs.output)
+            )
 
 
 if __name__ == "__main__":

@@ -134,12 +134,14 @@ class ProjectMetadataStoreTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("{bad json")
 
-            result = ProjectMetadataStore(tmp).read()
+            with self.assertLogs("squeakpose.project.metadata", level="WARNING") as logs:
+                result = ProjectMetadataStore(tmp).read()
 
             self.assertEqual(result.data, {})
             self.assertTrue(os.path.isfile(result.recovery_path))
             self.assertIn("Expecting property name", result.recovery_error)
             self.assertFalse(os.path.exists(path))
+            self.assertTrue(any("Invalid project metadata" in line for line in logs.output))
 
     def test_project_relative_paths_round_trip(self):
         with TemporaryDirectory() as tmp:

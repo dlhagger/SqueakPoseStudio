@@ -66,12 +66,14 @@ class AnnotationSaveServiceTests(unittest.TestCase):
             def fail(_replacements):
                 raise OSError("injected failure")
 
-            with self.assertRaises(OSError):
-                save_annotation_transaction(
-                    request,
-                    render_overlay=render,
-                    committer=fail,
-                )
+            with self.assertLogs("squeakpose.services.annotation_save", level="ERROR") as logs:
+                with self.assertRaises(OSError):
+                    save_annotation_transaction(
+                        request,
+                        render_overlay=render,
+                        committer=fail,
+                    )
+            self.assertTrue(any("Annotation transaction failed" in line for line in logs.output))
 
             with open(request.image_output_path, "rb") as fh:
                 self.assertEqual(fh.read(), b"old image")

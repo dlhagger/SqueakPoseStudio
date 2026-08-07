@@ -120,6 +120,11 @@ project/
 Use **File > Open Project...** to switch projects or **File > Close Project**
 to return to the launcher.
 
+Operational events and recoverable failures are written as structured JSON
+lines to `logs/squeakpose.jsonl` inside the active project. The log rotates at
+5 MiB and retains three backups. Opening a different project redirects new log
+events to that project's log directory.
+
 ## Labeling
 
 Add source images to the project's `images_to_label/` directory, then select

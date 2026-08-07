@@ -8,12 +8,12 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from layer_ops import layer_worker_mode, normalize_layer_id
 from squeakpose_core import (
     CURRENT_PROJECT_SCHEMA_VERSION,
     atomic_write_text,
     migrate_project_metadata,
 )
-from layer_ops import layer_worker_mode, normalize_layer_id
 
 from .paths import PROJECT_META_FILE
 
@@ -69,10 +69,7 @@ class ProjectMetadataStore:
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
             }
         normalized_updates = dict(updates)
-        if (
-            "active_workflow" in normalized_updates
-            and "active_layer" not in normalized_updates
-        ):
+        if "active_workflow" in normalized_updates and "active_layer" not in normalized_updates:
             normalized_updates["active_layer"] = normalize_layer_id(
                 normalized_updates["active_workflow"]
             )

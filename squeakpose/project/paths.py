@@ -65,12 +65,8 @@ class ProjectPaths(Mapping[str, str]):
             labels_all=os.path.join(root, "labels_all"),
             labels_seg_all=os.path.join(root, "labels_seg_all"),
             annotations=os.path.join(root, "annotations"),
-            annotations_keypoints=os.path.join(
-                root, "annotations", "keypoints"
-            ),
-            annotations_segmentation=os.path.join(
-                root, "annotations", "segmentation"
-            ),
+            annotations_keypoints=os.path.join(root, "annotations", "keypoints"),
+            annotations_segmentation=os.path.join(root, "annotations", "segmentation"),
             depth_maps=os.path.join(root, "depth maps"),
             depth_images=os.path.join(root, "depth maps", "images"),
             depth_previews=os.path.join(root, "depth maps", "previews"),
@@ -81,20 +77,12 @@ class ProjectPaths(Mapping[str, str]):
             distillation_runs=os.path.join(root, "runs", "distillation"),
             templates=os.path.join(root, "templates"),
             inference_outputs=os.path.join(root, "inference outputs"),
-            inference_keypoints=os.path.join(
-                root, "inference outputs", "keypoints"
-            ),
-            inference_segmentation=os.path.join(
-                root, "inference outputs", "segmentation"
-            ),
+            inference_keypoints=os.path.join(root, "inference outputs", "keypoints"),
+            inference_segmentation=os.path.join(root, "inference outputs", "segmentation"),
             inference_depth=os.path.join(root, "inference outputs", "depth"),
             analysis_outputs=os.path.join(root, "analysis outputs"),
-            analysis_keypoints=os.path.join(
-                root, "analysis outputs", "keypoints"
-            ),
-            analysis_segmentation=os.path.join(
-                root, "analysis outputs", "segmentation"
-            ),
+            analysis_keypoints=os.path.join(root, "analysis outputs", "keypoints"),
+            analysis_segmentation=os.path.join(root, "analysis outputs", "segmentation"),
             analysis_depth=os.path.join(root, "analysis outputs", "depth"),
             logs=os.path.join(root, "logs"),
             classes_file=os.path.join(root, "classes.txt"),

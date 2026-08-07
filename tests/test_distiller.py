@@ -7,7 +7,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-
 DISTILLER_PATH = Path(__file__).resolve().parents[1] / "distillation" / "distiller.py"
 
 

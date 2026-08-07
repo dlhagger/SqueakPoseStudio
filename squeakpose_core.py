@@ -6,9 +6,9 @@ in isolation.
 
 from __future__ import annotations
 
-import os
-import math
 import hashlib
+import math
+import os
 import shutil
 import tempfile
 import uuid
@@ -20,7 +20,6 @@ from layer_ops import (
     normalize_layer_id,
     normalize_layer_settings,
 )
-
 
 CURRENT_PROJECT_SCHEMA_VERSION = 4
 
@@ -236,13 +235,13 @@ def image_stem_collisions(file_names: Iterable[str]) -> dict[str, list[str]]:
         if stem:
             grouped.setdefault(stem, []).append(name)
     return {
-        stem: sorted(names, key=str.casefold)
-        for stem, names in grouped.items()
-        if len(names) > 1
+        stem: sorted(names, key=str.casefold) for stem, names in grouped.items() if len(names) > 1
     }
 
 
-def filter_image_stem_collisions(file_names: Iterable[str]) -> tuple[list[str], dict[str, list[str]]]:
+def filter_image_stem_collisions(
+    file_names: Iterable[str],
+) -> tuple[list[str], dict[str, list[str]]]:
     """Return files with ambiguous stems removed, plus the collision map."""
     names = list(file_names)
     collisions = image_stem_collisions(names)
@@ -259,7 +258,7 @@ def stable_path_id(path: str, *, length: int = 8) -> str:
     """Return a short stable identifier for a canonical filesystem path."""
     canonical = os.path.normcase(os.path.realpath(os.path.abspath(path)))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return digest[:max(4, int(length))]
+    return digest[: max(4, int(length))]
 
 
 def staging_path_for(target_path: str) -> str:

@@ -73,9 +73,7 @@ def run(argv: list[str] | None = None) -> int:
     )
 
     font_path = os.path.join(app_base, "fonts", "FiraSans-Regular.ttf")
-    system_family = QFontDatabase.systemFont(
-        QFontDatabase.SystemFont.GeneralFont
-    ).family()
+    system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
     preferred_family = system_family
     if os.path.exists(font_path):
         font_id = QFontDatabase.addApplicationFont(font_path)

@@ -244,7 +244,9 @@ class InferenceOpsTests(unittest.TestCase):
                 batch_size=1,
                 total_frames=2,
                 fps=10.0,
-                progress_callback=lambda processed, total, message: progress.append((processed, total, message)),
+                progress_callback=lambda processed, total, message: progress.append(
+                    (processed, total, message)
+                ),
             )
 
             self.assertFalse(result.had_error)
@@ -355,9 +357,7 @@ class InferenceOpsTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "depth.csv")
             preview_path = os.path.join(tmp, "depth_preview.mp4")
-            cv2 = _FakeCv2(
-                [np.zeros((2, 3, 3), dtype=np.uint8)], fps=10.0
-            )
+            cv2 = _FakeCv2([np.zeros((2, 3, 3), dtype=np.uint8)], fps=10.0)
             model = _DepthModel([_DepthResult([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]])])
 
             result = run_depth_video_inference(

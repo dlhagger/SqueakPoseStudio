@@ -7,7 +7,7 @@ import re
 import sys
 from typing import Optional
 
-from PyQt6.QtCore import QProcess, QTimer, Qt
+from PyQt6.QtCore import QProcess, Qt, QTimer
 from PyQt6.QtGui import QFontDatabase, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,12 +31,16 @@ from PyQt6.QtWidgets import (
 )
 
 from squeakpose.project.paths import ProjectPaths
-from squeakpose_core import stable_path_id, staging_path_for
 from squeakpose.workers.process import (
     remove_file_quietly as _remove_file_quietly,
+)
+from squeakpose.workers.process import (
     request_qprocess_stop,
+)
+from squeakpose.workers.process import (
     shutdown_qprocess as _shutdown_qprocess,
 )
+from squeakpose_core import stable_path_id, staging_path_for
 from ui_style import (
     ThemedComboBox,
     style_combo_popup,
@@ -98,9 +102,7 @@ class DistillationDialog(QDialog):
         self.resize(1050, 760)
         self.setMinimumSize(780, 560)
 
-        self.app_base_dir = os.path.abspath(
-            getattr(parent, "app_base_dir", APP_BASE_DIR)
-        )
+        self.app_base_dir = os.path.abspath(getattr(parent, "app_base_dir", APP_BASE_DIR))
         self.project_root = os.path.abspath(getattr(parent, "project_root", self.app_base_dir))
         self.paths = _project_paths(self.project_root)
         self.video_paths: list[str] = []
@@ -301,9 +303,15 @@ class DistillationDialog(QDialog):
         old_defaults = self.TASK_DEFAULTS[self._current_task]
         new_task = self._selected_task()
         new_defaults = self.TASK_DEFAULTS[new_task]
-        if not self.run_name_edit.text().strip() or self.run_name_edit.text() == old_defaults["run_name"]:
+        if (
+            not self.run_name_edit.text().strip()
+            or self.run_name_edit.text() == old_defaults["run_name"]
+        ):
             self.run_name_edit.setText(new_defaults["run_name"])
-        if not self.student_edit.text().strip() or self.student_edit.text() == old_defaults["student"]:
+        if (
+            not self.student_edit.text().strip()
+            or self.student_edit.text() == old_defaults["student"]
+        ):
             self.student_edit.setText(new_defaults["student"])
         self._current_task = new_task
         self._update_output_path()
@@ -335,7 +343,9 @@ class DistillationDialog(QDialog):
             self.video_list.addItem(normalized)
 
     def _remove_selected_videos(self) -> None:
-        rows = sorted({self.video_list.row(item) for item in self.video_list.selectedItems()}, reverse=True)
+        rows = sorted(
+            {self.video_list.row(item) for item in self.video_list.selectedItems()}, reverse=True
+        )
         for row in rows:
             self.video_list.takeItem(row)
             del self.video_paths[row]
@@ -396,10 +406,14 @@ class DistillationDialog(QDialog):
 
     def _create_dataset(self) -> None:
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Run uv sync --locked to restore project dependencies.")
+            QMessageBox.warning(
+                self, "OpenCV missing", "Run uv sync --locked to restore project dependencies."
+            )
             return
         if not self.video_paths:
-            QMessageBox.information(self, "Select videos", "Select one or more project videos first.")
+            QMessageBox.information(
+                self, "Select videos", "Select one or more project videos first."
+            )
             return
 
         data_text = self.data_dir_edit.text().strip()
@@ -439,7 +453,9 @@ class DistillationDialog(QDialog):
         try:
             os.makedirs(data_dir, exist_ok=True)
         except OSError as exc:
-            QMessageBox.warning(self, "Corpus error", f"Could not create the image directory:\n{exc}")
+            QMessageBox.warning(
+                self, "Corpus error", f"Could not create the image directory:\n{exc}"
+            )
             return
 
         progress = QProgressDialog("Preparing image corpus...", "Cancel", 0, estimated, self)
@@ -460,7 +476,9 @@ class DistillationDialog(QDialog):
                 break
             cap = _cv2.VideoCapture(path)
             source_id = stable_path_id(path)
-            base = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(path))[0]).strip("._")
+            base = re.sub(
+                r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(path))[0]
+            ).strip("._")
             base = base or "video"
             try:
                 for sample_number, frame_idx in enumerate(range(0, total, stride)):
@@ -476,7 +494,9 @@ class DistillationDialog(QDialog):
                         cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_idx)
                         ok, frame = cap.read()
                         if not ok or frame is None:
-                            failed.append(f"{os.path.basename(path)} frame {frame_idx}: read failed")
+                            failed.append(
+                                f"{os.path.basename(path)} frame {frame_idx}: read failed"
+                            )
                         else:
                             staged_path = staging_path_for(out_path)
                             try:
@@ -511,7 +531,9 @@ class DistillationDialog(QDialog):
         if canceled:
             summary += "\n\nExtraction was canceled; images already written were kept."
         if failed:
-            summary += f"\n\n{len(failed):,} frame(s) failed. First issues:\n" + "\n".join(failed[:8])
+            summary += f"\n\n{len(failed):,} frame(s) failed. First issues:\n" + "\n".join(
+                failed[:8]
+            )
         QMessageBox.information(self, "Image corpus updated", summary)
 
     def _run_name(self) -> str:
@@ -534,7 +556,9 @@ class DistillationDialog(QDialog):
 
     def _start_distillation(self) -> None:
         if self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning:
-            QMessageBox.information(self, "Distillation running", "A distillation run is already active.")
+            QMessageBox.information(
+                self, "Distillation running", "A distillation run is already active."
+            )
             return
 
         data_text = self.data_dir_edit.text().strip()
@@ -560,7 +584,9 @@ class DistillationDialog(QDialog):
             )
             return
         if not student or not teacher:
-            QMessageBox.warning(self, "Model required", "Both student and teacher model values are required.")
+            QMessageBox.warning(
+                self, "Model required", "Both student and teacher model values are required."
+            )
             return
         if self._student_task_mismatch(student, task):
             task_label = self.TASK_DEFAULTS[task]["label"]

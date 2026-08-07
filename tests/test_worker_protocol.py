@@ -4,6 +4,9 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
+from PyQt6.QtCore import QProcess
+
+from squeakpose.workers.process import request_qprocess_stop
 from squeakpose.workers.protocol import (
     JsonLineBuffer,
     WorkerProtocolError,
@@ -12,8 +15,6 @@ from squeakpose.workers.protocol import (
     validate_event,
     write_event,
 )
-from squeakpose.workers.process import request_qprocess_stop
-from PyQt6.QtCore import QProcess
 
 
 class WorkerProtocolTests(unittest.TestCase):

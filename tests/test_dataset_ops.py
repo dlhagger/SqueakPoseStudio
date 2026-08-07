@@ -61,8 +61,7 @@ class DatasetOpsTests(unittest.TestCase):
             (images_all / "frame1.jpg").write_bytes(b"fake-image")
             (images_all / "frame2.jpg").write_bytes(b"fake-image")
             (labels_all / "frame1.txt").write_text(
-                "0 0.5 0.5 0.2 0.2 0.1 0.1 2\n"
-                "bad row\n",
+                "0 0.5 0.5 0.2 0.2 0.1 0.1 2\nbad row\n",
                 encoding="utf-8",
             )
 
@@ -188,8 +187,7 @@ class DatasetOpsTests(unittest.TestCase):
             labels_all.mkdir()
             (images_all / "frame1.png").write_bytes(b"image")
             (labels_all / "frame1.txt").write_text(
-                "0 -0.1 0.1 0.8 0.1 0.8 1.2 0.1 0.8\n"
-                "0 0.2 0.2 0.3 0.3 0.4 0.4\n",
+                "0 -0.1 0.1 0.8 0.1 0.8 1.2 0.1 0.8\n0 0.2 0.2 0.3 0.3 0.4 0.4\n",
                 encoding="utf-8",
             )
             paths = dataset_export_paths(str(root), DATASET_SEGMENT)
@@ -210,8 +208,7 @@ class DatasetOpsTests(unittest.TestCase):
             exported = (Path(paths.labels_train_dir) / "frame1.txt").read_text(encoding="utf-8")
             self.assertEqual(
                 exported,
-                "0 0.000000 0.100000 0.800000 0.100000 "
-                "0.800000 1.000000 0.100000 0.800000\n",
+                "0 0.000000 0.100000 0.800000 0.100000 0.800000 1.000000 0.100000 0.800000\n",
             )
 
     def test_pose_export_normalizes_rows_to_current_keypoint_schema(self):
@@ -244,14 +241,19 @@ class DatasetOpsTests(unittest.TestCase):
             self.assertTrue(any("missing keypoint" in warning for warning in result.warnings))
             self.assertEqual(
                 (Path(paths.labels_train_dir) / "frame1.txt").read_text(encoding="utf-8"),
-                "0 1.000000 0.500000 0.200000 0.200000 "
-                "0.100000 0.100000 2 0.000000 0.000000 0\n",
+                "0 1.000000 0.500000 0.200000 0.200000 0.100000 0.100000 2 0.000000 0.000000 0\n",
             )
 
     def test_project_health_reports_orphans_copies_and_temp_files(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for directory in ("images_to_label", "images_all", "labels_all", "labels_seg_all", "datasets"):
+            for directory in (
+                "images_to_label",
+                "images_all",
+                "labels_all",
+                "labels_seg_all",
+                "datasets",
+            ):
                 (root / directory).mkdir()
             (root / "images_all" / "mouse.png").write_bytes(b"image")
             (root / "images_all" / "mouse 2.png").write_bytes(b"copy")
@@ -309,8 +311,7 @@ class DatasetOpsTests(unittest.TestCase):
             self.assertTrue((images_all / "frame1.jpg").exists())
             self.assertEqual(
                 (labels / "frame1.txt").read_text(encoding="utf-8"),
-                "0 1.000000 0.000000 0.200000 0.200000 "
-                "0.100000 0.100000 2 0.000000 0.000000 0\n",
+                "0 1.000000 0.000000 0.200000 0.200000 0.100000 0.100000 2 0.000000 0.000000 0\n",
             )
             backup_label = Path(result.backup_dir) / "frame1.txt"
             self.assertEqual(backup_label.read_text(encoding="utf-8"), original)
@@ -367,8 +368,12 @@ class DatasetOpsTests(unittest.TestCase):
             self.assertFalse(label_path.exists())
             self.assertIsNotNone(result.backup_dir)
             self.assertIsNotNone(result.quarantine_dir)
-            self.assertEqual((Path(result.backup_dir) / "frame1.txt").read_text(encoding="utf-8"), original)
-            self.assertEqual((Path(result.quarantine_dir) / "frame1.txt").read_text(encoding="utf-8"), original)
+            self.assertEqual(
+                (Path(result.backup_dir) / "frame1.txt").read_text(encoding="utf-8"), original
+            )
+            self.assertEqual(
+                (Path(result.quarantine_dir) / "frame1.txt").read_text(encoding="utf-8"), original
+            )
 
     def test_empty_and_invalid_labels_are_not_usable(self):
         with TemporaryDirectory() as tmp:

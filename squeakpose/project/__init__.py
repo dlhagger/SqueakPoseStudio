@@ -1,6 +1,5 @@
 """Project paths, structure, and metadata services."""
 
-from squeakpose.project.metadata import MetadataReadResult, ProjectMetadataStore
 from squeakpose.project.distillation import (
     DISTILLATION_MANIFEST_FILENAME,
     discover_distillation_exports,
@@ -10,14 +9,6 @@ from squeakpose.project.distillation import (
     normalize_distillation_task,
     preferred_distillation_export,
 )
-from squeakpose.project.paths import (
-    ProjectPaths,
-    default_projects_root,
-    ensure_project_structure,
-    load_last_project,
-    project_window_title,
-    save_last_project,
-)
 from squeakpose.project.layers import (
     LAYER_DEFINITIONS,
     LAYER_DEPTH,
@@ -26,6 +17,15 @@ from squeakpose.project.layers import (
     LayerDefinition,
     layer_definition,
     normalize_layer_id,
+)
+from squeakpose.project.metadata import MetadataReadResult, ProjectMetadataStore
+from squeakpose.project.paths import (
+    ProjectPaths,
+    default_projects_root,
+    ensure_project_structure,
+    load_last_project,
+    project_window_title,
+    save_last_project,
 )
 
 __all__ = [

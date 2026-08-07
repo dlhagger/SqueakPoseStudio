@@ -5,13 +5,11 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import sys
 import tempfile
 from typing import Any, Callable, Optional
 
 from analysis_ops import AnalysisConfig, AnalysisError, run_analysis_workflow
 from squeakpose.workers.protocol import read_config, write_event
-
 
 _CANCEL_REQUESTED = False
 
@@ -40,12 +38,16 @@ def run_analysis_worker(
     _CANCEL_REQUESTED = False
 
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "squeakpose-mpl"))
-    os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "squeakpose-numba-cache"))
+    os.environ.setdefault(
+        "NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "squeakpose-numba-cache")
+    )
 
     try:
         analysis_config = AnalysisConfig.from_dict(config)
     except Exception as exc:
-        _emit_event(event_writer, {"event": "error", "error_message": f"Invalid analysis config: {exc}"})
+        _emit_event(
+            event_writer, {"event": "error", "error_message": f"Invalid analysis config: {exc}"}
+        )
         return 1
 
     _emit_event(
@@ -59,7 +61,9 @@ def run_analysis_worker(
     )
 
     def progress(step: int, total: int, message: str) -> None:
-        _emit_event(event_writer, {"event": "progress", "step": step, "total": total, "message": message})
+        _emit_event(
+            event_writer, {"event": "progress", "step": step, "total": total, "message": message}
+        )
 
     try:
         result = run_analysis_workflow(analysis_config, progress_callback=progress)
@@ -78,7 +82,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
 
-    parser = argparse.ArgumentParser(description="Run SqueakPose inference analysis in a child process.")
+    parser = argparse.ArgumentParser(
+        description="Run SqueakPose inference analysis in a child process."
+    )
     parser.add_argument("--config", required=True, help="Path to JSON analysis config.")
     args = parser.parse_args(argv)
 

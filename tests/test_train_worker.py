@@ -36,7 +36,9 @@ class TrainWorkerTests(unittest.TestCase):
         )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(model.calls, [{"data": "dataset.yaml", "epochs": 2, "batch": 1, "task": "segment"}])
+        self.assertEqual(
+            model.calls, [{"data": "dataset.yaml", "epochs": 2, "batch": 1, "task": "segment"}]
+        )
         self.assertEqual([event["event"] for event in events], ["started", "training", "result"])
         self.assertFalse(events[-1]["had_error"])
         self.assertEqual(events[-1]["save_dir"], "/tmp/squeakpose-run")

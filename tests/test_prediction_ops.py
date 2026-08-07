@@ -3,8 +3,7 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
-import numpy as np
-
+from predict_worker import run_predict_server, run_predict_worker
 from prediction_ops import (
     best_predictions_by_class_from_payload,
     prediction_confidences_by_class,
@@ -12,7 +11,6 @@ from prediction_ops import (
     serialize_prediction_result,
     top_prediction_from_payload,
 )
-from predict_worker import run_predict_server, run_predict_worker
 from video_review_worker import run_video_review_worker
 
 
@@ -249,8 +247,18 @@ class PredictionOpsTests(unittest.TestCase):
     def test_top_prediction_from_payload_picks_highest_confidence_detection(self):
         payload = {
             "detections": [
-                {"class_id": 0, "confidence": 0.2, "xyxy": [0, 0, 5, 5], "keypoints": [[1, 2, 0.3]]},
-                {"class_id": 1, "confidence": 0.8, "xyxy": [10, 11, 20, 21], "keypoints": [[12, 13, 0.9]]},
+                {
+                    "class_id": 0,
+                    "confidence": 0.2,
+                    "xyxy": [0, 0, 5, 5],
+                    "keypoints": [[1, 2, 0.3]],
+                },
+                {
+                    "class_id": 1,
+                    "confidence": 0.8,
+                    "xyxy": [10, 11, 20, 21],
+                    "keypoints": [[12, 13, 0.9]],
+                },
             ]
         }
 
@@ -264,9 +272,24 @@ class PredictionOpsTests(unittest.TestCase):
     def test_best_predictions_by_class_matches_labeler_selection(self):
         payload = {
             "detections": [
-                {"class_id": 0, "confidence": 0.7, "xyxy": [1, 2, 3, 4], "keypoints": [[5, 6, 0.8]]},
-                {"class_id": 1, "confidence": 0.9, "xyxy": [10, 20, 30, 40], "keypoints": [[50, 60, 0.95]]},
-                {"class_id": 0, "confidence": 0.8, "xyxy": [7, 8, 9, 10], "keypoints": [[11, 12, 0.85]]},
+                {
+                    "class_id": 0,
+                    "confidence": 0.7,
+                    "xyxy": [1, 2, 3, 4],
+                    "keypoints": [[5, 6, 0.8]],
+                },
+                {
+                    "class_id": 1,
+                    "confidence": 0.9,
+                    "xyxy": [10, 20, 30, 40],
+                    "keypoints": [[50, 60, 0.95]],
+                },
+                {
+                    "class_id": 0,
+                    "confidence": 0.8,
+                    "xyxy": [7, 8, 9, 10],
+                    "keypoints": [[11, 12, 0.85]],
+                },
             ]
         }
 
@@ -477,7 +500,11 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertEqual([call["source"] for call in model.calls], ["one.png", "two.png"])
         self.assertEqual(events[0]["event"], "ready")
         self.assertEqual(
-            [(event["event"], event.get("request_id")) for event in events if event["event"] == "result"],
+            [
+                (event["event"], event.get("request_id"))
+                for event in events
+                if event["event"] == "result"
+            ],
             [("result", 2), ("result", 3)],
         )
 
@@ -489,9 +516,15 @@ class PredictionOpsTests(unittest.TestCase):
         factory_calls = []
         events = []
         requests = [
-            json.dumps({"command": "load", "request_id": 1, "model_path": "one.pt", "workflow": "pose"}),
-            json.dumps({"command": "load", "request_id": 2, "model_path": "one.pt", "workflow": "pose"}),
-            json.dumps({"command": "load", "request_id": 3, "model_path": "two.pt", "workflow": "pose"}),
+            json.dumps(
+                {"command": "load", "request_id": 1, "model_path": "one.pt", "workflow": "pose"}
+            ),
+            json.dumps(
+                {"command": "load", "request_id": 2, "model_path": "one.pt", "workflow": "pose"}
+            ),
+            json.dumps(
+                {"command": "load", "request_id": 3, "model_path": "two.pt", "workflow": "pose"}
+            ),
         ]
 
         def factory(path):

@@ -21,7 +21,6 @@ from analysis_ops import (
     _mm_per_pixel,
     _open_h264_video_writer,
     _progress,
-    _records_for_json,
     _setup_plotting,
     _smooth_centers,
     assign_roi_labels,
@@ -30,7 +29,6 @@ from analysis_ops import (
     normalize_rois,
     run_behavior_clustering,
 )
-
 
 SEGMENTATION_REQUIRED_COLUMNS = ["frame", "det", "x1", "y1", "x2", "y2", "mask_polygon"]
 
@@ -117,7 +115,9 @@ def _polygon_metrics(points: list[tuple[float, float]]) -> dict[str, float]:
             order = np.argsort(eigenvalues)[::-1]
             eigenvalues = eigenvalues[order]
             eigenvectors = eigenvectors[:, order]
-            orientation = float((math.degrees(math.atan2(eigenvectors[1, 0], eigenvectors[0, 0])) + 360.0) % 180.0)
+            orientation = float(
+                (math.degrees(math.atan2(eigenvectors[1, 0], eigenvectors[0, 0])) + 360.0) % 180.0
+            )
             major_axis = float(4.0 * math.sqrt(max(eigenvalues[0], 0.0)))
             minor_axis = float(4.0 * math.sqrt(max(eigenvalues[-1], 0.0)))
         except Exception:
@@ -159,7 +159,9 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
             detections[col] = pd.to_numeric(detections[col], errors="coerce")
 
     polygon_points = detections["mask_polygon"].map(_parse_polygon)
-    metrics = pd.DataFrame([_polygon_metrics(points) for points in polygon_points], index=detections.index)
+    metrics = pd.DataFrame(
+        [_polygon_metrics(points) for points in polygon_points], index=detections.index
+    )
     detections = pd.concat([detections, metrics], axis=1)
 
     detections["bbox_x1"] = pd.to_numeric(detections["x1"], errors="coerce")
@@ -171,7 +173,9 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
     detections["bbox_area_px2"] = detections["bbox_width"] * detections["bbox_height"]
     detections["bbox_center_x"] = (detections["bbox_x1"] + detections["bbox_x2"]) / 2.0
     detections["bbox_center_y"] = (detections["bbox_y1"] + detections["bbox_y2"]) / 2.0
-    detections["mask_fill_ratio"] = detections["mask_area_px2"] / detections["bbox_area_px2"].replace(0, np.nan)
+    detections["mask_fill_ratio"] = detections["mask_area_px2"] / detections[
+        "bbox_area_px2"
+    ].replace(0, np.nan)
 
     detections["bbox_center_x"] = detections["mask_centroid_x"].where(
         detections["mask_centroid_x"].notna(),
@@ -230,10 +234,14 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
         "mask_polygon",
         "is_primary_detection",
     ]
-    return detections[[col for col in output_cols if col in detections.columns]].reset_index(drop=True)
+    return detections[[col for col in output_cols if col in detections.columns]].reset_index(
+        drop=True
+    )
 
 
-def _smooth_segmentation_centers(df: pd.DataFrame, fps: float, config: AnalysisConfig) -> pd.DataFrame:
+def _smooth_segmentation_centers(
+    df: pd.DataFrame, fps: float, config: AnalysisConfig
+) -> pd.DataFrame:
     smoothed = _smooth_centers(df, fps, config)
     return smoothed
 
@@ -314,7 +322,9 @@ def summarize_segmentation_features(
     valid_frames = int(primary["frame_index"].nunique())
     no_detection_frames = max(total_frames - valid_frames, 0)
     multi_detection_frames = int((detections.groupby("frame_index").size() > 1).sum())
-    total_distance_mm = float(primary["distance_mm"].sum(skipna=True)) if "distance_mm" in primary.columns else 0.0
+    total_distance_mm = (
+        float(primary["distance_mm"].sum(skipna=True)) if "distance_mm" in primary.columns else 0.0
+    )
     return {
         "analysis_kind": "segmentation",
         "frames": int(len(primary)),
@@ -329,7 +339,9 @@ def summarize_segmentation_features(
         "total_distance_mm": total_distance_mm,
         "total_distance_m": total_distance_mm / 1000.0,
         "average_speed_mm_per_sec": float(primary["speed_mm_per_sec"].mean(skipna=True)),
-        "average_acceleration_mm_per_sec2": float(primary["acceleration_mm_per_sec2"].mean(skipna=True)),
+        "average_acceleration_mm_per_sec2": float(
+            primary["acceleration_mm_per_sec2"].mean(skipna=True)
+        ),
         "mean_confidence": float(detections["confidence"].mean(skipna=True)),
         "mean_mask_area_px2": float(detections["mask_area_px2"].mean(skipna=True)),
         "mean_mask_area_mm2": float(detections["mask_area_mm2"].mean(skipna=True)),
@@ -338,7 +350,9 @@ def summarize_segmentation_features(
     }
 
 
-def _line_plot(df: pd.DataFrame, x_col: str, y_col: str, path: Path, ylabel: str, title: str) -> Optional[str]:
+def _line_plot(
+    df: pd.DataFrame, x_col: str, y_col: str, path: Path, ylabel: str, title: str
+) -> Optional[str]:
     if x_col not in df.columns or y_col not in df.columns:
         return None
     clean = df[[x_col, y_col]].dropna()
@@ -414,15 +428,37 @@ def create_segmentation_plots(
     plt, sns = _setup_plotting()
     paths: list[str] = []
 
-    confidence_plot = _confidence_by_detection_index_plot(detections, output_dir / "segmentation_confidence.png")
+    confidence_plot = _confidence_by_detection_index_plot(
+        detections, output_dir / "segmentation_confidence.png"
+    )
     if confidence_plot:
         paths.append(confidence_plot)
 
     for y_col, ylabel, title, filename in [
-        ("mask_area_px2", "Area (px^2)", "Primary Mask Area by Frame", "segmentation_mask_area_px2.png"),
-        ("mask_fill_ratio", "Mask / bbox area", "Primary Mask Fill Ratio by Frame", "segmentation_fill_ratio.png"),
-        ("speed_mm_per_sec", "Speed (mm/s)", "Segmentation Centroid Speed", "segmentation_speed_mm_per_sec.png"),
-        ("distance_mm", "Distance (mm)", "Segmentation Centroid Distance", "segmentation_distance_mm.png"),
+        (
+            "mask_area_px2",
+            "Area (px^2)",
+            "Primary Mask Area by Frame",
+            "segmentation_mask_area_px2.png",
+        ),
+        (
+            "mask_fill_ratio",
+            "Mask / bbox area",
+            "Primary Mask Fill Ratio by Frame",
+            "segmentation_fill_ratio.png",
+        ),
+        (
+            "speed_mm_per_sec",
+            "Speed (mm/s)",
+            "Segmentation Centroid Speed",
+            "segmentation_speed_mm_per_sec.png",
+        ),
+        (
+            "distance_mm",
+            "Distance (mm)",
+            "Segmentation Centroid Distance",
+            "segmentation_distance_mm.png",
+        ),
     ]:
         plot_path = _line_plot(primary, "frame_index", y_col, output_dir / filename, ylabel, title)
         if plot_path:
@@ -485,7 +521,9 @@ def create_segmentation_plots(
                 frame_height, frame_width = frame.shape[:2]
             else:
                 frame_width = int(max(clean["bbox_x2"].max(), clean["bbox_center_x_euro"].max(), 1))
-                frame_height = int(max(clean["bbox_y2"].max(), clean["bbox_center_y_euro"].max(), 1))
+                frame_height = int(
+                    max(clean["bbox_y2"].max(), clean["bbox_center_y_euro"].max(), 1)
+                )
             heatmap, xedges, yedges = np.histogram2d(
                 clean["bbox_center_x_euro"],
                 clean["bbox_center_y_euro"],
@@ -538,7 +576,11 @@ def render_segmentation_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-    rows_by_frame = {int(row["frame_index"]): row for _, row in primary.iterrows() if not pd.isna(row.get("frame_index"))}
+    rows_by_frame = {
+        int(row["frame_index"]): row
+        for _, row in primary.iterrows()
+        if not pd.isna(row.get("frame_index"))
+    }
     normalized_rois = normalize_rois(rois or [])
 
     frame_idx = 0
@@ -550,13 +592,28 @@ def render_segmentation_annotated_video(
                     break
 
                 for roi in normalized_rois:
-                    x1, y1, x2, y2 = [int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")]
+                    x1, y1, x2, y2 = [
+                        int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
+                    ]
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
-                    cv2.putText(frame, str(roi["name"]), (x1 + 4, max(y1 + 18, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (66, 191, 245), 2)
+                    cv2.putText(
+                        frame,
+                        str(roi["name"]),
+                        (x1 + 4, max(y1 + 18, 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (66, 191, 245),
+                        2,
+                    )
 
                 row = rows_by_frame.get(frame_idx)
                 if row is not None:
-                    bbox_vals = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
+                    bbox_vals = [
+                        row.get("bbox_x1"),
+                        row.get("bbox_y1"),
+                        row.get("bbox_x2"),
+                        row.get("bbox_y2"),
+                    ]
                     if not any(pd.isna(v) for v in bbox_vals):
                         x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
@@ -564,26 +621,52 @@ def render_segmentation_annotated_video(
                     points = _parse_polygon(row.get("mask_polygon"))
                     if len(points) >= 3:
                         contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(frame, [contour], isClosed=True, color=(0, 255, 255), thickness=2)
+                        cv2.polylines(
+                            frame, [contour], isClosed=True, color=(0, 255, 255), thickness=2
+                        )
 
                     cx = row.get("bbox_center_x_euro")
                     cy = row.get("bbox_center_y_euro")
                     if not pd.isna(cx) and not pd.isna(cy):
-                        cv2.circle(frame, (int(round(float(cx))), int(round(float(cy)))), 4, (0, 0, 255), -1)
+                        cv2.circle(
+                            frame,
+                            (int(round(float(cx))), int(round(float(cy)))),
+                            4,
+                            (0, 0, 255),
+                            -1,
+                        )
 
                     text = f"Frame: {frame_idx}"
                     speed_val = row.get("speed_mm_per_sec")
                     if not pd.isna(speed_val):
                         text += f" | Speed: {float(speed_val):.1f} mm/s"
-                    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(
+                        frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
+                    )
 
                     area_val = row.get("mask_area_px2")
                     if not pd.isna(area_val):
-                        cv2.putText(frame, f"Mask area: {float(area_val):.0f} px^2", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        cv2.putText(
+                            frame,
+                            f"Mask area: {float(area_val):.0f} px^2",
+                            (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                        )
 
                     roi_label = row.get("roi_label")
                     if isinstance(roi_label, str) and roi_label:
-                        cv2.putText(frame, f"ROI: {roi_label}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        cv2.putText(
+                            frame,
+                            f"ROI: {roi_label}",
+                            (10, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                        )
 
                 writer.write(frame)
                 frame_idx += 1
@@ -626,7 +709,9 @@ def run_segmentation_analysis_workflow(
     primary = compute_segmentation_track_features(detections, raw, fps, scale, config)
     if rois:
         _progress(progress_callback, 4, total_steps, "Applying ROI annotations")
-        primary = assign_roi_labels(primary, rois, x_col="bbox_center_x_euro", y_col="bbox_center_y_euro")
+        primary = assign_roi_labels(
+            primary, rois, x_col="bbox_center_x_euro", y_col="bbox_center_y_euro"
+        )
     else:
         _progress(progress_callback, 4, total_steps, "No ROI annotations selected")
 
@@ -653,14 +738,18 @@ def run_segmentation_analysis_workflow(
     plot_paths: list[str] = []
     if config.make_plots:
         _progress(progress_callback, 6, total_steps, "Rendering segmentation plots")
-        plot_paths = create_segmentation_plots(primary, detections, output_dir / "plots", video_path=video_path, rois=rois)
+        plot_paths = create_segmentation_plots(
+            primary, detections, output_dir / "plots", video_path=video_path, rois=rois
+        )
     else:
         _progress(progress_callback, 6, total_steps, "Skipping plots")
 
     annotated_video = None
     if config.make_annotated_video:
         _progress(progress_callback, 7, total_steps, "Rendering segmentation annotated video")
-        annotated_video = render_segmentation_annotated_video(primary, video_path, output_dir / "annotated_output.mp4", fps, rois=rois)
+        annotated_video = render_segmentation_annotated_video(
+            primary, video_path, output_dir / "annotated_output.mp4", fps, rois=rois
+        )
     else:
         _progress(progress_callback, 7, total_steps, "Skipping annotated video")
 

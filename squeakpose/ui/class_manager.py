@@ -51,27 +51,20 @@ class AddClassDialog(QDialog):
         layout.addWidget(self.count_label)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
     def _update_count_label(self) -> None:
-        lines = [
-            line
-            for line in self.keypoints_edit.toPlainText().splitlines()
-            if line.strip()
-        ]
+        lines = [line for line in self.keypoints_edit.toPlainText().splitlines() if line.strip()]
         self.count_label.setText(f"Keypoint count: {len(lines)}")
 
     def get_data(self) -> tuple[str, list[str]]:
         name = self.name_edit.text().strip()
         keypoints = [
-            line.strip()
-            for line in self.keypoints_edit.toPlainText().splitlines()
-            if line.strip()
+            line.strip() for line in self.keypoints_edit.toPlainText().splitlines() if line.strip()
         ]
         return name, keypoints
 
@@ -90,10 +83,7 @@ class ClassManagerDialog(QDialog):
         self.resize(420, 480)
 
         self._classes = classes[:]
-        self._kp_map = {
-            name: keypoint_map.get(name, canonical[:])[:]
-            for name in self._classes
-        }
+        self._kp_map = {name: keypoint_map.get(name, canonical[:])[:] for name in self._classes}
         self._canonical_default = canonical[:]
         self._current_row = -1
         self._schema_locked = bool(schema_locked)
@@ -140,8 +130,7 @@ class ClassManagerDialog(QDialog):
             self._load_selected_class(-1)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
@@ -193,9 +182,7 @@ class ClassManagerDialog(QDialog):
 
     def _update_count_label(self) -> None:
         keypoints = [
-            line.strip()
-            for line in self.keypoints_edit.toPlainText().splitlines()
-            if line.strip()
+            line.strip() for line in self.keypoints_edit.toPlainText().splitlines() if line.strip()
         ]
         self.status_label.setText(f"Keypoint count: {len(keypoints)}")
 
@@ -217,9 +204,7 @@ class ClassManagerDialog(QDialog):
             return
         name = self._classes[self._current_row]
         self._kp_map[name] = [
-            line.strip()
-            for line in self.keypoints_edit.toPlainText().splitlines()
-            if line.strip()
+            line.strip() for line in self.keypoints_edit.toPlainText().splitlines() if line.strip()
         ]
 
     def _on_accept(self) -> None:
@@ -268,10 +253,7 @@ class ClassManagerDialog(QDialog):
         self._canonical_default = canonical[:]
         self.result_classes = self._classes[:]
         self.result_keypoints = canonical[:]
-        self.result_map = {
-            name: self._kp_map.get(name, [])[:]
-            for name in self._classes
-        }
+        self.result_map = {name: self._kp_map.get(name, [])[:] for name in self._classes}
         self.accept()
 
     def get_results(self) -> tuple[list[str], list[str], dict[str, list[str]]]:

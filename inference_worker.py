@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import sys
 from typing import Any, Callable, Optional
 
 from inference_ops import (
@@ -13,9 +12,9 @@ from inference_ops import (
     run_pose_video_inference,
     run_segmentation_video_inference,
 )
-from squeakpose_core import model_task_mismatch_message
 from layer_ops import normalize_layer_id
 from squeakpose.workers.protocol import read_config, write_event
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -75,7 +74,10 @@ def run_inference_worker(
         try:
             from ultralytics import YOLO
         except Exception as exc:
-            _emit_event(event_writer, {"event": "error", "error_message": f"Could not import ultralytics YOLO: {exc}"})
+            _emit_event(
+                event_writer,
+                {"event": "error", "error_message": f"Could not import ultralytics YOLO: {exc}"},
+            )
             return 1
         model_factory = YOLO
 
@@ -83,7 +85,9 @@ def run_inference_worker(
         try:
             import cv2 as cv2_module
         except Exception as exc:
-            _emit_event(event_writer, {"event": "error", "error_message": f"Could not import OpenCV: {exc}"})
+            _emit_event(
+                event_writer, {"event": "error", "error_message": f"Could not import OpenCV: {exc}"}
+            )
             return 1
 
     _emit_event(
@@ -98,7 +102,9 @@ def run_inference_worker(
     try:
         model = model_factory(model_path)
     except Exception as exc:
-        _emit_event(event_writer, {"event": "error", "error_message": f"Could not load model: {exc}"})
+        _emit_event(
+            event_writer, {"event": "error", "error_message": f"Could not load model: {exc}"}
+        )
         return 1
 
     task_error = model_task_mismatch_message(
@@ -125,7 +131,9 @@ def run_inference_worker(
         try:
             import numpy as np
         except Exception as exc:
-            _emit_event(event_writer, {"event": "error", "error_message": f"Could not import NumPy: {exc}"})
+            _emit_event(
+                event_writer, {"event": "error", "error_message": f"Could not import NumPy: {exc}"}
+            )
             return 1
         preview_path = str(config.get("preview_path") or "")
         if not preview_path:
@@ -195,7 +203,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
 
-    parser = argparse.ArgumentParser(description="Run SqueakPose video inference in a child process.")
+    parser = argparse.ArgumentParser(
+        description="Run SqueakPose video inference in a child process."
+    )
     parser.add_argument("--config", required=True, help="Path to JSON inference config.")
     args = parser.parse_args(argv)
 

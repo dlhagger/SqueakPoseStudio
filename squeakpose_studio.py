@@ -17,7 +17,6 @@ from squeakpose.ui.main_window import (
     _save_last_project,
 )
 
-
 if __name__ == "__main__":
     from squeakpose.app import run
 

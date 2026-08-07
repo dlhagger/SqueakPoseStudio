@@ -35,9 +35,7 @@ from squeakpose.annotation.models import BoundingBox, Keypoint
 def _ui_font(px: int) -> QFont:
     font = QFont()
     available = set(QFontDatabase.families())
-    system_family = QFontDatabase.systemFont(
-        QFontDatabase.SystemFont.GeneralFont
-    ).family()
+    system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
     for family in ("Fira Sans", system_family, "Segoe UI", "Arial", "Helvetica"):
         if family and family in available:
             font.setFamily(family)
@@ -60,9 +58,9 @@ class BoxItem(QGraphicsRectItem):
         self.class_name = class_name
 
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
         self.setAcceptHoverEvents(True)
         self.setZValue(2)
@@ -115,9 +113,7 @@ class BoxItem(QGraphicsRectItem):
         self._label_bg.setRect(x, y, bg_w, bg_h)
         self._label.setPos(x + self._label_pad_x, y + self._label_pad_y)
 
-    def set_reference_style(
-        self, color: QColor, *, show_label: bool = False
-    ) -> None:
+    def set_reference_style(self, color: QColor, *, show_label: bool = False) -> None:
         """Render a saved box as quiet, non-editable layer context."""
         pen = QPen(color)
         pen.setWidthF(1.5)
@@ -145,10 +141,14 @@ class BoxItem(QGraphicsRectItem):
         r = self.rect()
         tol = max(6.0, float(self.HANDLE))
         edges = 0
-        if abs(p_local.x() - r.left())   <= tol: edges |= self.LEFT
-        if abs(p_local.x() - r.right())  <= tol: edges |= self.RIGHT
-        if abs(p_local.y() - r.top())    <= tol: edges |= self.TOP
-        if abs(p_local.y() - r.bottom()) <= tol: edges |= self.BOTTOM
+        if abs(p_local.x() - r.left()) <= tol:
+            edges |= self.LEFT
+        if abs(p_local.x() - r.right()) <= tol:
+            edges |= self.RIGHT
+        if abs(p_local.y() - r.top()) <= tol:
+            edges |= self.TOP
+        if abs(p_local.y() - r.bottom()) <= tol:
+            edges |= self.BOTTOM
         return edges
 
     def _cursor_for_edges(self, edges: int):
@@ -218,7 +218,7 @@ class BoxItem(QGraphicsRectItem):
         if self.scene():
             sr = self.scene().sceneRect()
             new_pos.setX(max(sr.left(), new_pos.x()))
-            new_pos.setY(max(sr.top(),  new_pos.y()))
+            new_pos.setY(max(sr.top(), new_pos.y()))
             new_pos.setX(min(new_pos.x(), sr.right() - new_rect.width()))
             new_pos.setY(min(new_pos.y(), sr.bottom() - new_rect.height()))
 
@@ -240,12 +240,14 @@ class BoxItem(QGraphicsRectItem):
             r = self.rect()
             new_pos = value
             nx = min(max(new_pos.x(), sr.left()), sr.right() - r.width())
-            ny = min(max(new_pos.y(), sr.top()),  sr.bottom() - r.height())
+            ny = min(max(new_pos.y(), sr.top()), sr.bottom() - r.height())
             return QPointF(nx, ny)
         elif change == QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged:
             self._reposition_label()
-        elif change in (QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged,
-                        QGraphicsItem.GraphicsItemChange.ItemTransformChange):
+        elif change in (
+            QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged,
+            QGraphicsItem.GraphicsItemChange.ItemTransformChange,
+        ):
             self.update_model()
         return super().itemChange(change, value)
 
@@ -258,8 +260,9 @@ class KeypointItem(QGraphicsEllipseItem):
       - ignores transformations (constant on-screen size)
       - cosmetic pen; clamped to image bounds
     """
+
     def __init__(self, kp: Keypoint, pixel_radius: int = 4, font_px: int = 10):
-        super().__init__(-pixel_radius, -pixel_radius, pixel_radius*2, pixel_radius*2)
+        super().__init__(-pixel_radius, -pixel_radius, pixel_radius * 2, pixel_radius * 2)
         self.kp = kp
         self.visibility = 2
         self._pixel_radius = max(1, pixel_radius)
@@ -267,23 +270,28 @@ class KeypointItem(QGraphicsEllipseItem):
 
         self.setPos(kp.x, kp.y)  # scene-space anchor
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
         self.setZValue(3)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
 
         color = Qt.GlobalColor.red
-        pen = QPen(color); pen.setWidth(2); pen.setCosmetic(True)
-        self.setPen(pen); self.setBrush(QBrush(color))
+        pen = QPen(color)
+        pen.setWidth(2)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(QBrush(color))
 
         self.text_item = QGraphicsSimpleTextItem(kp.name, self)
         self.text_item.setFont(_ui_font(self._font_px))
         self.text_item.setBrush(QBrush(color))
 
         shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(0); shadow.setOffset(1, 1); shadow.setColor(Qt.GlobalColor.black)
+        shadow.setBlurRadius(0)
+        shadow.setOffset(1, 1)
+        shadow.setColor(Qt.GlobalColor.black)
         self.text_item.setGraphicsEffect(shadow)
 
         self._reposition_label()
@@ -295,7 +303,9 @@ class KeypointItem(QGraphicsEllipseItem):
         self._pixel_radius = max(1, pixel_radius)
         self._font_px = max(6, font_px)
         self.prepareGeometryChange()
-        self.setRect(-self._pixel_radius, -self._pixel_radius, self._pixel_radius*2, self._pixel_radius*2)
+        self.setRect(
+            -self._pixel_radius, -self._pixel_radius, self._pixel_radius * 2, self._pixel_radius * 2
+        )
         self.text_item.setFont(_ui_font(self._font_px))
         self._reposition_label()
 
@@ -303,28 +313,35 @@ class KeypointItem(QGraphicsEllipseItem):
         # 2 = visible (red), 1 = occluded (yellow), 0 = invisible/not present (gray dashed)
         if self.visibility == 2:
             color = Qt.GlobalColor.red
-            pen = QPen(color); pen.setWidth(2); pen.setCosmetic(True)
-            self.setPen(pen); self.setBrush(QBrush(color))
+            pen = QPen(color)
+            pen.setWidth(2)
+            pen.setCosmetic(True)
+            self.setPen(pen)
+            self.setBrush(QBrush(color))
             self.text_item.setBrush(QBrush(color))
             self.text_item.setVisible(True)
         elif self.visibility == 1:
             color = Qt.GlobalColor.yellow
-            pen = QPen(color); pen.setWidth(2); pen.setCosmetic(True)
-            self.setPen(pen); self.setBrush(QBrush(color))
+            pen = QPen(color)
+            pen.setWidth(2)
+            pen.setCosmetic(True)
+            self.setPen(pen)
+            self.setBrush(QBrush(color))
             self.text_item.setBrush(QBrush(color))
             self.text_item.setVisible(True)
         else:  # self.visibility == 0
             color = Qt.GlobalColor.lightGray
-            pen = QPen(color); pen.setStyle(Qt.PenStyle.DashLine); pen.setWidth(1); pen.setCosmetic(True)
+            pen = QPen(color)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setWidth(1)
+            pen.setCosmetic(True)
             self.setPen(pen)
             self.setBrush(QBrush(Qt.GlobalColor.transparent))
             self.text_item.setBrush(QBrush(color))
             # optional: keep labels hidden for invisible to reduce clutter
             self.text_item.setVisible(False)
 
-    def set_reference_style(
-        self, color: QColor, *, show_label: bool = False
-    ) -> None:
+    def set_reference_style(self, color: QColor, *, show_label: bool = False) -> None:
         """Render a saved keypoint as quiet, non-editable layer context."""
         pen = QPen(color)
         pen.setWidthF(1.5)
@@ -360,7 +377,7 @@ class KeypointItem(QGraphicsEllipseItem):
             sr = self.scene().sceneRect()
             p = value
             x = min(max(p.x(), sr.left()), sr.right())
-            y = min(max(p.y(), sr.top()),  sr.bottom())
+            y = min(max(p.y(), sr.top()), sr.bottom())
             return QPointF(x, y)
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self.update_model()
@@ -394,7 +411,7 @@ class LabelView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
     def wheelEvent(self, event):
-        if self.app.mode == 'panzoom':
+        if self.app.mode == "panzoom":
             old_pos = self.mapToScene(event.position().toPoint())
             zoom_in_factor = 1.05
             zoom_out_factor = 1 / zoom_in_factor
@@ -450,8 +467,12 @@ class LabelView(QGraphicsView):
             self._remove_crosshairs()
             return
         self._ensure_crosshairs()
-        self._crosshair_v.setLine(scene_pos.x(), img_bounds.top(), scene_pos.x(), img_bounds.bottom())
-        self._crosshair_h.setLine(img_bounds.left(), scene_pos.y(), img_bounds.right(), scene_pos.y())
+        self._crosshair_v.setLine(
+            scene_pos.x(), img_bounds.top(), scene_pos.x(), img_bounds.bottom()
+        )
+        self._crosshair_h.setLine(
+            img_bounds.left(), scene_pos.y(), img_bounds.right(), scene_pos.y()
+        )
 
     def draw_crosshairs_at(self, global_pos: QPoint):
         scene_pos = self.mapToScene(self.mapFromGlobal(global_pos))
@@ -469,7 +490,10 @@ class LabelView(QGraphicsView):
             return False
 
     def _ensure_seg_brush_cursor_ring(self):
-        if self._seg_brush_cursor_ring is not None and self._seg_brush_cursor_ring.scene() is self.scene():
+        if (
+            self._seg_brush_cursor_ring is not None
+            and self._seg_brush_cursor_ring.scene() is self.scene()
+        ):
             return
         self._seg_brush_cursor_ring = QGraphicsEllipseItem()
         pen = QPen(QColor(118, 188, 255, 220))
@@ -540,21 +564,22 @@ class LabelView(QGraphicsView):
 
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.position().toPoint())
-        if (
-            event.button() == Qt.MouseButton.RightButton
-            and self.app._is_depth_layer()
-        ):
+        if event.button() == Qt.MouseButton.RightButton and self.app._is_depth_layer():
             self.app._probe_depth_at(scene_pos)
             event.accept()
             return
         if self.app.mode == "segedit":
-            if event.button() == Qt.MouseButton.LeftButton and self.app._start_seg_brush(scene_pos, add=True):
+            if event.button() == Qt.MouseButton.LeftButton and self.app._start_seg_brush(
+                scene_pos, add=True
+            ):
                 self._seg_brush_active = True
                 self._seg_brush_add = True
                 self._seg_brush_last_pos = scene_pos
                 event.accept()
                 return
-            if event.button() == Qt.MouseButton.RightButton and self.app._start_seg_brush(scene_pos, add=False):
+            if event.button() == Qt.MouseButton.RightButton and self.app._start_seg_brush(
+                scene_pos, add=False
+            ):
                 self._seg_brush_active = True
                 self._seg_brush_add = False
                 self._seg_brush_last_pos = scene_pos
@@ -563,17 +588,17 @@ class LabelView(QGraphicsView):
             super().mousePressEvent(event)
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            if self.app.mode == 'panzoom':
+            if self.app.mode == "panzoom":
                 super().mousePressEvent(event)
-            elif self.app.mode == 'bbox':
+            elif self.app.mode == "bbox":
                 # Do NOT clear here — clear only when committing a valid rect
                 self._start_pos = scene_pos
                 self._drawing_cancelled = False
                 self._remove_crosshairs()
                 self.setCursor(Qt.CursorShape.CrossCursor)
-            elif self.app.mode == 'keypoint':
+            elif self.app.mode == "keypoint":
                 self.app.add_keypoint(scene_pos)
-            elif self.app.mode == 'segment':
+            elif self.app.mode == "segment":
                 self.app._add_seg_prompt(scene_pos, positive=True)
                 event.accept()
                 return
@@ -588,24 +613,31 @@ class LabelView(QGraphicsView):
         scene_pos = self.mapToScene(event.position().toPoint())
         self._update_seg_brush_cursor(scene_pos)
         if self.app.mode == "segedit" and self._seg_brush_active:
-            if self.app._apply_seg_brush(scene_pos, add=self._seg_brush_add, prev_scene_pos=self._seg_brush_last_pos):
+            if self.app._apply_seg_brush(
+                scene_pos, add=self._seg_brush_add, prev_scene_pos=self._seg_brush_last_pos
+            ):
                 self._seg_brush_last_pos = scene_pos
             event.accept()
             return
-        if (self.app.mode == 'bbox' and self._start_pos is None) or (self.app.mode in {'keypoint', 'segment'}):
+        if (self.app.mode == "bbox" and self._start_pos is None) or (
+            self.app.mode in {"keypoint", "segment"}
+        ):
             self._update_crosshairs(scene_pos)
-        elif self._start_pos and self.app.mode == 'bbox':
+        elif self._start_pos and self.app.mode == "bbox":
             self._remove_crosshairs()
             end_pos = self.mapToScene(event.position().toPoint())
             rect = QRectF(self._start_pos, end_pos).normalized()
             if not self._temp_rect:
                 self._temp_rect = QGraphicsRectItem(rect)
-                pen = QPen(Qt.GlobalColor.yellow); pen.setWidth(2); pen.setCosmetic(True)
-                self._temp_rect.setPen(pen); self._temp_rect.setZValue(1.5)
+                pen = QPen(Qt.GlobalColor.yellow)
+                pen.setWidth(2)
+                pen.setCosmetic(True)
+                self._temp_rect.setPen(pen)
+                self._temp_rect.setZValue(1.5)
                 self.scene().addItem(self._temp_rect)
             else:
                 self._temp_rect.setRect(rect)
-        elif self.app.mode == 'panzoom':
+        elif self.app.mode == "panzoom":
             self._remove_crosshairs()
             super().mouseMoveEvent(event)
 
@@ -621,13 +653,19 @@ class LabelView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if self.app.mode == "segedit" and self._seg_brush_active:
             scene_pos = self.mapToScene(event.position().toPoint())
-            self.app._apply_seg_brush(scene_pos, add=self._seg_brush_add, prev_scene_pos=self._seg_brush_last_pos)
+            self.app._apply_seg_brush(
+                scene_pos, add=self._seg_brush_add, prev_scene_pos=self._seg_brush_last_pos
+            )
             self._seg_brush_active = False
             self._seg_brush_last_pos = None
             self.app._finish_seg_brush()
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._start_pos and self.app.mode == 'bbox':
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._start_pos
+            and self.app.mode == "bbox"
+        ):
             if not self._drawing_cancelled:
                 end_pos = self.mapToScene(event.position().toPoint())
                 rect = QRectF(self._start_pos, end_pos).normalized()
@@ -640,7 +678,7 @@ class LabelView(QGraphicsView):
                 self._temp_rect = None
             self._start_pos = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
-        elif self.app.mode == 'panzoom':
+        elif self.app.mode == "panzoom":
             super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):

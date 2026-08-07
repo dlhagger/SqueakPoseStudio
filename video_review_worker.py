@@ -8,9 +8,13 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
-from prediction_ops import best_predictions_by_class_from_payload, serialize_prediction_result, top_prediction_from_payload
-from squeakpose_core import model_task_mismatch_message
+from prediction_ops import (
+    best_predictions_by_class_from_payload,
+    serialize_prediction_result,
+    top_prediction_from_payload,
+)
 from squeakpose.workers.protocol import read_config, write_event
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -24,7 +28,9 @@ def _stdout_event_writer(payload: dict[str, Any]) -> None:
     write_event(payload)
 
 
-def _load_model_factory(model_factory: Optional[Callable[[str], Any]]) -> Optional[Callable[[str], Any]]:
+def _load_model_factory(
+    model_factory: Optional[Callable[[str], Any]],
+) -> Optional[Callable[[str], Any]]:
     if model_factory is not None:
         return model_factory
     try:
@@ -89,7 +95,9 @@ def run_video_review_worker(
     conf = float(config.get("conf") if config.get("conf") is not None else 0.25)
     iou = float(config.get("iou") if config.get("iou") is not None else 0.5)
     requested_batch = int(config.get("batch") if config.get("batch") is not None else 0)
-    effective_batch = int(config.get("effective_batch") if config.get("effective_batch") is not None else 1)
+    effective_batch = int(
+        config.get("effective_batch") if config.get("effective_batch") is not None else 1
+    )
     effective_batch = max(1, effective_batch)
     auto_batch = requested_batch <= 0 and (device or "").lower().split(":", 1)[0] in {"cuda", "mps"}
     if not model_path:
@@ -302,8 +310,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
 
-    parser = argparse.ArgumentParser(description="Run SqueakPose Video Reviewer prediction in a child process.")
-    parser.add_argument("--config", required=True, help="Path to JSON video review prediction config.")
+    parser = argparse.ArgumentParser(
+        description="Run SqueakPose Video Reviewer prediction in a child process."
+    )
+    parser.add_argument(
+        "--config", required=True, help="Path to JSON video review prediction config."
+    )
     args = parser.parse_args(argv)
 
     try:

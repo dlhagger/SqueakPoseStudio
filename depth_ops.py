@@ -26,9 +26,7 @@ def sample_depth_map(
     py = int(float(y))
     height, width = array.shape
     if px < 0 or py < 0 or px >= width or py >= height:
-        raise DepthMapError(
-            f"Pixel ({px}, {py}) is outside depth map {width}×{height}."
-        )
+        raise DepthMapError(f"Pixel ({px}, {py}) is outside depth map {width}×{height}.")
     value = float(array[py, px])
     valid = bool(numpy_module.isfinite(value) and value > 0)
     return {
@@ -75,16 +73,12 @@ def depth_array_from_result(result: Any, *, numpy_module: Any) -> Any:
     array = numpy_module.asarray(data, dtype=numpy_module.float32)
     array = numpy_module.squeeze(array)
     if array.ndim != 2 or min(array.shape) <= 0:
-        raise DepthMapError(
-            f"Depth map must have shape (H, W); received {tuple(array.shape)}."
-        )
+        raise DepthMapError(f"Depth map must have shape (H, W); received {tuple(array.shape)}.")
 
     valid = numpy_module.isfinite(array) & (array > 0)
     if not bool(numpy_module.any(valid)):
         raise DepthMapError("Depth map contains no finite positive pixels.")
-    return numpy_module.where(valid, array, 0.0).astype(
-        numpy_module.float32, copy=False
-    )
+    return numpy_module.where(valid, array, 0.0).astype(numpy_module.float32, copy=False)
 
 
 def depth_map_summary(depth_map: Any, *, numpy_module: Any) -> dict[str, Any]:

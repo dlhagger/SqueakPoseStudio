@@ -346,10 +346,14 @@ def pose_inference_rows_from_result(
             "time_seconds": (frame_index / fps) if fps > 0 else "",
             "detections_in_frame": detections,
             "detection_index": det_idx,
-            "track_id": ids_list[det_idx] if det_idx < len(ids_list) and ids_list[det_idx] is not None else "",
+            "track_id": ids_list[det_idx]
+            if det_idx < len(ids_list) and ids_list[det_idx] is not None
+            else "",
             "class_id": cls_id,
             "class_name": _class_name(result, cls_id, classes),
-            "confidence": confs[det_idx] if det_idx < len(confs) and confs[det_idx] is not None else "",
+            "confidence": confs[det_idx]
+            if det_idx < len(confs) and confs[det_idx] is not None
+            else "",
             "bbox_x1": x1,
             "bbox_y1": y1,
             "bbox_x2": x2,
@@ -432,7 +436,9 @@ def segmentation_rows_from_result(
         if include_binary_mask and mask_data is not None and det_idx < len(mask_data):
             if numpy_module is not None:
                 try:
-                    binary_mask = (numpy_module.asarray(mask_data[det_idx]) > 0.5).astype(numpy_module.uint8)
+                    binary_mask = (numpy_module.asarray(mask_data[det_idx]) > 0.5).astype(
+                        numpy_module.uint8
+                    )
                 except Exception:
                     binary_mask = None
             else:
@@ -736,16 +742,11 @@ def run_depth_video_inference(
             )
             if len(predictions) != 1:
                 raise RuntimeError(
-                    "Depth prediction returned "
-                    f"{len(predictions)} results for one input frame."
+                    f"Depth prediction returned {len(predictions)} results for one input frame."
                 )
-            depth_map = depth_array_from_result(
-                predictions[0], numpy_module=numpy_module
-            )
+            depth_map = depth_array_from_result(predictions[0], numpy_module=numpy_module)
             summary = depth_map_summary(depth_map, numpy_module=numpy_module)
-            preview_rgb = colorize_depth_map(
-                depth_map, numpy_module=numpy_module, mode="disparity"
-            )
+            preview_rgb = colorize_depth_map(depth_map, numpy_module=numpy_module, mode="disparity")
 
             frame_height, frame_width = frame.shape[:2]
             if preview_rgb.shape[:2] != (frame_height, frame_width):
@@ -764,9 +765,7 @@ def run_depth_video_inference(
                     (int(frame_width), int(frame_height)),
                 )
                 if not video_writer.isOpened():
-                    raise RuntimeError(
-                        f"Unable to create depth preview video: {preview_path}"
-                    )
+                    raise RuntimeError(f"Unable to create depth preview video: {preview_path}")
             video_writer.write(preview_rgb[..., ::-1])
 
             writer.writerow(

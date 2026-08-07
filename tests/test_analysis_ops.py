@@ -255,9 +255,7 @@ class AnalysisOpsTests(unittest.TestCase):
             csv_path = os.path.join(tmp, "segmentation.csv")
             _write_demo_segmentation(csv_path)
 
-            with self.assertRaisesRegex(
-                AnalysisError, "contains segmentation layer results"
-            ):
+            with self.assertRaisesRegex(AnalysisError, "contains segmentation layer results"):
                 run_analysis_workflow(
                     AnalysisConfig(
                         detections_csv=csv_path,
@@ -377,7 +375,10 @@ class AnalysisOpsTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(result["roi_summary_csv"]))
             self.assertTrue(result["plot_paths"])
             self.assertTrue(
-                any(os.path.basename(path) == "segmentation_confidence.png" for path in result["plot_paths"])
+                any(
+                    os.path.basename(path) == "segmentation_confidence.png"
+                    for path in result["plot_paths"]
+                )
             )
 
             features = pd.read_csv(result["feature_csv"])

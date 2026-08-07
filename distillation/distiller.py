@@ -61,8 +61,14 @@ def build_run_config(
     resolved_task = normalize_task(task)
     resolved_run_name = str(run_name or "").strip() or DEFAULT_RUN_NAMES[resolved_task]
     resolved_model = str(model or "").strip() or DEFAULT_MODELS[resolved_task]
-    resolved_data_dir = os.path.abspath(data_dir) if str(data_dir or "").strip() else default_data_dir(root)
-    resolved_out_dir = os.path.abspath(out_dir) if str(out_dir or "").strip() else default_output_dir(root, resolved_run_name)
+    resolved_data_dir = (
+        os.path.abspath(data_dir) if str(data_dir or "").strip() else default_data_dir(root)
+    )
+    resolved_out_dir = (
+        os.path.abspath(out_dir)
+        if str(out_dir or "").strip()
+        else default_output_dir(root, resolved_run_name)
+    )
     return {
         "project_root": root,
         "data": resolved_data_dir,
@@ -132,7 +138,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run DINO distillation against a SqueakPose Studio project.",
     )
-    parser.add_argument("--project-root", required=True, help="Path to the SqueakPose Studio project root.")
+    parser.add_argument(
+        "--project-root", required=True, help="Path to the SqueakPose Studio project root."
+    )
     parser.add_argument(
         "--data-dir",
         default="",
@@ -159,10 +167,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Student model checkpoint or config. Defaults to the YOLOv26s model for the selected task.",
     )
-    parser.add_argument("--teacher", default=DEFAULT_TEACHER, help="Teacher model identifier for Lightly Train.")
+    parser.add_argument(
+        "--teacher", default=DEFAULT_TEACHER, help="Teacher model identifier for Lightly Train."
+    )
     parser.add_argument("--epochs", type=int, default=300, help="Number of distillation epochs.")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for distillation.")
-    parser.add_argument("--precision", default=DEFAULT_PRECISION, help="Lightning precision string.")
+    parser.add_argument(
+        "--precision", default=DEFAULT_PRECISION, help="Lightning precision string."
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",

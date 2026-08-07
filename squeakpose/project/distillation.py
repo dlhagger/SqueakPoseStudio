@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 
-
 DISTILLATION_MANIFEST_FILENAME = "squeakpose_distillation.json"
 
 
@@ -114,13 +113,8 @@ def discover_distillation_exports(
             seen_paths.add(normalized_checkpoint)
             run_label = os.path.relpath(normalized_run_dir, root)
             if run_label in {".", ""}:
-                run_label = (
-                    os.path.basename(normalized_run_dir)
-                    or os.path.basename(root)
-                )
-            root_exports.append(
-                (f"{source_label}: {run_label}", normalized_checkpoint)
-            )
+                run_label = os.path.basename(normalized_run_dir) or os.path.basename(root)
+            root_exports.append((f"{source_label}: {run_label}", normalized_checkpoint))
         root_exports.sort(key=lambda item: os.path.getmtime(item[1]), reverse=True)
         exports.extend(root_exports)
     return exports

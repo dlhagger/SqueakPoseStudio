@@ -54,11 +54,7 @@ class AnalysisConfig:
         return cls(
             detections_csv=str(raw.get("detections_csv") or ""),
             output_dir=str(raw.get("output_dir") or ""),
-            layer_id=(
-                normalize_layer_id(raw.get("layer_id"))
-                if raw.get("layer_id")
-                else ""
-            ),
+            layer_id=(normalize_layer_id(raw.get("layer_id")) if raw.get("layer_id") else ""),
             video_path=str(raw.get("video_path") or ""),
             fps=float(raw.get("fps") or 0.0),
             pixel_distance=float(raw.get("pixel_distance") or 1.0),
@@ -72,7 +68,9 @@ class AnalysisConfig:
             run_clustering=bool(raw.get("run_clustering", False)),
             export_cluster_clips=bool(raw.get("export_cluster_clips", False)),
             umap_neighbors=max(0, int(raw.get("umap_neighbors") or 0)),
-            umap_min_dist=float(raw.get("umap_min_dist") if raw.get("umap_min_dist") is not None else 0.3),
+            umap_min_dist=float(
+                raw.get("umap_min_dist") if raw.get("umap_min_dist") is not None else 0.3
+            ),
             hdbscan_min_cluster_size=max(0, int(raw.get("hdbscan_min_cluster_size") or 0)),
             cluster_clip_length_sec=float(raw.get("cluster_clip_length_sec") or 2.0),
             samples_per_cluster=max(1, int(raw.get("samples_per_cluster") or 1)),
@@ -196,10 +194,9 @@ def assign_roi_labels(
     x_values = pd.to_numeric(out[x_col], errors="coerce")
     y_values = pd.to_numeric(out[y_col], errors="coerce")
     for roi in normalized:
-        mask = (
-            x_values.between(float(roi["x1"]), float(roi["x2"]), inclusive="both")
-            & y_values.between(float(roi["y1"]), float(roi["y2"]), inclusive="both")
-        )
+        mask = x_values.between(
+            float(roi["x1"]), float(roi["x2"]), inclusive="both"
+        ) & y_values.between(float(roi["y1"]), float(roi["y2"]), inclusive="both")
         out.loc[mask, "roi_label"] = roi["name"]
     return out
 
@@ -315,9 +312,17 @@ def compute_features(df: pd.DataFrame, fps: float, mm_per_pixel: float) -> pd.Da
 
 
 def summarize_features(df: pd.DataFrame, fps: float, mm_per_pixel: float) -> dict[str, Any]:
-    duration_s = float(df["time_seconds"].max()) if "time_seconds" in df.columns and len(df) else 0.0
-    total_distance_mm = float(df["distance_mm"].sum(skipna=True)) if "distance_mm" in df.columns else 0.0
-    avg_speed = float(df["speed_mm_per_sec"].mean(skipna=True)) if "speed_mm_per_sec" in df.columns else math.nan
+    duration_s = (
+        float(df["time_seconds"].max()) if "time_seconds" in df.columns and len(df) else 0.0
+    )
+    total_distance_mm = (
+        float(df["distance_mm"].sum(skipna=True)) if "distance_mm" in df.columns else 0.0
+    )
+    avg_speed = (
+        float(df["speed_mm_per_sec"].mean(skipna=True))
+        if "speed_mm_per_sec" in df.columns
+        else math.nan
+    )
     avg_accel = (
         float(df["acceleration_mm_per_sec2"].mean(skipna=True))
         if "acceleration_mm_per_sec2" in df.columns
@@ -332,7 +337,9 @@ def summarize_features(df: pd.DataFrame, fps: float, mm_per_pixel: float) -> dic
         "total_distance_m": total_distance_mm / 1000.0,
         "average_speed_mm_per_sec": avg_speed,
         "average_acceleration_mm_per_sec2": avg_accel,
-        "mean_confidence": float(df["confidence"].mean(skipna=True)) if "confidence" in df.columns else math.nan,
+        "mean_confidence": float(df["confidence"].mean(skipna=True))
+        if "confidence" in df.columns
+        else math.nan,
     }
 
 
@@ -468,7 +475,9 @@ class _PyAVH264VideoWriter:
             self._discard()
             if isinstance(exc, AnalysisError):
                 raise
-            raise AnalysisError(f"Could not finalize video export {self.output_path}: {exc}") from exc
+            raise AnalysisError(
+                f"Could not finalize video export {self.output_path}: {exc}"
+            ) from exc
 
     def _discard(self) -> None:
         if self.closed:
@@ -525,7 +534,9 @@ def _open_h264_video_writer(
     return _PyAVH264VideoWriter(output_path, fps, width, height)
 
 
-def _plot_if_column(df: pd.DataFrame, x_col: str, y_col: str, path: Path, ylabel: str, title: str) -> Optional[str]:
+def _plot_if_column(
+    df: pd.DataFrame, x_col: str, y_col: str, path: Path, ylabel: str, title: str
+) -> Optional[str]:
     if y_col not in df.columns or x_col not in df.columns:
         return None
     plt, sns = _setup_plotting()
@@ -568,7 +579,12 @@ def _draw_roi_overlays(ax, rois: list[dict[str, Any]]) -> None:
             str(roi["name"]),
             color="#111820",
             fontsize=8,
-            bbox={"boxstyle": "round,pad=0.18", "facecolor": "#f5b942", "edgecolor": "none", "alpha": 0.9},
+            bbox={
+                "boxstyle": "round,pad=0.18",
+                "facecolor": "#f5b942",
+                "edgecolor": "none",
+                "alpha": 0.9,
+            },
         )
 
 
@@ -608,7 +624,9 @@ def create_roi_outputs(df: pd.DataFrame, output_dir: Path, fps: float) -> dict[s
     transition_csv = ""
     transition = pd.DataFrame()
     if len(labels) > 1:
-        transition = pd.crosstab(labels.iloc[:-1], labels.iloc[1:], rownames=["from_roi"], colnames=["to_roi"])
+        transition = pd.crosstab(
+            labels.iloc[:-1], labels.iloc[1:], rownames=["from_roi"], colnames=["to_roi"]
+        )
         transition_path = output_dir / "roi_transition_matrix.csv"
         transition.to_csv(transition_path)
         transition_csv = str(transition_path)
@@ -648,7 +666,9 @@ def create_roi_outputs(df: pd.DataFrame, output_dir: Path, fps: float) -> dict[s
     }
 
 
-def create_plots(df: pd.DataFrame, output_dir: Path, video_path: str = "", rois: Any = None) -> list[str]:
+def create_plots(
+    df: pd.DataFrame, output_dir: Path, video_path: str = "", rois: Any = None
+) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     plt, sns = _setup_plotting()
     paths: list[str] = []
@@ -673,7 +693,9 @@ def create_plots(df: pd.DataFrame, output_dir: Path, video_path: str = "", rois:
     ]
     existing_speed = [(col, label) for col, label in speed_cols if col in df.columns]
     if existing_speed:
-        fig, axes = plt.subplots(1, len(existing_speed), figsize=(5 * len(existing_speed), 4), squeeze=False)
+        fig, axes = plt.subplots(
+            1, len(existing_speed), figsize=(5 * len(existing_speed), 4), squeeze=False
+        )
         for ax, (col, label) in zip(axes[0], existing_speed):
             values = pd.to_numeric(df[col], errors="coerce").dropna()
             ax.boxplot(
@@ -696,7 +718,12 @@ def create_plots(df: pd.DataFrame, output_dir: Path, video_path: str = "", rois:
     for y_col, ylabel, title, filename in [
         ("distance_mm", "Distance (mm)", "Distance Traveled by Frame", "distance_mm.png"),
         ("speed_mm_per_sec", "Speed (mm/s)", "Speed by Frame", "speed_mm_per_sec.png"),
-        ("acceleration_mm_per_sec2", "Acceleration (mm/s^2)", "Acceleration by Frame", "acceleration_mm_per_sec2.png"),
+        (
+            "acceleration_mm_per_sec2",
+            "Acceleration (mm/s^2)",
+            "Acceleration by Frame",
+            "acceleration_mm_per_sec2.png",
+        ),
     ]:
         plot_path = _plot_if_column(df, "frame_index", y_col, output_dir / filename, ylabel, title)
         if plot_path:
@@ -807,7 +834,11 @@ def render_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-    rows_by_frame = {int(row["frame_index"]): row for _, row in df.iterrows() if not pd.isna(row.get("frame_index"))}
+    rows_by_frame = {
+        int(row["frame_index"]): row
+        for _, row in df.iterrows()
+        if not pd.isna(row.get("frame_index"))
+    }
     normalized_rois = normalize_rois(rois or [])
 
     frame_idx = 0
@@ -818,7 +849,9 @@ def render_annotated_video(
                 if not ok:
                     break
                 for roi in normalized_rois:
-                    x1, y1, x2, y2 = [int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")]
+                    x1, y1, x2, y2 = [
+                        int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
+                    ]
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
                     cv2.putText(
                         frame,
@@ -831,18 +864,31 @@ def render_annotated_video(
                     )
                 row = rows_by_frame.get(frame_idx)
                 if row is not None:
-                    bbox_vals = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
+                    bbox_vals = [
+                        row.get("bbox_x1"),
+                        row.get("bbox_y1"),
+                        row.get("bbox_x2"),
+                        row.get("bbox_y2"),
+                    ]
                     if not any(pd.isna(v) for v in bbox_vals):
                         x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                     cx = row.get("bbox_center_x_euro")
                     cy = row.get("bbox_center_y_euro")
                     if not pd.isna(cx) and not pd.isna(cy):
-                        cv2.circle(frame, (int(round(float(cx))), int(round(float(cy)))), 4, (0, 0, 255), -1)
+                        cv2.circle(
+                            frame,
+                            (int(round(float(cx))), int(round(float(cy)))),
+                            4,
+                            (0, 0, 255),
+                            -1,
+                        )
                     text = f"Frame: {frame_idx}"
                     if not pd.isna(row.get("cumulative_distance_mm")):
                         text += f" | Distance: {float(row['cumulative_distance_mm']):.1f} mm"
-                    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(
+                        frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
+                    )
                     speed_val = row.get("speed_mm_per_sec")
                     if not pd.isna(speed_val):
                         cv2.putText(
@@ -882,9 +928,9 @@ def run_behavior_clustering(
     hdbscan_min_cluster_size: int = 0,
 ) -> tuple[pd.DataFrame, list[str]]:
     try:
-        from sklearn.preprocessing import StandardScaler
         import hdbscan
         import umap
+        from sklearn.preprocessing import StandardScaler
     except Exception as exc:
         raise AnalysisError(f"UMAP/HDBSCAN clustering dependencies are unavailable: {exc}") from exc
 
@@ -908,14 +954,20 @@ def run_behavior_clustering(
 
     window_frames = max(int(round(float(fps))), 1)
     clean_features = df[feature_cols].replace([np.inf, -np.inf], np.nan)
-    rolled = clean_features.rolling(window=window_frames, min_periods=window_frames, center=True).agg(["mean", "std"])
+    rolled = clean_features.rolling(
+        window=window_frames, min_periods=window_frames, center=True
+    ).agg(["mean", "std"])
     rolled.columns = [f"{col}_{stat}_1s" for col, stat in rolled.columns]
     behavior_df = rolled.dropna()
     if behavior_df.empty:
-        raise AnalysisError("Rolling-window feature table is empty; use a longer video or lower FPS override.")
+        raise AnalysisError(
+            "Rolling-window feature table is empty; use a longer video or lower FPS override."
+        )
 
     X_scaled = StandardScaler().fit_transform(behavior_df)
-    n_neighbors = int(umap_neighbors) if umap_neighbors > 0 else min(50, max(2, len(behavior_df) - 1))
+    n_neighbors = (
+        int(umap_neighbors) if umap_neighbors > 0 else min(50, max(2, len(behavior_df) - 1))
+    )
     n_neighbors = min(max(2, n_neighbors), max(2, len(behavior_df) - 1))
     min_dist = min(max(float(umap_min_dist), 0.0), 1.0)
     embedding = umap.UMAP(
@@ -1001,12 +1053,21 @@ def export_cluster_clips(
     frame_count = int(df["frame_index"].max() + 1)
     paths: list[str] = []
     try:
-        clusters = sorted(c for c in df["behavior_cluster"].dropna().astype(int).unique() if c != -1)
+        clusters = sorted(
+            c for c in df["behavior_cluster"].dropna().astype(int).unique() if c != -1
+        )
         for cluster_id in clusters:
-            frames = df.loc[df["behavior_cluster"] == cluster_id, "frame_index"].dropna().astype(int).values
+            frames = (
+                df.loc[df["behavior_cluster"] == cluster_id, "frame_index"]
+                .dropna()
+                .astype(int)
+                .values
+            )
             if len(frames) == 0:
                 continue
-            sample_indices = np.linspace(0, len(frames) - 1, num=min(samples_per_cluster, len(frames)), dtype=int)
+            sample_indices = np.linspace(
+                0, len(frames) - 1, num=min(samples_per_cluster, len(frames)), dtype=int
+            )
             for clip_idx, frame_idx in enumerate(frames[sample_indices], start=1):
                 start_frame = max(int(frame_idx), 0)
                 end_frame = min(start_frame + frames_per_clip, frame_count)
@@ -1024,7 +1085,9 @@ def export_cluster_clips(
     return paths
 
 
-def run_analysis_workflow(config: AnalysisConfig, progress_callback: ProgressCallback = None) -> dict[str, Any]:
+def run_analysis_workflow(
+    config: AnalysisConfig, progress_callback: ProgressCallback = None
+) -> dict[str, Any]:
     if not config.detections_csv or not os.path.isfile(config.detections_csv):
         raise AnalysisError("Select a valid detections CSV.")
     if not config.output_dir:
@@ -1036,13 +1099,12 @@ def run_analysis_workflow(config: AnalysisConfig, progress_callback: ProgressCal
 
     _progress(progress_callback, 1, total_steps, "Loading detections CSV")
     raw = pd.read_csv(config.detections_csv).dropna(axis=1, how="all")
-    from segmentation_analysis_ops import is_segmentation_inference_csv, run_segmentation_analysis_workflow
-
-    detected_layer = (
-        LAYER_SEGMENTATION
-        if is_segmentation_inference_csv(raw)
-        else LAYER_KEYPOINTS
+    from segmentation_analysis_ops import (
+        is_segmentation_inference_csv,
+        run_segmentation_analysis_workflow,
     )
+
+    detected_layer = LAYER_SEGMENTATION if is_segmentation_inference_csv(raw) else LAYER_KEYPOINTS
     if config.layer_id and config.layer_id != detected_layer:
         raise AnalysisError(
             f"The selected CSV contains {detected_layer} layer results, "
@@ -1103,7 +1165,9 @@ def run_analysis_workflow(config: AnalysisConfig, progress_callback: ProgressCal
     annotated_video = None
     if config.make_annotated_video:
         _progress(progress_callback, 7, total_steps, "Rendering annotated video")
-        annotated_video = render_annotated_video(features, video_path, output_dir / "annotated_output.mp4", fps, rois=rois)
+        annotated_video = render_annotated_video(
+            features, video_path, output_dir / "annotated_output.mp4", fps, rois=rois
+        )
     else:
         _progress(progress_callback, 7, total_steps, "Skipping annotated video")
 

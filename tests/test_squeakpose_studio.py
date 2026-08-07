@@ -19,10 +19,10 @@ def _is_optional_studio_import_error(exc: Exception) -> bool:
 
 try:
     from squeakpose_studio import (
-        LabelingApp,
-        VideoReviewDialog,
         WORKFLOW_POSE,
         WORKFLOW_SEG,
+        LabelingApp,
+        VideoReviewDialog,
         _discover_distillation_exports,
         _distillation_export_search_roots,
         _distillation_sample_count,
@@ -30,6 +30,7 @@ try:
         _project_paths,
         _retain_main_window,
     )
+
     _STUDIO_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - environment-dependent import gate
     if not _is_optional_studio_import_error(exc):
@@ -93,7 +94,9 @@ class _FakeCombo:
         self.minimum_contents_length = value
 
 
-@unittest.skipIf(VideoReviewDialog is None, f"squeakpose_studio import unavailable: {_STUDIO_IMPORT_ERROR}")
+@unittest.skipIf(
+    VideoReviewDialog is None, f"squeakpose_studio import unavailable: {_STUDIO_IMPORT_ERROR}"
+)
 class StudioVideoReviewTests(unittest.TestCase):
     def test_retain_main_window_stores_reference_on_qapplication(self):
         fake_app = type("FakeApp", (), {})()
@@ -118,9 +121,7 @@ class StudioVideoReviewTests(unittest.TestCase):
             self.assertEqual(payload, {})
             self.assertFalse(os.path.exists(meta_path))
             backups = [
-                name
-                for name in os.listdir(tmp)
-                if name.startswith("squeakpose_project.corrupt-")
+                name for name in os.listdir(tmp) if name.startswith("squeakpose_project.corrupt-")
             ]
             self.assertEqual(len(backups), 1)
             self.assertIsNotNone(app._project_meta_recovery)
@@ -302,7 +303,9 @@ class StudioVideoReviewTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(app.kp_names, app.class_keypoints["mouse"])
             with open(keypoint_file, "r", encoding="utf-8") as f:
-                self.assertEqual([line.strip() for line in f if line.strip()], app.class_keypoints["mouse"])
+                self.assertEqual(
+                    [line.strip() for line in f if line.strip()], app.class_keypoints["mouse"]
+                )
 
     def test_cache_validation_rejects_workflow_mismatch(self):
         with TemporaryDirectory() as tmp:
@@ -390,12 +393,8 @@ class StudioVideoReviewTests(unittest.TestCase):
             ok = VideoReviewDialog._load_cache_if_valid(dummy)
 
             self.assertTrue(ok)
-            self.assertEqual(
-                sorted(dummy.preds_by_layer["segmentation"]), [2]
-            )
-            self.assertEqual(
-                sorted(dummy.preds_by_layer["keypoints"]), [5]
-            )
+            self.assertEqual(sorted(dummy.preds_by_layer["segmentation"]), [2])
+            self.assertEqual(sorted(dummy.preds_by_layer["keypoints"]), [5])
 
     def test_cache_validation_rejects_changed_project_model(self):
         with TemporaryDirectory() as tmp:
@@ -591,7 +590,10 @@ class StudioVideoReviewTests(unittest.TestCase):
             app.image_dir_all = images_all
 
             with (
-                patch("squeakpose.ui.main_window.commit_staged_paths", side_effect=OSError("injected failure")),
+                patch(
+                    "squeakpose.ui.main_window.commit_staged_paths",
+                    side_effect=OSError("injected failure"),
+                ),
                 patch("squeakpose.ui.main_window.QMessageBox.warning"),
             ):
                 saved = LabelingApp.save_labels(app)
@@ -627,6 +629,7 @@ class StudioVideoReviewTests(unittest.TestCase):
 
     def test_schema_state_is_unchanged_when_transaction_fails(self):
         with TemporaryDirectory() as tmp:
+
             class SchemaDummy:
                 def _schema_is_locked(self):
                     return False
@@ -640,7 +643,10 @@ class StudioVideoReviewTests(unittest.TestCase):
             app.class_keypoints_path = os.path.join(tmp, "class_keypoints.json")
 
             with (
-                patch("squeakpose.ui.main_window.atomic_write_text_files", side_effect=OSError("disk full")),
+                patch(
+                    "squeakpose.ui.main_window.atomic_write_text_files",
+                    side_effect=OSError("disk full"),
+                ),
                 patch("squeakpose.ui.main_window.QMessageBox.warning"),
             ):
                 changed = LabelingApp._apply_class_manager_results(
@@ -699,7 +705,9 @@ class StudioVideoReviewTests(unittest.TestCase):
 
         LabelingApp._fit_class_selector_to_items(app)
 
-        self.assertEqual(app.class_selector.minimum_contents_length, len("very_long_behavioral_state"))
+        self.assertEqual(
+            app.class_selector.minimum_contents_length, len("very_long_behavioral_state")
+        )
 
     def test_distillation_sample_count_applies_stride_and_cap(self):
         self.assertEqual(_distillation_sample_count(0, 30), 0)
@@ -745,10 +753,12 @@ class StudioVideoReviewTests(unittest.TestCase):
                 roots,
                 [("Project runs", os.path.join(tmp, "runs", "distillation"))],
             )
-            self.assertEqual(exports, [
-                ("Project runs: dinov3-pose", os.path.abspath(export_path)),
-            ])
-
+            self.assertEqual(
+                exports,
+                [
+                    ("Project runs: dinov3-pose", os.path.abspath(export_path)),
+                ],
+            )
 
 
 if __name__ == "__main__":

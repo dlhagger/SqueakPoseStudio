@@ -11,8 +11,8 @@ from typing import Any, Callable, Optional
 
 from depth_ops import serialize_depth_prediction_result
 from prediction_ops import serialize_prediction_result
-from squeakpose_core import model_task_mismatch_message
 from squeakpose.workers.protocol import read_config, write_event
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -81,7 +81,9 @@ def run_predict_server(
         try:
             request = json.loads(line)
         except Exception as exc:
-            event_writer({"event": "error", "request_id": None, "error_message": f"Invalid request: {exc}"})
+            event_writer(
+                {"event": "error", "request_id": None, "error_message": f"Invalid request: {exc}"}
+            )
             continue
 
         request_id = request.get("request_id")
@@ -99,15 +101,29 @@ def run_predict_server(
         depth_preview_path = str(request.get("depth_preview_path") or "")
         depth_metadata_path = str(request.get("depth_metadata_path") or "")
         if not model_path:
-            event_writer({"event": "error", "request_id": request_id, "error_message": "model_path is required"})
+            event_writer(
+                {
+                    "event": "error",
+                    "request_id": request_id,
+                    "error_message": "model_path is required",
+                }
+            )
             continue
         if command == "predict" and not image_path:
-            event_writer({"event": "error", "request_id": request_id, "error_message": "image_path is required"})
+            event_writer(
+                {
+                    "event": "error",
+                    "request_id": request_id,
+                    "error_message": "image_path is required",
+                }
+            )
             continue
 
         try:
             if cached_model is None or cached_model_path != model_path:
-                event_writer({"event": "loading", "request_id": request_id, "model_path": model_path})
+                event_writer(
+                    {"event": "loading", "request_id": request_id, "model_path": model_path}
+                )
                 with contextlib.redirect_stdout(sys.stderr):
                     cached_model = factory(model_path)
                 cached_model_path = model_path
@@ -118,13 +134,17 @@ def run_predict_server(
                 subject="Prediction model",
             )
             if task_error:
-                event_writer({"event": "error", "request_id": request_id, "error_message": task_error})
+                event_writer(
+                    {"event": "error", "request_id": request_id, "error_message": task_error}
+                )
                 continue
 
             if command == "load":
                 # Run no dummy prediction here; the first real image initializes
                 # device-specific predictor state without guessing an input shape.
-                event_writer({"event": "loaded", "request_id": request_id, "model_path": model_path})
+                event_writer(
+                    {"event": "loaded", "request_id": request_id, "model_path": model_path}
+                )
                 continue
             if command != "predict":
                 event_writer(
@@ -218,7 +238,9 @@ def run_predict_worker(
         event_writer({"event": "error", "error_message": "image_path is required"})
         return 1
 
-    model_factory, cv2_module, numpy_module, dependency_error = _load_prediction_dependencies(model_factory)
+    model_factory, cv2_module, numpy_module, dependency_error = _load_prediction_dependencies(
+        model_factory
+    )
     if model_factory is None:
         event_writer({"event": "error", "error_message": dependency_error})
         return 1
@@ -245,7 +267,9 @@ def run_predict_worker(
                 predict_kwargs.update({"conf": 0.25, "iou": 0.5, "end2end": False})
             results_list = model.predict(**predict_kwargs)
         if _CANCEL_REQUESTED:
-            event_writer({"event": "result", "canceled": True, "had_error": False, "prediction": None})
+            event_writer(
+                {"event": "result", "canceled": True, "had_error": False, "prediction": None}
+            )
             return 0
         results = list(results_list or [])
         if not results:
@@ -305,10 +329,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
 
-    parser = argparse.ArgumentParser(description="Run SqueakPose single-image prediction in a child process.")
+    parser = argparse.ArgumentParser(
+        description="Run SqueakPose single-image prediction in a child process."
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--config", help="Path to JSON prediction config.")
-    mode.add_argument("--server", action="store_true", help="Serve newline-delimited requests on stdin.")
+    mode.add_argument(
+        "--server", action="store_true", help="Serve newline-delimited requests on stdin."
+    )
     args = parser.parse_args(argv)
 
     if args.server:

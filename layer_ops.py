@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-
 LAYER_KEYPOINTS = "keypoints"
 LAYER_SEGMENTATION = "segmentation"
 LAYER_DEPTH = "depth"

@@ -8,9 +8,9 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
-from squeakpose_core import model_task_mismatch_message
 from layer_ops import normalize_layer_id
 from squeakpose.workers.protocol import read_config, write_event
+from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 
@@ -53,7 +53,10 @@ def run_training_worker(
             with contextlib.redirect_stdout(sys.stderr):
                 from ultralytics import YOLO
         except Exception as exc:
-            _emit_event(event_writer, {"event": "error", "error_message": f"Could not import ultralytics YOLO: {exc}"})
+            _emit_event(
+                event_writer,
+                {"event": "error", "error_message": f"Could not import ultralytics YOLO: {exc}"},
+            )
             return 1
         model_factory = YOLO
 
@@ -65,7 +68,13 @@ def run_training_worker(
         with contextlib.redirect_stdout(sys.stderr):
             model = model_factory(model_cfg)
     except Exception as exc:
-        _emit_event(event_writer, {"event": "error", "error_message": f"Could not load model config '{model_cfg}': {exc}"})
+        _emit_event(
+            event_writer,
+            {
+                "event": "error",
+                "error_message": f"Could not load model config '{model_cfg}': {exc}",
+            },
+        )
         return 1
 
     task_error = model_task_mismatch_message(

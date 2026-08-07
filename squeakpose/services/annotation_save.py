@@ -43,9 +43,7 @@ def save_annotation_transaction(
     """Stage and atomically install an image, label, and rendered overlay."""
     if not request.label_text.strip():
         raise ValueError("annotation label text must not be empty")
-    source_exists = bool(request.source_image_path) and os.path.isfile(
-        request.source_image_path
-    )
+    source_exists = bool(request.source_image_path) and os.path.isfile(request.source_image_path)
     output_exists = os.path.isfile(request.image_output_path)
     if not source_exists and not output_exists:
         raise FileNotFoundError("annotation source image is missing")
@@ -59,10 +57,8 @@ def save_annotation_transaction(
 
     staged: list[tuple[str, str]] = []
     try:
-        if (
-            source_exists
-            and os.path.abspath(request.source_image_path)
-            != os.path.abspath(request.image_output_path)
+        if source_exists and os.path.abspath(request.source_image_path) != os.path.abspath(
+            request.image_output_path
         ):
             staged.append(
                 (

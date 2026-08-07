@@ -6,8 +6,8 @@ from unittest.mock import patch
 from squeakpose_core import (
     CURRENT_PROJECT_SCHEMA_VERSION,
     InferenceCsvWriter,
-    atomic_write_text_files,
     atomic_write_text,
+    atomic_write_text_files,
     build_segmentation_inference_rows,
     commit_staged_paths,
     effective_prediction_batch,
@@ -184,7 +184,9 @@ class CoreHelpersTests(unittest.TestCase):
 
             self.assertEqual(classes.read_text(encoding="utf-8"), "old-class\n")
             self.assertEqual(keypoints.read_text(encoding="utf-8"), "old-keypoint\n")
-            self.assertFalse(any(".backup-" in item.name or ".tmp" in item.name for item in root.iterdir()))
+            self.assertFalse(
+                any(".backup-" in item.name or ".tmp" in item.name for item in root.iterdir())
+            )
 
     def test_commit_staged_paths_restores_directories_when_final_install_fails(self):
         with TemporaryDirectory() as tmp:
@@ -241,10 +243,7 @@ class CoreHelpersTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(
             normalized,
-            [
-                "0 1.000000 0.000000 1.000000 0.200000 "
-                "1.000000 0.000000 2 0.400000 0.600000 2"
-            ],
+            ["0 1.000000 0.000000 1.000000 0.200000 1.000000 0.000000 2 0.400000 0.600000 2"],
         )
         self.assertTrue(any("extra keypoint" in warning for warning in warnings))
         self.assertTrue(any("parse error" in warning for warning in warnings))
@@ -371,7 +370,9 @@ class CoreHelpersTests(unittest.TestCase):
                 str(detect),
             )
 
-            (segment / "dataset.yaml").write_text("task: segment\nnames: [mouse]\n", encoding="utf-8")
+            (segment / "dataset.yaml").write_text(
+                "task: segment\nnames: [mouse]\n", encoding="utf-8"
+            )
             self.assertEqual(
                 resolve_default_training_dataset_path(str(root)),
                 str(segment),

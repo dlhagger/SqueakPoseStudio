@@ -128,9 +128,7 @@ def list_label_files(labels_dir: str) -> list[str]:
     if not os.path.isdir(labels_dir):
         return []
     return [
-        f
-        for f in os.listdir(labels_dir)
-        if not f.startswith(".") and f.lower().endswith(".txt")
+        f for f in os.listdir(labels_dir) if not f.startswith(".") and f.lower().endswith(".txt")
     ]
 
 
@@ -144,7 +142,9 @@ def remove_dataset_split_dirs(paths: DatasetExportPaths) -> None:
             shutil.rmtree(directory, ignore_errors=True)
 
 
-def split_train_val_images(images: Iterable[str], train_ratio: float) -> tuple[list[str], list[str]]:
+def split_train_val_images(
+    images: Iterable[str], train_ratio: float
+) -> tuple[list[str], list[str]]:
     items = list(images)
     train_count = int(len(items) * train_ratio)
     if train_count <= 0 and len(items) > 0:
@@ -349,32 +349,19 @@ def scan_project_health(
         stored_collisions=image_stem_collisions(stored_images),
     )
 
-    image_stems = {
-        os.path.splitext(name)[0].casefold()
-        for name in stored_images
-    }
-    pose_stems = {
-        os.path.splitext(name)[0].casefold()
-        for name in pose_labels
-    }
-    seg_stems = {
-        os.path.splitext(name)[0].casefold()
-        for name in seg_labels
-    }
+    image_stems = {os.path.splitext(name)[0].casefold() for name in stored_images}
+    pose_stems = {os.path.splitext(name)[0].casefold() for name in pose_labels}
+    seg_stems = {os.path.splitext(name)[0].casefold() for name in seg_labels}
     report.unlabeled_images = [
         name
         for name in stored_images
         if os.path.splitext(name)[0].casefold() not in pose_stems | seg_stems
     ]
     report.orphan_pose_labels = [
-        name
-        for name in pose_labels
-        if os.path.splitext(name)[0].casefold() not in image_stems
+        name for name in pose_labels if os.path.splitext(name)[0].casefold() not in image_stems
     ]
     report.orphan_segmentation_labels = [
-        name
-        for name in seg_labels
-        if os.path.splitext(name)[0].casefold() not in image_stems
+        name for name in seg_labels if os.path.splitext(name)[0].casefold() not in image_stems
     ]
 
     report.usable_pose_labels = sum(
@@ -621,7 +608,9 @@ def label_file_has_usable_rows(
     if not lines:
         return False
     if is_segmentation_mode(mode):
-        normalized, _, _ = normalize_segmentation_label_lines(lines, class_count=max(1, class_count))
+        normalized, _, _ = normalize_segmentation_label_lines(
+            lines, class_count=max(1, class_count)
+        )
     else:
         normalized, _, _ = normalize_pose_label_lines(
             lines,

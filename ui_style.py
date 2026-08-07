@@ -10,7 +10,6 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QComboBox, QFrame, QGraphicsDropShadowEffect, QWidget
 
-
 COLORS = {
     "app_bg": "#171a1d",
     "canvas_bg": "#202429",
@@ -36,7 +35,9 @@ COLORS = {
 }
 
 
-def apply_panel_shadow(widget: QWidget, *, blur: int = 18, y_offset: int = 2, alpha: int = 90) -> None:
+def apply_panel_shadow(
+    widget: QWidget, *, blur: int = 18, y_offset: int = 2, alpha: int = 90
+) -> None:
     """Apply a restrained desktop-panel shadow."""
     shadow = QGraphicsDropShadowEffect(widget)
     shadow.setBlurRadius(blur)
@@ -111,7 +112,9 @@ def style_combo_popup(view: QWidget) -> None:
         viewport.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         viewport.setAutoFillBackground(True)
         viewport.setPalette(palette)
-        viewport.setStyleSheet(f"QWidget#ComboPopupViewport {{ background-color: {COLORS['input_bg']}; }}")
+        viewport.setStyleSheet(
+            f"QWidget#ComboPopupViewport {{ background-color: {COLORS['input_bg']}; }}"
+        )
 
     container = view.window()
     if container is not view and container is not combo:
@@ -308,22 +311,22 @@ def app_stylesheet(preferred_family: str, system_family: str) -> str:
 
 def launcher_stylesheet() -> str:
     """Stylesheet for the project launcher dialog."""
-    return f"""
-    QDialog {{
+    return """
+    QDialog {
         background-color: #f4f6f8;
         color: #161b20;
-    }}
-    QLabel#LauncherTitle {{
+    }
+    QLabel#LauncherTitle {
         color: #14191f;
         font-size: 16pt;
         font-weight: 800;
-    }}
-    QLabel#LauncherSubtitle {{
+    }
+    QLabel#LauncherSubtitle {
         color: #53606b;
         font-size: 10pt;
         line-height: 1.2;
-    }}
-    QPushButton {{
+    }
+    QPushButton {
         background-color: #ffffff;
         border: 1px solid #bcc7d1;
         border-radius: 7px;
@@ -331,19 +334,19 @@ def launcher_stylesheet() -> str:
         color: #1c232a;
         font-weight: 650;
         min-height: 28px;
-    }}
-    QPushButton:hover {{
+    }
+    QPushButton:hover {
         background-color: #edf4fb;
         border-color: #8ba6bd;
-    }}
-    QPushButton#PrimaryLauncherButton {{
+    }
+    QPushButton#PrimaryLauncherButton {
         background-color: #245f8f;
         border-color: #245f8f;
         color: #ffffff;
-    }}
-    QPushButton#PrimaryLauncherButton:hover {{
+    }
+    QPushButton#PrimaryLauncherButton:hover {
         background-color: #2d74ad;
-    }}
+    }
     """
 
 

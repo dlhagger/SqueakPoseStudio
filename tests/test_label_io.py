@@ -94,7 +94,9 @@ class LabelIoTests(unittest.TestCase):
             img_h=50,
         )
 
-        self.assertEqual(line, "1 0.100000 0.100000 0.500000 0.100000 0.500000 0.500000 0.100000 0.500000")
+        self.assertEqual(
+            line, "1 0.100000 0.100000 0.500000 0.100000 0.500000 0.500000 0.100000 0.500000"
+        )
         self.assertEqual(parsed, entry)
 
     def test_load_segmentation_annotations_keeps_last_row_per_class(self):

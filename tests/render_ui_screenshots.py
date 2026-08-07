@@ -21,8 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import PyQt6
 import numpy as np
+import PyQt6
 
 QT_PLUGINS = Path(PyQt6.__file__).resolve().parent / "Qt6" / "plugins"
 QT_PLATFORMS = QT_PLUGINS / "platforms"
@@ -36,8 +36,8 @@ from PyQt6.QtGui import QColor, QFontDatabase, QImage, QPainter, QPen
 from PyQt6.QtWidgets import QApplication
 
 import squeakpose_studio as studio
-from ui_style import app_stylesheet
 from squeakpose.ui.project_models_dialog import ProjectModelsDialog
+from ui_style import app_stylesheet
 
 
 def _ensure_app() -> QApplication:
@@ -106,16 +106,11 @@ def _build_demo_project(root: Path) -> dict[str, str]:
         encoding="utf-8",
     )
     Path(paths["labels_seg_all"], "frame001.txt").write_text(
-        "0 0.340 0.405 0.485 0.365 0.610 0.395 0.655 0.485 "
-        "0.625 0.590 0.445 0.625 0.335 0.535\n",
+        "0 0.340 0.405 0.485 0.365 0.610 0.395 0.655 0.485 0.625 0.590 0.445 0.625 0.335 0.535\n",
         encoding="utf-8",
     )
-    _write_demo_depth_preview(
-        Path(paths["depth_previews"]) / "frame001_depth.png"
-    )
-    demo_depth = np.linspace(
-        0.42, 4.81, num=540 * 960, dtype=np.float32
-    ).reshape(540, 960)
+    _write_demo_depth_preview(Path(paths["depth_previews"]) / "frame001_depth.png")
+    demo_depth = np.linspace(0.42, 4.81, num=540 * 960, dtype=np.float32).reshape(540, 960)
     np.save(Path(paths["depth_images"]) / "frame001.npy", demo_depth)
     Path(paths["depth_images"], "frame001_depth.json").write_text(
         json.dumps(
@@ -210,17 +205,13 @@ def render_screenshots(output_dir: Path) -> list[Path]:
     _save_widget(window, depth_probes_path, app)
     screenshots.append(depth_probes_path)
 
-    window.depth_display_combo.setCurrentIndex(
-        window.depth_display_combo.findData("overlay")
-    )
+    window.depth_display_combo.setCurrentIndex(window.depth_display_combo.findData("overlay"))
     _flush_events(app, rounds=6)
     depth_overlay_path = output_dir / "main_depth_overlay.png"
     _save_widget(window, depth_overlay_path, app)
     screenshots.append(depth_overlay_path)
 
-    window.depth_display_combo.setCurrentIndex(
-        window.depth_display_combo.findData("original")
-    )
+    window.depth_display_combo.setCurrentIndex(window.depth_display_combo.findData("original"))
     _flush_events(app, rounds=6)
     depth_original_path = output_dir / "main_depth_original.png"
     _save_widget(window, depth_original_path, app)
@@ -315,7 +306,9 @@ def render_screenshots(output_dir: Path) -> list[Path]:
             "keypoints": {
                 "classes": ["mouse"],
                 "kp_names": ["nose", "head", "left_ear", "right_ear", "back", "tail_base"],
-                "class_keypoints": {"mouse": ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]},
+                "class_keypoints": {
+                    "mouse": ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
+                },
             },
             "segmentation": {"classes": ["mouse"], "kp_names": [], "class_keypoints": {}},
         },
@@ -326,14 +319,18 @@ def render_screenshots(output_dir: Path) -> list[Path]:
     screenshots.append(reviewer_no_models_path)
     reviewer_no_models.close()
 
-    train = studio.TrainDialog(window, str(Path(paths["datasets"]) / "demo_dataset"), default_task="pose")
+    train = studio.TrainDialog(
+        window, str(Path(paths["datasets"]) / "demo_dataset"), default_task="pose"
+    )
     train.resize(1100, 720)
     train_path = output_dir / "train_dialog.png"
     _save_widget(train, train_path, app)
     screenshots.append(train_path)
     train.close()
 
-    analysis = studio.AnalysisDialog(window, project_root=paths["root"], app_base_dir=str(REPO_ROOT))
+    analysis = studio.AnalysisDialog(
+        window, project_root=paths["root"], app_base_dir=str(REPO_ROOT)
+    )
     analysis.resize(1240, 900)
     analysis_path = output_dir / "analysis_dialog.png"
     _save_widget(analysis, analysis_path, app)

@@ -38,7 +38,9 @@ class DatasetServiceTests(unittest.TestCase):
             self.assertEqual(result.split_seed, 17)
             self.assertTrue(os.path.isfile(paths.dataset_yaml_path))
             self.assertTrue(os.path.isfile(os.path.join(paths.images_train_dir, "frame.jpg")))
-            with open(os.path.join(paths.labels_train_dir, "frame.txt"), "r", encoding="utf-8") as fh:
+            with open(
+                os.path.join(paths.labels_train_dir, "frame.txt"), "r", encoding="utf-8"
+            ) as fh:
                 self.assertEqual(fh.read(), "0 0.5 0.5 0.2 0.2\n")
 
     def test_failed_install_leaves_existing_dataset_and_removes_staging(self):

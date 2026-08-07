@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from fractions import Fraction
 import sys
+from fractions import Fraction
 from typing import Optional
 
 import av

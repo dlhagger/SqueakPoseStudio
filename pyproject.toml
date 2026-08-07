@@ -48,6 +48,31 @@ test = [
     "seaborn>=0.13.2",
 ]
 
+dev = [
+    "ruff==0.16.2",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+    "analysis_toolset/analysis_toolkit.ipynb",
+]
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E9",
+    "F",
+    "I",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The legacy launcher re-exports names imported by the main-window module.
+"squeakpose/ui/main_window.py" = ["F401"]
+"squeakpose_studio.py" = ["F401", "F403"]
+"tests/render_ui_screenshots.py" = ["E402"]
+
 [tool.uv]
 torch-backend = "auto"
 

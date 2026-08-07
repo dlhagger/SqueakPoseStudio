@@ -2,8 +2,9 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from dataset_builder import create_dataset_yaml
 import yaml
+
+from dataset_builder import create_dataset_yaml
 
 
 class DatasetBuilderTests(unittest.TestCase):

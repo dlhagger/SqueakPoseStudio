@@ -449,10 +449,29 @@ distillation/              Project-aware DINO distillation entry point
 `squeakpose_studio.py` remains the compatible direct launcher while UI
 responsibilities are incrementally moved into the `squeakpose` package. Project
 formats and worker entry points remain backward compatible during this
-transition. See `REFACTOR_PLAN.md` for the architectural guardrails and target
-boundaries.
+transition.
 
 ## Development Checks
+
+Install the locked developer tools without the application dependencies:
+
+```bash
+uv sync --locked --only-group dev
+```
+
+Check lint and formatting:
+
+```bash
+uv run --locked --only-group dev ruff check .
+uv run --locked --only-group dev ruff format --check .
+```
+
+Apply Ruff's safe lint fixes and formatter locally:
+
+```bash
+uv run --locked --only-group dev ruff check --fix .
+uv run --locked --only-group dev ruff format .
+```
 
 Run the unit tests:
 

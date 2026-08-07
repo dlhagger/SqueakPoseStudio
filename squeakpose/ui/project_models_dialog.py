@@ -68,9 +68,7 @@ class ProjectModelsDialog(QDialog):
         grid.addWidget(QLabel("Expected"), 0, 2)
         grid.addWidget(QLabel("Status"), 0, 3)
 
-        for row, layer_id in enumerate(
-            (LAYER_KEYPOINTS, LAYER_SEGMENTATION), start=1
-        ):
+        for row, layer_id in enumerate((LAYER_KEYPOINTS, LAYER_SEGMENTATION), start=1):
             layer = layer_definition(layer_id)
             layer_label = QLabel(layer.display_name)
             if layer_id == active_layer:
@@ -88,15 +86,11 @@ class ProjectModelsDialog(QDialog):
             path_row.addWidget(path_edit, 1)
 
             choose_btn = QPushButton("Choose…")
-            choose_btn.clicked.connect(
-                lambda _checked=False, lid=layer_id: self._choose_model(lid)
-            )
+            choose_btn.clicked.connect(lambda _checked=False, lid=layer_id: self._choose_model(lid))
             path_row.addWidget(choose_btn)
 
             clear_btn = QPushButton("Clear")
-            clear_btn.clicked.connect(
-                lambda _checked=False, lid=layer_id: self._set_path(lid, "")
-            )
+            clear_btn.clicked.connect(lambda _checked=False, lid=layer_id: self._set_path(lid, ""))
             path_row.addWidget(clear_btn)
             grid.addLayout(path_row, row, 1)
 
@@ -118,12 +112,9 @@ class ProjectModelsDialog(QDialog):
         root.addWidget(validation_note)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText(
-            "Save Models"
-        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Save Models")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)

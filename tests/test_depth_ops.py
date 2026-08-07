@@ -50,13 +50,9 @@ class _Cv2:
 
 class DepthOpsTests(unittest.TestCase):
     def test_sample_depth_map_uses_image_xy_without_transposing(self):
-        depth = np.asarray(
-            [[0.1, 0.2, 0.3], [1.1, 1.2, 1.3]], dtype=np.float32
-        )
+        depth = np.asarray([[0.1, 0.2, 0.3], [1.1, 1.2, 1.3]], dtype=np.float32)
 
-        sample = sample_depth_map(
-            depth, x=2.8, y=1.2, numpy_module=np
-        )
+        sample = sample_depth_map(depth, x=2.8, y=1.2, numpy_module=np)
 
         self.assertEqual((sample["x"], sample["y"]), (2, 1))
         self.assertAlmostEqual(sample["depth"], 1.3, places=6)
@@ -65,9 +61,7 @@ class DepthOpsTests(unittest.TestCase):
     def test_sample_depth_map_rejects_out_of_bounds_and_marks_invalid(self):
         depth = np.asarray([[0.0, 2.0]], dtype=np.float32)
 
-        invalid = sample_depth_map(
-            depth, x=0, y=0, numpy_module=np
-        )
+        invalid = sample_depth_map(depth, x=0, y=0, numpy_module=np)
 
         self.assertFalse(invalid["valid"])
         self.assertIsNone(invalid["depth"])
@@ -77,18 +71,14 @@ class DepthOpsTests(unittest.TestCase):
     def test_keypoint_depth_label_appends_aligned_metric_value(self):
         depth = np.asarray([[0.25, 0.5], [1.25, 1.5]], dtype=np.float32)
 
-        label = keypoint_depth_label(
-            "nose", depth, x=1.9, y=0.8, numpy_module=np
-        )
+        label = keypoint_depth_label("nose", depth, x=1.9, y=0.8, numpy_module=np)
 
         self.assertEqual(label, "nose · 0.500 m")
 
     def test_keypoint_depth_label_reports_invalid_sample(self):
         depth = np.asarray([[0.0]], dtype=np.float32)
 
-        label = keypoint_depth_label(
-            "tail", depth, x=0, y=0, numpy_module=np
-        )
+        label = keypoint_depth_label("tail", depth, x=0, y=0, numpy_module=np)
 
         self.assertEqual(label, "tail · invalid")
 
@@ -131,16 +121,12 @@ class DepthOpsTests(unittest.TestCase):
         self.assertGreater(int(preview[0, 1].sum()), 0)
 
     def test_colorized_depth_preserves_orientation_and_makes_near_bright(self):
-        depth = np.asarray(
-            [[1.0, 2.0, 4.0], [8.0, 16.0, 32.0]], dtype=np.float32
-        )
+        depth = np.asarray([[1.0, 2.0, 4.0], [8.0, 16.0, 32.0]], dtype=np.float32)
 
         preview = colorize_depth_map(depth, numpy_module=np)
 
         self.assertEqual(preview.shape, (2, 3, 3))
-        self.assertGreater(
-            int(preview[0, 0].sum()), int(preview[1, 2].sum())
-        )
+        self.assertGreater(int(preview[0, 0].sum()), int(preview[1, 2].sum()))
 
     def test_serialization_writes_raw_preview_and_metadata(self):
         with TemporaryDirectory() as tmp:

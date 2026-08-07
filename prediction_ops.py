@@ -6,6 +6,7 @@ from typing import Any
 
 from layer_ops import normalize_layer_id
 
+
 def _to_list(value: Any) -> list:
     if value is None:
         return []
@@ -21,7 +22,9 @@ def _to_list(value: Any) -> list:
         return []
 
 
-def _mask_segments_from_data(mask_data: Any, det_idx: int, *, cv2_module: Any = None, numpy_module: Any = None) -> list[list[float]]:
+def _mask_segments_from_data(
+    mask_data: Any, det_idx: int, *, cv2_module: Any = None, numpy_module: Any = None
+) -> list[list[float]]:
     if cv2_module is None or numpy_module is None:
         return []
     try:
@@ -35,7 +38,9 @@ def _mask_segments_from_data(mask_data: Any, det_idx: int, *, cv2_module: Any = 
         if getattr(mask_arr, "ndim", 0) == 3:
             mask_arr = mask_arr[0]
         mask_u8 = (numpy_module.asarray(mask_arr) > 0.5).astype(numpy_module.uint8) * 255
-        contours_info = cv2_module.findContours(mask_u8, cv2_module.RETR_EXTERNAL, cv2_module.CHAIN_APPROX_NONE)
+        contours_info = cv2_module.findContours(
+            mask_u8, cv2_module.RETR_EXTERNAL, cv2_module.CHAIN_APPROX_NONE
+        )
         contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
         if not contours:
             return []
@@ -117,7 +122,9 @@ def serialize_prediction_result(
             if len(points) >= 3:
                 det["segments"] = points
         if not det["segments"]:
-            fallback = _mask_segments_from_data(mask_data, det_idx, cv2_module=cv2_module, numpy_module=numpy_module)
+            fallback = _mask_segments_from_data(
+                mask_data, det_idx, cv2_module=cv2_module, numpy_module=numpy_module
+            )
             if len(fallback) >= 3:
                 det["segments"] = fallback
 
@@ -129,7 +136,14 @@ def serialize_prediction_result(
 
 def top_prediction_from_payload(payload: dict[str, Any], *, workflow: str) -> dict[str, Any]:
     """Convert serialized detections to the Video Reviewer single-overlay shape."""
-    out: dict[str, Any] = {"ok": False, "conf": 0.0, "cls": 0, "xyxy": None, "kps": [], "segments": []}
+    out: dict[str, Any] = {
+        "ok": False,
+        "conf": 0.0,
+        "cls": 0,
+        "xyxy": None,
+        "kps": [],
+        "segments": [],
+    }
     detections = payload.get("detections") or []
     if not isinstance(detections, list):
         return out
@@ -186,7 +200,9 @@ def top_prediction_from_payload(payload: dict[str, Any], *, workflow: str) -> di
     return out
 
 
-def best_predictions_by_class_from_payload(payload: dict[str, Any], *, workflow: str) -> list[dict[str, Any]]:
+def best_predictions_by_class_from_payload(
+    payload: dict[str, Any], *, workflow: str
+) -> list[dict[str, Any]]:
     """Return the highest-confidence serialized detection for each model class."""
     detections = payload.get("detections") or []
     if not isinstance(detections, list):

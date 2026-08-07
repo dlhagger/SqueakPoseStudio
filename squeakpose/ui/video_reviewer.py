@@ -6,11 +6,10 @@ import datetime
 import json
 import os
 import random
-import re
 import sys
 from typing import Optional
 
-from PyQt6.QtCore import QProcess, QTimer, Qt
+from PyQt6.QtCore import QProcess, Qt, QTimer
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -25,10 +24,10 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QCheckBox,
     QFileDialog,
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -48,14 +47,24 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from prediction_ops import rank_prediction_frames
 from layer_ops import (
     LAYER_KEYPOINTS,
     LAYER_SEGMENTATION,
     layer_definition,
     normalize_layer_id,
 )
+from prediction_ops import rank_prediction_frames
 from squeakpose.annotation.video_view import VideoView
+from squeakpose.workers.process import (
+    remove_file_quietly as _remove_file_quietly,
+)
+from squeakpose.workers.process import (
+    request_qprocess_stop,
+)
+from squeakpose.workers.process import (
+    shutdown_qprocess as _shutdown_qprocess,
+)
+from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from squeakpose_core import (
     atomic_write_text,
     commit_staged_paths,
@@ -64,12 +73,6 @@ from squeakpose_core import (
     stable_path_id,
     staging_path_for,
 )
-from squeakpose.workers.process import (
-    remove_file_quietly as _remove_file_quietly,
-    request_qprocess_stop,
-    shutdown_qprocess as _shutdown_qprocess,
-)
-from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_POSE = "pose"
@@ -84,9 +87,7 @@ except Exception:
 def _ui_font(px: int) -> QFont:
     font = QFont()
     available = set(QFontDatabase.families())
-    system_family = QFontDatabase.systemFont(
-        QFontDatabase.SystemFont.GeneralFont
-    ).family()
+    system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
     for family in ("Fira Sans", system_family, "Segoe UI", "Arial", "Helvetica"):
         if family and family in available:
             font.setFamily(family)
@@ -103,6 +104,7 @@ class VideoReviewDialog(QDialog):
       2) Runs YOLO predict over a chosen frame range in a child process
       3) Lets you scrub a timeline and see prediction overlays and confidence
     """
+
     def __init__(
         self,
         parent,
@@ -126,9 +128,7 @@ class VideoReviewDialog(QDialog):
         inherited_model = getattr(parent, "predict_model_path", None)
         self.model_paths = {
             LAYER_KEYPOINTS: str((model_paths or {}).get(LAYER_KEYPOINTS) or ""),
-            LAYER_SEGMENTATION: str(
-                (model_paths or {}).get(LAYER_SEGMENTATION) or ""
-            ),
+            LAYER_SEGMENTATION: str((model_paths or {}).get(LAYER_SEGMENTATION) or ""),
         }
         if not any(self.model_paths.values()) and inherited_model:
             self.model_paths[self.layer_id] = str(inherited_model)
@@ -157,17 +157,13 @@ class VideoReviewDialog(QDialog):
             primary_schema = self.layer_schemas.get(self.layer_id, {})
             self.classes = list(primary_schema.get("classes") or [])
             self.kp_names = list(primary_schema.get("kp_names") or [])
-            self.class_keypoints = dict(
-                primary_schema.get("class_keypoints") or {}
-            )
+            self.class_keypoints = dict(primary_schema.get("class_keypoints") or {})
         self.model_path = self.model_paths.get(self.layer_id) or None
 
         if len(self.review_layers) > 1:
             self.setWindowTitle("Video Review (Project Models)")
         else:
-            layer_title = (
-                "Segmentation" if self._is_seg_workflow() else "Keypoints"
-            )
+            layer_title = "Segmentation" if self._is_seg_workflow() else "Keypoints"
             self.setWindowTitle(f"Video Review ({layer_title} Layer)")
         self.resize(1080, 760)
 
@@ -280,7 +276,9 @@ class VideoReviewDialog(QDialog):
                 "Run the configured Keypoints and Segmentation models sequentially over the selected frame range."
             )
         elif self._is_seg_workflow():
-            self.btn_predict.setToolTip("Run segmentation predictions over the selected frame range.")
+            self.btn_predict.setToolTip(
+                "Run segmentation predictions over the selected frame range."
+            )
         else:
             self.btn_predict.setToolTip("Run pose predictions over the selected frame range.")
         self.btn_predict.clicked.connect(self._start_range_prediction)
@@ -328,27 +326,15 @@ class VideoReviewDialog(QDialog):
         overlay_row.addWidget(QLabel("Overlays"))
         self.keypoints_overlay_check = QCheckBox("Keypoints")
         self.segmentation_overlay_check = QCheckBox("Segmentation")
-        self.keypoints_overlay_check.setChecked(
-            LAYER_KEYPOINTS in self.review_layers
-        )
-        self.segmentation_overlay_check.setChecked(
-            LAYER_SEGMENTATION in self.review_layers
-        )
-        self.keypoints_overlay_check.setEnabled(
-            LAYER_KEYPOINTS in self.review_layers
-        )
-        self.segmentation_overlay_check.setEnabled(
-            LAYER_SEGMENTATION in self.review_layers
-        )
+        self.keypoints_overlay_check.setChecked(LAYER_KEYPOINTS in self.review_layers)
+        self.segmentation_overlay_check.setChecked(LAYER_SEGMENTATION in self.review_layers)
+        self.keypoints_overlay_check.setEnabled(LAYER_KEYPOINTS in self.review_layers)
+        self.segmentation_overlay_check.setEnabled(LAYER_SEGMENTATION in self.review_layers)
         self.keypoints_overlay_check.toggled.connect(
-            lambda _checked: self._seek(self.cur, show_only=False)
-            if self.cap is not None
-            else None
+            lambda _checked: self._seek(self.cur, show_only=False) if self.cap is not None else None
         )
         self.segmentation_overlay_check.toggled.connect(
-            lambda _checked: self._seek(self.cur, show_only=False)
-            if self.cap is not None
-            else None
+            lambda _checked: self._seek(self.cur, show_only=False) if self.cap is not None else None
         )
         overlay_row.addWidget(self.keypoints_overlay_check)
         overlay_row.addWidget(self.segmentation_overlay_check)
@@ -360,9 +346,7 @@ class VideoReviewDialog(QDialog):
                 f"{os.path.basename(self.model_paths[configured_layer])}"
             )
         self.model_summary_label = QLabel(
-            "  ·  ".join(configured_text)
-            if configured_text
-            else "No models · browse/export only"
+            "  ·  ".join(configured_text) if configured_text else "No models · browse/export only"
         )
         self.model_summary_label.setToolTip(
             "\n".join(configured_text)
@@ -452,7 +436,7 @@ class VideoReviewDialog(QDialog):
         self._zoom_in_sc = QShortcut(QKeySequence("+"), self)
         self._zoom_in_sc.activated.connect(lambda: self.view.scale(1.05, 1.05))
         self._zoom_out_sc = QShortcut(QKeySequence("-"), self)
-        self._zoom_out_sc.activated.connect(lambda: self.view.scale(1/1.05, 1/1.05))
+        self._zoom_out_sc.activated.connect(lambda: self.view.scale(1 / 1.05, 1 / 1.05))
         self._zoom_reset_sc = QShortcut(QKeySequence("R"), self)
         self._zoom_reset_sc.activated.connect(self.view.reset_view)
 
@@ -528,51 +512,37 @@ class VideoReviewDialog(QDialog):
             cur = self._video_signature()
 
             # Same file check (path/size) and mtime within a couple seconds
-            if (vid.get("path") != cur.get("path")) or (int(vid.get("size", -1)) != int(cur.get("size", -2))):
+            if (vid.get("path") != cur.get("path")) or (
+                int(vid.get("size", -1)) != int(cur.get("size", -2))
+            ):
                 return False
             if abs(float(vid.get("mtime", 0.0)) - float(cur.get("mtime", 0.0))) > 2.0:
                 return False
 
             saved_models = meta.get("model_paths")
             cached_by_layer = data.get("preds_by_layer")
-            if isinstance(saved_models, dict) and isinstance(
-                cached_by_layer, dict
-            ):
+            if isinstance(saved_models, dict) and isinstance(cached_by_layer, dict):
                 for layer in self.review_layers:
-                    if str(saved_models.get(layer) or "") != str(
-                        self.model_paths.get(layer) or ""
-                    ):
+                    if str(saved_models.get(layer) or "") != str(self.model_paths.get(layer) or ""):
                         return False
                 for layer in (LAYER_KEYPOINTS, LAYER_SEGMENTATION):
                     raw = cached_by_layer.get(layer) or {}
                     if isinstance(raw, dict):
-                        self.preds_by_layer[layer] = {
-                            int(k): v for k, v in raw.items()
-                        }
-                self.preds = self.preds_by_layer.get(
-                    self.layer_id, {}
-                )
+                        self.preds_by_layer[layer] = {int(k): v for k, v in raw.items()}
+                self.preds = self.preds_by_layer.get(self.layer_id, {})
                 return any(self.preds_by_layer.values())
 
             # Backward-compatible single-layer cache.
             mp_saved = meta.get("model_path")
-            if mp_saved and self.model_path and (
-                mp_saved != self.model_path
-            ):
+            if mp_saved and self.model_path and (mp_saved != self.model_path):
                 return False
-            saved_workflow = str(
-                meta.get("workflow", WORKFLOW_POSE)
-            ).strip().lower()
+            saved_workflow = str(meta.get("workflow", WORKFLOW_POSE)).strip().lower()
             if saved_workflow != self.workflow:
                 return False
             preds = data.get("preds", {})
-            legacy_predictions = {
-                int(k): v for k, v in preds.items()
-            }
+            legacy_predictions = {int(k): v for k, v in preds.items()}
             if hasattr(self, "preds_by_layer"):
-                legacy_layer = normalize_layer_id(
-                    getattr(self, "layer_id", saved_workflow)
-                )
+                legacy_layer = normalize_layer_id(getattr(self, "layer_id", saved_workflow))
                 self.preds_by_layer[legacy_layer] = legacy_predictions
                 self.preds = self.preds_by_layer[legacy_layer]
             else:
@@ -600,19 +570,25 @@ class VideoReviewDialog(QDialog):
 
     # ---------- video load ----------
     def _choose_video(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select video", "", "Videos (*.mp4 *.mov *.avi *.mkv)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select video", "", "Videos (*.mp4 *.mov *.avi *.mkv)"
+        )
         if not path:
             return
         self._open_video(path)
 
     def _open_video(self, path: str):
         if self.cap is not None:
-            try: self.cap.release()
-            except Exception: pass
+            try:
+                self.cap.release()
+            except Exception:
+                pass
             self.cap = None
 
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
+            QMessageBox.warning(
+                self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies."
+            )
             return
 
         cap = _cv2.VideoCapture(path)
@@ -631,8 +607,10 @@ class VideoReviewDialog(QDialog):
         h = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
         self._set_info_text(f"{self.base} — {w}x{h} @ {self.fps:.2f} fps — {self.total} frames")
-        self.spin_start.setRange(0, max(0, self.total - 1)); self.spin_start.setValue(0)
-        self.spin_end.setRange(0, max(0, self.total - 1)); self.spin_end.setValue(max(0, self.total - 1))
+        self.spin_start.setRange(0, max(0, self.total - 1))
+        self.spin_start.setValue(0)
+        self.spin_end.setRange(0, max(0, self.total - 1))
+        self.spin_end.setValue(max(0, self.total - 1))
         self.slider.setRange(0, max(0, self.total - 1))
         self.btn_predict.setEnabled(bool(self.review_layers))
         if hasattr(self, "btn_send"):
@@ -647,13 +625,9 @@ class VideoReviewDialog(QDialog):
         if self._load_cache_if_valid():
             self.slider.setEnabled(True)
             if hasattr(self, "btn_send_low"):
-                self.btn_send_low.setEnabled(
-                    any(self.preds_by_layer.values())
-                )
+                self.btn_send_low.setEnabled(any(self.preds_by_layer.values()))
             if hasattr(self, "btn_send_high"):
-                self.btn_send_high.setEnabled(
-                    any(self.preds_by_layer.values())
-                )
+                self.btn_send_high.setEnabled(any(self.preds_by_layer.values()))
             cached_keys = sorted(
                 {
                     frame_idx
@@ -683,8 +657,13 @@ class VideoReviewDialog(QDialog):
                 "Configure a Keypoints or Segmentation model in Project Models first.",
             )
             return
-        if self._review_process is not None and self._review_process.state() != QProcess.ProcessState.NotRunning:
-            QMessageBox.information(self, "Prediction running", "Video prediction is already running.")
+        if (
+            self._review_process is not None
+            and self._review_process.state() != QProcess.ProcessState.NotRunning
+        ):
+            QMessageBox.information(
+                self, "Prediction running", "Video prediction is already running."
+            )
             return
 
         start = int(self.spin_start.value())
@@ -697,8 +676,7 @@ class VideoReviewDialog(QDialog):
         imgsz = 640
         kpvis = (
             float(self.spin_kpvis.value())
-            if hasattr(self, "spin_kpvis")
-            and LAYER_KEYPOINTS in self.review_layers
+            if hasattr(self, "spin_kpvis") and LAYER_KEYPOINTS in self.review_layers
             else None
         )
 
@@ -708,9 +686,7 @@ class VideoReviewDialog(QDialog):
 
         steps = max(1, ((end - start) // stride) + 1)
         total_steps = steps * len(self.review_layers)
-        prog = QProgressDialog(
-            "Preparing project models…", "Cancel", 0, total_steps, self
-        )
+        prog = QProgressDialog("Preparing project models…", "Cancel", 0, total_steps, self)
         prog.setWindowTitle("Project Video Review")
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         prog.setMinimumDuration(0)
@@ -719,10 +695,7 @@ class VideoReviewDialog(QDialog):
 
         self._review_run_meta = {
             "video": self._video_signature(),
-            "model_paths": {
-                layer: self.model_paths[layer]
-                for layer in self.review_layers
-            },
+            "model_paths": {layer: self.model_paths[layer] for layer in self.review_layers},
             "layers": list(self.review_layers),
             "imgsz": imgsz,
             "conf": conf,
@@ -735,10 +708,7 @@ class VideoReviewDialog(QDialog):
             "initial_effective_batch": effective_batch,
             "total": self.total,
             "fps": self.fps,
-            "schemas": {
-                layer: self.layer_schemas.get(layer, {})
-                for layer in self.review_layers
-            },
+            "schemas": {layer: self.layer_schemas.get(layer, {}) for layer in self.review_layers},
         }
         self._review_settings = {
             "start": start,
@@ -788,11 +758,7 @@ class VideoReviewDialog(QDialog):
         }
 
         parent = self.parent()
-        parent_log_path = (
-            getattr(parent, "_log_path", "")
-            if parent is not None
-            else ""
-        )
+        parent_log_path = getattr(parent, "_log_path", "") if parent is not None else ""
         config_dir = (
             os.path.dirname(parent_log_path)
             if parent_log_path
@@ -807,24 +773,16 @@ class VideoReviewDialog(QDialog):
             )
             atomic_write_text(config_path, json.dumps(config, indent=2))
         except Exception as e:
-            self._review_run_errors.append(
-                f"{layer_definition(layer_id).display_name}: {e}"
-            )
+            self._review_run_errors.append(f"{layer_definition(layer_id).display_name}: {e}")
             QTimer.singleShot(0, self._start_next_review_prediction_pass)
             return
 
         process = QProcess(self)
         process.setProgram(sys.executable)
-        process.setArguments(
-            ["-m", "video_review_worker", "--config", config_path]
-        )
+        process.setArguments(["-m", "video_review_worker", "--config", config_path])
         process.setWorkingDirectory(APP_BASE_DIR)
-        process.readyReadStandardOutput.connect(
-            self._read_review_prediction_stdout
-        )
-        process.readyReadStandardError.connect(
-            self._read_review_prediction_stderr
-        )
+        process.readyReadStandardOutput.connect(self._read_review_prediction_stdout)
+        process.readyReadStandardError.connect(self._read_review_prediction_stderr)
         process.finished.connect(self._finish_review_prediction_process)
         process.errorOccurred.connect(self._handle_review_prediction_error)
 
@@ -866,7 +824,9 @@ class VideoReviewDialog(QDialog):
         process = self._review_process
         if process is None:
             return
-        self._review_stderr += bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+        self._review_stderr += bytes(process.readAllStandardError()).decode(
+            "utf-8", errors="replace"
+        )
 
     def _handle_review_prediction_event_line(self, line: str):
         if not line:
@@ -905,26 +865,16 @@ class VideoReviewDialog(QDialog):
             progress = self._review_progress
             if progress is not None:
                 processed = int(event.get("processed") or 0)
-                total = int(
-                    event.get("total") or self._review_steps_per_pass
-                )
-                completed_before = (
-                    self._review_pass_index - 1
-                ) * self._review_steps_per_pass
+                total = int(event.get("total") or self._review_steps_per_pass)
+                completed_before = (self._review_pass_index - 1) * self._review_steps_per_pass
                 progress.setMaximum(
                     max(
                         1,
-                        self._review_steps_per_pass
-                        * self._review_pass_total,
+                        self._review_steps_per_pass * self._review_pass_total,
                     )
                 )
-                progress.setValue(
-                    completed_before + min(processed, max(1, total))
-                )
-                detail = str(
-                    event.get("message")
-                    or f"Predicting {processed}/{total}"
-                )
+                progress.setValue(completed_before + min(processed, max(1, total)))
+                detail = str(event.get("message") or f"Predicting {processed}/{total}")
                 progress.setLabelText(
                     f"Pass {self._review_pass_index}/{self._review_pass_total} · "
                     f"{layer_definition(self._review_current_layer).display_name}\n{detail}"
@@ -1017,8 +967,7 @@ class VideoReviewDialog(QDialog):
                 "event": "result",
                 "canceled": False,
                 "had_error": True,
-                "error_message": stderr_text
-                or f"Process exited with code {exit_code}.",
+                "error_message": stderr_text or f"Process exited with code {exit_code}.",
                 "preds": {},
             }
 
@@ -1030,9 +979,7 @@ class VideoReviewDialog(QDialog):
             for key, value in raw_preds.items():
                 try:
                     layer_predictions[int(key)] = (
-                        value
-                        if isinstance(value, dict)
-                        else {"ok": False}
+                        value if isinstance(value, dict) else {"ok": False}
                     )
                 except Exception:
                     continue
@@ -1043,7 +990,9 @@ class VideoReviewDialog(QDialog):
         had_error = bool(event.get("had_error")) or (
             not canceled and (exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0)
         )
-        error_message = str(event.get("error_message") or stderr_text or "Unknown video prediction error")
+        error_message = str(
+            event.get("error_message") or stderr_text or "Unknown video prediction error"
+        )
 
         if had_error:
             self._review_run_errors.append(
@@ -1066,9 +1015,7 @@ class VideoReviewDialog(QDialog):
         self._review_progress = None
         self._review_process = None
         self._review_config_path = None
-        self.btn_predict.setEnabled(
-            self.cap is not None and bool(self.review_layers)
-        )
+        self.btn_predict.setEnabled(self.cap is not None and bool(self.review_layers))
 
         self.preds = self.preds_by_layer.get(self.layer_id, {})
         has_predictions = any(self.preds_by_layer.values())
@@ -1079,13 +1026,9 @@ class VideoReviewDialog(QDialog):
                 pass
             self.slider.setEnabled(True)
             if hasattr(self, "btn_send_low"):
-                self.btn_send_low.setEnabled(
-                    any(self.preds_by_layer.values())
-                )
+                self.btn_send_low.setEnabled(any(self.preds_by_layer.values()))
             if hasattr(self, "btn_send_high"):
-                self.btn_send_high.setEnabled(
-                    any(self.preds_by_layer.values())
-                )
+                self.btn_send_high.setEnabled(any(self.preds_by_layer.values()))
             frame_keys = sorted(
                 {
                     frame_idx
@@ -1151,7 +1094,7 @@ class VideoReviewDialog(QDialog):
         if self.cap is None:
             return
         self.cur = frame_idx
-        self.lbl_idx.setText(f"{self.cur+1}/{self.total}")
+        self.lbl_idx.setText(f"{self.cur + 1}/{self.total}")
 
         self.cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = self.cap.read()
@@ -1175,7 +1118,9 @@ class VideoReviewDialog(QDialog):
         parent = self.parent()
         dest_dir = self._labeler_image_dir()
         if not dest_dir:
-            QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
+            QMessageBox.warning(
+                self, "Export Error", "Could not locate the labeler's images_to_label directory."
+            )
             return
         if self._last_frame_bgr is None:
             QMessageBox.information(self, "No frame", "Load a video and seek to a frame first.")
@@ -1187,7 +1132,7 @@ class VideoReviewDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Already exported",
-                f"Frame {self.cur} is already in images_to_label.\nSkipping duplicate export."
+                f"Frame {self.cur} is already in images_to_label.\nSkipping duplicate export.",
             )
             return
 
@@ -1197,7 +1142,11 @@ class VideoReviewDialog(QDialog):
             out_path = os.path.join(dest_dir, base_name)
 
             if _cv2 is None:
-                QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
+                QMessageBox.warning(
+                    self,
+                    "OpenCV missing",
+                    "Run `uv sync --locked` to restore project dependencies.",
+                )
                 return
 
             if not self._write_frame_image(out_path, self._last_frame_bgr):
@@ -1229,7 +1178,7 @@ class VideoReviewDialog(QDialog):
             except Exception:
                 pass
             return False
-            
+
     def _export_random_frames(self):
         """Export N random frames from the loaded video for fresh labeling."""
         if self.cap is None or self.total <= 0:
@@ -1238,10 +1187,14 @@ class VideoReviewDialog(QDialog):
         parent = self.parent()
         dest_dir = self._labeler_image_dir()
         if not dest_dir:
-            QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
+            QMessageBox.warning(
+                self, "Export Error", "Could not locate the labeler's images_to_label directory."
+            )
             return
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
+            QMessageBox.warning(
+                self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies."
+            )
             return
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -1254,7 +1207,11 @@ class VideoReviewDialog(QDialog):
         if existing:
             available = [idx for idx in available if idx not in existing]
         if not available:
-            QMessageBox.information(self, "Nothing to export", "Every frame from this video is already in images_to_label.")
+            QMessageBox.information(
+                self,
+                "Nothing to export",
+                "Every frame from this video is already in images_to_label.",
+            )
             return
 
         max_n = len(available)
@@ -1336,7 +1293,9 @@ class VideoReviewDialog(QDialog):
             title = "Export canceled" if canceled else "No frames saved"
             detail = "Export was canceled." if canceled else "Nothing was written."
             if failed:
-                detail += "\n\nIssues:\n" + "\n".join(f"frame {fi}: {reason}" for fi, reason in failed[:10])
+                detail += "\n\nIssues:\n" + "\n".join(
+                    f"frame {fi}: {reason}" for fi, reason in failed[:10]
+                )
                 if len(failed) > 10:
                     detail += f"\n…{len(failed) - 10} more"
             QMessageBox.information(self, title, detail)
@@ -1344,8 +1303,12 @@ class VideoReviewDialog(QDialog):
         if failed:
             msg = "\n".join(f"frame {fi}: {reason}" for fi, reason in failed[:10])
             more = "" if len(failed) <= 10 else f"\n…{len(failed) - 10} more"
-            QMessageBox.warning(self, "Some exports failed", f"{saved} succeeded, {len(failed)} failed.\n\n{msg}{more}")
-            
+            QMessageBox.warning(
+                self,
+                "Some exports failed",
+                f"{saved} succeeded, {len(failed)} failed.\n\n{msg}{more}",
+            )
+
     def _existing_export_indices(self) -> set[int]:
         """Scan the labeler's images_to_label folder for frames already exported for this video."""
         out: set[int] = set()
@@ -1354,6 +1317,7 @@ class VideoReviewDialog(QDialog):
             return out
         try:
             import re
+
             prefix = f"{self.base}_{self.video_source_id}_f"
             pat = re.compile(
                 rf"^{re.escape(prefix)}(\d{{6}})(?:_.*)?\.(?:png|jpg|jpeg|bmp|webp)$",
@@ -1369,7 +1333,7 @@ class VideoReviewDialog(QDialog):
         except Exception:
             pass
         return out
-    
+
     def _export_low_confidence_frames(self):
         self._export_predictions_by_confidence(order="low")
 
@@ -1382,22 +1346,19 @@ class VideoReviewDialog(QDialog):
             order_key = "low"
 
         ranking_layers = [
-            layer_id
-            for layer_id in self.review_layers
-            if self.preds_by_layer.get(layer_id)
+            layer_id for layer_id in self.review_layers if self.preds_by_layer.get(layer_id)
         ]
         if not ranking_layers:
-            QMessageBox.information(self, "No predictions", "Run Predict Range first to generate predictions.")
+            QMessageBox.information(
+                self, "No predictions", "Run Predict Range first to generate predictions."
+            )
             return
         if self.cap is None or not self.path:
             QMessageBox.information(self, "No video", "Load a video first.")
             return
 
         if len(ranking_layers) > 1:
-            layer_choices = [
-                layer_definition(layer_id).display_name
-                for layer_id in ranking_layers
-            ]
+            layer_choices = [layer_definition(layer_id).display_name for layer_id in ranking_layers]
             layer_choice, layer_ok = QInputDialog.getItem(
                 self,
                 "Confidence Ranking Layer",
@@ -1409,25 +1370,19 @@ class VideoReviewDialog(QDialog):
             if not layer_ok:
                 return
             try:
-                ranking_layer_id = ranking_layers[
-                    layer_choices.index(layer_choice)
-                ]
+                ranking_layer_id = ranking_layers[layer_choices.index(layer_choice)]
             except ValueError:
                 return
         else:
             ranking_layer_id = ranking_layers[0]
 
-        ranking_layer_name = layer_definition(
-            ranking_layer_id
-        ).display_name
+        ranking_layer_name = layer_definition(ranking_layer_id).display_name
         ranking_predictions = self.preds_by_layer[ranking_layer_id]
         schema = self.layer_schemas.get(ranking_layer_id, {})
         ranking_classes = list(schema.get("classes") or self.classes)
 
         mode_choices = ["Balanced by class"] + [
-            ranking_classes[class_id]
-            if class_id < len(ranking_classes)
-            else str(class_id)
+            ranking_classes[class_id] if class_id < len(ranking_classes) else str(class_id)
             for class_id in range(len(ranking_classes))
         ]
         ranking_choice, choice_ok = QInputDialog.getItem(
@@ -1497,15 +1452,19 @@ class VideoReviewDialog(QDialog):
         if not ok or n <= 0:
             return
 
-        selected = pending[:min(n, len(pending))]
+        selected = pending[: min(n, len(pending))]
 
         parent = self.parent()
         dest_dir = self._labeler_image_dir()
         if not dest_dir:
-            QMessageBox.warning(self, "Export Error", "Could not locate the labeler's images_to_label directory.")
+            QMessageBox.warning(
+                self, "Export Error", "Could not locate the labeler's images_to_label directory."
+            )
             return
         if _cv2 is None:
-            QMessageBox.warning(self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies.")
+            QMessageBox.warning(
+                self, "OpenCV missing", "Run `uv sync --locked` to restore project dependencies."
+            )
             return
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -1570,10 +1529,7 @@ class VideoReviewDialog(QDialog):
         if saved > 0:
             msg = f"Saved {saved} frame(s) to:\n{dest_dir}"
             if saved_rankings:
-                msg += (
-                    f"\nRanking: {ranking_layer_name}, "
-                    f"{order_label} confidence, {ranking_label}"
-                )
+                msg += f"\nRanking: {ranking_layer_name}, {order_label} confidence, {ranking_label}"
                 for class_id in ranking_class_ids:
                     class_confs = [
                         confidence
@@ -1598,7 +1554,9 @@ class VideoReviewDialog(QDialog):
             title = "Export canceled" if canceled else "No frames saved"
             detail = "Export was canceled." if canceled else "Nothing was written."
             if failed:
-                detail += "\n\nIssues:\n" + "\n".join(f"frame {fi}: {reason}" for fi, reason in failed[:10])
+                detail += "\n\nIssues:\n" + "\n".join(
+                    f"frame {fi}: {reason}" for fi, reason in failed[:10]
+                )
                 if len(failed) > 10:
                     detail += f"\n…{len(failed) - 10} more"
             QMessageBox.information(self, title, detail)
@@ -1606,7 +1564,11 @@ class VideoReviewDialog(QDialog):
         if failed:
             msg = "\n".join(f"frame {fi}: {reason}" for fi, reason in failed[:10])
             more = "" if len(failed) <= 10 else f"\n…{len(failed) - 10} more"
-            QMessageBox.warning(self, "Some exports failed", f"{saved} succeeded, {len(failed)} failed.\n\n{msg}{more}")
+            QMessageBox.warning(
+                self,
+                "Some exports failed",
+                f"{saved} succeeded, {len(failed)} failed.\n\n{msg}{more}",
+            )
 
     def _draw_overlay_for(self, frame_idx: int):
         # clear old
@@ -1636,28 +1598,18 @@ class VideoReviewDialog(QDialog):
             if isinstance(detections, list) and detections:
                 for detection in detections:
                     if isinstance(detection, dict) and detection.get("ok"):
-                        self._draw_prediction_overlay(
-                            detection, layer_id=layer_id
-                        )
+                        self._draw_prediction_overlay(detection, layer_id=layer_id)
                 continue
             self._draw_prediction_overlay(p, layer_id=layer_id)
 
-    def _draw_prediction_overlay(
-        self, p: dict, *, layer_id: Optional[str] = None
-    ):
+    def _draw_prediction_overlay(self, p: dict, *, layer_id: Optional[str] = None):
         layer_id = normalize_layer_id(layer_id or self.layer_id)
         schema = self.layer_schemas.get(layer_id, {})
         classes = list(schema.get("classes") or self.classes)
         kp_names = list(schema.get("kp_names") or self.kp_names)
-        class_keypoints = dict(
-            schema.get("class_keypoints") or self.class_keypoints
-        )
+        class_keypoints = dict(schema.get("class_keypoints") or self.class_keypoints)
         cls_id = int(p.get("cls", 0))
-        class_name = (
-            classes[cls_id]
-            if 0 <= cls_id < len(classes)
-            else str(cls_id)
-        )
+        class_name = classes[cls_id] if 0 <= cls_id < len(classes) else str(cls_id)
         if self._is_seg_workflow(layer_id):
             seg_points_raw = p.get("segments", []) or []
             seg_points: list[tuple[float, float]] = []
@@ -1669,9 +1621,7 @@ class VideoReviewDialog(QDialog):
                 except Exception:
                     continue
 
-            color = QColor.fromHsv(
-                int((cls_id * 47) % 360), 210, 245, 255
-            )
+            color = QColor.fromHsv(int((cls_id * 47) % 360), 210, 245, 255)
             frame_color = QColor(32, 78, 255)
             label_x = 6.0
             label_y = 6.0
@@ -1733,16 +1683,22 @@ class VideoReviewDialog(QDialog):
         if p.get("xyxy"):
             x1, y1, x2, y2 = p["xyxy"]
             r = QGraphicsRectItem(x1, y1, x2 - x1, y2 - y1)
-            pen = QPen(Qt.GlobalColor.blue); pen.setWidth(3); pen.setCosmetic(True)
-            r.setPen(pen); r.setZValue(5)
-            self.scene.addItem(r); self._overlay_items.append(r)
+            pen = QPen(Qt.GlobalColor.blue)
+            pen.setWidth(3)
+            pen.setCosmetic(True)
+            r.setPen(pen)
+            r.setZValue(5)
+            self.scene.addItem(r)
+            self._overlay_items.append(r)
 
             # class + confidence (bigger, blue)
             t = QGraphicsSimpleTextItem(f"{class_name} {p.get('conf', 0.0):.2f}")
             t.setFont(_ui_font(24))
             t.setBrush(QBrush(Qt.GlobalColor.blue))
-            t.setPos(x1 + 2, y1 + 2); t.setZValue(6)
-            self.scene.addItem(t); self._overlay_items.append(t)
+            t.setPos(x1 + 2, y1 + 2)
+            t.setZValue(6)
+            self.scene.addItem(t)
+            self._overlay_items.append(t)
 
         # ---- Keypoints (map kp conf → visibility) ----
         thr = float(self.spin_kpvis.value()) if hasattr(self, "spin_kpvis") else 0.5
@@ -1756,25 +1712,39 @@ class VideoReviewDialog(QDialog):
             vis = 2 if conf >= thr else 1  # 2=visible(red), 1=occluded(yellow)
 
             if vis == 2:
-                color = Qt.GlobalColor.red; fill = QBrush(color); style = Qt.PenStyle.SolidLine
+                color = Qt.GlobalColor.red
+                fill = QBrush(color)
+                style = Qt.PenStyle.SolidLine
             elif vis == 1:
-                color = Qt.GlobalColor.yellow; fill = QBrush(color); style = Qt.PenStyle.SolidLine
+                color = Qt.GlobalColor.yellow
+                fill = QBrush(color)
+                style = Qt.PenStyle.SolidLine
             else:
-                color = Qt.GlobalColor.lightGray; fill = QBrush(Qt.GlobalColor.transparent); style = Qt.PenStyle.DashLine
+                color = Qt.GlobalColor.lightGray
+                fill = QBrush(Qt.GlobalColor.transparent)
+                style = Qt.PenStyle.DashLine
 
             dot = QGraphicsEllipseItem(-4, -4, 8, 8)  # slightly larger dot
             dot.setPos(x, y)
-            pen = QPen(color); pen.setCosmetic(True); pen.setWidth(2); pen.setStyle(style)
-            dot.setPen(pen); dot.setBrush(fill); dot.setZValue(7)
-            self.scene.addItem(dot); self._overlay_items.append(dot)
+            pen = QPen(color)
+            pen.setCosmetic(True)
+            pen.setWidth(2)
+            pen.setStyle(style)
+            dot.setPen(pen)
+            dot.setBrush(fill)
+            dot.setZValue(7)
+            self.scene.addItem(dot)
+            self._overlay_items.append(dot)
 
             # label next to kp
             lbl = QGraphicsSimpleTextItem(name)
             lbl.setFont(_ui_font(18))
             lbl.setBrush(QBrush(color))
-            lbl.setPos(x + 8, y - 16); lbl.setZValue(8)
+            lbl.setPos(x + 8, y - 16)
+            lbl.setZValue(8)
             lbl.setVisible(vis != 0)  # hide if invisible
-            self.scene.addItem(lbl); self._overlay_items.append(lbl)
+            self.scene.addItem(lbl)
+            self._overlay_items.append(lbl)
 
     @staticmethod
     def _cv_to_qpix(frame_bgr) -> QPixmap:
@@ -1782,11 +1752,15 @@ class VideoReviewDialog(QDialog):
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         from PyQt6.QtGui import QImage
+
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         return QPixmap.fromImage(qimg)
 
     def reject(self):
-        if self._review_process is not None and self._review_process.state() != QProcess.ProcessState.NotRunning:
+        if (
+            self._review_process is not None
+            and self._review_process.state() != QProcess.ProcessState.NotRunning
+        ):
             answer = QMessageBox.question(
                 self,
                 "Cancel prediction?",

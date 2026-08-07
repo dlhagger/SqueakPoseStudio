@@ -10,7 +10,7 @@ import sys
 from typing import Optional
 
 import yaml
-from PyQt6.QtCore import QProcess, QTimer, Qt
+from PyQt6.QtCore import QProcess, Qt, QTimer
 from PyQt6.QtGui import QFontDatabase, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -30,18 +30,24 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from layer_ops import layer_definition, normalize_layer_id
 from squeakpose.project.distillation import (
     discover_distillation_exports as _discover_distillation_exports,
+)
+from squeakpose.project.distillation import (
     distillation_export_search_roots as _distillation_export_search_roots,
 )
-from squeakpose_core import atomic_write_text, infer_dataset_task
-from layer_ops import layer_definition, normalize_layer_id
 from squeakpose.workers.process import (
     remove_file_quietly as _remove_file_quietly,
+)
+from squeakpose.workers.process import (
     request_qprocess_stop,
+)
+from squeakpose.workers.process import (
     shutdown_qprocess as _shutdown_qprocess,
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
+from squeakpose_core import atomic_write_text, infer_dataset_task
 from ui_style import (
     ThemedComboBox,
     style_combo_popup,
@@ -252,9 +258,7 @@ class TrainDialog(QDialog):
         else:
             self.task_combo.addItem("Keypoints (YOLO Pose)")
         self.task_combo.setEnabled(False)
-        self.task_combo.setToolTip(
-            "Training task is determined by the active project layer."
-        )
+        self.task_combo.setToolTip("Training task is determined by the active project layer.")
         form.addRow("Training task:", self.task_combo)
         train_combos = (
             self.source_combo,
@@ -389,7 +393,11 @@ class TrainDialog(QDialog):
 
     def _browse_dino_file(self):
         start_dir = next(
-            (root for _label, root in getattr(self, "distillation_search_roots", []) if os.path.isdir(root)),
+            (
+                root
+                for _label, root in getattr(self, "distillation_search_roots", [])
+                if os.path.isdir(root)
+            ),
             os.getcwd(),
         )
         path, _ = QFileDialog.getOpenFileName(
@@ -480,11 +488,11 @@ class TrainDialog(QDialog):
         return safe or "model"
 
     def _configure_batch_controls(self):
-        if self.device == 'cuda':
+        if self.device == "cuda":
             self.batch_spin.setValue(0)
             self.batch_spin.setEnabled(False)
             self.batch_hint.setText("CUDA detected → using automatic batch sizing.")
-        elif self.device == 'mps':
+        elif self.device == "mps":
             default = max(1, self.batch_spin.value() or 16)
             self.batch_spin.setValue(default)
             self.batch_spin.setEnabled(True)
@@ -493,7 +501,9 @@ class TrainDialog(QDialog):
             default = self.batch_spin.value() or 16
             self.batch_spin.setValue(default)
             self.batch_spin.setEnabled(True)
-            self.batch_hint.setText("CPU detected → adjust batch size as needed (lower values use less memory).")
+            self.batch_hint.setText(
+                "CPU detected → adjust batch size as needed (lower values use less memory)."
+            )
 
     def _set_training_status(self, text: str, tone: str = "idle"):
         self.train_status_label.setText(text)
@@ -545,7 +555,9 @@ class TrainDialog(QDialog):
             self.training_running = False
         super().closeEvent(event)
 
-    def _resolve_model_config(self, base_cfg: str, task_value: Optional[str]) -> tuple[str, Optional[str]]:
+    def _resolve_model_config(
+        self, base_cfg: str, task_value: Optional[str]
+    ) -> tuple[str, Optional[str]]:
         cfg = base_cfg
         notice = None
         if not task_value:
@@ -581,7 +593,9 @@ class TrainDialog(QDialog):
 
     def _start_training(self):
         if self.training_running:
-            QMessageBox.information(self, "Training running", "A training session is already in progress.")
+            QMessageBox.information(
+                self, "Training running", "A training session is already in progress."
+            )
             return
 
         source_idx = self.source_combo.currentIndex()
@@ -593,7 +607,9 @@ class TrainDialog(QDialog):
         if not use_exact_resume:
             dataset_path = self.dataset_edit.text().strip()
             if not dataset_path:
-                QMessageBox.warning(self, "Dataset required", "Select a dataset folder before starting training.")
+                QMessageBox.warning(
+                    self, "Dataset required", "Select a dataset folder before starting training."
+                )
                 return
             if os.path.isdir(dataset_path):
                 data_yaml = os.path.join(dataset_path, "dataset.yaml")
@@ -604,7 +620,7 @@ class TrainDialog(QDialog):
                         self,
                         "dataset.yaml missing",
                         "Could not find dataset.yaml in the selected folder.\n"
-                        "Select the dataset root (contains dataset.yaml) or the YAML file directly."
+                        "Select the dataset root (contains dataset.yaml) or the YAML file directly.",
                     )
                     return
             elif dataset_path.lower().endswith((".yaml", ".yml")) and os.path.isfile(dataset_path):
@@ -626,7 +642,7 @@ class TrainDialog(QDialog):
                 QMessageBox.warning(
                     self,
                     "Checkpoint required",
-                    "Select a valid DINO distillation export (.pt) before training."
+                    "Select a valid DINO distillation export (.pt) before training.",
                 )
                 return
         elif use_checkpoint_continue or use_exact_resume:
@@ -635,23 +651,23 @@ class TrainDialog(QDialog):
                 QMessageBox.warning(
                     self,
                     "Checkpoint required",
-                    "Select a valid YOLO checkpoint (.pt) before continuing."
+                    "Select a valid YOLO checkpoint (.pt) before continuing.",
                 )
                 return
             if use_exact_resume and os.path.basename(resume_path).lower() != "last.pt":
                 QMessageBox.warning(
                     self,
                     "Exact resume requires last.pt",
-                    "For exact run continuation, select a weights/last.pt checkpoint."
+                    "For exact run continuation, select a weights/last.pt checkpoint.",
                 )
                 return
 
-        if (not use_exact_resume) and self.device == 'mps' and batch <= 0:
+        if (not use_exact_resume) and self.device == "mps" and batch <= 0:
             QMessageBox.warning(
                 self,
                 "Batch size required",
                 "Automatic batch sizing is unavailable on Apple MPS.\n"
-                "Set a positive batch size before starting training."
+                "Set a positive batch size before starting training.",
             )
             return
 
@@ -732,7 +748,11 @@ class TrainDialog(QDialog):
         else:
             batch_param = -1 if batch <= 0 else int(batch)
 
-            task_folder = task_value if task_value in ("pose", "detect", "segment") else ("pose" if use_dino else "auto")
+            task_folder = (
+                task_value
+                if task_value in ("pose", "detect", "segment")
+                else ("pose" if use_dino else "auto")
+            )
             project_dir = os.path.join(self.project_runs_dir, "train", task_folder)
             try:
                 os.makedirs(project_dir, exist_ok=True)
@@ -762,8 +782,13 @@ class TrainDialog(QDialog):
         self._start_training_process(model_cfg=model_cfg, params=params)
 
     def _start_training_process(self, *, model_cfg: str, params: dict):
-        if self.train_process is not None and self.train_process.state() != QProcess.ProcessState.NotRunning:
-            QMessageBox.information(self, "Training running", "A training session is already in progress.")
+        if (
+            self.train_process is not None
+            and self.train_process.state() != QProcess.ProcessState.NotRunning
+        ):
+            QMessageBox.information(
+                self, "Training running", "A training session is already in progress."
+            )
             return
 
         config = {
@@ -775,14 +800,20 @@ class TrainDialog(QDialog):
         try:
             os.makedirs(run_root, exist_ok=True)
         except Exception as e:
-            QMessageBox.warning(self, "Training setup error", f"Could not create training run directory:\n{e}")
+            QMessageBox.warning(
+                self, "Training setup error", f"Could not create training run directory:\n{e}"
+            )
             return
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         config_path = os.path.join(run_root, f".train_config_{timestamp}.json")
         try:
             atomic_write_text(config_path, json.dumps(config, indent=2))
         except Exception as e:
-            QMessageBox.warning(self, "Training setup error", f"Could not write training config:\n{config_path}\n\n{e}")
+            QMessageBox.warning(
+                self,
+                "Training setup error",
+                f"Could not write training config:\n{config_path}\n\n{e}",
+            )
             return
 
         process = QProcess(self)
@@ -917,7 +948,9 @@ class TrainDialog(QDialog):
         if cancel_requested and event is None:
             self._set_training_status("Canceled", "canceled")
             self._log("Training canceled.")
-            QMessageBox.information(self, "Training canceled", "Training worker process was canceled.")
+            QMessageBox.information(
+                self, "Training canceled", "Training worker process was canceled."
+            )
             return
 
         if event is None:

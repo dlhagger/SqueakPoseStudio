@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import datetime
 import csv
+import datetime
 import json
 import math
 import os
@@ -49,10 +49,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from layer_ops import layer_definition, normalize_layer_id
 from squeakpose.workers.process import remove_file_quietly, shutdown_qprocess
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from ui_style import analysis_dialog_stylesheet
-from layer_ops import layer_definition, normalize_layer_id
 
 
 def _remove_file_quietly(path: Optional[str]) -> None:
@@ -145,7 +145,10 @@ class FrameAnnotationView(QWidget):
 
     def _image_to_widget(self, x: float, y: float) -> QPointF:
         rect = self._content_rect()
-        return QPointF(rect.x() + x / self._image_width * rect.width(), rect.y() + y / self._image_height * rect.height())
+        return QPointF(
+            rect.x() + x / self._image_width * rect.width(),
+            rect.y() + y / self._image_height * rect.height(),
+        )
 
     def _roi_to_widget_rect(self, roi: dict[str, Any]) -> QRectF:
         p1 = self._image_to_widget(float(roi["x1"]), float(roi["y1"]))
@@ -185,7 +188,11 @@ class FrameAnnotationView(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() != Qt.MouseButton.LeftButton or self._mode != "roi" or self._drag_start is None:
+        if (
+            event.button() != Qt.MouseButton.LeftButton
+            or self._mode != "roi"
+            or self._drag_start is None
+        ):
             return
         image_point = self._widget_to_image(event.position()) or self._drag_current
         if image_point is None:
@@ -227,10 +234,16 @@ class FrameAnnotationView(QWidget):
             painter.setPen(roi_pen)
             painter.fillRect(roi_rect, roi_fill)
             painter.drawRect(roi_rect)
-            label_rect = QRectF(roi_rect.x() + 4, roi_rect.y() + 4, min(roi_rect.width() - 8, 180), 20)
+            label_rect = QRectF(
+                roi_rect.x() + 4, roi_rect.y() + 4, min(roi_rect.width() - 8, 180), 20
+            )
             painter.fillRect(label_rect, QColor(17, 24, 32, 190))
             painter.setPen(QColor("#f9d782"))
-            painter.drawText(label_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter, str(roi.get("name", "ROI")))
+            painter.drawText(
+                label_rect.adjusted(5, 0, -5, 0),
+                Qt.AlignmentFlag.AlignVCenter,
+                str(roi.get("name", "ROI")),
+            )
 
         if self._drag_start is not None and self._drag_current is not None:
             x1, y1 = self._drag_start
@@ -533,8 +546,12 @@ class AnalysisDialog(QDialog):
         self.roi_mode_btn.setCheckable(True)
         self.mode_group.addButton(self.scale_mode_btn)
         self.mode_group.addButton(self.roi_mode_btn)
-        self.scale_mode_btn.toggled.connect(lambda checked: checked and self._set_annotation_mode("scale"))
-        self.roi_mode_btn.toggled.connect(lambda checked: checked and self._set_annotation_mode("roi"))
+        self.scale_mode_btn.toggled.connect(
+            lambda checked: checked and self._set_annotation_mode("scale")
+        )
+        self.roi_mode_btn.toggled.connect(
+            lambda checked: checked and self._set_annotation_mode("roi")
+        )
         toolbar.addWidget(self.scale_mode_btn)
         toolbar.addWidget(self.roi_mode_btn)
 
@@ -636,9 +653,7 @@ class AnalysisDialog(QDialog):
 
     def _candidate_csv_dirs(self) -> list[str]:
         return [
-            os.path.join(
-                self.project_root, "inference outputs", self.layer_id
-            ),
+            os.path.join(self.project_root, "inference outputs", self.layer_id),
             os.path.join(self.project_root, "inference outputs"),
             os.path.join(self.app_base_dir, "analysis_toolset", "inference outputs"),
         ]
@@ -662,9 +677,7 @@ class AnalysisDialog(QDialog):
                 fieldnames = set(next(csv.reader(handle), []))
         except (OSError, csv.Error):
             return False
-        is_segmentation = {"frame", "det", "mask_polygon"}.issubset(
-            fieldnames
-        )
+        is_segmentation = {"frame", "det", "mask_polygon"}.issubset(fieldnames)
         return is_segmentation == (self.layer_id == "segmentation")
 
     def _default_output_dir_for_csv(self, csv_path: str) -> str:
@@ -684,7 +697,10 @@ class AnalysisDialog(QDialog):
     def _browse_csv(self) -> None:
         start = os.path.dirname(self.csv_edit.text().strip())
         if not start or not os.path.isdir(start):
-            start = next((folder for folder in self._candidate_csv_dirs() if os.path.isdir(folder)), self.project_root)
+            start = next(
+                (folder for folder in self._candidate_csv_dirs() if os.path.isdir(folder)),
+                self.project_root,
+            )
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select inference CSV",
@@ -711,7 +727,9 @@ class AnalysisDialog(QDialog):
             self._load_preview_frame(silent=False)
 
     def _browse_output_dir(self) -> None:
-        start = self.output_edit.text().strip() or os.path.join(self.project_root, "analysis outputs")
+        start = self.output_edit.text().strip() or os.path.join(
+            self.project_root, "analysis outputs"
+        )
         path = QFileDialog.getExistingDirectory(self, "Select output folder", start)
         if path:
             self.output_edit.setText(path)
@@ -784,7 +802,9 @@ class AnalysisDialog(QDialog):
                 return None
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb.shape
-            image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+            image = QImage(
+                rgb.data, width, height, channels * width, QImage.Format.Format_RGB888
+            ).copy()
             return (QPixmap.fromImage(image), width, height)
         finally:
             cap.release()
@@ -804,7 +824,11 @@ class AnalysisDialog(QDialog):
             return
 
         if video_path and not silent:
-            QMessageBox.information(self, "Frame preview", "Could not read the selected video. Showing CSV coordinates instead.")
+            QMessageBox.information(
+                self,
+                "Frame preview",
+                "Could not read the selected video. Showing CSV coordinates instead.",
+            )
 
         width, height = self._frame_dimensions_from_csv()
         self.frame_view.set_frame(self._blank_frame_pixmap(width, height), width, height)
@@ -853,7 +877,9 @@ class AnalysisDialog(QDialog):
         real_distance = self.real_distance_spin.value()
         if pixel_distance > 0:
             mm_per_pixel = real_distance / pixel_distance
-            self.scale_status_label.setText(f"{mm_per_pixel:.4f} mm/px | {len(self.scale_points)}/2")
+            self.scale_status_label.setText(
+                f"{mm_per_pixel:.4f} mm/px | {len(self.scale_points)}/2"
+            )
         else:
             self.scale_status_label.setText(f"Scale unset | {len(self.scale_points)}/2")
 
@@ -877,7 +903,9 @@ class AnalysisDialog(QDialog):
         for index, roi in enumerate(self.rois, start=1):
             width = float(roi["x2"]) - float(roi["x1"])
             height = float(roi["y2"]) - float(roi["y1"])
-            item = QListWidgetItem(f"{index}. {roi.get('name', 'ROI')}  {width:.0f} x {height:.0f}px")
+            item = QListWidgetItem(
+                f"{index}. {roi.get('name', 'ROI')}  {width:.0f} x {height:.0f}px"
+            )
             self.roi_list.addItem(item)
         self.roi_count_label.setText(f"{len(self.rois)} ROI{'s' if len(self.rois) != 1 else ''}")
         self.frame_view.set_rois(self.rois)
@@ -925,7 +953,9 @@ class AnalysisDialog(QDialog):
 
     def _validate_inputs(self) -> bool:
         if not os.path.isfile(self.csv_edit.text().strip()):
-            QMessageBox.warning(self, "CSV required", "Select a valid inference CSV before running analysis.")
+            QMessageBox.warning(
+                self, "CSV required", "Select a valid inference CSV before running analysis."
+            )
             return False
         video_path = self.video_edit.text().strip()
         if video_path and not os.path.isfile(video_path):
@@ -939,7 +969,9 @@ class AnalysisDialog(QDialog):
             )
             return False
         if self.cluster_clips_check.isChecked() and not self.cluster_check.isChecked():
-            QMessageBox.warning(self, "Clustering required", "Enable UMAP/HDBSCAN before exporting cluster clips.")
+            QMessageBox.warning(
+                self, "Clustering required", "Enable UMAP/HDBSCAN before exporting cluster clips."
+            )
             return False
         if self.annotated_video_check.isChecked() and not video_path:
             QMessageBox.information(
@@ -950,7 +982,10 @@ class AnalysisDialog(QDialog):
         return True
 
     def _start_analysis(self) -> None:
-        if self.analysis_process and self.analysis_process.state() != QProcess.ProcessState.NotRunning:
+        if (
+            self.analysis_process
+            and self.analysis_process.state() != QProcess.ProcessState.NotRunning
+        ):
             QMessageBox.information(self, "Analysis running", "An analysis job is already running.")
             return
         if not self._validate_inputs():
@@ -958,7 +993,9 @@ class AnalysisDialog(QDialog):
 
         payload = self._config_payload()
         os.makedirs(payload["output_dir"], exist_ok=True)
-        handle = tempfile.NamedTemporaryFile("w", suffix=".json", prefix="squeakpose_analysis_", delete=False)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", prefix="squeakpose_analysis_", delete=False
+        )
         with handle:
             json.dump(payload, handle, indent=2)
         self.analysis_config_path = handle.name
@@ -974,7 +1011,13 @@ class AnalysisDialog(QDialog):
         process = QProcess(self)
         self.analysis_process = process
         process.setProgram(sys.executable)
-        process.setArguments([os.path.join(self.app_base_dir, "analysis_worker.py"), "--config", self.analysis_config_path])
+        process.setArguments(
+            [
+                os.path.join(self.app_base_dir, "analysis_worker.py"),
+                "--config",
+                self.analysis_config_path,
+            ]
+        )
         process.readyReadStandardOutput.connect(self._read_analysis_stdout)
         process.readyReadStandardError.connect(self._read_analysis_stderr)
         process.finished.connect(self._analysis_finished)
@@ -992,7 +1035,9 @@ class AnalysisDialog(QDialog):
     def _read_analysis_stdout(self) -> None:
         if self.analysis_process is None:
             return
-        data = bytes(self.analysis_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        data = bytes(self.analysis_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
         self.analysis_stdout_buffer += data
         while "\n" in self.analysis_stdout_buffer:
             line, self.analysis_stdout_buffer = self.analysis_stdout_buffer.split("\n", 1)
@@ -1073,7 +1118,9 @@ class AnalysisDialog(QDialog):
                 )
             self._append_log(f"Feature CSV: {event.get('feature_csv', '')}")
             if event.get("segmentation_detections_csv"):
-                self._append_log(f"Segmentation detections: {event.get('segmentation_detections_csv')}")
+                self._append_log(
+                    f"Segmentation detections: {event.get('segmentation_detections_csv')}"
+                )
             if event.get("roi_summary_csv"):
                 self._append_log(f"ROI summary: {event.get('roi_summary_csv')}")
             self._show_result_summary(event)

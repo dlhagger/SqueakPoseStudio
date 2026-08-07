@@ -499,7 +499,7 @@ uv run --locked --only-group dev ruff format .
 Run the unit tests:
 
 ```bash
-uv run python -m unittest -q
+uv run --locked --only-group test python -m unittest discover -s tests -q
 ```
 
 Run the PyTorch and Ultralytics environment check:
@@ -510,6 +510,25 @@ uv run python torch_ultralytics_checks.py
 
 The environment check reports the selected PyTorch device and verifies that the
 core model stack imports successfully.
+
+## Dependency Security
+
+Audit the locked application dependencies without installing them:
+
+```bash
+uv audit --locked --no-default-groups
+```
+
+The audit command is built into uv and queries the OSV vulnerability database,
+so security tooling does not need to be added to the `dev` or GitHub-only
+`test` dependency groups. The weekly Supply Chain workflow also validates the
+lockfile, audits the Linux/Python 3.12 dependency set, and publishes a
+CycloneDX SBOM artifact. Dependabot checks both uv dependencies and pinned
+GitHub Actions each week.
+
+The CLIP Git dependency and every third-party workflow action are pinned to
+immutable commit revisions. Version comments next to workflow action pins keep
+the corresponding release visible to reviewers.
 
 ## Benchmarking
 

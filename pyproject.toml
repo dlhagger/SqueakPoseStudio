@@ -77,4 +77,4 @@ select = [
 torch-backend = "auto"
 
 [tool.uv.sources]
-clip = { git = "https://github.com/ultralytics/CLIP/"}
+clip = { git = "https://github.com/ultralytics/CLIP/", rev = "488e81a6711eea7346872b46ea928b367da8889d" }

@@ -30,6 +30,7 @@ def run(argv: list[str] | None = None) -> int:
         ProjectLauncherDialog,
         _acquire_project_lock_for_ui,
         _ensure_qt_plugin_paths,
+        _recover_project_transactions_for_ui,
         _retain_main_window,
     )
 
@@ -55,6 +56,7 @@ def run(argv: list[str] | None = None) -> int:
     if project_lock is None:
         return 1
     try:
+        _recover_project_transactions_for_ui(project_root, parent=launcher)
         project_paths = ensure_project_structure(
             project_root,
             default_segmentation_classes=tuple(DEFAULT_CLASS_NAMES),

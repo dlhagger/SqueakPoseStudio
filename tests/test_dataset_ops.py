@@ -265,7 +265,7 @@ class DatasetOpsTests(unittest.TestCase):
                 "0 0.1 0.1 0.8 0.1 0.8 0.8\n",
                 encoding="utf-8",
             )
-            temp_path = root / "images_all" / ".mouse.abc.tmp.png"
+            temp_path = root / "images_all" / ".mouse.abcdefgh.tmp.png"
             temp_path.write_bytes(b"staged")
 
             report = scan_project_health(

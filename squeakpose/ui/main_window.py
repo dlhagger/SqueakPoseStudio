@@ -152,6 +152,11 @@ from squeakpose.project.paths import (
     project_window_title,
     save_last_project,
 )
+from squeakpose.project.recovery import (
+    cleanup_transaction_staging,
+    restore_missing_transaction_targets,
+    scan_transaction_artifacts,
+)
 from squeakpose.project.safety import (
     ProjectLock,
     ProjectLockedError,
@@ -289,6 +294,72 @@ def _acquire_project_lock_for_ui(
                 f"Could not acquire the project writer lock.\n\n{retry_error}",
             )
             return None
+
+
+def _recover_project_transactions_for_ui(
+    project_root: str,
+    *,
+    parent: Optional[QWidget] = None,
+) -> None:
+    """Safely recover interrupted writes after the project lock is held."""
+
+    recovery = restore_missing_transaction_targets(project_root)
+    if recovery.restored_paths:
+        restored = "\n".join(
+            os.path.relpath(path, project_root) for path in recovery.restored_paths[:8]
+        )
+        if len(recovery.restored_paths) > 8:
+            restored += f"\n...{len(recovery.restored_paths) - 8} more"
+        QMessageBox.information(
+            parent,
+            "Interrupted Write Recovered",
+            "SqueakPose restored missing project data from an interrupted "
+            f"transaction:\n\n{restored}",
+        )
+    if recovery.errors:
+        QMessageBox.warning(
+            parent,
+            "Transaction Recovery Incomplete",
+            "Some missing transaction targets could not be restored. Their backups "
+            "were left in place:\n\n" + "\n".join(recovery.errors[:8]),
+        )
+
+    report = scan_transaction_artifacts(project_root)
+    if report.preserved_backups:
+        preserved = "\n".join(
+            os.path.relpath(item.backup_path, project_root) for item in report.preserved_backups[:8]
+        )
+        if len(report.preserved_backups) > 8:
+            preserved += f"\n...{len(report.preserved_backups) - 8} more"
+        QMessageBox.warning(
+            parent,
+            "Transaction Backups Need Review",
+            "Transaction backups conflict with existing data or are ambiguous. "
+            "SqueakPose did not modify or delete them:\n\n" + preserved,
+        )
+
+    if not report.staging_paths:
+        return
+    answer = QMessageBox.question(
+        parent,
+        "Remove Interrupted Transaction Files?",
+        (
+            f"Found {len(report.staging_paths)} recognized staging file(s) or "
+            "export folder(s) from an interrupted transaction. Remove them?\n\n"
+            "Transaction backups and project data will not be removed."
+        ),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    if answer != QMessageBox.StandardButton.Yes:
+        return
+    cleanup = cleanup_transaction_staging(project_root)
+    if cleanup.errors:
+        QMessageBox.warning(
+            parent,
+            "Transaction Cleanup Incomplete",
+            "Some staging paths could not be removed:\n\n" + "\n".join(cleanup.errors[:8]),
+        )
 
 
 def _refresh_qt_style(widget: Optional[QWidget]) -> None:
@@ -3237,6 +3308,7 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("Project switch canceled because the project is locked.")
             return
         try:
+            _recover_project_transactions_for_ui(target_root, parent=self)
             paths = _ensure_project_structure(target_root)
         except (OSError, ProjectPathError) as exc:
             project_lock.release()
@@ -7104,6 +7176,32 @@ class LabelingApp(QMainWindow):
             "Project Health",
             format_project_health_summary(report),
         )
+        if report.restorable_transaction_backups:
+            answer = QMessageBox.question(
+                self,
+                "Restore Missing Transaction Targets?",
+                (
+                    f"Restore {len(report.restorable_transaction_backups)} missing "
+                    "project target(s) from their sole transaction backup?\n\n"
+                    "Ambiguous or conflicting backups will remain untouched."
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                recovery = restore_missing_transaction_targets(self.project_root)
+                if recovery.errors:
+                    QMessageBox.warning(
+                        self,
+                        "Recovery Incomplete",
+                        "Some targets could not be restored:\n\n" + "\n".join(recovery.errors[:8]),
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Recovery Complete",
+                        f"Restored {len(recovery.restored_paths)} project target(s).",
+                    )
         if not report.temporary_paths:
             self.update_status_bar("Project health scan complete.")
             return
@@ -7114,7 +7212,7 @@ class LabelingApp(QMainWindow):
             (
                 f"Remove {len(report.temporary_paths)} stale transaction "
                 "file(s) or staging folder(s)?\n\n"
-                "Worker config files and project data will not be removed."
+                "Transaction backups, worker config files, and project data will not be removed."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,

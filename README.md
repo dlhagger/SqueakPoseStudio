@@ -310,7 +310,11 @@ Canceling or failing an export leaves the previous dataset unchanged.
 Use **Project Health** to inspect image counts, usable labels, orphan labels,
 ambiguous stems, likely numbered image copies, worker config files, and stale
 transaction artifacts. Its cleanup prompt removes only transaction staging
-paths; it does not delete images, labels, or worker configs.
+paths; it does not delete images, labels, worker configs, or transaction backups.
+When a project opens, SqueakPose automatically restores a missing target only
+when exactly one recognized transaction backup exists. Conflicting or ambiguous
+backups are preserved for manual review, and recognized staging files are removed
+only after confirmation.
 
 ## Training
 

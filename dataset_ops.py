@@ -10,12 +10,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
 from dataset_builder import create_dataset_yaml
+from squeakpose.project.recovery import (
+    cleanup_transaction_staging,
+    scan_transaction_artifacts,
+)
 from squeakpose_core import (
     atomic_write_text,
     image_stem_collisions,
     normalize_pose_label_lines,
     normalize_segmentation_label_lines,
-    remove_path,
 )
 
 DATASET_POSE = "pose"
@@ -90,6 +93,8 @@ class ProjectHealthReport:
     stored_collisions: dict[str, list[str]] = field(default_factory=dict)
     likely_duplicate_images: list[tuple[str, str]] = field(default_factory=list)
     temporary_paths: list[str] = field(default_factory=list)
+    restorable_transaction_backups: list[str] = field(default_factory=list)
+    preserved_transaction_backups: list[str] = field(default_factory=list)
     worker_config_paths: list[str] = field(default_factory=list)
 
 
@@ -382,6 +387,15 @@ def scan_project_health(
         for name in seg_labels
     )
 
+    transaction_report = scan_transaction_artifacts(root)
+    report.temporary_paths = transaction_report.staging_paths
+    report.restorable_transaction_backups = [
+        item.backup_path for item in transaction_report.restorable_backups
+    ]
+    report.preserved_transaction_backups = [
+        item.backup_path for item in transaction_report.preserved_backups
+    ]
+
     names_by_key = {name.casefold(): name for name in stored_images}
     for name in stored_images:
         stem, ext = os.path.splitext(name)
@@ -392,50 +406,24 @@ def scan_project_health(
         if original:
             report.likely_duplicate_images.append((original, name))
 
-    scan_roots = [
-        queue_dir,
-        images_dir,
-        pose_dir,
-        seg_dir,
-        os.path.join(root, "datasets"),
-        os.path.join(root, "logs"),
-        os.path.join(root, "runs"),
-    ]
-    for scan_root in scan_roots:
-        if not os.path.isdir(scan_root):
-            continue
-        for current, dir_names, file_names in os.walk(scan_root):
-            retained_dirs: list[str] = []
-            for name in dir_names:
-                path = os.path.join(current, name)
-                if name.startswith(".") and "-export-" in name:
-                    report.temporary_paths.append(path)
-                elif name not in {"__pycache__", ".git", ".venv"}:
-                    retained_dirs.append(name)
-            dir_names[:] = retained_dirs
-            for name in file_names:
-                if not name.startswith("."):
-                    continue
-                path = os.path.join(current, name)
-                if ".tmp" in name:
-                    report.temporary_paths.append(path)
-                elif name.endswith(".json") and "config" in name:
-                    report.worker_config_paths.append(path)
+    for current, dir_names, file_names in os.walk(root, followlinks=False):
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if name not in {"__pycache__", ".git", ".venv"}
+            and not os.path.islink(os.path.join(current, name))
+        ]
+        for name in file_names:
+            if name.startswith(".") and name.endswith(".json") and "config" in name:
+                report.worker_config_paths.append(os.path.join(current, name))
 
-    report.temporary_paths = sorted(set(report.temporary_paths), key=str.casefold)
     report.worker_config_paths = sorted(set(report.worker_config_paths), key=str.casefold)
     return report
 
 
 def cleanup_project_temporary_paths(report: ProjectHealthReport) -> list[str]:
     """Remove only transaction staging paths identified by a health scan."""
-    errors: list[str] = []
-    for path in report.temporary_paths:
-        try:
-            remove_path(path)
-        except Exception as exc:
-            errors.append(f"{path}: {exc}")
-    return errors
+    return cleanup_transaction_staging(report.project_root).errors
 
 
 def format_project_health_summary(report: ProjectHealthReport) -> str:
@@ -456,6 +444,8 @@ def format_project_health_summary(report: ProjectHealthReport) -> str:
         f"Ambiguous stored-image stems: {len(report.stored_collisions)}",
         f"Likely numbered image copies: {len(report.likely_duplicate_images)}",
         f"Temporary transaction paths: {len(report.temporary_paths)}",
+        f"Restorable transaction backups: {len(report.restorable_transaction_backups)}",
+        f"Preserved transaction backups: {len(report.preserved_transaction_backups)}",
         f"Worker config files: {len(report.worker_config_paths)}",
     ]
 
@@ -470,6 +460,20 @@ def format_project_health_summary(report: ProjectHealthReport) -> str:
         (
             "Temporary transaction paths",
             [os.path.relpath(path, report.project_root) for path in report.temporary_paths],
+        ),
+        (
+            "Restorable transaction backups",
+            [
+                os.path.relpath(path, report.project_root)
+                for path in report.restorable_transaction_backups
+            ],
+        ),
+        (
+            "Preserved transaction backups",
+            [
+                os.path.relpath(path, report.project_root)
+                for path in report.preserved_transaction_backups
+            ],
         ),
     )
     for title, items in detail_groups:

@@ -93,6 +93,44 @@ class AnnotationSaveServiceTests(unittest.TestCase):
                 )
             self.assertEqual(hidden, [])
 
+    def test_renderer_exception_removes_every_staged_file_and_keeps_targets(self):
+        with TemporaryDirectory() as tmp:
+            request = self._request(tmp)
+            for path in (
+                request.source_image_path,
+                request.image_output_path,
+                request.label_output_path,
+                request.overlay_output_path,
+            ):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(request.source_image_path, "wb") as fh:
+                fh.write(b"new image")
+            with open(request.image_output_path, "wb") as fh:
+                fh.write(b"old image")
+            with open(request.label_output_path, "w", encoding="utf-8") as fh:
+                fh.write("old label\n")
+            with open(request.overlay_output_path, "wb") as fh:
+                fh.write(b"old overlay")
+
+            def fail_render(path: str) -> bool:
+                with open(path, "wb") as fh:
+                    fh.write(b"partial overlay")
+                raise RuntimeError("injected renderer failure")
+
+            with self.assertRaises(RuntimeError):
+                save_annotation_transaction(request, render_overlay=fail_render)
+
+            with open(request.image_output_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"old image")
+            with open(request.label_output_path, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "old label\n")
+            with open(request.overlay_output_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"old overlay")
+            for directory in ("images", "labels", "overlays"):
+                self.assertFalse(
+                    any(name.startswith(".") for name in os.listdir(os.path.join(tmp, directory)))
+                )
+
     def test_empty_label_text_is_rejected_before_writes(self):
         with TemporaryDirectory() as tmp:
             request = self._request(tmp)

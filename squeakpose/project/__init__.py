@@ -27,6 +27,14 @@ from squeakpose.project.paths import (
     project_window_title,
     save_last_project,
 )
+from squeakpose.project.recovery import (
+    TransactionBackup,
+    TransactionRecoveryReport,
+    TransactionRecoveryResult,
+    cleanup_transaction_staging,
+    restore_missing_transaction_targets,
+    scan_transaction_artifacts,
+)
 from squeakpose.project.safety import (
     ProjectLock,
     ProjectLockedError,
@@ -46,6 +54,9 @@ __all__ = [
     "ProjectLockInfo",
     "ProjectPathError",
     "ProjectPaths",
+    "TransactionBackup",
+    "TransactionRecoveryReport",
+    "TransactionRecoveryResult",
     "LayerDefinition",
     "LAYER_DEFINITIONS",
     "LAYER_DEPTH",
@@ -54,6 +65,7 @@ __all__ = [
     "DISTILLATION_MANIFEST_FILENAME",
     "default_projects_root",
     "break_stale_project_lock",
+    "cleanup_transaction_staging",
     "discover_distillation_exports",
     "distillation_export_search_roots",
     "distillation_run_task",
@@ -68,5 +80,7 @@ __all__ = [
     "project_window_title",
     "preferred_distillation_export",
     "require_path_within_project",
+    "restore_missing_transaction_targets",
     "save_last_project",
+    "scan_transaction_artifacts",
 ]

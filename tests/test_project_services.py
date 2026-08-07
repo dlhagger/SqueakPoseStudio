@@ -2,6 +2,7 @@ import json
 import os
 import unittest
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from squeakpose.project.distillation import (
     DISTILLATION_MANIFEST_FILENAME,
@@ -101,6 +102,23 @@ class ProjectPathTests(unittest.TestCase):
 
 
 class ProjectMetadataStoreTests(unittest.TestCase):
+    def test_failed_metadata_migration_leaves_original_file_intact(self):
+        with TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "squeakpose_project.json")
+            original = {"created_at": "earlier", "active_workflow": "pose"}
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(original, fh)
+
+            with patch(
+                "squeakpose.project.metadata.atomic_write_text",
+                side_effect=OSError("injected write failure"),
+            ):
+                with self.assertRaises(OSError):
+                    ProjectMetadataStore(tmp).read()
+
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), original)
+
     def test_update_preserves_unknown_fields_and_removes_none_values(self):
         with TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "squeakpose_project.json")

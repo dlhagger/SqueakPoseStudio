@@ -86,10 +86,9 @@ def save_annotation_transaction(
             )
 
         staged_overlay = staging_path_for(request.overlay_output_path)
-        if not render_overlay(staged_overlay):
-            remove_path(staged_overlay)
-            raise OSError("could not render the annotated preview image")
         staged.append((staged_overlay, request.overlay_output_path))
+        if not render_overlay(staged_overlay):
+            raise OSError("could not render the annotated preview image")
 
         staged.append(
             (

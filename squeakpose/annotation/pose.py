@@ -76,6 +76,12 @@ class PoseEditState:
 
     def set_box(self, box: BoundingBox) -> BoundingBox:
         """Set a box for the active class and start its keypoints again."""
+        stored = self.replace_box(box)
+        self.keypoints.clear()
+        return stored
+
+    def replace_box(self, box: BoundingBox) -> BoundingBox:
+        """Replace the active box while preserving already placed keypoints."""
         class_id = self._required_class_id()
         self.box = BoundingBox(
             x=float(box.x),
@@ -84,7 +90,6 @@ class PoseEditState:
             h=float(box.h),
             class_id=class_id,
         )
-        self.keypoints.clear()
         return deepcopy(self.box)
 
     def add_next_keypoint(

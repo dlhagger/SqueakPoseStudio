@@ -27,6 +27,7 @@ class UiPanelTests(unittest.TestCase):
                 mode_changed=lambda mode: events.append(("mode", mode)),
                 class_changed=lambda class_id: events.append(("class", class_id)),
                 manage_classes=lambda: events.append(("manage", None)),
+                use_segmentation_box=lambda: events.append(("seg_box", None)),
             ),
         )
         panel.show()
@@ -40,17 +41,25 @@ class UiPanelTests(unittest.TestCase):
         panel.bbox_btn.click()
         panel.class_selector.setCurrentIndex(1)
         panel.manage_classes_btn.click()
+        panel.set_segmentation_box_available(True)
+        panel.use_segmentation_box_btn.click()
         panel.set_progress("3 / 12 labeled")
 
         self.assertEqual(
             events,
-            [("mode", "bbox"), ("class", 1), ("manage", None)],
+            [
+                ("mode", "bbox"),
+                ("class", 1),
+                ("manage", None),
+                ("seg_box", None),
+            ],
         )
         self.assertEqual(panel.active_mode, "bbox")
         self.assertEqual(panel.progress_label.text(), "3 / 12 labeled")
 
         panel.set_layer(layers.LAYER_SEGMENTATION)
         self.assertTrue(panel.bbox_btn.isHidden())
+        self.assertTrue(panel.use_segmentation_box_btn.isHidden())
         self.assertFalse(panel.segment_btn.isHidden())
         self.assertEqual(panel.panzoom_btn.text(), "Pan (1)")
         self.assertIn("Segmentation", panel.predict_btn.toolTip())

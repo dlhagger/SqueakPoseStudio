@@ -180,10 +180,12 @@ from squeakpose.services.dataset_ops import (
     split_train_val_images,
 )
 from squeakpose.services.frame_annotations import (
+    SegmentationBoxUnavailableError,
     build_pose_save_request,
     build_segmentation_save_request,
     load_pose_document,
     load_segmentation_document,
+    plan_segmentation_box_transfer,
 )
 from squeakpose.services.image_queue import (
     ImageDeletionPlan,
@@ -3491,6 +3493,7 @@ class LabelingApp(QMainWindow):
                 mode_changed=self.set_mode,
                 class_changed=self._on_class_changed,
                 manage_classes=self.open_class_manager,
+                use_segmentation_box=self._use_segmentation_box_for_pose,
             ),
             embedded=True,
             parent=self.left_sidebar_content,
@@ -3502,6 +3505,7 @@ class LabelingApp(QMainWindow):
         self.seg_edit_btn = self.annotation_panel.seg_edit_btn
         self.keypoint_btn = self.annotation_panel.keypoint_btn
         self.predict_btn = self.annotation_panel.predict_btn
+        self.use_segmentation_box_btn = self.annotation_panel.use_segmentation_box_btn
         self.class_controls_frame = self.annotation_panel.class_controls_frame
         self.class_label_widget = self.annotation_panel.class_label
         self.class_selector = self.annotation_panel.class_selector
@@ -3753,6 +3757,68 @@ class LabelingApp(QMainWindow):
         controller.state = self.seg_edit_state
         return controller
 
+    def _segmentation_box_transfer_plan(self):
+        if not self._is_keypoints_layer():
+            raise SegmentationBoxUnavailableError(
+                "Switch to the Keypoints layer to use a segmentation box."
+            )
+        if not self.images or self.current_idx < 0 or self.current_idx >= len(self.images):
+            raise SegmentationBoxUnavailableError("Load an image first.")
+        class_id = self.class_selector.currentIndex()
+        base = os.path.splitext(self.images[self.current_idx])[0]
+        label_file = os.path.join(self.seg_label_dir, f"{base}.txt")
+        segmentation_document = load_segmentation_document(
+            label_file,
+            classes_count=len(self.seg_classes),
+            image_width=self.img_w,
+            image_height=self.img_h,
+        )
+        return plan_segmentation_box_transfer(
+            pose_class_id=class_id,
+            pose_classes=self.pose_classes,
+            segmentation_classes=self.seg_classes,
+            segmentation_document=segmentation_document,
+        )
+
+    def _refresh_segmentation_box_action(self) -> None:
+        panel = self.__dict__.get("annotation_panel")
+        if panel is None:
+            return
+        try:
+            plan = self._segmentation_box_transfer_plan()
+        except SegmentationBoxUnavailableError as error:
+            panel.set_segmentation_box_available(False, reason=str(error))
+            return
+        panel.set_segmentation_box_available(
+            True,
+            reason=f"Use saved segmentation bounds for '{plan.class_name}'.",
+        )
+
+    def _use_segmentation_box_for_pose(self) -> None:
+        try:
+            plan = self._segmentation_box_transfer_plan()
+        except SegmentationBoxUnavailableError as error:
+            QMessageBox.information(self, "Segmentation box unavailable", str(error))
+            self._refresh_segmentation_box_action()
+            return
+
+        class_id = plan.pose_class_id
+        state = self._sync_pose_state_from_scene(class_id)
+        controller = self._bind_pose_annotation_controller()
+        if controller is not None:
+            controller.replace_box_preserving_keypoints(plan.box)
+        else:
+            state.push_undo_snapshot()
+            state.replace_box(plan.box)
+            self.annotation_cache.apply_edit_state(state, require_complete=True)
+        self._render_pose_edit_state()
+        self._update_status()
+        self._update_item_editability()
+        self.update_status_bar(
+            f"Updated the {plan.class_name} keypoint box from segmentation; "
+            "existing keypoints were preserved."
+        )
+
     def _pose_state_for_class(self, class_id: int) -> PoseEditState:
         controller = self._bind_pose_annotation_controller()
         if controller is not None:
@@ -3921,6 +3987,7 @@ class LabelingApp(QMainWindow):
             self._update_status()
         self._clear_seg_edit_handles()
         self._refresh_sam_controls()
+        self._refresh_segmentation_box_action()
 
     def _cache_active_annotation(self, class_id: Optional[int] = None) -> bool:
         if not self.images:
@@ -5554,6 +5621,7 @@ class LabelingApp(QMainWindow):
         self._item_refs.clear()
         self._active_depth_map = None
         if not self.images:
+            self._refresh_segmentation_box_action()
             return
 
         current_image_name = self.images[self.current_idx]
@@ -5680,6 +5748,7 @@ class LabelingApp(QMainWindow):
         if hasattr(self.view, "refresh_seg_brush_cursor"):
             self.view.refresh_seg_brush_cursor()
         self._refresh_reference_layer_overlay()
+        self._refresh_segmentation_box_action()
         scene_center = self.scene.sceneRect().center()
         self.view.centerOn(scene_center)
 

@@ -9,6 +9,7 @@ from squeakpose.annotation.segmentation import (
     downsample_polygon_points,
     mask_to_polygon,
     normalize_polygon_points,
+    polygon_bounds,
     polygon_signed_area,
     polygon_to_mask,
     rotate_polygon_to_anchor,
@@ -102,6 +103,14 @@ class SegmentationGeometryTests(unittest.TestCase):
             normalize_polygon_points(points),
             [(1.0, 2.5), (4.0, 5.0), (6.0, 7.0)],
         )
+
+    def test_polygon_bounds_are_tight_and_reject_degenerate_geometry(self):
+        self.assertEqual(
+            polygon_bounds([(8, 4), (2, 10), (12, 7), (4, 1)]),
+            (2.0, 1.0, 10.0, 9.0),
+        )
+        self.assertIsNone(polygon_bounds([(1, 1), (1, 5), (1, 9)]))
+        self.assertIsNone(polygon_bounds([(1, 1), (2, 2)]))
 
     def test_mask_shape_and_polygon_rasterization_match_image_convention(self):
         backend = _RasterBackend()

@@ -11,6 +11,8 @@ from squeakpose.annotation.documents import (
     SegmentationAnnotationDocument,
     SegmentationDocumentSnapshot,
 )
+from squeakpose.annotation.models import BoundingBox
+from squeakpose.annotation.segmentation import polygon_bounds
 from squeakpose.annotation.serialization import (
     load_pose_annotations_from_file,
     load_segmentation_annotations_from_file,
@@ -26,6 +28,69 @@ class PoseFrameLoadResult:
 
     document: PoseAnnotationDocument
     extra_keypoint_rows: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentationBoxTransferPlan:
+    """A class-name-matched segmentation box ready for a pose document."""
+
+    pose_class_id: int
+    segmentation_class_id: int
+    class_name: str
+    box: BoundingBox
+
+
+class SegmentationBoxUnavailableError(ValueError):
+    """Raised when no unambiguous saved segmentation can supply a pose box."""
+
+
+def plan_segmentation_box_transfer(
+    *,
+    pose_class_id: int,
+    pose_classes: Sequence[str],
+    segmentation_classes: Sequence[str],
+    segmentation_document: SegmentationAnnotationDocument,
+) -> SegmentationBoxTransferPlan:
+    """Match a pose class by name and derive tight bounds from its segmentation."""
+    target_id = int(pose_class_id)
+    if target_id < 0 or target_id >= len(pose_classes):
+        raise SegmentationBoxUnavailableError("Select a valid keypoint class first.")
+    class_name = str(pose_classes[target_id]).strip()
+    exact_matches = [
+        index
+        for index, candidate in enumerate(segmentation_classes)
+        if str(candidate).strip() == class_name
+    ]
+    if not exact_matches:
+        folded_matches = [
+            index
+            for index, candidate in enumerate(segmentation_classes)
+            if str(candidate).strip().casefold() == class_name.casefold()
+        ]
+        if len(folded_matches) != 1:
+            raise SegmentationBoxUnavailableError(
+                f"No matching segmentation class named '{class_name}'."
+            )
+        source_id = folded_matches[0]
+    else:
+        source_id = exact_matches[0]
+
+    annotation = segmentation_document.annotation(source_id)
+    if annotation is None:
+        raise SegmentationBoxUnavailableError(
+            f"No saved segmentation exists for '{class_name}' on this image."
+        )
+    bounds = polygon_bounds(annotation.segments)
+    if bounds is None:
+        raise SegmentationBoxUnavailableError(
+            f"The saved segmentation for '{class_name}' has no usable bounds."
+        )
+    return SegmentationBoxTransferPlan(
+        pose_class_id=target_id,
+        segmentation_class_id=source_id,
+        class_name=class_name,
+        box=BoundingBox(*bounds, class_id=target_id),
+    )
 
 
 def load_pose_document(
@@ -187,10 +252,13 @@ def _save_request(
 
 __all__ = [
     "PoseFrameLoadResult",
+    "SegmentationBoxTransferPlan",
+    "SegmentationBoxUnavailableError",
     "build_pose_save_request",
     "build_segmentation_save_request",
     "load_pose_document",
     "load_segmentation_document",
+    "plan_segmentation_box_transfer",
     "serialize_pose_snapshot",
     "serialize_segmentation_snapshot",
 ]

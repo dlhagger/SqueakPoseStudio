@@ -11,16 +11,46 @@ from squeakpose.annotation.documents import (
 )
 from squeakpose.services.annotation_save import AnnotationSaveRequest
 from squeakpose.services.frame_annotations import (
+    SegmentationBoxUnavailableError,
     build_pose_save_request,
     build_segmentation_save_request,
     load_pose_document,
     load_segmentation_document,
+    plan_segmentation_box_transfer,
     serialize_pose_snapshot,
     serialize_segmentation_snapshot,
 )
 
 
 class FrameAnnotationServiceTests(unittest.TestCase):
+    def test_segmentation_box_transfer_matches_class_name_not_schema_index(self):
+        document = SegmentationAnnotationDocument(
+            {
+                0: {"segments": [(1, 1), (4, 1), (4, 4)]},
+                1: {"segments": [(8, 6), (28, 6), (28, 20), (8, 20)]},
+            }
+        )
+
+        plan = plan_segmentation_box_transfer(
+            pose_class_id=0,
+            pose_classes=["mouse", "rat"],
+            segmentation_classes=["background", "Mouse"],
+            segmentation_document=document,
+        )
+
+        self.assertEqual(plan.class_name, "mouse")
+        self.assertEqual(plan.segmentation_class_id, 1)
+        self.assertEqual((plan.box.x, plan.box.y, plan.box.w, plan.box.h), (8, 6, 20, 14))
+        self.assertEqual(plan.box.class_id, 0)
+
+        with self.assertRaisesRegex(SegmentationBoxUnavailableError, "No matching"):
+            plan_segmentation_box_transfer(
+                pose_class_id=1,
+                pose_classes=["mouse", "rat"],
+                segmentation_classes=["background", "Mouse"],
+                segmentation_document=document,
+            )
+
     def test_pose_load_preserves_duplicate_malformed_and_extra_row_semantics(self):
         with TemporaryDirectory() as tmp:
             label_file = Path(tmp, "frame.txt")

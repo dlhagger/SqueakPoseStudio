@@ -48,6 +48,28 @@ class PoseAnnotationControllerTests(unittest.TestCase):
         self.assertNotIn(2, document)
         self.assertEqual(controller.state.next_keypoint_name, "tail")
 
+    def test_segmentation_box_replacement_preserves_keypoints_and_is_undoable(self):
+        document = PoseAnnotationDocument()
+        controller = PoseAnnotationController(
+            document,
+            keypoint_order_for=lambda _class_id: ("nose",),
+            canonical_names=("nose",),
+        )
+        controller.select_class(0)
+        controller.set_box(BoundingBox(1, 2, 20, 10, 0))
+        controller.add_next_keypoint(4, 5)
+
+        controller.replace_box_preserving_keypoints(BoundingBox(3, 4, 30, 15, 99))
+
+        self.assertEqual(controller.state.box, BoundingBox(3, 4, 30, 15, 0))
+        self.assertEqual(controller.state.keypoints["nose"].kp.x, 4)
+        annotation = document.annotation(0)
+        self.assertIsNotNone(annotation)
+        self.assertEqual(annotation.box, (3.0, 4.0, 30.0, 15.0))
+        self.assertTrue(controller.undo())
+        self.assertEqual(controller.state.box, BoundingBox(1, 2, 20, 10, 0))
+        self.assertIn("nose", controller.state.keypoints)
+
     def test_class_switch_and_document_replacement_do_not_leak_edits(self):
         document = PoseAnnotationDocument()
         controller = PoseAnnotationController(

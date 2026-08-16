@@ -95,6 +95,14 @@ class PoseAnnotationController:
         self._emit_all()
         return stored
 
+    def replace_box_preserving_keypoints(self, box: BoundingBox) -> BoundingBox:
+        """Replace the active box without discarding keypoints, with undo support."""
+        self.state.push_undo_snapshot()
+        stored = self.state.replace_box(box)
+        self._sync_document(require_complete=True)
+        self._emit_all()
+        return stored
+
     def add_next_keypoint(
         self,
         x: float,

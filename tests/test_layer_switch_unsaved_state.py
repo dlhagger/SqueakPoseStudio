@@ -25,7 +25,7 @@ class LayerSwitchUnsavedStateTests(unittest.TestCase):
         )
         cls.qt_app.setQuitOnLastWindowClosed(False)
 
-    def _open_window(self, root: Path):
+    def _open_window(self, root: Path, *, segmentation_class: str = "body"):
         paths = studio._ensure_project_structure(str(root))
         Path(paths["classes_file"]).write_text("mouse\n", encoding="utf-8")
         Path(paths["keypoints_file"]).write_text("nose\ntail\n", encoding="utf-8")
@@ -33,7 +33,10 @@ class LayerSwitchUnsavedStateTests(unittest.TestCase):
             '{"mouse": ["nose", "tail"]}\n',
             encoding="utf-8",
         )
-        Path(paths["classes_seg_file"]).write_text("body\n", encoding="utf-8")
+        Path(paths["classes_seg_file"]).write_text(
+            f"{segmentation_class}\n",
+            encoding="utf-8",
+        )
         image = qt_gui.QImage(40, 30, qt_gui.QImage.Format.Format_RGB32)
         image.fill(0xFFE7EBEF)
         self.assertTrue(image.save(str(Path(paths["images_to_label"]) / "frame.png")))
@@ -104,6 +107,60 @@ class LayerSwitchUnsavedStateTests(unittest.TestCase):
                     self.assertEqual(len(window.annotation_cache.export_annotations()), 1)
                     self.assertIsNotNone(window.pose_edit_state.box)
                     self.assertTrue(window.pose_edit_state.is_complete)
+                finally:
+                    window.close()
+
+    def test_saved_segmentation_box_can_replace_pose_box_without_moving_keypoints(self):
+        with TemporaryDirectory() as tmp:
+            stack, window, paths = self._open_window(
+                Path(tmp),
+                segmentation_class="Mouse",
+            )
+            with stack:
+                try:
+                    self._complete_pose(window)
+                    original_keypoints = {
+                        name: (entry.kp.x, entry.kp.y, entry.visibility)
+                        for name, entry in window.pose_edit_state.keypoints.items()
+                    }
+                    Path(paths["labels_seg_all"], "frame.txt").write_text(
+                        "0 0.050000 0.100000 0.750000 0.100000 "
+                        "0.750000 0.800000 0.050000 0.800000\n",
+                        encoding="utf-8",
+                    )
+                    window._refresh_segmentation_box_action()
+                    self.assertTrue(window.use_segmentation_box_btn.isEnabled())
+
+                    window.use_segmentation_box_btn.click()
+
+                    box = window.pose_edit_state.box
+                    self.assertIsNotNone(box)
+                    self.assertEqual((box.x, box.y, box.w, box.h), (2.0, 3.0, 28.0, 21.0))
+                    self.assertEqual(
+                        {
+                            name: (entry.kp.x, entry.kp.y, entry.visibility)
+                            for name, entry in window.pose_edit_state.keypoints.items()
+                        },
+                        original_keypoints,
+                    )
+                    annotation = window.annotation_cache.annotation(0)
+                    self.assertIsNotNone(annotation)
+                    self.assertEqual(annotation.box, (2.0, 3.0, 28.0, 21.0))
+
+                    window.undo()
+                    restored = window.pose_edit_state.box
+                    self.assertIsNotNone(restored)
+                    self.assertEqual(
+                        (restored.x, restored.y, restored.w, restored.h),
+                        (4.0, 5.0, 20.0, 15.0),
+                    )
+                    self.assertEqual(
+                        {
+                            name: (entry.kp.x, entry.kp.y, entry.visibility)
+                            for name, entry in window.pose_edit_state.keypoints.items()
+                        },
+                        original_keypoints,
+                    )
                 finally:
                     window.close()
 

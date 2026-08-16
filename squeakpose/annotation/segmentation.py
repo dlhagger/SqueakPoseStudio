@@ -200,6 +200,22 @@ def normalize_polygon_points(points: Iterable[object]) -> list[Point]:
     return normalized
 
 
+def polygon_bounds(points: Iterable[object]) -> tuple[float, float, float, float] | None:
+    """Return the tight ``(x, y, width, height)`` bounds of a usable polygon."""
+    normalized = normalize_polygon_points(points)
+    if len(normalized) < 3:
+        return None
+    xs = [point[0] for point in normalized]
+    ys = [point[1] for point in normalized]
+    min_x = min(xs)
+    min_y = min(ys)
+    width = max(xs) - min_x
+    height = max(ys) - min_y
+    if width <= 0 or height <= 0:
+        return None
+    return min_x, min_y, width, height
+
+
 def segmentation_mask_shape(image_width: float, image_height: float) -> tuple[int, int]:
     """Return the existing OpenCV mask shape convention, ``(height, width)``."""
     return (

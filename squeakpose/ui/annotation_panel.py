@@ -45,6 +45,7 @@ class AnnotationPanelCallbacks:
     mode_changed: Callable[[str], None] = _ignore_mode
     class_changed: Callable[[int], None] = _ignore_class
     manage_classes: Callable[[], None] = _ignore_action
+    use_segmentation_box: Callable[[], None] = _ignore_action
 
 
 def _panel_button(text: str, *, tooltip: str = "") -> QPushButton:
@@ -124,6 +125,20 @@ class AnnotationPanel(QFrame):
                 lambda _checked=False, selected_mode=mode: self._choose_mode(selected_mode)
             )
 
+        self.use_segmentation_box_btn = _panel_button(
+            "Use Segmentation Box",
+            tooltip=(
+                "Replace this class's keypoint box with the tight bounds of its saved "
+                "segmentation mask. Existing keypoints are preserved."
+            ),
+        )
+        self.use_segmentation_box_btn.clicked.connect(
+            lambda _checked=False: self.callbacks.use_segmentation_box()
+        )
+        layout.addWidget(self.use_segmentation_box_btn)
+        self._segmentation_box_available = False
+        self._segmentation_box_reason = "No matching saved segmentation is available."
+
         self.class_controls_frame = QFrame()
         class_layout = QVBoxLayout(self.class_controls_frame)
         class_layout.setContentsMargins(0, 0, 0, 0)
@@ -201,6 +216,8 @@ class AnnotationPanel(QFrame):
         self.bbox_btn.setEnabled(is_pose)
         self.keypoint_btn.setVisible(is_pose)
         self.keypoint_btn.setEnabled(is_pose)
+        self.use_segmentation_box_btn.setVisible(is_pose)
+        self.use_segmentation_box_btn.setEnabled(is_pose and self._segmentation_box_available)
         self.segment_btn.setVisible(is_segmentation)
         self.segment_btn.setEnabled(is_segmentation)
         self.seg_edit_btn.setVisible(is_segmentation)
@@ -224,6 +241,28 @@ class AnnotationPanel(QFrame):
             )
         )
         self._reflow_modes()
+
+    def set_segmentation_box_available(
+        self,
+        available: bool,
+        *,
+        reason: str = "",
+    ) -> None:
+        """Present whether the current pose class has transferable saved bounds."""
+        self._segmentation_box_available = bool(available)
+        self._segmentation_box_reason = str(reason).strip()
+        self.use_segmentation_box_btn.setEnabled(
+            self.active_layer == LAYER_KEYPOINTS and self._segmentation_box_available
+        )
+        if self._segmentation_box_available:
+            self.use_segmentation_box_btn.setToolTip(
+                "Replace this class's keypoint box with the tight bounds of its saved "
+                "segmentation mask. Existing keypoints are preserved."
+            )
+        else:
+            self.use_segmentation_box_btn.setToolTip(
+                self._segmentation_box_reason or "No matching saved segmentation is available."
+            )
 
     def set_active_mode(self, mode: str) -> None:
         self.active_mode = str(mode)

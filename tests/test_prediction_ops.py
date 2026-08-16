@@ -3,6 +3,7 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
+import prediction_ops
 from predict_worker import run_predict_server, run_predict_worker
 from prediction_ops import (
     best_predictions_by_class_from_payload,
@@ -11,6 +12,7 @@ from prediction_ops import (
     serialize_prediction_result,
     top_prediction_from_payload,
 )
+from squeakpose.services import prediction_serialization
 from video_review_worker import run_video_review_worker
 
 
@@ -177,6 +179,22 @@ def _streamed_predictions(events):
 
 
 class PredictionOpsTests(unittest.TestCase):
+    def test_root_compatibility_exports_preserve_function_identity(self):
+        public_names = (
+            "best_predictions_by_class_from_payload",
+            "prediction_confidences_by_class",
+            "rank_prediction_frames",
+            "serialize_prediction_result",
+            "top_prediction_from_payload",
+        )
+
+        for name in public_names:
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(prediction_ops, name),
+                    getattr(prediction_serialization, name),
+                )
+
     def test_predict_worker_writes_depth_outputs_without_json_array(self):
         with TemporaryDirectory() as tmp:
             model = _PredictModel([_DepthResult([[1.0, 2.0], [3.0, 4.0]])])

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 from typing import Optional
 
-from PyQt6.QtCore import QProcess, Qt, QTimer
+from PyQt6.QtCore import QProcess, Qt
 from PyQt6.QtGui import QFontDatabase, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,20 +32,29 @@ from PyQt6.QtWidgets import (
 )
 
 from squeakpose.project.paths import ProjectPaths
-from squeakpose.workers.process import (
-    remove_file_quietly as _remove_file_quietly,
+from squeakpose.services.distillation import (
+    DISTILLATION_IMAGE_EXTENSIONS,
+    DISTILLATION_TASK_DEFAULTS,
+    DistillationCorpusProgress,
+    DistillationPlanError,
+    build_distillation_corpus,
+    build_distillation_run_plan,
+    count_distillation_images,
+    distillation_sample_count,
+    plan_distillation_corpus,
+    student_task_mismatch,
 )
-from squeakpose.workers.process import (
-    request_qprocess_stop,
-)
-from squeakpose.workers.process import (
-    shutdown_qprocess as _shutdown_qprocess,
-)
-from squeakpose_core import stable_path_id, staging_path_for
-from ui_style import (
+from squeakpose.ui.style import (
     ThemedComboBox,
     style_combo_popup,
     train_dialog_stylesheet,
+)
+from squeakpose.workers.process import (
+    WorkerJobController,
+    WorkerJobResult,
+)
+from squeakpose.workers.process import (
+    shutdown_qprocess as _shutdown_qprocess,
 )
 
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,10 +74,7 @@ def _distillation_sample_count(
     stride: int,
     max_frames: int = 0,
 ) -> int:
-    total = max(0, int(total_frames))
-    step = max(1, int(stride))
-    count = (total + step - 1) // step
-    return min(count, int(max_frames)) if int(max_frames) > 0 else count
+    return distillation_sample_count(total_frames, stride, max_frames)
 
 
 def _refresh_qt_style(widget: QWidget | None) -> None:
@@ -78,23 +85,27 @@ def _refresh_qt_style(widget: QWidget | None) -> None:
     widget.update()
 
 
+class _OpenCVVideoReader:
+    """Adapt OpenCV capture to the Qt-free corpus builder protocol."""
+
+    def __init__(self, path: str) -> None:
+        self._capture = _cv2.VideoCapture(path)
+
+    def read_frame(self, frame_index: int):
+        self._capture.set(_cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = self._capture.read()
+        return frame if ok and frame is not None else None
+
+    def close(self) -> None:
+        self._capture.release()
+
+
 class DistillationDialog(QDialog):
     """Prepare a project image corpus and launch DINO distillation."""
 
     ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-    IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
-    TASK_DEFAULTS = {
-        "pose": {
-            "label": "Keypoints",
-            "student": "ultralytics/yolo26s-pose.pt",
-            "run_name": "dinov3-pose",
-        },
-        "segment": {
-            "label": "Segmentation",
-            "student": "ultralytics/yolo26s-seg.pt",
-            "run_name": "dinov3-segmentation",
-        },
-    }
+    IMAGE_EXTENSIONS = DISTILLATION_IMAGE_EXTENSIONS
+    TASK_DEFAULTS = DISTILLATION_TASK_DEFAULTS
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -106,8 +117,11 @@ class DistillationDialog(QDialog):
         self.project_root = os.path.abspath(getattr(parent, "project_root", self.app_base_dir))
         self.paths = _project_paths(self.project_root)
         self.video_paths: list[str] = []
+        self.process_controller: Optional[WorkerJobController] = None
         self.process: Optional[QProcess] = None
         self.cancel_requested = False
+        self._starting_process = False
+        self._deferred_terminal_result: Optional[WorkerJobResult] = None
         self._current_task = "pose"
 
         layout = QVBoxLayout(self)
@@ -318,10 +332,7 @@ class DistillationDialog(QDialog):
 
     @staticmethod
     def _student_task_mismatch(student: str, task: str) -> bool:
-        model_name = os.path.basename(student).lower()
-        if task == "segment":
-            return "-pose" in model_name
-        return "-seg" in model_name or "segment" in model_name
+        return student_task_mismatch(student, task)
 
     def _set_status(self, text: str, tone: str = "idle") -> None:
         self.status_label.setText(text)
@@ -365,15 +376,7 @@ class DistillationDialog(QDialog):
             self._refresh_dataset_summary()
 
     def _image_count(self, root: str) -> int:
-        if not os.path.isdir(root):
-            return 0
-        count = 0
-        try:
-            for _dirpath, _dirnames, names in os.walk(root):
-                count += sum(name.lower().endswith(self.IMAGE_EXTENSIONS) for name in names)
-        except OSError:
-            return 0
-        return count
+        return count_distillation_images(root)
 
     def _refresh_dataset_summary(self) -> None:
         data_dir = self.data_dir_edit.text().strip()
@@ -402,7 +405,12 @@ class DistillationDialog(QDialog):
             finally:
                 if cap:
                     cap.release()
-        return probes, errors
+        plan = plan_distillation_corpus(
+            ((path, total) for path, total, _count in probes),
+            stride=stride,
+            maximum_per_video=maximum,
+        )
+        return list(plan.videos), errors
 
     def _create_dataset(self) -> None:
         if _cv2 is None:
@@ -463,76 +471,53 @@ class DistillationDialog(QDialog):
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
 
-        stride = self.stride_spin.value()
-        maximum = self.max_frames_spin.value()
         quality = self.jpeg_quality_spin.value()
-        handled = 0
-        saved = 0
-        skipped = 0
-        failed: list[str] = []
+        plan = plan_distillation_corpus(
+            ((path, total) for path, total, _sample_count in probes),
+            stride=self.stride_spin.value(),
+            maximum_per_video=self.max_frames_spin.value(),
+        )
 
-        for path, total, sample_count in probes:
-            if progress.wasCanceled():
-                break
-            cap = _cv2.VideoCapture(path)
-            source_id = stable_path_id(path)
-            base = re.sub(
-                r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(path))[0]
-            ).strip("._")
-            base = base or "video"
-            try:
-                for sample_number, frame_idx in enumerate(range(0, total, stride)):
-                    if maximum > 0 and sample_number >= maximum:
-                        break
-                    if progress.wasCanceled():
-                        break
+        def write_jpeg(path, frame, jpeg_quality):
+            write_ok = _cv2.imwrite(
+                path,
+                frame,
+                [_cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+            )
+            if not write_ok:
+                raise OSError("OpenCV could not encode the frame")
+            return True
 
-                    out_path = os.path.join(data_dir, f"{base}_{source_id}_f{frame_idx:09d}.jpg")
-                    if os.path.exists(out_path):
-                        skipped += 1
-                    else:
-                        cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        ok, frame = cap.read()
-                        if not ok or frame is None:
-                            failed.append(
-                                f"{os.path.basename(path)} frame {frame_idx}: read failed"
-                            )
-                        else:
-                            staged_path = staging_path_for(out_path)
-                            try:
-                                write_ok = _cv2.imwrite(
-                                    staged_path,
-                                    frame,
-                                    [_cv2.IMWRITE_JPEG_QUALITY, quality],
-                                )
-                                if not write_ok:
-                                    raise OSError("OpenCV could not encode the frame")
-                                os.replace(staged_path, out_path)
-                                saved += 1
-                            except Exception as exc:
-                                _remove_file_quietly(staged_path)
-                                failed.append(f"{os.path.basename(path)} frame {frame_idx}: {exc}")
+        def report_progress(event: DistillationCorpusProgress) -> None:
+            progress.setValue(event.handled)
+            progress.setLabelText(
+                f"{os.path.basename(event.source_path)}: "
+                f"{event.sample_number:,}/{event.source_samples:,} samples"
+            )
+            QApplication.processEvents()
 
-                    handled += 1
-                    progress.setValue(handled)
-                    progress.setLabelText(
-                        f"{os.path.basename(path)}: {sample_number + 1:,}/{sample_count:,} samples"
-                    )
-                    QApplication.processEvents()
-            finally:
-                cap.release()
+        result = build_distillation_corpus(
+            plan,
+            data_dir=data_dir,
+            jpeg_quality=quality,
+            open_video=_OpenCVVideoReader,
+            write_image=write_jpeg,
+            is_canceled=progress.wasCanceled,
+            on_progress=report_progress,
+        )
 
-        canceled = progress.wasCanceled()
-        progress.setValue(min(handled, estimated))
+        progress.setValue(min(result.handled, estimated))
         progress.close()
         self._refresh_dataset_summary()
 
-        summary = f"Saved {saved:,} new image(s); skipped {skipped:,} existing image(s)."
-        if canceled:
+        summary = (
+            f"Saved {result.saved:,} new image(s); skipped {result.skipped:,} existing image(s)."
+        )
+        if result.canceled:
             summary += "\n\nExtraction was canceled; images already written were kept."
-        if failed:
-            summary += f"\n\n{len(failed):,} frame(s) failed. First issues:\n" + "\n".join(
-                failed[:8]
+        if result.failures:
+            summary += f"\n\n{result.failed:,} frame(s) failed. First issues:\n" + "\n".join(
+                result.failures[:8]
             )
         QMessageBox.information(self, "Image corpus updated", summary)
 
@@ -555,117 +540,109 @@ class DistillationDialog(QDialog):
         self.log_view.ensureCursorVisible()
 
     def _start_distillation(self) -> None:
-        if self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning:
+        controller_running = (
+            self.process_controller is not None and self.process_controller.is_running
+        )
+        raw_process_running = (
+            self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
+        )
+        if controller_running or raw_process_running:
             QMessageBox.information(
                 self, "Distillation running", "A distillation run is already active."
             )
             return
 
         data_text = self.data_dir_edit.text().strip()
-        data_dir = os.path.abspath(data_text) if data_text else ""
-        run_name = self._run_name()
-        student = self.student_edit.text().strip()
-        teacher = self.teacher_edit.text().strip()
-        task = self._selected_task()
         script_path = os.path.join(self.app_base_dir, "distillation", "distiller.py")
-
-        if not data_dir or not os.path.isdir(data_dir) or self._image_count(data_dir) == 0:
-            QMessageBox.warning(
-                self,
-                "Image corpus required",
-                "Choose a directory containing unlabeled images, or create the corpus in the first tab.",
+        try:
+            plan = build_distillation_run_plan(
+                program=sys.executable,
+                script_path=script_path,
+                app_base_dir=self.app_base_dir,
+                project_root=self.project_root,
+                runs_root=self.paths["distillation_runs"],
+                data_dir=data_text,
+                run_name=self._run_name(),
+                student=self.student_edit.text(),
+                teacher=self.teacher_edit.text(),
+                task=self._selected_task(),
+                epochs=self.epochs_spin.value(),
+                batch_size=self.batch_spin.value(),
+                precision=self.precision_combo.currentText(),
+                overwrite=self.overwrite_check.isChecked(),
             )
-            return
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_name):
-            QMessageBox.warning(
-                self,
-                "Invalid run name",
-                "Use letters, numbers, periods, underscores, or hyphens; start with a letter or number.",
+        except DistillationPlanError as exc:
+            presenter = (
+                QMessageBox.critical if exc.code == "distiller_missing" else QMessageBox.warning
             )
+            presenter(self, exc.title, exc.message)
             return
-        if not student or not teacher:
-            QMessageBox.warning(
-                self, "Model required", "Both student and teacher model values are required."
-            )
-            return
-        if self._student_task_mismatch(student, task):
-            task_label = self.TASK_DEFAULTS[task]["label"]
-            QMessageBox.warning(
-                self,
-                "Student model task mismatch",
-                f"The selected task is {task_label}, but the student model appears to use a different head.\n\n"
-                f"Choose a compatible model or switch the task.",
-            )
-            return
-        if not os.path.isfile(script_path):
-            QMessageBox.critical(self, "Distiller missing", f"Could not find:\n{script_path}")
-            return
-
-        out_dir = self._output_dir()
-        if os.path.exists(out_dir) and not self.overwrite_check.isChecked():
-            QMessageBox.warning(
-                self,
-                "Run directory exists",
-                f"The output directory already exists:\n{out_dir}\n\n"
-                "Choose a new run name or explicitly allow overwrite.",
-            )
-            return
-
-        args = [
-            "-u",
-            script_path,
-            "--project-root",
-            self.project_root,
-            "--data-dir",
-            data_dir,
-            "--run-name",
-            run_name,
-            "--model",
-            student,
-            "--task",
-            task,
-            "--teacher",
-            teacher,
-            "--epochs",
-            str(self.epochs_spin.value()),
-            "--batch-size",
-            str(self.batch_spin.value()),
-            "--precision",
-            self.precision_combo.currentText(),
-        ]
-        if self.overwrite_check.isChecked():
-            args.append("--overwrite")
 
         self.log_view.clear()
         self._append_log(
-            f"Project: {self.project_root}\n"
-            f"Images: {data_dir} ({self._image_count(data_dir):,} files)\n"
-            f"Task: {self.TASK_DEFAULTS[task]['label']}\n"
-            f"Student: {student}\n"
-            f"Output: {out_dir}\n\n"
+            f"Project: {plan.project_root}\n"
+            f"Images: {plan.data_dir} ({plan.image_count:,} files)\n"
+            f"Task: {plan.task_label}\n"
+            f"Student: {plan.student}\n"
+            f"Output: {plan.output_dir}\n\n"
         )
 
-        process = QProcess(self)
-        process.setProgram(sys.executable)
-        process.setArguments(args)
-        process.setWorkingDirectory(self.app_base_dir)
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        process.readyReadStandardOutput.connect(self._read_process_output)
-        process.finished.connect(self._finish_process)
-        process.errorOccurred.connect(self._process_error)
-
-        self.process = process
+        controller = WorkerJobController(
+            self,
+            process_factory=self._create_distillation_process,
+        )
+        self.process_controller = controller
+        controller.event_received.connect(self._handle_process_event)
+        controller.output_received.connect(self._handle_process_output)
+        controller.stderr_received.connect(self._handle_process_output)
+        controller.terminal.connect(self._handle_process_terminal)
         self.cancel_requested = False
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.create_dataset_btn.setEnabled(False)
         self._set_status("Launching", "running")
-        process.start()
-        if not process.waitForStarted(1000):
-            self._append_log(f"Could not start distillation: {process.errorString()}\n")
-            self._finish_process(1, QProcess.ExitStatus.CrashExit)
+
+        self._starting_process = True
+        self._deferred_terminal_result = None
+        started = controller.start(
+            plan.program,
+            list(plan.arguments),
+            working_directory=plan.working_directory,
+            start_timeout_ms=1000,
+        )
+        self.process = controller.process
+        self._starting_process = False
+        if not started:
+            result = self._deferred_terminal_result or controller.terminal_result
+            error_message = result.error_message if result is not None else "Unknown process error"
+            self._append_log(f"Could not start distillation: {error_message}\n")
+        deferred = self._deferred_terminal_result
+        self._deferred_terminal_result = None
+        if deferred is not None:
+            self._finish_process_result(deferred)
+
+    def _create_distillation_process(self, parent) -> QProcess:
+        process = QProcess(parent)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        return process
+
+    def _handle_process_output(self, text: str) -> None:
+        if not text:
+            return
+        self._append_log(text + "\n")
+        self._set_status("Running", "running")
+
+    def _handle_process_event(self, event: dict) -> None:
+        self._handle_process_output(json.dumps(event, sort_keys=True))
+
+    def _handle_process_terminal(self, result: WorkerJobResult) -> None:
+        if self._starting_process:
+            self._deferred_terminal_result = result
+            return
+        self._finish_process_result(result)
 
     def _read_process_output(self) -> None:
+        """Compatibility helper for callers that still own a raw process."""
         if self.process is None:
             return
         text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
@@ -674,42 +651,62 @@ class DistillationDialog(QDialog):
             self._set_status("Running", "running")
 
     def _process_error(self, _error) -> None:
+        """Compatibility helper for callers that still own a raw process."""
         if self.process is not None:
             self._append_log(f"\nProcess error: {self.process.errorString()}\n")
 
     def _cancel_process(self) -> None:
-        if self.process is None or self.process.state() == QProcess.ProcessState.NotRunning:
+        controller = self.process_controller
+        if controller is None or not controller.is_running:
             return
         self.cancel_requested = True
         self._set_status("Canceling", "canceled")
         self._append_log("\nCancel requested. Stopping distillation...\n")
-        request_qprocess_stop(
-            self.process,
-            schedule=QTimer.singleShot,
-            force_kill=self._kill_process_if_running,
-            kill_after_ms=5000,
-        )
+        controller.cancel(kill_after_ms=5000)
 
     def _kill_process_if_running(self) -> None:
         if self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.kill()
 
     def _finish_process(self, exit_code: int, exit_status) -> None:
-        if self.process is None:
+        """Compatibility adapter for the legacy raw-QProcess completion callback."""
+        if self.process is None and self.process_controller is None:
             return
-        self._read_process_output()
-        canceled = self.cancel_requested
+        state = (
+            "cancelled"
+            if self.cancel_requested
+            else "failed"
+            if exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0
+            else "finished"
+        )
+        self._finish_process_result(
+            WorkerJobResult(
+                state=state,
+                exit_code=int(exit_code),
+                exit_status=exit_status,
+            )
+        )
+
+    def _finish_process_result(self, result: WorkerJobResult) -> None:
+        canceled = self.cancel_requested or result.state == "cancelled"
+        controller = self.process_controller
+        self.process_controller = None
         self.process = None
         self.cancel_requested = False
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.create_dataset_btn.setEnabled(True)
+        if controller is not None:
+            controller.deleteLater()
 
         if canceled:
             self._set_status("Canceled", "canceled")
             self._append_log("\nDistillation canceled.\n")
             return
-        if exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
+        if not result.succeeded:
+            if result.error_message:
+                self._append_log(f"\nProcess error: {result.error_message}\n")
+            exit_code = result.exit_code if result.exit_code is not None else 1
             self._set_status("Failed", "failed")
             self._append_log(f"\nDistillation failed with exit code {exit_code}.\n")
             QMessageBox.critical(self, "Distillation failed", "Review the output log for details.")
@@ -724,7 +721,11 @@ class DistillationDialog(QDialog):
         )
 
     def _confirm_stop_for_close(self) -> bool:
-        if self.process is None or self.process.state() == QProcess.ProcessState.NotRunning:
+        controller = self.process_controller
+        raw_process_running = (
+            self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
+        )
+        if (controller is None or not controller.is_running) and not raw_process_running:
             return True
         answer = QMessageBox.question(
             self,
@@ -735,7 +736,16 @@ class DistillationDialog(QDialog):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return False
-        _shutdown_qprocess(self.process)
+        if controller is not None:
+            try:
+                controller.terminal.disconnect(self._handle_process_terminal)
+            except (TypeError, RuntimeError):
+                pass
+            controller.shutdown()
+            controller.deleteLater()
+        else:
+            _shutdown_qprocess(self.process)
+        self.process_controller = None
         self.process = None
         return True
 

@@ -211,6 +211,12 @@ The application automatically looks for SAM weights in the project root and
 prioritizes `sam3.pt`. Accepted polygons are written in YOLO segmentation
 format to `labels_seg_all/<image-stem>.txt`.
 
+SAM model loading and prompt inference run in a persistent child process rather
+than the Qt process. The worker keeps one model warm, correlates replies to the
+current request and image, and is stopped deterministically when the project or
+application closes. A result produced for an image that is no longer displayed
+is discarded instead of mutating the new frame.
+
 In mask edit mode, left-drag adds to a mask and right-drag erases from it.
 
 ### Depth Layer
@@ -441,22 +447,26 @@ segmentation coverage, mask area, trajectory, and ROI occupancy outputs.
 squeakpose_studio.py       Backward-compatible launcher and import facade
 squeakpose/                Extracted application package
 squeakpose/app.py          QApplication setup and startup
+squeakpose/core.py         Canonical Qt-free core helpers
+squeakpose/depth_ops.py    Canonical depth-map validation and persistence
 squeakpose/project/        Canonical project paths and metadata persistence
 squeakpose/annotation/     Qt-free annotation state and reusable views
-squeakpose/services/       Transactional annotation and dataset operations
+squeakpose/services/       Workflow planning, file coordination, and transactions
 squeakpose/workers/        Worker protocol and process lifecycle helpers
 squeakpose/ui/             Main window and feature dialogs
 squeakpose/ui/main_window.py  Main annotation window
 squeakpose/ui/video_reviewer.py  Video review and frame export
 squeakpose/ui/training_dialog.py  YOLO training configuration
 squeakpose/ui/distillation_dialog.py  DINO corpus and training workflow
-squeakpose_core.py         Qt-free project and layer compatibility logic
-label_io.py                Label parsing and normalization
-dataset_builder.py         YOLO pose dataset YAML generation
-dataset_ops.py             Dataset validation and export helpers
-prediction_ops.py          Prediction serialization helpers
-inference_ops.py           Video inference row generation
+squeakpose_core.py         Compatibility imports for squeakpose.core
+label_io.py                Compatibility imports for annotation serialization
+dataset_builder.py         Compatibility imports for dataset YAML generation
+dataset_ops.py             Compatibility imports for service dataset operations
+depth_ops.py               Compatibility imports for squeakpose.depth_ops
+prediction_ops.py          Compatibility imports for prediction serialization
+inference_ops.py           Compatibility imports for inference runtime
 predict_worker.py          Single-image prediction process
+sam_worker.py              Persistent interactive SAM assistant process
 video_review_worker.py     Video review prediction process
 inference_worker.py        Video inference process
 analysis_ops.py            Inference CSV analysis workflow
@@ -474,6 +484,9 @@ responsibilities are incrementally moved into the `squeakpose` package. Project
 formats and worker entry points remain backward compatible during this
 transition.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership, worker protocol contracts,
+project-data guardrails, and the contribution path for new workflows.
+
 ## Development Checks
 
 Install the locked developer tools without the application dependencies:
@@ -489,6 +502,16 @@ uv run --locked --only-group dev ruff check .
 uv run --locked --only-group dev ruff format --check .
 ```
 
+Type-check the project, annotation, service, and worker boundaries:
+
+```bash
+uv run --locked --only-group dev mypy
+```
+
+The checked paths are configured in `pyproject.toml`. Missing third-party stubs are
+ignored because parts of the Qt and scientific/model stack do not publish complete
+typing metadata; local errors in the configured SqueakPose modules still fail the check.
+
 Apply Ruff's safe lint fixes and formatter locally:
 
 ```bash
@@ -496,11 +519,34 @@ uv run --locked --only-group dev ruff check --fix .
 uv run --locked --only-group dev ruff format .
 ```
 
-Run the unit tests:
+Install and run the same reduced dependency set used by CI:
 
 ```bash
+uv lock --check
+uv sync --locked --only-group test
 uv run --locked --only-group test python -m unittest discover -s tests -q
+QT_QPA_PLATFORM=offscreen uv run --locked --only-group test \
+  python tests/render_ui_screenshots.py --output-dir /tmp/squeakpose-ui
 ```
+
+The test group explicitly includes OpenCV and PyAV because annotation and video-encoder
+tests import them directly; `--only-group test` does not install the application runtime
+dependencies implicitly.
+
+Before a release, also exercise the locked application dependency set from a clean
+checkout:
+
+```bash
+uv lock --check
+uv sync --locked
+QT_QPA_PLATFORM=offscreen uv run --locked python -m unittest -q tests.test_main_window_lifecycle
+```
+
+The lifecycle test creates a temporary project, opens the complete main window without
+model weights, closes it, and verifies project-lock cleanup. The Phase 6 acceptance was
+also reproduced in a clean temporary workspace using the locked test-only group: the
+complete unit suite, lifecycle smoke, and all UI screenshot renders passed. The locked
+full dependency environment passed the same application smoke path.
 
 Run the PyTorch and Ultralytics environment check:
 

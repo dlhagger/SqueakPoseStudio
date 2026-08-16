@@ -15,8 +15,8 @@ from typing import Any, Callable, Optional
 import numpy as np
 import pandas as pd
 
-from layer_ops import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
-from squeakpose_core import commit_staged_paths, remove_path, staging_path_for
+from squeakpose.core import commit_staged_paths, remove_path, staging_path_for
+from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 

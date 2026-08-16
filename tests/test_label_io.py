@@ -2,7 +2,10 @@ import os
 import unittest
 from tempfile import TemporaryDirectory
 
-from label_io import (
+import label_io
+import squeakpose.annotation as annotation_package
+import squeakpose.annotation.serialization as serialization
+from squeakpose.annotation.serialization import (
     load_pose_annotations_from_file,
     load_segmentation_annotations_from_file,
     parse_pose_label_line,
@@ -13,6 +16,24 @@ from label_io import (
 
 
 class LabelIoTests(unittest.TestCase):
+    def test_legacy_and_package_exports_preserve_function_identity(self):
+        public_names = (
+            "load_pose_annotations_from_file",
+            "load_segmentation_annotations_from_file",
+            "parse_pose_label_line",
+            "parse_segmentation_label_line",
+            "pose_annotation_to_line",
+            "segmentation_annotation_to_line",
+        )
+
+        for name in public_names:
+            package_function = getattr(annotation_package, name)
+            self.assertIs(getattr(label_io, name), package_function)
+            self.assertEqual(package_function.__module__, "squeakpose.annotation.serialization")
+
+        self.assertFalse(hasattr(label_io, "parse_yolo_pose_label_line"))
+        self.assertFalse(hasattr(serialization, "parse_yolo_pose_label_line"))
+
     def test_pose_annotation_round_trips_through_canonical_keypoint_order(self):
         canonical_names = ["nose", "head", "tail"]
         class_lookup = [["nose", "tail"]]

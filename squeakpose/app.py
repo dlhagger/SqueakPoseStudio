@@ -17,7 +17,7 @@ from squeakpose.project.paths import (
     save_last_project,
 )
 from squeakpose.project.safety import ProjectPathError
-from ui_style import app_stylesheet
+from squeakpose.ui.style import app_stylesheet
 
 
 def run(argv: list[str] | None = None) -> int:

@@ -4,24 +4,39 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
-.DS_Store
+*.egg-info/
+
+# Tool and test caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+.mpl-cache/
+.xdg-cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
 
 # Virtual environments
-.venv
+.venv/
+
+# OS-generated files
+.DS_Store
 
 # Local model artifacts
-sam3.pt
-yolo26*-depth.pt
+/sam3.pt
+/yolo26*-depth.pt
 
-# App runtime data
-annotations/
-datasets/
-images_all/
-images_to_label/
-labels_all/
-runs/
-class_keypoints.json
-classes.txt
-keypoints.txt
+# App runtime data created when the repository root is used as a project
+/annotations/
+/datasets/
+/images_all/
+/images_to_label/
+/labels_all/
+/runs/
+/class_keypoints.json
+/classes.txt
+/keypoints.txt
 *.sqp_preds.json

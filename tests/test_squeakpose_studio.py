@@ -4,6 +4,13 @@ import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from squeakpose.annotation.documents import PoseAnnotationDocument, PoseDocumentSnapshot
+from squeakpose.services.frame_annotations import (
+    build_pose_save_request,
+    load_pose_document,
+    load_segmentation_document,
+)
+
 _OPTIONAL_STUDIO_IMPORT_MODULES = {"PyQt6", "cv2", "numpy", "torch", "ultralytics", "yaml"}
 
 
@@ -108,6 +115,52 @@ class _FakeCombo:
     VideoReviewDialog is None, f"squeakpose_studio import unavailable: {_STUDIO_IMPORT_ERROR}"
 )
 class StudioVideoReviewTests(unittest.TestCase):
+    def test_annotation_load_wrappers_delegate_to_typed_file_service(self):
+        with TemporaryDirectory() as tmp:
+            pose_path = os.path.join(tmp, "pose.txt")
+            with open(pose_path, "w", encoding="utf-8") as handle:
+                handle.write("0 0.5 0.5 0.4 0.4 0.2 0.3 2\n")
+            segmentation_path = os.path.join(tmp, "segmentation.txt")
+            with open(segmentation_path, "w", encoding="utf-8") as handle:
+                handle.write("0 0.1 0.1 0.8 0.1 0.5 0.8\n")
+
+            class LoadDummy:
+                classes = ["mouse"]
+                kp_names = ["nose"]
+                img_w = 100
+                img_h = 50
+                segmentation = False
+
+                def _is_seg_workflow(self):
+                    return self.segmentation
+
+                def _kp_names_for_index(self, _class_id):
+                    return ["nose"]
+
+                def _load_seg_annotations_from_file(self, label_file):
+                    return LabelingApp._load_seg_annotations_from_file(self, label_file)
+
+            app = LoadDummy()
+            with patch(
+                "squeakpose.ui.main_window.load_pose_document",
+                wraps=load_pose_document,
+            ) as pose_loader:
+                pose_entries = LabelingApp._load_annotations_from_file(app, pose_path)
+
+            app.segmentation = True
+            with patch(
+                "squeakpose.ui.main_window.load_segmentation_document",
+                wraps=load_segmentation_document,
+            ) as segmentation_loader:
+                segmentation_entries = LabelingApp._load_annotations_from_file(
+                    app, segmentation_path
+                )
+
+        pose_loader.assert_called_once()
+        segmentation_loader.assert_called_once()
+        self.assertEqual(pose_entries[0]["keypoints"][0]["name"], "nose")
+        self.assertEqual(len(segmentation_entries[0]["segments"]), 3)
+
     def test_retain_main_window_stores_reference_on_qapplication(self):
         fake_app = type("FakeApp", (), {})()
         marker = object()
@@ -193,69 +246,77 @@ class StudioVideoReviewTests(unittest.TestCase):
                     {"mouse": ["nose", "tail"]},
                 )
 
-    def test_prediction_result_for_previous_image_is_discarded(self):
+    def test_prediction_payload_rejects_a_mismatched_declared_layer(self):
+        errors = []
+        cleaned = []
+        app = type("PredictionApplyDummy", (), {})()
+        app.active_layer = "keypoints"
+        app.images = ["current.png"]
+        app.current_idx = 0
+        app.project_root = "/tmp/project"
+        app._cleanup_prediction_depth_staging = lambda: cleaned.append(True)
+        app._on_predict_error = errors.append
+
+        LabelingApp._apply_prediction_payload(
+            app,
+            {
+                "layer_id": "segmentation",
+                "workflow": "segmentation",
+                "detections": [],
+            },
+        )
+
+        self.assertEqual(cleaned, [True])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("does not match", errors[0])
+
+    def test_depth_prediction_application_commits_all_staged_outputs(self):
         with TemporaryDirectory() as tmp:
-            app = type("PredictionDummy", (), {})()
-            app.images = ["second.png"]
-            app.current_idx = 0
-            app.active_image_dir = tmp
-            app._prediction_current_request_id = 7
-            app._prediction_image_path = os.path.join(tmp, "first.png")
-            app._predict_busy = True
-            applied = []
+            staged = {
+                "map": os.path.join(tmp, ".frame.npy.tmp"),
+                "preview": os.path.join(tmp, ".frame_depth.png.tmp"),
+                "metadata": os.path.join(tmp, ".frame_depth.json.tmp"),
+            }
+            final = {
+                "map": os.path.join(tmp, "frame.npy"),
+                "preview": os.path.join(tmp, "frame_depth.png"),
+                "metadata": os.path.join(tmp, "frame_depth.json"),
+            }
+            for key, path in staged.items():
+                with open(path, "wb") as handle:
+                    handle.write(key.encode("utf-8"))
+
+            calls = []
             statuses = []
-            app._apply_prediction_payload = applied.append
+            app = type("DepthPredictionApplyDummy", (), {})()
+            app.active_layer = "depth"
+            app._prediction_depth_targets = {
+                **{f"staged_{key}": path for key, path in staged.items()},
+                **{f"final_{key}": path for key, path in final.items()},
+            }
+            app._clear_depth_probes = lambda: calls.append("clear")
+            app.load_image = lambda: calls.append("load")
+            app._update_progress_label = lambda: calls.append("progress")
             app.update_status_bar = statuses.append
-            app._displayed_image_path = lambda: LabelingApp._displayed_image_path(app)
 
-            LabelingApp._handle_prediction_event_line(
+            LabelingApp._apply_prediction_payload(
                 app,
-                json.dumps(
-                    {
-                        "event": "result",
-                        "request_id": 7,
-                        "canceled": False,
-                        "had_error": False,
-                        "prediction": {"detections": []},
-                    }
-                ),
+                {
+                    "ok": True,
+                    "layer_id": "depth",
+                    "workflow": "depth",
+                    "depth_metadata": {"median_depth": 1.2345},
+                },
             )
 
-            self.assertEqual(applied, [])
-            self.assertFalse(app._predict_busy)
-            self.assertIsNone(app._prediction_current_request_id)
-            self.assertIn("discarded", statuses[-1].lower())
-
-    def test_prediction_result_for_displayed_image_is_applied(self):
-        with TemporaryDirectory() as tmp:
-            current_path = os.path.join(tmp, "current.png")
-            app = type("PredictionDummy", (), {})()
-            app.images = ["current.png"]
-            app.current_idx = 0
-            app.active_image_dir = tmp
-            app._prediction_current_request_id = 8
-            app._prediction_image_path = current_path
-            app._predict_busy = True
-            applied = []
-            app._apply_prediction_payload = applied.append
-            app.update_status_bar = lambda _message: None
-            app._displayed_image_path = lambda: LabelingApp._displayed_image_path(app)
-            prediction = {"detections": []}
-
-            LabelingApp._handle_prediction_event_line(
-                app,
-                json.dumps(
-                    {
-                        "event": "result",
-                        "request_id": 8,
-                        "canceled": False,
-                        "had_error": False,
-                        "prediction": prediction,
-                    }
-                ),
-            )
-
-            self.assertEqual(applied, [prediction])
+            self.assertIsNone(app._prediction_depth_targets)
+            self.assertEqual(calls, ["clear", "load", "progress"])
+            self.assertIn("1.234 m", statuses[-1])
+            for key, path in final.items():
+                self.assertTrue(os.path.isfile(path))
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), key.encode("utf-8"))
+                self.assertFalse(os.path.exists(staged[key]))
 
     def test_video_reviewer_opens_from_depth_without_models(self):
         app = type("ReviewerDummy", (), {})()
@@ -515,23 +576,6 @@ class StudioVideoReviewTests(unittest.TestCase):
 
             self.assertEqual(os.listdir(outside), ["sample.mp4"])
 
-    def test_segmentation_rows_include_no_detection_frames(self):
-        app = LabelingApp.__new__(LabelingApp)
-        app.classes = ["mouse"]
-        results = _Results(boxes=_EmptyBoxes())
-
-        rows = LabelingApp._segmentation_rows_from_result(
-            app,
-            results,
-            frame_idx=12,
-            include_binary_mask=False,
-        )
-
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["frame"], 12)
-        self.assertEqual(rows[0]["det"], -1)
-        self.assertEqual(rows[0]["class_id"], "")
-
     def test_backup_label_dir_copies_existing_labels(self):
         with TemporaryDirectory() as tmp:
             labels_dir = os.path.join(tmp, "labels_all")
@@ -576,7 +620,8 @@ class StudioVideoReviewTests(unittest.TestCase):
                 with open(path, "wb") as f:
                     f.write(b"data")
 
-            removed, errors = LabelingApp._delete_image_files(app, frame)
+            deletion_plan = LabelingApp._image_deletion_plan(app, frame)
+            removed, errors = LabelingApp._delete_planned_image_files(app, deletion_plan.paths)
 
             self.assertEqual(errors, [])
             for path in paths:
@@ -661,7 +706,17 @@ class StudioVideoReviewTests(unittest.TestCase):
             app.project_root = tmp
             app.label_dir = labels
             app.classes = ["mouse"]
-            app.annotation_cache = {0: {"class_id": 0}}
+            app.kp_names = []
+            app.img_w = 100
+            app.img_h = 100
+            app.annotation_cache = PoseAnnotationDocument(
+                {
+                    0: {
+                        "bbox": {"x": 40.0, "y": 40.0, "w": 20.0, "h": 20.0},
+                        "keypoints": [],
+                    }
+                }
+            )
             app.current_image_path = source_path
             app.active_image_dir = queue
             app.image_dir_queue = queue
@@ -672,11 +727,17 @@ class StudioVideoReviewTests(unittest.TestCase):
                     "squeakpose.ui.main_window.commit_staged_paths",
                     side_effect=OSError("injected failure"),
                 ),
+                patch(
+                    "squeakpose.ui.main_window.build_pose_save_request",
+                    wraps=build_pose_save_request,
+                ) as build_request,
                 patch("squeakpose.ui.main_window.QMessageBox.warning"),
             ):
                 saved = LabelingApp.save_labels(app)
 
             self.assertFalse(saved)
+            build_request.assert_called_once()
+            self.assertIsInstance(build_request.call_args.args[0], PoseDocumentSnapshot)
             with open(image_path, "rb") as fh:
                 self.assertEqual(fh.read(), b"old-image")
             with open(label_path, "r", encoding="utf-8") as fh:

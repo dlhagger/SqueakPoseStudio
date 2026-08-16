@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
 import sys
 from typing import Optional
 
@@ -47,20 +46,41 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from layer_ops import (
+from squeakpose.annotation.video_view import VideoView
+from squeakpose.core import (
+    atomic_write_text,
+    commit_staged_paths,
+    effective_prediction_batch,
+    remove_path,
+    stable_path_id,
+    staging_path_for,
+)
+from squeakpose.json_io import read_json_file
+from squeakpose.project.layers import (
     LAYER_KEYPOINTS,
     LAYER_SEGMENTATION,
     layer_definition,
     normalize_layer_id,
 )
-from prediction_ops import rank_prediction_frames
-from squeakpose.annotation.video_view import VideoView
-from squeakpose.json_io import read_json_file
-from squeakpose.project.paths import ProjectPaths
-from squeakpose.project.safety import require_path_within_project
+from squeakpose.services.video_review import (
+    MAX_VIDEO_CACHE_BYTES,
+    available_export_frame_indices,
+    build_video_review_cache_payload,
+    build_video_review_pass_config,
+    build_video_signature,
+    complete_video_review_pass,
+    decide_video_review_cache,
+    exported_frame_indices,
+    plan_confidence_export,
+    plan_export_frame_path,
+    plan_video_review_run,
+    select_random_export_frames,
+    video_review_cache_path,
+)
 from squeakpose.workers.process import (
+    WorkerJobController,
+    WorkerJobResult,
     create_worker_config,
-    request_qprocess_stop,
 )
 from squeakpose.workers.process import (
     remove_file_quietly as _remove_file_quietly,
@@ -69,19 +89,10 @@ from squeakpose.workers.process import (
     shutdown_qprocess as _shutdown_qprocess,
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
-from squeakpose_core import (
-    atomic_write_text,
-    commit_staged_paths,
-    effective_prediction_batch,
-    remove_path,
-    stable_path_id,
-    staging_path_for,
-)
 
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
-MAX_VIDEO_CACHE_BYTES = 128 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 try:
@@ -187,6 +198,7 @@ class VideoReviewDialog(QDialog):
         }
         self.preds: dict[int, dict] = self.preds_by_layer[self.layer_id]
         self._last_frame_bgr = None  # holds the current raw frame for export
+        self._review_job: Optional[WorkerJobController] = None
         self._review_process: Optional[QProcess] = None
         self._review_progress: Optional[QProgressDialog] = None
         self._review_stdout_buffer = ""
@@ -204,6 +216,7 @@ class VideoReviewDialog(QDialog):
         self._review_pass_index = 0
         self._review_pass_total = 0
         self._review_settings: dict = {}
+        self._review_closing = False
 
         # build all widgets/layouts
         self._build_ui()
@@ -485,34 +498,10 @@ class VideoReviewDialog(QDialog):
 
     # ---------- caching ----------
     def _cache_path(self) -> Optional[str]:
-        if not self.path:
-            return None
-        cache_dir = ProjectPaths.from_root(self.project_root).video_prediction_cache
-        source_id = stable_path_id(self.path, length=16)
-        return require_path_within_project(
-            self.project_root,
-            os.path.join(cache_dir, f"{source_id}.json"),
-            purpose="video prediction cache",
-            allow_root=False,
-        )
+        return video_review_cache_path(self.project_root, self.path)
 
     def _video_signature(self) -> dict:
-        try:
-            return {
-                "path": os.path.abspath(self.path) if self.path else "",
-                "size": int(os.path.getsize(self.path)) if self.path else 0,
-                "mtime": float(os.path.getmtime(self.path)) if self.path else 0.0,
-                "total": int(self.total),
-                "fps": float(self.fps),
-            }
-        except Exception:
-            return {
-                "path": os.path.abspath(self.path) if self.path else "",
-                "size": 0,
-                "mtime": 0.0,
-                "total": int(self.total),
-                "fps": float(self.fps),
-            }
+        return build_video_signature(self.path, total=self.total, fps=self.fps)
 
     def _load_cache_if_valid(self) -> bool:
         try:
@@ -537,54 +526,24 @@ class VideoReviewDialog(QDialog):
                 max_bytes=MAX_VIDEO_CACHE_BYTES,
                 require_object=True,
             )
-            meta = data.get("meta", {})
-            vid = meta.get("video", {})
-            cur = self._video_signature()
-
-            # Same file check (path/size) and mtime within a couple seconds
-            if (vid.get("path") != cur.get("path")) or (
-                int(vid.get("size", -1)) != int(cur.get("size", -2))
-            ):
+            active_layer = getattr(self, "layer_id", getattr(self, "workflow", WORKFLOW_POSE))
+            decision = decide_video_review_cache(
+                data,
+                current_video=self._video_signature(),
+                review_layers=getattr(self, "review_layers", []),
+                model_paths=getattr(self, "model_paths", {}),
+                layer_id=active_layer,
+                model_path=getattr(self, "model_path", None),
+                workflow=getattr(self, "workflow", WORKFLOW_POSE),
+            )
+            if decision is None:
                 return False
-            if abs(float(vid.get("mtime", 0.0)) - float(cur.get("mtime", 0.0))) > 2.0:
-                return False
-
-            saved_models = meta.get("model_paths")
-            cached_by_layer = data.get("preds_by_layer")
-            if isinstance(saved_models, dict) and isinstance(cached_by_layer, dict):
-                for layer in self.review_layers:
-                    if str(saved_models.get(layer) or "") != str(self.model_paths.get(layer) or ""):
-                        return False
-                loaded_by_layer: dict[str, dict[int, dict]] = {}
-                for layer in (LAYER_KEYPOINTS, LAYER_SEGMENTATION):
-                    raw = cached_by_layer.get(layer) or {}
-                    if isinstance(raw, dict):
-                        loaded_by_layer[layer] = {
-                            int(k): v for k, v in raw.items() if isinstance(v, dict)
-                        }
-                for layer, predictions in loaded_by_layer.items():
-                    self.preds_by_layer[layer] = predictions
-                self.preds = self.preds_by_layer.get(self.layer_id, {})
-                return any(self.preds_by_layer.values())
-
-            # Backward-compatible single-layer cache.
-            mp_saved = meta.get("model_path")
-            if mp_saved and self.model_path and (mp_saved != self.model_path):
-                return False
-            saved_workflow = str(meta.get("workflow", WORKFLOW_POSE)).strip().lower()
-            if saved_workflow != self.workflow:
-                return False
-            preds = data.get("preds", {})
-            if not isinstance(preds, dict):
-                return False
-            legacy_predictions = {int(k): v for k, v in preds.items() if isinstance(v, dict)}
             if hasattr(self, "preds_by_layer"):
-                legacy_layer = normalize_layer_id(getattr(self, "layer_id", saved_workflow))
-                self.preds_by_layer[legacy_layer] = legacy_predictions
-                self.preds = self.preds_by_layer[legacy_layer]
+                self.preds_by_layer.update(decision.predictions_by_layer)
+                self.preds = self.preds_by_layer.get(active_layer, {})
             else:
-                self.preds = legacy_predictions
-            return bool(self.preds)
+                self.preds = decision.predictions_by_layer.get(normalize_layer_id(active_layer), {})
+            return decision.has_predictions
         except (OSError, UnicodeError, TypeError, ValueError, AttributeError):
             logger.warning(
                 "Ignored invalid video prediction cache",
@@ -615,14 +574,7 @@ class VideoReviewDialog(QDialog):
             return
         if not fp:
             return
-        data = {
-            "meta": meta,
-            "preds_by_layer": {
-                layer: {str(k): v for k, v in predictions.items()}
-                for layer, predictions in self.preds_by_layer.items()
-                if predictions
-            },
-        }
+        data = build_video_review_cache_payload(meta, self.preds_by_layer)
         try:
             serialized = json.dumps(data)
             if len(serialized.encode("utf-8")) > MAX_VIDEO_CACHE_BYTES:
@@ -729,6 +681,16 @@ class VideoReviewDialog(QDialog):
             self.view.reset_view()
 
     # ---------- prediction ----------
+    def _review_prediction_is_running(self) -> bool:
+        job = self._review_job
+        if job is not None:
+            return job.is_running
+        process = self._review_process
+        return process is not None and process.state() != QProcess.ProcessState.NotRunning
+
+    def _create_review_job_controller(self) -> WorkerJobController:
+        return WorkerJobController(self)
+
     def _start_range_prediction(self):
         if self.cap is None or not self.path:
             QMessageBox.information(self, "No video", "Load a video first.")
@@ -740,10 +702,7 @@ class VideoReviewDialog(QDialog):
                 "Configure a Keypoints or Segmentation model in Project Models first.",
             )
             return
-        if (
-            self._review_process is not None
-            and self._review_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self._review_prediction_is_running():
             QMessageBox.information(
                 self, "Prediction running", "Video prediction is already running."
             )
@@ -767,42 +726,32 @@ class VideoReviewDialog(QDialog):
             QMessageBox.warning(self, "Range Error", "End must be ≥ Start.")
             return
 
-        steps = max(1, ((end - start) // stride) + 1)
-        total_steps = steps * len(self.review_layers)
-        prog = QProgressDialog("Preparing project models…", "Cancel", 0, total_steps, self)
+        run_plan = plan_video_review_run(
+            video_signature=self._video_signature(),
+            model_paths=self.model_paths,
+            review_layers=self.review_layers,
+            layer_schemas=self.layer_schemas,
+            start=start,
+            end=end,
+            stride=stride,
+            imgsz=imgsz,
+            conf=conf,
+            iou=iou,
+            kpvis=kpvis,
+            requested_batch=requested_batch,
+            effective_batch=effective_batch,
+            total=self.total,
+            fps=self.fps,
+        )
+        prog = QProgressDialog("Preparing project models…", "Cancel", 0, run_plan.total_steps, self)
         prog.setWindowTitle("Project Video Review")
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         prog.setMinimumDuration(0)
         prog.setValue(0)
         prog.canceled.connect(self._cancel_review_prediction_process)
 
-        self._review_run_meta = {
-            "video": self._video_signature(),
-            "model_paths": {layer: self.model_paths[layer] for layer in self.review_layers},
-            "layers": list(self.review_layers),
-            "imgsz": imgsz,
-            "conf": conf,
-            "iou": iou,
-            "kpvis": kpvis,
-            "start": start,
-            "end": end,
-            "stride": stride,
-            "batch": requested_batch,
-            "initial_effective_batch": effective_batch,
-            "total": self.total,
-            "fps": self.fps,
-            "schemas": {layer: self.layer_schemas.get(layer, {}) for layer in self.review_layers},
-        }
-        self._review_settings = {
-            "start": start,
-            "end": end,
-            "stride": stride,
-            "imgsz": imgsz,
-            "conf": conf,
-            "iou": iou,
-            "batch": requested_batch,
-            "effective_batch": effective_batch,
-        }
+        self._review_run_meta = run_plan.meta
+        self._review_settings = run_plan.settings
         self._review_progress = prog
         self._review_cancel_requested = False
         self._review_run_canceled = False
@@ -810,7 +759,7 @@ class VideoReviewDialog(QDialog):
         self._review_job_queue = list(self.review_layers)
         self._review_pass_total = len(self.review_layers)
         self._review_pass_index = 0
-        self._review_steps_per_pass = steps
+        self._review_steps_per_pass = run_plan.steps_per_pass
         for layer in self.review_layers:
             self.preds_by_layer[layer] = {}
         self.preds = self.preds_by_layer[self.layer_id]
@@ -830,15 +779,13 @@ class VideoReviewDialog(QDialog):
         layer_id = self._review_job_queue.pop(0)
         self._review_current_layer = layer_id
         self._review_pass_index += 1
-        workflow = layer_definition(layer_id).worker_mode
-        config = {
-            "model_path": self.model_paths.get(layer_id) or "",
-            "video_path": self.path,
-            "workflow": workflow,
-            "layer_id": layer_id,
-            "device": self.device,
-            **self._review_settings,
-        }
+        config = build_video_review_pass_config(
+            layer_id=layer_id,
+            model_path=self.model_paths.get(layer_id) or "",
+            video_path=self.path,
+            device=self.device,
+            settings=self._review_settings,
+        )
 
         config_dir = os.path.join(self.project_root, "logs")
         try:
@@ -853,16 +800,14 @@ class VideoReviewDialog(QDialog):
             QTimer.singleShot(0, self._start_next_review_prediction_pass)
             return
 
-        process = QProcess(self)
-        process.setProgram(sys.executable)
-        process.setArguments(["-m", "video_review_worker", "--config", config_path])
-        process.setWorkingDirectory(APP_BASE_DIR)
-        process.readyReadStandardOutput.connect(self._read_review_prediction_stdout)
-        process.readyReadStandardError.connect(self._read_review_prediction_stderr)
-        process.finished.connect(self._finish_review_prediction_process)
-        process.errorOccurred.connect(self._handle_review_prediction_error)
+        job = self._create_review_job_controller()
+        job.event_received.connect(self._handle_review_prediction_event)
+        job.output_received.connect(self._handle_review_prediction_output)
+        job.stderr_received.connect(self._handle_review_prediction_stderr)
+        job.terminal.connect(self._finish_review_prediction_job)
 
-        self._review_process = process
+        self._review_job = job
+        self._review_process = None
         self._review_stdout_buffer = ""
         self._review_stderr = ""
         self._review_result_event = None
@@ -874,11 +819,15 @@ class VideoReviewDialog(QDialog):
                 f"Pass {self._review_pass_index}/{self._review_pass_total} · "
                 f"Loading {layer_definition(layer_id).display_name} model…"
             )
-        process.start()
-        if not process.waitForStarted(1000):
-            self._review_stderr = process.errorString()
-            self._finish_review_prediction_process(1, QProcess.ExitStatus.CrashExit)
-            return
+        started = job.start(
+            sys.executable,
+            ["-m", "video_review_worker", "--config", config_path],
+            config_path=config_path,
+            working_directory=APP_BASE_DIR,
+            start_timeout_ms=1000,
+        )
+        if started and self._review_job is job:
+            self._review_process = job.process
 
     def _read_review_prediction_stdout(self):
         process = self._review_process
@@ -904,15 +853,26 @@ class VideoReviewDialog(QDialog):
             "utf-8", errors="replace"
         )
 
+    def _handle_review_prediction_output(self, line: str) -> None:
+        if line:
+            self._review_stderr += line.rstrip("\n") + "\n"
+
+    def _handle_review_prediction_stderr(self, line: str) -> None:
+        if line:
+            self._review_stderr += line.rstrip("\n") + "\n"
+
     def _handle_review_prediction_event_line(self, line: str):
         if not line:
             return
         try:
             event = parse_event_line(line).as_dict()
         except WorkerProtocolError:
-            self._review_stderr += line + "\n"
+            self._handle_review_prediction_output(line)
             return
 
+        self._handle_review_prediction_event(event)
+
+    def _handle_review_prediction_event(self, event: dict) -> None:
         event_type = event.get("event")
         if event_type == "started":
             progress = self._review_progress
@@ -979,8 +939,8 @@ class VideoReviewDialog(QDialog):
 
     def _cancel_review_prediction_process(self):
         self._review_run_canceled = True
-        process = self._review_process
-        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+        job = self._review_job
+        if job is None or not job.is_running:
             self._review_job_queue.clear()
             self._finish_project_review_prediction()
             return
@@ -988,39 +948,52 @@ class VideoReviewDialog(QDialog):
         progress = self._review_progress
         if progress is not None:
             progress.setLabelText("Canceling prediction process…")
-        request_qprocess_stop(
-            process,
-            schedule=QTimer.singleShot,
-            force_kill=self._kill_review_prediction_if_running,
-            kill_after_ms=5000,
-        )
+        job.cancel(kill_after_ms=5000)
 
     def _kill_review_prediction_if_running(self):
-        process = self._review_process
+        job = self._review_job
+        process = job.process if job is not None else self._review_process
         if process is not None and process.state() != QProcess.ProcessState.NotRunning:
             process.kill()
 
     def _handle_review_prediction_error(self, _error):
-        process = self._review_process
+        job = self._review_job
+        process = job.process if job is not None else self._review_process
         if process is not None:
             self._review_stderr += process.errorString() + "\n"
 
-    def _finish_review_prediction_process(self, exit_code: int, exit_status):
+    def _finish_review_prediction_process(self, exit_code: int, exit_status) -> None:
+        """Compatibility adapter for callers using the former QProcess callback."""
         if self._review_process is None and self._review_config_path is None:
             return
         if self._review_stdout_buffer.strip():
             self._handle_review_prediction_event_line(self._review_stdout_buffer.strip())
             self._review_stdout_buffer = ""
+        _remove_file_quietly(self._review_config_path)
+        state = (
+            "cancelled"
+            if self._review_cancel_requested
+            else "finished"
+            if int(exit_code) == 0
+            else "failed"
+        )
+        self._finish_review_prediction_job(
+            WorkerJobResult(
+                state=state,
+                exit_code=int(exit_code),
+                exit_status=exit_status,
+                stderr=self._review_stderr,
+            )
+        )
 
-        config_path = self._review_config_path
-        _remove_file_quietly(config_path)
-
+    def _finish_review_prediction_job(self, result: WorkerJobResult) -> None:
         event = self._review_result_event
         partial_preds = dict(self._review_partial_preds)
-        stderr_text = self._review_stderr.strip()
+        stderr_text = self._review_stderr.strip() or result.stderr.strip()
         cancel_requested = self._review_cancel_requested
         layer_id = self._review_current_layer
 
+        self._review_job = None
         self._review_process = None
         self._review_config_path = None
         self._review_result_event = None
@@ -1029,53 +1002,28 @@ class VideoReviewDialog(QDialog):
         self._review_stderr = ""
         self._review_cancel_requested = False
 
-        if cancel_requested and event is None:
-            event = {
-                "event": "result",
-                "canceled": True,
-                "had_error": False,
-                "error_message": "",
-                "preds": {},
-            }
+        if self._review_closing:
+            return
 
-        if event is None:
-            event = {
-                "event": "result",
-                "canceled": False,
-                "had_error": True,
-                "error_message": stderr_text or f"Process exited with code {exit_code}.",
-                "preds": {},
-            }
-
-        raw_preds = event.get("preds") or {}
-        layer_predictions: dict[int, dict] = {}
-        for key, value in partial_preds.items():
-            layer_predictions[key] = value
-        if isinstance(raw_preds, dict):
-            for key, value in raw_preds.items():
-                try:
-                    layer_predictions[int(key)] = (
-                        value if isinstance(value, dict) else {"ok": False}
-                    )
-                except Exception:
-                    continue
-        self.preds_by_layer[layer_id] = layer_predictions
+        completion = complete_video_review_pass(
+            partial_predictions=partial_preds,
+            result_event=event,
+            cancel_requested=cancel_requested,
+            worker_state=result.state,
+            exit_code=result.exit_code,
+            crashed=result.exit_status == QProcess.ExitStatus.CrashExit,
+            worker_error=result.error_message,
+            stderr=stderr_text,
+        )
+        self.preds_by_layer[layer_id] = completion.predictions
         self.preds = self.preds_by_layer.get(self.layer_id, {})
 
-        canceled = bool(event.get("canceled")) or cancel_requested
-        had_error = bool(event.get("had_error")) or (
-            not canceled and (exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0)
-        )
-        error_message = str(
-            event.get("error_message") or stderr_text or "Unknown video prediction error"
-        )
-
-        if had_error:
+        if completion.had_error:
             self._review_run_errors.append(
-                f"{layer_definition(layer_id).display_name}: {error_message}"
+                f"{layer_definition(layer_id).display_name}: {completion.error_message}"
             )
 
-        if canceled:
+        if completion.canceled:
             self._review_run_canceled = True
             self._review_job_queue.clear()
 
@@ -1089,6 +1037,7 @@ class VideoReviewDialog(QDialog):
         if progress is not None:
             progress.close()
         self._review_progress = None
+        self._review_job = None
         self._review_process = None
         self._review_config_path = None
         self.btn_predict.setEnabled(self.cap is not None and bool(self.review_layers))
@@ -1214,8 +1163,13 @@ class VideoReviewDialog(QDialog):
 
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            base_name = f"{self.base}_{self.video_source_id}_f{self.cur:06d}.png"
-            out_path = os.path.join(dest_dir, base_name)
+            out_path = plan_export_frame_path(
+                dest_dir,
+                video_base=self.base,
+                source_id=self.video_source_id,
+                frame_index=self.cur,
+                avoid_collisions=False,
+            )
 
             if _cv2 is None:
                 QMessageBox.warning(
@@ -1278,10 +1232,11 @@ class VideoReviewDialog(QDialog):
             QMessageBox.warning(self, "Export Error", f"Could not create destination folder:\n{e}")
             return
 
-        available = list(range(self.total))
         existing = self._existing_export_indices()
-        if existing:
-            available = [idx for idx in available if idx not in existing]
+        available = available_export_frame_indices(
+            self.total,
+            already_exported=existing,
+        )
         if not available:
             QMessageBox.information(
                 self,
@@ -1304,9 +1259,11 @@ class VideoReviewDialog(QDialog):
         if not ok or n <= 0:
             return
 
-        count = min(n, len(available))
-        selected = random.sample(available, count)
-        selected.sort()
+        selected = select_random_export_frames(
+            self.total,
+            already_exported=existing,
+            count=n,
+        )
 
         prog = QProgressDialog("Saving frames…", "Cancel", 0, len(selected), self)
         prog.setWindowTitle("Exporting")
@@ -1327,15 +1284,12 @@ class VideoReviewDialog(QDialog):
             if not ok or frame is None:
                 failed.append((fi, "read-failed"))
             else:
-                base_name = f"{self.base}_{self.video_source_id}_f{fi:06d}.png"
-                dest_path = os.path.join(dest_dir, base_name)
-                suffix = 1
-                while os.path.exists(dest_path):
-                    dest_path = os.path.join(
-                        dest_dir,
-                        f"{self.base}_{self.video_source_id}_f{fi:06d}_{suffix}.png",
-                    )
-                    suffix += 1
+                dest_path = plan_export_frame_path(
+                    dest_dir,
+                    video_base=self.base,
+                    source_id=self.video_source_id,
+                    frame_index=fi,
+                )
                 if self._write_frame_image(dest_path, frame):
                     saved += 1
                 else:
@@ -1387,28 +1341,17 @@ class VideoReviewDialog(QDialog):
 
     def _existing_export_indices(self) -> set[int]:
         """Scan the labeler's images_to_label folder for frames already exported for this video."""
-        out: set[int] = set()
         dest_dir = self._labeler_image_dir()
         if not dest_dir or not os.path.isdir(dest_dir):
-            return out
+            return set()
         try:
-            import re
-
-            prefix = f"{self.base}_{self.video_source_id}_f"
-            pat = re.compile(
-                rf"^{re.escape(prefix)}(\d{{6}})(?:_.*)?\.(?:png|jpg|jpeg|bmp|webp)$",
-                re.IGNORECASE,
+            return exported_frame_indices(
+                os.listdir(dest_dir),
+                video_base=self.base,
+                source_id=self.video_source_id,
             )
-            for fn in os.listdir(dest_dir):
-                m = pat.match(fn)
-                if m:
-                    try:
-                        out.add(int(m.group(1)))
-                    except Exception:
-                        pass
         except Exception:
-            pass
-        return out
+            return set()
 
     def _export_low_confidence_frames(self):
         self._export_predictions_by_confidence(order="low")
@@ -1483,13 +1426,14 @@ class VideoReviewDialog(QDialog):
                 return
             ranking_label = ranking_choice
 
-        candidates = rank_prediction_frames(
+        export_plan = plan_confidence_export(
             ranking_predictions,
             class_ids=ranking_class_ids,
             order=order_key,
             balanced=balanced,
+            already_exported=self._existing_export_indices(),
         )
-        if not candidates:
+        if not export_plan.candidates:
             QMessageBox.information(
                 self,
                 "No predictions",
@@ -1504,8 +1448,7 @@ class VideoReviewDialog(QDialog):
             order_label = "highest"
             dialog_title = f"Export Highest {ranking_layer_name} Confidence"
 
-        already = self._existing_export_indices()
-        pending = [candidate for candidate in candidates if candidate[0] not in already]
+        pending = export_plan.pending
         if not pending:
             QMessageBox.information(
                 self,
@@ -1528,7 +1471,14 @@ class VideoReviewDialog(QDialog):
         if not ok or n <= 0:
             return
 
-        selected = pending[: min(n, len(pending))]
+        selected = plan_confidence_export(
+            ranking_predictions,
+            class_ids=ranking_class_ids,
+            order=order_key,
+            balanced=balanced,
+            already_exported=self._existing_export_indices(),
+            count=n,
+        ).selected
 
         parent = self.parent()
         dest_dir = self._labeler_image_dir()
@@ -1568,15 +1518,12 @@ class VideoReviewDialog(QDialog):
             if not ok or frame is None:
                 failed.append((fi, "read-failed"))
             else:
-                base_name = f"{self.base}_{self.video_source_id}_f{fi:06d}.png"
-                dest_path = os.path.join(dest_dir, base_name)
-                suffix = 1
-                while os.path.exists(dest_path):
-                    dest_path = os.path.join(
-                        dest_dir,
-                        f"{self.base}_{self.video_source_id}_f{fi:06d}_{suffix}.png",
-                    )
-                    suffix += 1
+                dest_path = plan_export_frame_path(
+                    dest_dir,
+                    video_base=self.base,
+                    source_id=self.video_source_id,
+                    frame_index=fi,
+                )
                 if self._write_frame_image(dest_path, frame):
                     saved += 1
                     saved_rankings.append((ranking_conf, ranking_class_id))
@@ -1833,10 +1780,7 @@ class VideoReviewDialog(QDialog):
         return QPixmap.fromImage(qimg)
 
     def reject(self):
-        if (
-            self._review_process is not None
-            and self._review_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self._review_prediction_is_running():
             answer = QMessageBox.question(
                 self,
                 "Cancel prediction?",
@@ -1846,12 +1790,18 @@ class VideoReviewDialog(QDialog):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+            self._review_closing = True
             self._review_run_canceled = True
             self._review_job_queue.clear()
-            _shutdown_qprocess(self._review_process)
-            _remove_file_quietly(self._review_config_path)
+            job = self._review_job
+            if job is not None:
+                job.shutdown()
+            else:
+                _shutdown_qprocess(self._review_process)
+                _remove_file_quietly(self._review_config_path)
             if self._review_progress is not None:
                 self._review_progress.close()
+            self._review_job = None
             self._review_process = None
             self._review_progress = None
             self._review_config_path = None

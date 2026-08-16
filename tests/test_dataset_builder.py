@@ -1,13 +1,22 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import yaml
 
-from dataset_builder import create_dataset_yaml
+import dataset_builder
+import dataset_ops
+from squeakpose.services.dataset_yaml import create_dataset_yaml
 
 
 class DatasetBuilderTests(unittest.TestCase):
+    def test_legacy_and_dataset_ops_aliases_preserve_package_function_identity(self):
+        self.assertIs(dataset_builder.create_dataset_yaml, create_dataset_yaml)
+        self.assertIs(dataset_ops.create_dataset_yaml, create_dataset_yaml)
+        self.assertEqual(create_dataset_yaml.__module__, "squeakpose.services.dataset_yaml")
+        self.assertFalse(hasattr(dataset_builder, "_default_flip_indices"))
+
     def test_create_dataset_yaml_writes_expected_pose_metadata(self):
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -71,6 +80,31 @@ class DatasetBuilderTests(unittest.TestCase):
 
             data = yaml.safe_load(Path(out_path).read_text(encoding="utf-8"))
             self.assertEqual(data["path"], "/final/project/datasets/pose")
+
+    def test_package_writer_retains_atomic_write_patch_seam(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for rel in (
+                ("images", "train"),
+                ("images", "val"),
+                ("labels", "train"),
+                ("labels", "val"),
+            ):
+                (base.joinpath(*rel)).mkdir(parents=True, exist_ok=True)
+
+            with patch("squeakpose.services.dataset_yaml.atomic_write_text") as atomic_write:
+                output = create_dataset_yaml(
+                    str(base),
+                    ["mouse"],
+                    ["left_ear", "right_ear"],
+                    verbose=False,
+                )
+
+            self.assertEqual(output, str(base / "dataset.yaml"))
+            atomic_write.assert_called_once()
+            path, payload = atomic_write.call_args.args
+            self.assertEqual(path, output)
+            self.assertEqual(yaml.safe_load(payload)["flip_idx"], [1, 0])
 
 
 if __name__ == "__main__":

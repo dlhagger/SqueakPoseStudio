@@ -9,13 +9,13 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from layer_ops import layer_worker_mode, normalize_layer_id
-from squeakpose.json_io import read_json_file
-from squeakpose_core import (
+from squeakpose.core import (
     CURRENT_PROJECT_SCHEMA_VERSION,
     atomic_write_text,
     migrate_project_metadata,
 )
+from squeakpose.json_io import read_json_file
+from squeakpose.project.layers import layer_worker_mode, normalize_layer_id
 
 from .paths import PROJECT_META_FILE
 from .safety import require_path_within_project

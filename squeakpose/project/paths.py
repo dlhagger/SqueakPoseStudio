@@ -9,8 +9,8 @@ import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 
+from squeakpose.core import CURRENT_PROJECT_SCHEMA_VERSION, atomic_write_text
 from squeakpose.json_io import read_json_file
-from squeakpose_core import CURRENT_PROJECT_SCHEMA_VERSION, atomic_write_text
 
 from .safety import require_path_within_project
 

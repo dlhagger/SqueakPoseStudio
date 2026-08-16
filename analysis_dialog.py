@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import csv
-import datetime
+import json
 import math
 import os
 import sys
-from pathlib import Path
 from typing import Any, Optional
 
 from PyQt6.QtCore import QPointF, QProcess, QRectF, QSize, Qt, QUrl, pyqtSignal
@@ -48,7 +46,20 @@ from PyQt6.QtWidgets import (
 )
 
 from layer_ops import layer_definition, normalize_layer_id
+from squeakpose.services.analysis import (
+    AnalysisConfigError,
+    AnalysisRunConfig,
+    analysis_csv_matches_layer,
+    build_analysis_run_config,
+    default_analysis_output_dir,
+    inspect_analysis_csv,
+    latest_analysis_csv,
+    safe_analysis_stem,
+)
+from squeakpose.services.analysis_state import AnalysisAnnotationState
 from squeakpose.workers.process import (
+    WorkerJobController,
+    WorkerJobResult,
     create_worker_config,
     remove_file_quietly,
     shutdown_qprocess,
@@ -66,9 +77,7 @@ def _shutdown_qprocess(process: Optional[QProcess]) -> bool:
 
 
 def _safe_stem(path: str) -> str:
-    stem = Path(path).stem if path else "analysis"
-    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in stem).strip("_")
-    return cleaned or "analysis"
+    return safe_analysis_stem(path)
 
 
 def _fmt_number(value: Any, decimals: int = 2) -> str:
@@ -290,13 +299,11 @@ class AnalysisDialog(QDialog):
         self.setMinimumSize(1040, 680)
         self.project_root = os.path.abspath(project_root)
         self.app_base_dir = os.path.abspath(app_base_dir)
+        self.analysis_controller: Optional[WorkerJobController] = None
         self.analysis_process: Optional[QProcess] = None
         self.analysis_config_path: Optional[str] = None
-        self.analysis_stdout_buffer = ""
-        self.analysis_stderr_buffer = ""
         self.last_output_dir = ""
-        self.scale_points: list[tuple[float, float]] = []
-        self.rois: list[dict[str, Any]] = []
+        self.annotation_state = AnalysisAnnotationState()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -653,6 +660,33 @@ class AnalysisDialog(QDialog):
         self._sync_output_settings()
         self._load_preview_frame(silent=True)
 
+    @property
+    def scale_points(self) -> list[tuple[float, float]]:
+        """Compatibility view of the selected scale points."""
+        return list(self.annotation_state.scale_points)
+
+    @scale_points.setter
+    def scale_points(self, points: list[tuple[float, float]]) -> None:
+        self.annotation_state.set_scale_points(points)
+
+    @property
+    def pixel_distance_px(self) -> float:
+        """Compatibility alias for the domain state's pixel distance."""
+        return self.annotation_state.pixel_distance
+
+    @pixel_distance_px.setter
+    def pixel_distance_px(self, distance: float) -> None:
+        self.annotation_state.set_pixel_distance(distance)
+
+    @property
+    def rois(self) -> list[dict[str, Any]]:
+        """Compatibility export using the worker's existing ROI dictionaries."""
+        return self.annotation_state.worker_rois()
+
+    @rois.setter
+    def rois(self, rois: list[dict[str, Any]]) -> None:
+        self.annotation_state.replace_rois(rois)
+
     def _candidate_csv_dirs(self) -> list[str]:
         return [
             os.path.join(self.project_root, "inference outputs", self.layer_id),
@@ -661,35 +695,15 @@ class AnalysisDialog(QDialog):
         ]
 
     def _select_initial_csv(self) -> None:
-        candidates: list[str] = []
-        for folder in self._candidate_csv_dirs():
-            if os.path.isdir(folder):
-                for name in os.listdir(folder):
-                    if name.lower().endswith(".csv"):
-                        path = os.path.join(folder, name)
-                        if self._csv_matches_active_layer(path):
-                            candidates.append(path)
-        if candidates:
-            newest = max(candidates, key=lambda path: os.path.getmtime(path))
+        newest = latest_analysis_csv(self._candidate_csv_dirs(), self.layer_id)
+        if newest:
             self.csv_edit.setText(newest)
 
     def _csv_matches_active_layer(self, path: str) -> bool:
-        try:
-            with open(path, "r", encoding="utf-8", newline="") as handle:
-                fieldnames = set(next(csv.reader(handle), []))
-        except (OSError, csv.Error):
-            return False
-        is_segmentation = {"frame", "det", "mask_polygon"}.issubset(fieldnames)
-        return is_segmentation == (self.layer_id == "segmentation")
+        return analysis_csv_matches_layer(path, self.layer_id)
 
     def _default_output_dir_for_csv(self, csv_path: str) -> str:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        return os.path.join(
-            self.project_root,
-            "analysis outputs",
-            self.layer_id,
-            f"{_safe_stem(csv_path)}_{timestamp}",
-        )
+        return default_analysis_output_dir(self.project_root, self.layer_id, csv_path)
 
     def _refresh_default_output_dir(self) -> None:
         if self.output_edit.text().strip():
@@ -737,40 +751,11 @@ class AnalysisDialog(QDialog):
             self.output_edit.setText(path)
 
     def _video_path_from_csv(self) -> str:
-        csv_path = self.csv_edit.text().strip()
-        if not os.path.isfile(csv_path):
-            return ""
-        try:
-            import pandas as pd
-
-            raw = pd.read_csv(csv_path, nrows=1000)
-        except Exception:
-            return ""
-        if "video_path" not in raw.columns:
-            return ""
-        for value in raw["video_path"].dropna().unique():
-            path = str(value).strip()
-            if path and os.path.isfile(path):
-                return path
-        return ""
+        return inspect_analysis_csv(self.csv_edit.text().strip()).video_path
 
     def _frame_dimensions_from_csv(self) -> tuple[int, int]:
-        csv_path = self.csv_edit.text().strip()
-        if not os.path.isfile(csv_path):
-            return (1280, 720)
-        try:
-            import pandas as pd
-
-            raw = pd.read_csv(csv_path, nrows=1000)
-        except Exception:
-            return (1280, 720)
-        width = 0
-        height = 0
-        if "image_width" in raw.columns:
-            width = int(pd.to_numeric(raw["image_width"], errors="coerce").dropna().max() or 0)
-        if "image_height" in raw.columns:
-            height = int(pd.to_numeric(raw["image_height"], errors="coerce").dropna().max() or 0)
-        return (width or 1280, height or 720)
+        context = inspect_analysis_csv(self.csv_edit.text().strip())
+        return (context.width, context.height)
 
     def _blank_frame_pixmap(self, width: int, height: int) -> QPixmap:
         pixmap = QPixmap(width, height)
@@ -821,6 +806,7 @@ class AnalysisDialog(QDialog):
         loaded = self._load_video_pixmap(video_path)
         if loaded is not None:
             pixmap, width, height = loaded
+            self.annotation_state.set_frame_dimensions(width, height)
             self.frame_view.set_frame(pixmap, width, height)
             self.frame_info_label.setText(f"{width} x {height} | {os.path.basename(video_path)}")
             return
@@ -833,6 +819,7 @@ class AnalysisDialog(QDialog):
             )
 
         width, height = self._frame_dimensions_from_csv()
+        self.annotation_state.set_frame_dimensions(width, height)
         self.frame_view.set_frame(self._blank_frame_pixmap(width, height), width, height)
         self.frame_info_label.setText(f"{width} x {height} | CSV coordinates")
 
@@ -850,24 +837,23 @@ class AnalysisDialog(QDialog):
         )
 
     def _set_scale_points(self, points: list[tuple[float, float]]) -> None:
-        self.scale_points = [(float(x), float(y)) for x, y in points[:2]]
+        self.annotation_state.set_scale_points(points)
         self._update_scale_label()
 
     def _apply_scale_distance(self, distance: float) -> None:
         if distance > 0:
-            self.pixel_distance_px = float(distance)
+            self.annotation_state.set_pixel_distance(distance)
             self.pixel_distance_label.setText(f"{distance:.1f} px")
         self._update_scale_label()
 
     def _clear_scale(self) -> None:
-        self.scale_points = []
-        self.pixel_distance_px = 0.0
+        self.annotation_state.clear_scale()
         self.pixel_distance_label.setText("Draw scale")
         self.frame_view.set_scale_points([])
         self._update_scale_label()
 
     def _clear_rois(self) -> None:
-        self.rois = []
+        self.annotation_state.clear_rois()
         self._refresh_roi_list()
 
     def _clear_annotations(self) -> None:
@@ -875,10 +861,10 @@ class AnalysisDialog(QDialog):
         self._clear_rois()
 
     def _update_scale_label(self) -> None:
-        pixel_distance = self.pixel_distance_px
         real_distance = self.real_distance_spin.value()
-        if pixel_distance > 0:
-            mm_per_pixel = real_distance / pixel_distance
+        self.annotation_state.set_real_world_distance(real_distance)
+        mm_per_pixel = self.annotation_state.mm_per_pixel
+        if mm_per_pixel is not None:
             self.scale_status_label.setText(
                 f"{mm_per_pixel:.4f} mm/px | {len(self.scale_points)}/2"
             )
@@ -890,27 +876,26 @@ class AnalysisDialog(QDialog):
         name, accepted = QInputDialog.getText(self, "Name ROI", "ROI name:", text=default_name)
         if not accepted:
             return
-        roi["name"] = name.strip() or default_name
-        self.rois.append(roi)
+        self.annotation_state.add_roi(roi, name=name.strip() or default_name)
         self._refresh_roi_list()
 
     def _delete_selected_roi(self) -> None:
         row = self.roi_list.currentRow()
-        if 0 <= row < len(self.rois):
-            del self.rois[row]
+        if self.annotation_state.delete_roi(row):
             self._refresh_roi_list()
 
     def _refresh_roi_list(self) -> None:
         self.roi_list.clear()
-        for index, roi in enumerate(self.rois, start=1):
+        rois = self.annotation_state.worker_rois()
+        for index, roi in enumerate(rois, start=1):
             width = float(roi["x2"]) - float(roi["x1"])
             height = float(roi["y2"]) - float(roi["y1"])
             item = QListWidgetItem(
                 f"{index}. {roi.get('name', 'ROI')}  {width:.0f} x {height:.0f}px"
             )
             self.roi_list.addItem(item)
-        self.roi_count_label.setText(f"{len(self.rois)} ROI{'s' if len(self.rois) != 1 else ''}")
-        self.frame_view.set_rois(self.rois)
+        self.roi_count_label.setText(f"{len(rois)} ROI{'s' if len(rois) != 1 else ''}")
+        self.frame_view.set_rois(rois)
 
     def _append_log(self, text: str) -> None:
         if not text:
@@ -929,53 +914,45 @@ class AnalysisDialog(QDialog):
             self.progress.setValue(0)
 
     def _config_payload(self) -> dict[str, Any]:
-        return {
-            "layer_id": self.layer_id,
-            "detections_csv": self.csv_edit.text().strip(),
-            "video_path": self.video_edit.text().strip(),
-            "output_dir": self.output_edit.text().strip(),
-            "fps": 0.0,
-            "pixel_distance": self.pixel_distance_px,
-            "real_world_distance_mm": self.real_distance_spin.value(),
-            "smooth": self.smooth_check.isChecked(),
-            "min_cutoff": self.min_cutoff_spin.value(),
-            "beta": self.beta_spin.value(),
-            "d_cutoff": 1.0,
-            "make_plots": self.plots_check.isChecked(),
-            "make_annotated_video": self.annotated_video_check.isChecked(),
-            "run_clustering": self.cluster_check.isChecked(),
-            "export_cluster_clips": self.cluster_clips_check.isChecked(),
-            "umap_neighbors": self.umap_neighbors_spin.value(),
-            "umap_min_dist": self.umap_min_dist_spin.value(),
-            "hdbscan_min_cluster_size": self.hdbscan_min_cluster_size_spin.value(),
-            "cluster_clip_length_sec": self.clip_length_spin.value(),
-            "samples_per_cluster": self.samples_per_cluster_spin.value(),
-            "rois": [dict(roi) for roi in self.rois],
-        }
+        return self._build_analysis_config().as_dict()
+
+    def _build_analysis_config(self) -> AnalysisRunConfig:
+        self.annotation_state.set_real_world_distance(self.real_distance_spin.value())
+        pixel_distance = (
+            self.annotation_state.pixel_distance
+            if len(self.annotation_state.scale_points) >= 2
+            else 0.0
+        )
+        return build_analysis_run_config(
+            layer_id=self.layer_id,
+            detections_csv=self.csv_edit.text(),
+            video_path=self.video_edit.text(),
+            output_dir=self.output_edit.text(),
+            pixel_distance=pixel_distance,
+            real_world_distance_mm=self.real_distance_spin.value(),
+            smooth=self.smooth_check.isChecked(),
+            min_cutoff=self.min_cutoff_spin.value(),
+            beta=self.beta_spin.value(),
+            make_plots=self.plots_check.isChecked(),
+            make_annotated_video=self.annotated_video_check.isChecked(),
+            run_clustering=self.cluster_check.isChecked(),
+            export_cluster_clips=self.cluster_clips_check.isChecked(),
+            umap_neighbors=self.umap_neighbors_spin.value(),
+            umap_min_dist=self.umap_min_dist_spin.value(),
+            hdbscan_min_cluster_size=self.hdbscan_min_cluster_size_spin.value(),
+            cluster_clip_length_sec=self.clip_length_spin.value(),
+            samples_per_cluster=self.samples_per_cluster_spin.value(),
+            rois=self.annotation_state.worker_rois(),
+        )
 
     def _validate_inputs(self) -> bool:
-        if not os.path.isfile(self.csv_edit.text().strip()):
-            QMessageBox.warning(
-                self, "CSV required", "Select a valid inference CSV before running analysis."
-            )
+        try:
+            config = self._build_analysis_config()
+        except AnalysisConfigError as exc:
+            QMessageBox.warning(self, exc.title, exc.message)
             return False
-        video_path = self.video_edit.text().strip()
-        if video_path and not os.path.isfile(video_path):
-            QMessageBox.warning(self, "Invalid video", f"Video file not found:\n{video_path}")
-            return False
-        if len(self.scale_points) < 2 or self.pixel_distance_px <= 0:
-            QMessageBox.warning(
-                self,
-                "Scale required",
-                "Draw a two-point scale bar before running analysis.",
-            )
-            return False
-        if self.cluster_clips_check.isChecked() and not self.cluster_check.isChecked():
-            QMessageBox.warning(
-                self, "Clustering required", "Enable UMAP/HDBSCAN before exporting cluster clips."
-            )
-            return False
-        if self.annotated_video_check.isChecked() and not video_path:
+        self._validated_analysis_config = config
+        if config.video_fallback_notice:
             QMessageBox.information(
                 self,
                 "Video optional",
@@ -984,16 +961,17 @@ class AnalysisDialog(QDialog):
         return True
 
     def _start_analysis(self) -> None:
-        if (
-            self.analysis_process
-            and self.analysis_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self.analysis_controller is not None and self.analysis_controller.is_running:
             QMessageBox.information(self, "Analysis running", "An analysis job is already running.")
             return
         if not self._validate_inputs():
             return
 
-        payload = self._config_payload()
+        config = getattr(self, "_validated_analysis_config", None)
+        if config is None:
+            config = self._build_analysis_config()
+        self._validated_analysis_config = None
+        payload = config.as_dict()
         os.makedirs(payload["output_dir"], exist_ok=True)
         try:
             self.analysis_config_path = create_worker_config(
@@ -1018,50 +996,25 @@ class AnalysisDialog(QDialog):
         self._append_log(f"Output: {payload['output_dir']}")
         self._append_log(f"ROIs: {len(self.rois)}")
 
-        process = QProcess(self)
-        self.analysis_process = process
-        process.setProgram(sys.executable)
-        process.setArguments(
+        controller = WorkerJobController(self)
+        self.analysis_controller = controller
+        controller.event_received.connect(self._handle_worker_event)
+        controller.output_received.connect(self._append_log)
+        controller.stderr_received.connect(self._append_log)
+        controller.terminal.connect(self._analysis_job_finished)
+        self._set_running(True)
+        started = controller.start(
+            sys.executable,
             [
                 os.path.join(self.app_base_dir, "analysis_worker.py"),
                 "--config",
                 self.analysis_config_path,
-            ]
+            ],
+            config_path=self.analysis_config_path,
         )
-        process.readyReadStandardOutput.connect(self._read_analysis_stdout)
-        process.readyReadStandardError.connect(self._read_analysis_stderr)
-        process.finished.connect(self._analysis_finished)
-        self._set_running(True)
-        process.start()
-        if not process.waitForStarted(3000):
-            self._set_running(False)
-            self.status_label.setText("Failed")
-            _remove_file_quietly(self.analysis_config_path)
-            self.analysis_config_path = None
-            self.analysis_process = None
-            process.deleteLater()
+        self.analysis_process = controller.process if controller.terminal_result is None else None
+        if not started:
             QMessageBox.warning(self, "Analysis failed", "Could not start the analysis worker.")
-
-    def _read_analysis_stdout(self) -> None:
-        if self.analysis_process is None:
-            return
-        data = bytes(self.analysis_process.readAllStandardOutput()).decode(
-            "utf-8", errors="replace"
-        )
-        self.analysis_stdout_buffer += data
-        while "\n" in self.analysis_stdout_buffer:
-            line, self.analysis_stdout_buffer = self.analysis_stdout_buffer.split("\n", 1)
-            self._handle_worker_line(line.strip())
-
-    def _read_analysis_stderr(self) -> None:
-        if self.analysis_process is None:
-            return
-        data = bytes(self.analysis_process.readAllStandardError()).decode("utf-8", errors="replace")
-        self.analysis_stderr_buffer += data
-        while "\n" in self.analysis_stderr_buffer:
-            line, self.analysis_stderr_buffer = self.analysis_stderr_buffer.split("\n", 1)
-            if line.strip():
-                self._append_log(line.strip())
 
     def _show_result_summary(self, event: dict[str, Any]) -> None:
         summary = event.get("summary") or {}
@@ -1103,6 +1056,11 @@ class AnalysisDialog(QDialog):
             self._append_log(line)
             return
 
+        self._handle_worker_event(event)
+
+    def _handle_worker_event(self, event: dict[str, Any]) -> None:
+        """Apply a parsed worker protocol event to the dialog UI."""
+
         kind = event.get("event")
         if kind == "started":
             self._append_log("Analysis started.")
@@ -1139,28 +1097,30 @@ class AnalysisDialog(QDialog):
             self.status_label.setText("Failed")
             self._append_log(f"Error: {event.get('error_message', '')}")
         else:
-            self._append_log(line)
+            self._append_log(json.dumps(event, sort_keys=True))
 
-    def _analysis_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
-        if self.analysis_stdout_buffer.strip():
-            self._handle_worker_line(self.analysis_stdout_buffer.strip())
-        if self.analysis_stderr_buffer.strip():
-            self._append_log(self.analysis_stderr_buffer.strip())
-        self.analysis_stdout_buffer = ""
-        self.analysis_stderr_buffer = ""
-        _remove_file_quietly(self.analysis_config_path)
+    def _analysis_job_finished(self, result: WorkerJobResult) -> None:
+        controller = self.analysis_controller
+        self.analysis_controller = None
         self.analysis_config_path = None
-        if exit_code and self.status_label.text() == "Running":
+        self.analysis_process = None
+        if not result.succeeded and self.status_label.text() == "Running":
             self.status_label.setText("Failed")
         self._set_running(False)
+        if controller is not None:
+            controller.deleteLater()
 
     def _open_output_dir(self) -> None:
         if self.last_output_dir and os.path.isdir(self.last_output_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
 
     def closeEvent(self, event):
-        _shutdown_qprocess(self.analysis_process)
-        _remove_file_quietly(self.analysis_config_path)
+        if self.analysis_controller is not None:
+            self.analysis_controller.shutdown()
+        else:
+            _shutdown_qprocess(self.analysis_process)
+            _remove_file_quietly(self.analysis_config_path)
+        self.analysis_controller = None
         self.analysis_process = None
         self.analysis_config_path = None
         super().closeEvent(event)

@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
+import inference_ops
 from inference_ops import (
     probe_video_metadata,
     run_depth_video_inference,
@@ -14,6 +15,7 @@ from inference_ops import (
     segmentation_rows_from_result,
 )
 from inference_worker import run_inference_worker
+from squeakpose.services import inference_runtime
 
 
 class _Tensor:
@@ -187,6 +189,32 @@ class _DepthModel:
 
 
 class InferenceOpsTests(unittest.TestCase):
+    def test_root_compatibility_exports_preserve_identity(self):
+        public_names = (
+            "DEPTH_FIELDNAMES",
+            "POSE_BASE_FIELDNAMES",
+            "SEGMENTATION_FIELDNAMES",
+            "CancelCallback",
+            "InferenceRunResult",
+            "ProgressCallback",
+            "VideoMetadata",
+            "keypoint_column_key",
+            "pose_inference_fieldnames",
+            "pose_inference_rows_from_result",
+            "probe_video_metadata",
+            "run_depth_video_inference",
+            "run_pose_video_inference",
+            "run_segmentation_video_inference",
+            "segmentation_rows_from_result",
+        )
+
+        for name in public_names:
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(inference_ops, name),
+                    getattr(inference_runtime, name),
+                )
+
     def test_probe_video_metadata_reads_count_and_fps(self):
         cv2 = _FakeCv2(["f1", "f2"], fps=12.5)
 

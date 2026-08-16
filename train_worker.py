@@ -8,9 +8,9 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
-from layer_ops import normalize_layer_id
+from squeakpose.core import model_task_mismatch_message
+from squeakpose.project.layers import normalize_layer_id
 from squeakpose.workers.protocol import read_config, write_event
-from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 

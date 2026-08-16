@@ -10,9 +10,13 @@ from layer_ops import (
     normalize_layer_id,
     normalize_layer_settings,
 )
+from squeakpose.project.layers import layer_definition as package_layer_definition
 
 
 class LayerOpsTests(unittest.TestCase):
+    def test_root_module_is_an_identity_preserving_compatibility_shim(self):
+        self.assertIs(layer_definition, package_layer_definition)
+
     def test_legacy_workflow_names_normalize_to_layers(self):
         self.assertEqual(normalize_layer_id("pose"), LAYER_KEYPOINTS)
         self.assertEqual(normalize_layer_id("keypoint"), LAYER_KEYPOINTS)

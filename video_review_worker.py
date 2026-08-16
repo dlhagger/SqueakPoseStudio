@@ -8,13 +8,13 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
-from prediction_ops import (
+from squeakpose.core import model_task_mismatch_message
+from squeakpose.services.prediction_serialization import (
     best_predictions_by_class_from_payload,
     serialize_prediction_result,
     top_prediction_from_payload,
 )
 from squeakpose.workers.protocol import read_config, write_event
-from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 

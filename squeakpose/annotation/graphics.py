@@ -104,8 +104,9 @@ class BoxItem(QGraphicsRectItem):
         x = margin
         y = -(bg_h + margin)
 
-        if self.scene():
-            sr = self.scene().sceneRect()
+        scene = self.scene()
+        if scene is not None:
+            sr = scene.sceneRect()
             # If above would clip off-screen, move label below the box.
             if self.pos().y() + y < sr.top():
                 y = self.rect().height() + margin
@@ -215,8 +216,9 @@ class BoxItem(QGraphicsRectItem):
         if edges & self.BOTTOM:
             new_rect.setHeight(max(self.MIN_H, self._press_rect.height() + delta_local.y()))
 
-        if self.scene():
-            sr = self.scene().sceneRect()
+        scene = self.scene()
+        if scene is not None:
+            sr = scene.sceneRect()
             new_pos.setX(max(sr.left(), new_pos.x()))
             new_pos.setY(max(sr.top(), new_pos.y()))
             new_pos.setX(min(new_pos.x(), sr.right() - new_rect.width()))
@@ -235,8 +237,9 @@ class BoxItem(QGraphicsRectItem):
         self._reposition_label()
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
-            sr = self.scene().sceneRect()
+        scene = self.scene()
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and scene is not None:
+            sr = scene.sceneRect()
             r = self.rect()
             new_pos = value
             nx = min(max(new_pos.x(), sr.left()), sr.right() - r.width())
@@ -373,8 +376,9 @@ class KeypointItem(QGraphicsEllipseItem):
         self.kp.y = p.y()
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
-            sr = self.scene().sceneRect()
+        scene = self.scene()
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and scene is not None:
+            sr = scene.sceneRect()
             p = value
             x = min(max(p.x(), sr.left()), sr.right())
             y = min(max(p.y(), sr.top()), sr.bottom())
@@ -399,7 +403,9 @@ class LabelView(QGraphicsView):
         self._seg_brush_cursor_ring: Optional[QGraphicsEllipseItem] = None
 
         self.setMouseTracking(True)
-        self.viewport().setMouseTracking(True)
+        viewport = self.viewport()
+        if viewport is not None:
+            viewport.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setCacheMode(QGraphicsView.CacheModeFlag.CacheBackground)
@@ -443,36 +449,40 @@ class LabelView(QGraphicsView):
 
     def _ensure_crosshairs(self):
         """Create crosshair items with consistent styling if they do not exist."""
+        scene = self.scene()
+        if scene is None:
+            return
         if self._crosshair_v is None:
             self._crosshair_v = QGraphicsLineItem()
             self._crosshair_v.setZValue(10)
             pen = QPen(Qt.GlobalColor.cyan)
             pen.setCosmetic(True)
             self._crosshair_v.setPen(pen)
-            self.scene().addItem(self._crosshair_v)
+            scene.addItem(self._crosshair_v)
         if self._crosshair_h is None:
             self._crosshair_h = QGraphicsLineItem()
             self._crosshair_h.setZValue(10)
             pen = QPen(Qt.GlobalColor.cyan)
             pen.setCosmetic(True)
             self._crosshair_h.setPen(pen)
-            self.scene().addItem(self._crosshair_h)
+            scene.addItem(self._crosshair_h)
 
     def _update_crosshairs(self, scene_pos: QPointF):
         """Ensure crosshairs exist and update them to intersect at scene_pos."""
-        if not self.scene():
+        scene = self.scene()
+        if scene is None:
             return
-        img_bounds = self.scene().sceneRect()
+        img_bounds = scene.sceneRect()
         if not img_bounds.contains(scene_pos):
             self._remove_crosshairs()
             return
         self._ensure_crosshairs()
-        self._crosshair_v.setLine(
-            scene_pos.x(), img_bounds.top(), scene_pos.x(), img_bounds.bottom()
-        )
-        self._crosshair_h.setLine(
-            img_bounds.left(), scene_pos.y(), img_bounds.right(), scene_pos.y()
-        )
+        crosshair_v = self._crosshair_v
+        crosshair_h = self._crosshair_h
+        if crosshair_v is None or crosshair_h is None:
+            return
+        crosshair_v.setLine(scene_pos.x(), img_bounds.top(), scene_pos.x(), img_bounds.bottom())
+        crosshair_h.setLine(img_bounds.left(), scene_pos.y(), img_bounds.right(), scene_pos.y())
 
     def draw_crosshairs_at(self, global_pos: QPoint):
         scene_pos = self.mapToScene(self.mapFromGlobal(global_pos))
@@ -505,7 +515,9 @@ class LabelView(QGraphicsView):
         self._seg_brush_cursor_ring.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._seg_brush_cursor_ring.setAcceptHoverEvents(False)
         self._seg_brush_cursor_ring.setVisible(False)
-        self.scene().addItem(self._seg_brush_cursor_ring)
+        scene = self.scene()
+        if scene is not None:
+            scene.addItem(self._seg_brush_cursor_ring)
 
     def _hide_seg_brush_cursor(self):
         ring = self._seg_brush_cursor_ring
@@ -517,8 +529,9 @@ class LabelView(QGraphicsView):
         if ring is None:
             return
         try:
-            if ring.scene() is not None:
-                ring.scene().removeItem(ring)
+            scene = ring.scene()
+            if scene is not None:
+                scene.removeItem(ring)
         except Exception:
             pass
         self._seg_brush_cursor_ring = None
@@ -541,8 +554,11 @@ class LabelView(QGraphicsView):
         if not self._should_show_seg_brush_cursor():
             self._hide_seg_brush_cursor()
             return
-        vp = self.viewport().mapFromGlobal(QCursor.pos())
-        if not self.viewport().rect().contains(vp):
+        viewport = self.viewport()
+        if viewport is None:
+            return
+        vp = viewport.mapFromGlobal(QCursor.pos())
+        if not viewport.rect().contains(vp):
             self._hide_seg_brush_cursor()
             return
         self._update_seg_brush_cursor(self.mapToScene(vp))
@@ -634,7 +650,9 @@ class LabelView(QGraphicsView):
                 pen.setCosmetic(True)
                 self._temp_rect.setPen(pen)
                 self._temp_rect.setZValue(1.5)
-                self.scene().addItem(self._temp_rect)
+                scene = self.scene()
+                if scene is not None:
+                    scene.addItem(self._temp_rect)
             else:
                 self._temp_rect.setRect(rect)
         elif self.app.mode == "panzoom":

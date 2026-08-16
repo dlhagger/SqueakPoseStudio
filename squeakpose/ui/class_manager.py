@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from squeakpose_core import find_duplicate_names
+from squeakpose.core import find_duplicate_names
 
 
 class AddClassDialog(QDialog):

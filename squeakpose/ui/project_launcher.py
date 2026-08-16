@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ui_style import launcher_stylesheet
+from squeakpose.ui.style import launcher_stylesheet
 
 
 def choose_project_root(

@@ -7,8 +7,8 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from squeakpose.core import remove_path
 from squeakpose.project.safety import ProjectPathError, require_path_within_project
-from squeakpose_core import remove_path
 
 logger = logging.getLogger(__name__)
 

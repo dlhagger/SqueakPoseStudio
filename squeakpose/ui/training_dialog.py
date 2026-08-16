@@ -7,8 +7,7 @@ import re
 import sys
 from typing import Optional
 
-import yaml
-from PyQt6.QtCore import QProcess, Qt, QTimer
+from PyQt6.QtCore import QProcess, Qt
 from PyQt6.QtGui import QFontDatabase, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -28,16 +27,30 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from layer_ops import layer_definition, normalize_layer_id
 from squeakpose.project.distillation import (
     discover_distillation_exports as _discover_distillation_exports,
 )
 from squeakpose.project.distillation import (
     distillation_export_search_roots as _distillation_export_search_roots,
 )
+from squeakpose.project.layers import layer_definition, normalize_layer_id
+from squeakpose.services.training import (
+    TrainingConfigError,
+    build_training_run_plan,
+    build_training_worker_config,
+    infer_training_task_from_yaml,
+    resolve_model_config,
+    training_run_name,
+)
+from squeakpose.ui.style import (
+    ThemedComboBox,
+    style_combo_popup,
+    train_dialog_stylesheet,
+)
 from squeakpose.workers.process import (
+    WorkerJobController,
+    WorkerJobResult,
     create_worker_config,
-    request_qprocess_stop,
 )
 from squeakpose.workers.process import (
     remove_file_quietly as _remove_file_quietly,
@@ -46,12 +59,6 @@ from squeakpose.workers.process import (
     shutdown_qprocess as _shutdown_qprocess,
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
-from squeakpose_core import infer_dataset_task
-from ui_style import (
-    ThemedComboBox,
-    style_combo_popup,
-    train_dialog_stylesheet,
-)
 
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -126,6 +133,7 @@ class TrainDialog(QDialog):
         self.resume_manual_path: Optional[str] = None
         self.device = _auto_device()
         self.training_running = False
+        self.training_controller: Optional[WorkerJobController] = None
         self.train_process: Optional[QProcess] = None
         self.train_stdout_buffer = ""
         self.train_stderr_buffer = ""
@@ -479,12 +487,8 @@ class TrainDialog(QDialog):
         return data or ""
 
     def _run_name_from_model(self, model_spec: str, use_dino: bool) -> str:
-        if use_dino or model_spec.lower().endswith((".pt", ".pth", ".yaml", ".yml")):
-            base = os.path.splitext(os.path.basename(model_spec))[0]
-        else:
-            base = os.path.basename(model_spec)
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")
-        return safe or "model"
+        del use_dino  # retained in the compatibility signature
+        return training_run_name(model_spec)
 
     def _configure_batch_controls(self):
         if self.device == "cuda":
@@ -547,8 +551,17 @@ class TrainDialog(QDialog):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            _shutdown_qprocess(self.train_process)
-            _remove_file_quietly(self.train_config_path)
+            if self.training_controller is not None:
+                try:
+                    self.training_controller.terminal.disconnect(self._finish_training_job)
+                except (TypeError, RuntimeError):
+                    pass
+                self.training_controller.shutdown()
+                self.training_controller.deleteLater()
+                self.training_controller = None
+            else:
+                _shutdown_qprocess(self.train_process)
+                _remove_file_quietly(self.train_config_path)
             self.train_process = None
             self.train_config_path = None
             self.training_running = False
@@ -557,38 +570,10 @@ class TrainDialog(QDialog):
     def _resolve_model_config(
         self, base_cfg: str, task_value: Optional[str]
     ) -> tuple[str, Optional[str]]:
-        cfg = base_cfg
-        notice = None
-        if not task_value:
-            return cfg, notice
-
-        has_yaml_ext = cfg.lower().endswith(".yaml")
-        stem = cfg[:-5] if has_yaml_ext else cfg
-        stem_clean = re.sub(r"-(pose|seg)$", "", stem, flags=re.IGNORECASE)
-
-        if task_value == "pose":
-            target = f"{stem_clean}-pose"
-            cfg = f"{target}.yaml" if has_yaml_ext else target
-            if cfg != base_cfg:
-                notice = "Pose task detected → switched to pose variant of the model config."
-        elif task_value == "segment":
-            target = f"{stem_clean}-seg"
-            cfg = f"{target}.yaml" if has_yaml_ext else target
-            if cfg != base_cfg:
-                notice = "Segmentation task detected → switched to segmentation variant of the model config."
-        elif task_value == "detect":
-            cfg = f"{stem_clean}.yaml" if has_yaml_ext else stem_clean
-            if cfg != base_cfg:
-                notice = "Detection task selected → using detection variant of the model config."
-        return cfg, notice
+        return resolve_model_config(base_cfg, task_value)
 
     def _infer_task_from_yaml(self, yaml_path: str) -> Optional[str]:
-        try:
-            with open(yaml_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        except Exception:
-            return None
-        return infer_dataset_task(data)
+        return infer_training_task_from_yaml(yaml_path)
 
     def _start_training(self):
         if self.training_running:
@@ -602,116 +587,67 @@ class TrainDialog(QDialog):
         use_checkpoint_continue = source_idx == self.checkpoint_source_index
         use_exact_resume = source_idx == self.resume_source_index
 
-        resolved: Optional[str] = None
-        if not use_exact_resume:
-            dataset_path = self.dataset_edit.text().strip()
-            if not dataset_path:
-                QMessageBox.warning(
-                    self, "Dataset required", "Select a dataset folder before starting training."
-                )
-                return
-            if os.path.isdir(dataset_path):
-                data_yaml = os.path.join(dataset_path, "dataset.yaml")
-                if os.path.isfile(data_yaml):
-                    resolved = data_yaml
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "dataset.yaml missing",
-                        "Could not find dataset.yaml in the selected folder.\n"
-                        "Select the dataset root (contains dataset.yaml) or the YAML file directly.",
-                    )
-                    return
-            elif dataset_path.lower().endswith((".yaml", ".yml")) and os.path.isfile(dataset_path):
-                resolved = dataset_path
-            else:
-                QMessageBox.warning(self, "Invalid dataset", f"Path not found:\n{dataset_path}")
-                return
-
         model_label = self.model_combo.currentText()
         base_model_cfg = self.MODEL_OPTIONS[model_label]
         epochs = self.epoch_spin.value()
         batch = self.batch_spin.value()
         batch_display = "auto" if batch <= 0 else str(batch)
-        distilled_path = ""
-        resume_path = ""
+        checkpoint_path = ""
         if use_dino:
-            distilled_path = self._selected_dino_path()
-            if not distilled_path or not os.path.isfile(distilled_path):
-                QMessageBox.warning(
-                    self,
-                    "Checkpoint required",
-                    "Select a valid DINO distillation export (.pt) before training.",
-                )
-                return
+            checkpoint_path = self._selected_dino_path()
         elif use_checkpoint_continue or use_exact_resume:
-            resume_path = self._selected_resume_path()
-            if not resume_path or not os.path.isfile(resume_path):
-                QMessageBox.warning(
-                    self,
-                    "Checkpoint required",
-                    "Select a valid YOLO checkpoint (.pt) before continuing.",
-                )
-                return
-            if use_exact_resume and os.path.basename(resume_path).lower() != "last.pt":
-                QMessageBox.warning(
-                    self,
-                    "Exact resume requires last.pt",
-                    "For exact run continuation, select a weights/last.pt checkpoint.",
-                )
-                return
-
-        if (not use_exact_resume) and self.device == "mps" and batch <= 0:
-            QMessageBox.warning(
-                self,
-                "Batch size required",
-                "Automatic batch sizing is unavailable on Apple MPS.\n"
-                "Set a positive batch size before starting training.",
-            )
-            return
+            checkpoint_path = self._selected_resume_path()
 
         task_selection = self.task_combo.currentText()
-        if use_dino:
-            task_value = self.layer.model_task
-        elif use_exact_resume:
-            task_value = None
-        elif task_selection.startswith("Auto"):
-            inferred_task = self._infer_task_from_yaml(resolved) if resolved else None
-            if inferred_task in {"pose", "detect", "segment"}:
-                task_value = inferred_task
-            elif self.default_task in {"pose", "detect", "segment"}:
-                task_value = self.default_task
-            else:
-                task_value = None
-        elif task_selection.startswith("Detection"):
-            task_value = "detect"
+        selected_task = "auto"
+        if task_selection.startswith("Detection"):
+            selected_task = "detect"
         elif task_selection.startswith("Segmentation"):
-            task_value = "segment"
-        else:
-            task_value = "pose"
-
-        dataset_task = self._infer_task_from_yaml(resolved) if resolved else None
-        if task_value and dataset_task and task_value != dataset_task:
-            QMessageBox.warning(
-                self,
-                "Dataset Task Mismatch",
-                f"The selected dataset is '{dataset_task}', but the training task is '{task_value}'.\n\n"
-                "Choose the matching task or select a different dataset.",
+            selected_task = "segment"
+        elif not task_selection.startswith("Auto"):
+            selected_task = "pose"
+        source_mode = (
+            "dino"
+            if use_dino
+            else "checkpoint"
+            if use_checkpoint_continue
+            else "resume"
+            if use_exact_resume
+            else "scratch"
+        )
+        try:
+            plan = build_training_run_plan(
+                source_mode=source_mode,
+                dataset_path=self.dataset_edit.text(),
+                base_model_cfg=base_model_cfg,
+                checkpoint_path=checkpoint_path,
+                selected_task=selected_task,
+                default_task=self.default_task,
+                layer_task=self.layer.model_task,
+                device=self.device,
+                epochs=epochs,
+                batch=batch,
+                project_runs_dir=self.project_runs_dir,
             )
+        except TrainingConfigError as exc:
+            title = {
+                "required": "Dataset required",
+                "yaml_missing": "dataset.yaml missing",
+                "checkpoint_required": "Checkpoint required",
+                "resume_checkpoint": "Exact resume requires last.pt",
+                "mps_batch": "Batch size required",
+                "task_mismatch": "Dataset Task Mismatch",
+            }.get(exc.code, "Invalid training configuration")
+            QMessageBox.warning(self, title, str(exc))
             return
 
-        model_cfg = (
-            distilled_path
-            if use_dino
-            else (resume_path if (use_checkpoint_continue or use_exact_resume) else base_model_cfg)
-        )
-        cfg_notice = None
+        resolved = plan.dataset_yaml
+        task_value = plan.task
+        model_cfg = plan.model_cfg
         self.log_view.clear()
         self._set_training_status("Preparing", "running")
-        if not (use_dino or use_checkpoint_continue or use_exact_resume):
-            model_cfg, cfg_notice = self._resolve_model_config(base_model_cfg, task_value)
-            if cfg_notice:
-                self._log(cfg_notice)
+        if plan.model_notice:
+            self._log(plan.model_notice)
 
         if use_dino:
             self._log(f"Starting training from DINO export: {model_cfg}")
@@ -739,62 +675,28 @@ class TrainDialog(QDialog):
         self._log("Running training in a child process.")
         self._log("")
 
-        if use_exact_resume:
-            params = {
-                "resume": True,
-                "device": self.device,
-            }
-        else:
-            batch_param = -1 if batch <= 0 else int(batch)
-
-            task_folder = (
-                task_value
-                if task_value in ("pose", "detect", "segment")
-                else ("pose" if use_dino else "auto")
-            )
-            project_dir = os.path.join(self.project_runs_dir, "train", task_folder)
+        params = plan.params
+        if not use_exact_resume:
+            project_dir = str(params["project"])
             try:
                 os.makedirs(project_dir, exist_ok=True)
             except Exception as e:
                 self._log(f"Warning: could not create runs directory at {project_dir}: {e}")
 
-            if use_checkpoint_continue:
-                checkpoint_run = os.path.basename(os.path.dirname(os.path.dirname(model_cfg)))
-                run_name = self._run_name_from_model(checkpoint_run or model_cfg, use_dino=True)
-                if not run_name.endswith("_continue"):
-                    run_name = f"{run_name}_continue"
-            else:
-                run_name = self._run_name_from_model(model_cfg, use_dino)
-
-            params = {
-                "data": resolved,
-                "epochs": epochs,
-                "device": self.device,
-                "exist_ok": False,
-                "batch": batch_param,
-                "project": project_dir,
-                "name": run_name,
-            }
-            if task_value:
-                params["task"] = task_value
-
         self._start_training_process(model_cfg=model_cfg, params=params)
 
     def _start_training_process(self, *, model_cfg: str, params: dict):
-        if (
-            self.train_process is not None
-            and self.train_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self.training_controller is not None and self.training_controller.is_running:
             QMessageBox.information(
                 self, "Training running", "A training session is already in progress."
             )
             return
 
-        config = {
-            "layer_id": self.layer_id,
-            "model_cfg": model_cfg,
-            "params": params,
-        }
+        config = build_training_worker_config(
+            layer_id=self.layer_id,
+            model_cfg=model_cfg,
+            params=params,
+        ).as_dict()
         run_root = os.path.join(self.project_runs_dir, "train")
         try:
             os.makedirs(run_root, exist_ok=True)
@@ -818,16 +720,6 @@ class TrainDialog(QDialog):
             )
             return
 
-        process = QProcess(self)
-        process.setProgram(sys.executable)
-        process.setArguments(["-m", "train_worker", "--config", config_path])
-        process.setWorkingDirectory(self.app_base_dir)
-        process.readyReadStandardOutput.connect(self._read_training_process_stdout)
-        process.readyReadStandardError.connect(self._read_training_process_stderr)
-        process.finished.connect(self._finish_training_process)
-        process.errorOccurred.connect(self._handle_training_process_error)
-
-        self.train_process = process
         self.train_stdout_buffer = ""
         self.train_stderr_buffer = ""
         self.train_result_event = None
@@ -839,10 +731,21 @@ class TrainDialog(QDialog):
         self._set_training_status("Launching", "running")
 
         self._log("Launching training worker process...")
-        process.start()
-        if not process.waitForStarted(1000):
-            self.train_stderr_buffer = process.errorString()
-            self._finish_training_process(1, QProcess.ExitStatus.CrashExit)
+        controller = WorkerJobController(self)
+        self.training_controller = controller
+        controller.event_received.connect(self._handle_training_event)
+        controller.output_received.connect(self._log)
+        controller.stderr_received.connect(self._write_training_terminal_output)
+        controller.terminal.connect(self._finish_training_job)
+        started = controller.start(
+            sys.executable,
+            ["-m", "train_worker", "--config", config_path],
+            config_path=config_path,
+            working_directory=self.app_base_dir,
+            start_timeout_ms=1000,
+        )
+        self.train_process = controller.process if controller.terminal_result is None else None
+        if not started:
             return
 
     def _read_training_process_stdout(self):
@@ -879,6 +782,9 @@ class TrainDialog(QDialog):
         except WorkerProtocolError:
             self._log(line)
             return
+        self._handle_training_event(event)
+
+    def _handle_training_event(self, event: dict):
         event_type = event.get("event")
         if event_type == "started":
             self._log(f"Training worker loaded config: {event.get('model_cfg', '')}")
@@ -898,45 +804,56 @@ class TrainDialog(QDialog):
             }
 
     def _cancel_training_process(self):
-        process = self.train_process
-        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+        controller = self.training_controller
+        if controller is None or not controller.is_running:
             return
         self.train_cancel_requested = True
         self._set_training_status("Canceling", "canceled")
         self._log("Cancel requested. Stopping training worker process...")
-        request_qprocess_stop(
-            process,
-            schedule=QTimer.singleShot,
-            force_kill=self._kill_training_process_if_running,
-            kill_after_ms=5000,
-        )
+        controller.cancel(kill_after_ms=5000)
 
     def _kill_training_process_if_running(self):
-        process = self.train_process
+        process = (
+            self.training_controller.process if self.training_controller else self.train_process
+        )
         if process is not None and process.state() != QProcess.ProcessState.NotRunning:
             self._log("Training worker did not stop after terminate; killing process.")
             process.kill()
 
     def _handle_training_process_error(self, _error):
-        process = self.train_process
+        process = (
+            self.training_controller.process if self.training_controller else self.train_process
+        )
         if process is not None:
             self.train_stderr_buffer += process.errorString() + "\n"
 
     def _finish_training_process(self, exit_code: int, exit_status):
-        if self.train_process is None and self.train_config_path is None:
-            return
-        self._flush_training_terminal_output()
-        if self.train_stdout_buffer.strip():
-            self._handle_training_event_line(self.train_stdout_buffer.strip())
-            self.train_stdout_buffer = ""
+        """Compatibility entry point for legacy callers and tests."""
+        state = (
+            "cancelled"
+            if self.train_cancel_requested
+            else ("finished" if int(exit_code) == 0 else "failed")
+        )
+        self._finish_training_job(
+            WorkerJobResult(
+                state=state,
+                exit_code=int(exit_code),
+                exit_status=exit_status,
+                stderr=self.train_stderr_buffer,
+            )
+        )
 
-        config_path = self.train_config_path
-        _remove_file_quietly(config_path)
+    def _finish_training_job(self, result: WorkerJobResult):
+        self._flush_training_terminal_output()
 
         event = self.train_result_event
-        stderr_text = self.train_stderr_buffer.strip()
-        cancel_requested = self.train_cancel_requested
+        stderr_text = (result.stderr or self.train_stderr_buffer).strip()
+        cancel_requested = self.train_cancel_requested or result.state == "cancelled"
+        exit_code = result.exit_code if result.exit_code is not None else 1
+        exit_status = result.exit_status
 
+        controller = self.training_controller
+        self.training_controller = None
         self.training_running = False
         self.run_btn.setEnabled(True)
         self.cancel_train_btn.setEnabled(False)
@@ -946,6 +863,8 @@ class TrainDialog(QDialog):
         self.train_stdout_buffer = ""
         self.train_stderr_buffer = ""
         self.train_cancel_requested = False
+        if controller is not None:
+            controller.deleteLater()
 
         if cancel_requested and event is None:
             self._set_training_status("Canceled", "canceled")
@@ -973,7 +892,12 @@ class TrainDialog(QDialog):
             QMessageBox.information(self, "Training canceled", "Training was canceled.")
             return
 
-        if had_error or exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
+        if (
+            had_error
+            or exit_status == QProcess.ExitStatus.CrashExit
+            or exit_code != 0
+            or result.state in {"failed", "start_failed"}
+        ):
             self._set_training_status("Failed", "failed")
             self._log(f"Training failed: {error_message}")
             QMessageBox.critical(self, "Training error", f"Training failed:\n{error_message}")

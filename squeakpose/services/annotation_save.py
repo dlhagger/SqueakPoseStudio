@@ -7,14 +7,14 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from squeakpose.project.safety import require_path_within_project
-from squeakpose_core import (
+from squeakpose.core import (
     commit_staged_paths,
     remove_path,
     stage_copy_file,
     stage_text_file,
     staging_path_for,
 )
+from squeakpose.project.safety import require_path_within_project
 
 Committer = Callable[[list[tuple[str, str]]], None]
 OverlayRenderer = Callable[[str], bool]

@@ -9,10 +9,10 @@ import signal
 import sys
 from typing import Any, Callable, Optional
 
-from depth_ops import serialize_depth_prediction_result
-from prediction_ops import serialize_prediction_result
+from squeakpose.core import model_task_mismatch_message
+from squeakpose.depth_ops import serialize_depth_prediction_result
+from squeakpose.services.prediction_serialization import serialize_prediction_result
 from squeakpose.workers.protocol import read_config, write_event
-from squeakpose_core import model_task_mismatch_message
 
 _CANCEL_REQUESTED = False
 

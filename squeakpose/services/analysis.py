@@ -1,0 +1,203 @@
+"""Qt-free configuration and input validation for analysis runs."""
+
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+
+class AnalysisConfigError(ValueError):
+    """Stable validation failure suitable for presentation by a UI."""
+
+    def __init__(self, code: str, title: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.title = title
+        self.message = message
+
+
+@dataclass(frozen=True)
+class AnalysisRunConfig:
+    """Validated, detached worker configuration for one analysis run."""
+
+    payload: Mapping[str, Any]
+    video_fallback_notice: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        result = dict(self.payload)
+        result["rois"] = [dict(roi) for roi in self.payload.get("rois", ())]
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisCsvContext:
+    """Preview metadata discovered from an inference CSV."""
+
+    video_path: str = ""
+    width: int = 1280
+    height: int = 720
+
+
+def safe_analysis_stem(path: str) -> str:
+    stem = Path(path).stem if path else "analysis"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    return cleaned or "analysis"
+
+
+def default_analysis_output_dir(
+    project_root: str,
+    layer_id: str,
+    csv_path: str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    stamp = timestamp or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(
+        os.path.abspath(project_root),
+        "analysis outputs",
+        layer_id,
+        f"{safe_analysis_stem(csv_path)}_{stamp}",
+    )
+
+
+def analysis_csv_matches_layer(path: str, layer_id: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            fieldnames = set(next(csv.reader(handle), []))
+    except (OSError, csv.Error):
+        return False
+    is_segmentation = {"frame", "det", "mask_polygon"}.issubset(fieldnames)
+    return is_segmentation == (layer_id == "segmentation")
+
+
+def inspect_analysis_csv(path: str, *, row_limit: int = 1000) -> AnalysisCsvContext:
+    """Read preview video and frame dimensions without importing a dataframe stack."""
+
+    video_path = ""
+    width = 0
+    height = 0
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            for index, row in enumerate(csv.DictReader(handle)):
+                if index >= max(0, int(row_limit)):
+                    break
+                candidate = str(row.get("video_path") or "").strip()
+                if not video_path and candidate and os.path.isfile(candidate):
+                    video_path = candidate
+                try:
+                    width = max(width, int(float(row.get("image_width") or 0)))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    height = max(height, int(float(row.get("image_height") or 0)))
+                except (TypeError, ValueError):
+                    pass
+    except (OSError, csv.Error):
+        pass
+    return AnalysisCsvContext(video_path, width or 1280, height or 720)
+
+
+def latest_analysis_csv(directories: Iterable[str], layer_id: str) -> str:
+    """Return the newest readable inference CSV matching the active layer."""
+
+    candidates: list[str] = []
+    for folder in directories:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if name.lower().endswith(".csv") and analysis_csv_matches_layer(path, layer_id):
+                candidates.append(path)
+    if not candidates:
+        return ""
+    try:
+        return max(candidates, key=os.path.getmtime)
+    except OSError:
+        return ""
+
+
+def build_analysis_run_config(
+    *,
+    layer_id: str,
+    detections_csv: str,
+    video_path: str,
+    output_dir: str,
+    pixel_distance: float,
+    real_world_distance_mm: float,
+    smooth: bool,
+    min_cutoff: float,
+    beta: float,
+    make_plots: bool,
+    make_annotated_video: bool,
+    run_clustering: bool,
+    export_cluster_clips: bool,
+    umap_neighbors: int,
+    umap_min_dist: float,
+    hdbscan_min_cluster_size: int,
+    cluster_clip_length_sec: float,
+    samples_per_cluster: int,
+    rois: Iterable[Mapping[str, Any]],
+) -> AnalysisRunConfig:
+    """Validate UI-independent invariants and preserve the worker payload schema."""
+
+    csv_path = str(detections_csv).strip()
+    if not os.path.isfile(csv_path):
+        raise AnalysisConfigError(
+            "csv_required",
+            "CSV required",
+            "Select a valid inference CSV before running analysis.",
+        )
+    clean_video_path = str(video_path).strip()
+    if clean_video_path and not os.path.isfile(clean_video_path):
+        raise AnalysisConfigError(
+            "invalid_video",
+            "Invalid video",
+            f"Video file not found:\n{clean_video_path}",
+        )
+    if float(pixel_distance) <= 0:
+        raise AnalysisConfigError(
+            "scale_required",
+            "Scale required",
+            "Draw a two-point scale bar before running analysis.",
+        )
+    if export_cluster_clips and not run_clustering:
+        raise AnalysisConfigError(
+            "clustering_required",
+            "Clustering required",
+            "Enable UMAP/HDBSCAN before exporting cluster clips.",
+        )
+
+    payload = {
+        "layer_id": layer_id,
+        "detections_csv": csv_path,
+        "video_path": clean_video_path,
+        "output_dir": str(output_dir).strip(),
+        "fps": 0.0,
+        "pixel_distance": float(pixel_distance),
+        "real_world_distance_mm": float(real_world_distance_mm),
+        "smooth": bool(smooth),
+        "min_cutoff": float(min_cutoff),
+        "beta": float(beta),
+        "d_cutoff": 1.0,
+        "make_plots": bool(make_plots),
+        "make_annotated_video": bool(make_annotated_video),
+        "run_clustering": bool(run_clustering),
+        "export_cluster_clips": bool(export_cluster_clips),
+        "umap_neighbors": int(umap_neighbors),
+        "umap_min_dist": float(umap_min_dist),
+        "hdbscan_min_cluster_size": int(hdbscan_min_cluster_size),
+        "cluster_clip_length_sec": float(cluster_clip_length_sec),
+        "samples_per_cluster": int(samples_per_cluster),
+        "rois": tuple(dict(roi) for roi in rois),
+    }
+    return AnalysisRunConfig(
+        payload=payload,
+        video_fallback_notice=bool(make_annotated_video and not clean_video_path),
+    )

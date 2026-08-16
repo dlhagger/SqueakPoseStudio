@@ -7,15 +7,15 @@ import os
 import tempfile
 from collections.abc import Callable
 
-from dataset_ops import (
+from squeakpose.core import commit_staged_paths, remove_path
+from squeakpose.project.safety import require_path_within_project
+from squeakpose.services.dataset_ops import (
     DatasetExportPaths,
     DatasetExportResult,
     dataset_export_paths_from_base,
     export_dataset_files,
     write_dataset_yaml_for_mode,
 )
-from squeakpose.project.safety import require_path_within_project
-from squeakpose_core import commit_staged_paths, remove_path
 
 ProgressCallback = Callable[[int, str], None]
 CancelCallback = Callable[[], bool]

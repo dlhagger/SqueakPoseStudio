@@ -549,6 +549,92 @@ def train_dialog_stylesheet() -> str:
         color: {COLORS["text_muted"]};
         font-size: 9pt;
     }}
+    QLabel#TrainPhaseLabel {{
+        color: #bfe8ff;
+        font-size: 11pt;
+        font-weight: 750;
+    }}
+    QLabel#TrainEpochLabel, QLabel#TrainEtaLabel {{
+        color: {COLORS["text_muted"]};
+        font-weight: 650;
+        padding-left: 12px;
+    }}
+    QTabWidget#TrainOutputTabs::pane {{
+        background-color: {COLORS["panel_bg_alt"]};
+        border: 1px solid {COLORS["panel_border_soft"]};
+        border-radius: 6px;
+        top: -1px;
+    }}
+    QTabWidget#TrainOutputTabs QTabBar::tab {{
+        background-color: {COLORS["button_bg_pressed"]};
+        border: 1px solid {COLORS["panel_border_soft"]};
+        color: {COLORS["text_muted"]};
+        min-width: 90px;
+        padding: 6px 14px;
+    }}
+    QTabWidget#TrainOutputTabs QTabBar::tab:selected {{
+        background-color: {COLORS["panel_bg_alt"]};
+        border-bottom-color: {COLORS["panel_bg_alt"]};
+        color: {COLORS["text"]};
+        font-weight: 700;
+    }}
+    QProgressBar#TrainOverallProgress, QProgressBar#TrainEpochProgress {{
+        background-color: {COLORS["terminal_bg"]};
+        border: 1px solid {COLORS["panel_border_soft"]};
+        border-radius: 6px;
+        color: #eef7fb;
+        min-height: 20px;
+        text-align: center;
+    }}
+    QProgressBar#TrainOverallProgress::chunk {{
+        background-color: #2b8dbd;
+        border-radius: 5px;
+    }}
+    QProgressBar#TrainEpochProgress::chunk {{
+        background-color: #3d9b70;
+        border-radius: 5px;
+    }}
+    QFrame#TrainMetricCard {{
+        background-color: {COLORS["terminal_bg"]};
+        border: 1px solid {COLORS["panel_border_soft"]};
+        border-radius: 7px;
+    }}
+    QLabel#TrainMetricCaption {{
+        color: {COLORS["text_muted"]};
+        font-size: 9pt;
+    }}
+    QLabel#TrainMetricValue {{
+        color: #f4fbff;
+        font-size: 15pt;
+        font-weight: 800;
+    }}
+    QLabel#TrainLossDetail {{
+        color: {COLORS["text_muted"]};
+        font-size: 9pt;
+        padding: 0 3px 2px 3px;
+    }}
+    QLabel#TrainHistoryTitle {{
+        color: {COLORS["text"]};
+        font-weight: 750;
+        padding-top: 2px;
+    }}
+    QTableWidget#TrainHistoryTable {{
+        background-color: {COLORS["terminal_bg"]};
+        alternate-background-color: {COLORS["terminal_bg"]};
+        border: 1px solid {COLORS["panel_border_soft"]};
+        color: {COLORS["text"]};
+        gridline-color: #303941;
+        selection-background-color: {COLORS["accent"]};
+    }}
+    QTableWidget#TrainHistoryTable QHeaderView::section {{
+        background-color: {COLORS["button_bg_pressed"]};
+        border: none;
+        border-right: 1px solid {COLORS["panel_border_soft"]};
+        border-bottom: 1px solid {COLORS["panel_border_soft"]};
+        color: {COLORS["text_muted"]};
+        font-weight: 700;
+        padding: 5px;
+    }}
     QPlainTextEdit#TrainLogView {{
         background-color: {COLORS["terminal_bg"]};
         color: #d8dee4;
@@ -681,6 +767,21 @@ def analysis_dialog_stylesheet() -> str:
         color: {COLORS["text"]};
         padding: 4px;
         selection-background-color: {COLORS["accent"]};
+    }}
+    QListWidget#VideoLibraryList {{
+        background-color: {COLORS["terminal_bg"]};
+        border: 1px solid #303941;
+        border-radius: 6px;
+        color: {COLORS["text"]};
+        selection-background-color: {COLORS["accent"]};
+        selection-color: #ffffff;
+    }}
+    QListWidget#VideoLibraryList::item {{
+        padding: 3px 5px;
+    }}
+    QLabel#VideoLibrarySummary {{
+        color: {COLORS["text_muted"]};
+        font-weight: 600;
     }}
     QProgressBar {{
         background-color: {COLORS["terminal_bg"]};

@@ -87,6 +87,7 @@ The application creates the following entries inside each project:
 
 ```text
 project/
+├── videos/                # lightweight links to source videos (or local videos)
 ├── images_to_label/       # labeling queue
 ├── images_all/            # images that have been saved or validated
 ├── labels_all/            # YOLO pose labels
@@ -121,6 +122,11 @@ project/
 
 Use **File > Open Project...** to switch projects or **File > Close Project**
 to return to the launcher.
+
+Use the **Videos** menu to add, rename, retarget, or remove links to source
+videos stored elsewhere. Video links use negligible disk space. Removing or
+renaming a link does not modify the source video; a moved or disconnected
+source is shown as missing in the video manager.
 
 Operational events and recoverable failures are written as structured JSON
 lines to `logs/squeakpose.jsonl` inside the active project. The log rotates at
@@ -337,7 +343,16 @@ training, or vice versa. The dialog supports:
 - fine-tuning from an existing YOLO checkpoint; and
 - exact resume from a run containing `weights/last.pt`.
 
-Training runs in a child process and streams output into the dialog. Results are
+The optional **Run name** field is passed to Ultralytics as its supported
+`name=` training argument. Unsafe path characters are normalized, blank input
+uses the model-derived default, and repeated names are numbered rather than
+overwriting an existing run.
+
+Training runs in a child process and reports structured Ultralytics lifecycle
+events to the dialog. The Overview tab shows overall and current-epoch progress,
+ETA, task-specific precision/recall/mAP, combined training loss, and an epoch
+history table. The Console tab retains readable setup and diagnostic output while
+collapsing terminal carriage-return animations into stable lines. Results are
 stored under the active project's `runs/train/<task>/` directory.
 The dialog blocks dataset/task mismatches before launch, and each worker checks
 the loaded model's Ultralytics task before prediction, review, inference, or

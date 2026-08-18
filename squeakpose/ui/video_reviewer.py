@@ -62,6 +62,7 @@ from squeakpose.project.layers import (
     layer_definition,
     normalize_layer_id,
 )
+from squeakpose.services.video_library import list_project_videos
 from squeakpose.services.video_review import (
     MAX_VIDEO_CACHE_BYTES,
     available_export_frame_indices,
@@ -237,6 +238,11 @@ class VideoReviewDialog(QDialog):
         self.btn_load = QPushButton("Load Video")
         self.btn_load.clicked.connect(self._choose_video)
         row.addWidget(self.btn_load)
+
+        self.btn_project_video = QPushButton("Project Videos…")
+        self.btn_project_video.setToolTip("Choose a video from this project's videos library")
+        self.btn_project_video.clicked.connect(self._choose_project_video)
+        row.addWidget(self.btn_project_video)
 
         self.info = QLabel("")
         self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -606,11 +612,50 @@ class VideoReviewDialog(QDialog):
     # ---------- video load ----------
     def _choose_video(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select video", "", "Videos (*.mp4 *.mov *.avi *.mkv)"
+            self,
+            "Select video",
+            os.path.join(self.project_root, "videos"),
+            "Videos (*.mp4 *.mov *.avi *.mkv)",
         )
         if not path:
             return
         self._open_video(path)
+
+    def _choose_project_video(self):
+        videos_dir = os.path.join(self.project_root, "videos")
+        entries = list_project_videos(videos_dir)
+        available = [entry for entry in entries if entry.target_exists]
+        missing_count = len(entries) - len(available)
+        if not available:
+            detail = (
+                "All project video links have missing sources."
+                if entries
+                else "No videos have been added to this project yet."
+            )
+            QMessageBox.information(
+                self,
+                "No Project Videos Available",
+                f"{detail}\n\nUse Videos > Add Video Links… in the main window.",
+            )
+            return
+        prompt = f"Choose a project video ({len(available)} available"
+        if missing_count:
+            prompt += f", {missing_count} missing"
+        prompt += "):"
+        names = [entry.name for entry in available]
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Select Project Video",
+            prompt,
+            names,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        entry = next((candidate for candidate in available if candidate.name == selected), None)
+        if entry is not None:
+            self._open_video(entry.path)
 
     def _open_video(self, path: str):
         if self.cap is not None:
@@ -1034,9 +1079,17 @@ class VideoReviewDialog(QDialog):
 
     def _finish_project_review_prediction(self) -> None:
         progress = self._review_progress
-        if progress is not None:
-            progress.close()
         self._review_progress = None
+        if progress is not None:
+            # QProgressDialog.close() emits canceled(), even when the dialog
+            # already reached its maximum and the worker finished normally.
+            # Disconnect the user-cancel handler before programmatic cleanup so
+            # a successful run is not reported as canceled.
+            try:
+                progress.canceled.disconnect(self._cancel_review_prediction_process)
+            except (TypeError, RuntimeError):
+                pass
+            progress.close()
         self._review_job = None
         self._review_process = None
         self._review_config_path = None

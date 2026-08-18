@@ -269,6 +269,7 @@ from squeakpose.ui.style import (
     train_dialog_stylesheet,
 )
 from squeakpose.ui.training_dialog import TrainDialog
+from squeakpose.ui.video_library_dialog import VideoLibraryDialog
 from squeakpose.ui.video_reviewer import VideoReviewDialog
 from squeakpose.workers.process import remove_file_quietly, shutdown_qprocess
 
@@ -3320,6 +3321,22 @@ class LabelingApp(QMainWindow):
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(QApplication.instance().quit)
 
+        videos_menu = menu_bar.addMenu("&Videos")
+        manage_videos_action = videos_menu.addAction("Manage Video Links…")
+        manage_videos_action.triggered.connect(self.open_video_library)
+
+        add_videos_action = videos_menu.addAction("Add Video Links…")
+        add_videos_action.triggered.connect(
+            lambda: self.open_video_library(add_immediately=True)
+        )
+
+    def open_video_library(self, _checked: bool = False, *, add_immediately: bool = False):
+        videos_dir = ProjectPaths.from_root(self.project_root).videos
+        dialog = VideoLibraryDialog(videos_dir, self)
+        if add_immediately:
+            QTimer.singleShot(0, dialog.add_video_links)
+        dialog.exec()
+
     def _confirm_project_change(self, message: str) -> bool:
         decision = QMessageBox.question(
             self,
@@ -4769,7 +4786,7 @@ class LabelingApp(QMainWindow):
         video_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select video for inference",
-            "",
+            ProjectPaths.from_root(self.project_root).videos,
             "Video Files (*.mp4 *.mov *.avi *.mkv *.wmv *.mpg *.mpeg);;All Files (*)",
         )
         if not video_path:

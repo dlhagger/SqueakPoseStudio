@@ -5,9 +5,11 @@ from tempfile import TemporaryDirectory
 
 from squeakpose.services.training import (
     TrainingConfigError,
+    TrainingConsoleBuffer,
     build_training_run_plan,
     build_training_worker_config,
     infer_training_task_from_yaml,
+    normalize_training_run_label,
     resolve_dataset_yaml,
     resolve_model_config,
     training_run_name,
@@ -15,6 +17,20 @@ from squeakpose.services.training import (
 
 
 class TrainingServiceTests(unittest.TestCase):
+    def test_console_buffer_collapses_carriage_return_progress_updates(self):
+        buffer = TrainingConsoleBuffer()
+
+        lines = buffer.feed(
+            "Loading model\n\r\x1b[K1/10: 10% ━─────────── 1/10\r"
+            "\x1b[K1/10: 100% ━━━━━━━━━━━━ 10/10\nValidation complete\n"
+        )
+
+        self.assertEqual(
+            lines,
+            ["Loading model", "1/10: 100% ━━━━━━━━━━━━ 10/10", "Validation complete"],
+        )
+        self.assertEqual(buffer.finish(), [])
+
     def test_dataset_root_and_yaml_file_resolve(self):
         with TemporaryDirectory() as tmp:
             dataset_yaml = Path(tmp, "dataset.yaml")
@@ -127,6 +143,26 @@ class TrainingServiceTests(unittest.TestCase):
             self.assertIsNone(resumed.dataset_yaml)
             self.assertEqual(resumed.params, {"resume": True, "device": "mps"})
 
+    def test_run_plan_passes_a_safe_custom_ultralytics_name(self):
+        with TemporaryDirectory() as tmp:
+            dataset = Path(tmp, "dataset.yaml")
+            dataset.write_text("task: segment\n", encoding="utf-8")
+
+            plan = build_training_run_plan(
+                source_mode="scratch",
+                dataset_path=str(dataset),
+                base_model_cfg="yolo26n.yaml",
+                selected_task="segment",
+                device="mps",
+                epochs=20,
+                batch=4,
+                project_runs_dir=os.path.join(tmp, "runs"),
+                run_name="Baseline masks / August #1",
+            )
+
+            self.assertEqual(plan.params["name"], "Baseline_masks_August_1")
+            self.assertFalse(plan.params["exist_ok"])
+
     def test_run_plan_reports_task_resume_and_mps_errors(self):
         with TemporaryDirectory() as tmp:
             dataset = Path(tmp, "dataset.yaml")
@@ -162,6 +198,7 @@ class TrainingServiceTests(unittest.TestCase):
     def test_training_run_name_sanitizes_worker_output_name(self):
         self.assertEqual(training_run_name("/tmp/My model.yaml"), "My_model")
         self.assertEqual(training_run_name(""), "model")
+        self.assertEqual(normalize_training_run_label("Study / cohort #2"), "Study_cohort_2")
 
 
 if __name__ == "__main__":

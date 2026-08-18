@@ -8,21 +8,28 @@ import sys
 from typing import Optional
 
 from PyQt6.QtCore import QProcess, Qt
-from PyQt6.QtGui import QFontDatabase, QTextCursor
+from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -36,6 +43,7 @@ from squeakpose.project.distillation import (
 from squeakpose.project.layers import layer_definition, normalize_layer_id
 from squeakpose.services.training import (
     TrainingConfigError,
+    TrainingConsoleBuffer,
     build_training_run_plan,
     build_training_worker_config,
     infer_training_task_from_yaml,
@@ -140,6 +148,7 @@ class TrainDialog(QDialog):
         self.train_result_event: Optional[dict] = None
         self.train_config_path: Optional[str] = None
         self.train_cancel_requested = False
+        self.training_console = TrainingConsoleBuffer()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -267,6 +276,14 @@ class TrainDialog(QDialog):
         self.task_combo.setEnabled(False)
         self.task_combo.setToolTip("Training task is determined by the active project layer.")
         form.addRow("Training task:", self.task_combo)
+
+        self.run_name_edit = QLineEdit()
+        self.run_name_edit.setPlaceholderText("Optional — generated from the selected model")
+        self.run_name_edit.setToolTip(
+            "Passed to Ultralytics as name=. Spaces and path-unsafe punctuation are normalized; "
+            "an existing name is automatically numbered rather than overwritten."
+        )
+        form.addRow("Run name:", self.run_name_edit)
         train_combos = (
             self.source_combo,
             self.model_combo,
@@ -302,12 +319,103 @@ class TrainDialog(QDialog):
         output_layout.setContentsMargins(10, 10, 10, 10)
         output_layout.setSpacing(8)
         output_header = QHBoxLayout()
-        output_title = QLabel("Training Output")
+        output_title = QLabel("Training Monitor")
         output_title.setObjectName("TrainPanelTitle")
         output_header.addWidget(output_title)
         output_header.addStretch(1)
         output_layout.addLayout(output_header)
 
+        self.output_tabs = QTabWidget()
+        self.output_tabs.setObjectName("TrainOutputTabs")
+
+        overview_tab = QWidget()
+        overview_layout = QVBoxLayout(overview_tab)
+        overview_layout.setContentsMargins(8, 8, 8, 8)
+        overview_layout.setSpacing(8)
+
+        monitor_header = QHBoxLayout()
+        self.phase_label = QLabel("Ready")
+        self.phase_label.setObjectName("TrainPhaseLabel")
+        monitor_header.addWidget(self.phase_label)
+        monitor_header.addStretch(1)
+        self.epoch_label = QLabel("Epoch — / —")
+        self.epoch_label.setObjectName("TrainEpochLabel")
+        monitor_header.addWidget(self.epoch_label)
+        self.eta_label = QLabel("ETA —")
+        self.eta_label.setObjectName("TrainEtaLabel")
+        monitor_header.addWidget(self.eta_label)
+        overview_layout.addLayout(monitor_header)
+
+        progress_grid = QGridLayout()
+        progress_grid.setHorizontalSpacing(8)
+        progress_grid.setVerticalSpacing(5)
+        progress_grid.addWidget(QLabel("Overall"), 0, 0)
+        self.overall_progress = QProgressBar()
+        self.overall_progress.setObjectName("TrainOverallProgress")
+        self.overall_progress.setRange(0, 1000)
+        self.overall_progress.setValue(0)
+        self.overall_progress.setFormat("Waiting to start")
+        progress_grid.addWidget(self.overall_progress, 0, 1)
+        progress_grid.addWidget(QLabel("Current epoch"), 1, 0)
+        self.epoch_progress = QProgressBar()
+        self.epoch_progress.setObjectName("TrainEpochProgress")
+        self.epoch_progress.setRange(0, 1000)
+        self.epoch_progress.setValue(0)
+        self.epoch_progress.setFormat("Waiting for batches")
+        progress_grid.addWidget(self.epoch_progress, 1, 1)
+        overview_layout.addLayout(progress_grid)
+
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(8)
+        self.metric_values: dict[str, QLabel] = {}
+        primary_metric_title = (
+            "Mask mAP50–95" if self.layer.model_task == "segment" else "Pose mAP50–95"
+        )
+        for key, title in (
+            ("primary_map", primary_metric_title),
+            ("map50", "mAP50"),
+            ("precision", "Precision"),
+            ("recall", "Recall"),
+            ("loss", "Train loss"),
+        ):
+            card = QFrame()
+            card.setObjectName("TrainMetricCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(9, 7, 9, 7)
+            card_layout.setSpacing(2)
+            caption = QLabel(title)
+            caption.setObjectName("TrainMetricCaption")
+            value = QLabel("—")
+            value.setObjectName("TrainMetricValue")
+            card_layout.addWidget(caption)
+            card_layout.addWidget(value)
+            cards_layout.addWidget(card, 1)
+            self.metric_values[key] = value
+        overview_layout.addLayout(cards_layout)
+        self.loss_detail_label = QLabel("Loss components will appear when training begins.")
+        self.loss_detail_label.setObjectName("TrainLossDetail")
+        self.loss_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        overview_layout.addWidget(self.loss_detail_label)
+
+        history_title = QLabel("Epoch history")
+        history_title.setObjectName("TrainHistoryTitle")
+        overview_layout.addWidget(history_title)
+        self.history_table = QTableWidget(0, 8)
+        self.history_table.setObjectName("TrainHistoryTable")
+        self.history_table.setHorizontalHeaderLabels(
+            ["Epoch", "Time", "Loss", "Precision", "Recall", "mAP50", "mAP50–95", "Best"]
+        )
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setAlternatingRowColors(False)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.history_table.setMinimumHeight(150)
+        overview_layout.addWidget(self.history_table, 1)
+
+        console_tab = QWidget()
+        console_layout = QVBoxLayout(console_tab)
+        console_layout.setContentsMargins(6, 6, 6, 6)
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("TrainLogView")
         self.log_view.setReadOnly(True)
@@ -317,7 +425,11 @@ class TrainDialog(QDialog):
         terminal_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         terminal_font.setPointSize(11)
         self.log_view.setFont(terminal_font)
-        output_layout.addWidget(self.log_view, 1)
+        console_layout.addWidget(self.log_view)
+
+        self.output_tabs.addTab(overview_tab, "Overview")
+        self.output_tabs.addTab(console_tab, "Console")
+        output_layout.addWidget(self.output_tabs, 1)
         layout.addWidget(output_panel, 1)
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -360,6 +472,12 @@ class TrainDialog(QDialog):
         self.dino_form_label.setVisible(use_dino)
         self.resume_row.setVisible(use_resume)
         self.resume_form_label.setVisible(use_resume)
+        self.run_name_edit.setEnabled(not use_exact_resume)
+        self.run_name_edit.setPlaceholderText(
+            "Inherited from the resumed run"
+            if use_exact_resume
+            else "Optional — generated from the selected model"
+        )
         if use_exact_resume:
             self.resume_path_edit.setPlaceholderText("Select weights/last.pt from a prior run")
         else:
@@ -514,21 +632,214 @@ class TrainDialog(QDialog):
         self.train_status_label.setProperty("tone", tone)
         _refresh_qt_style(self.train_status_label)
 
+    @staticmethod
+    def _format_duration(seconds) -> str:
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError):
+            return "—"
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes:d}m {secs:02d}s"
+        return f"{secs:d}s"
+
+    @staticmethod
+    def _set_fractional_progress(bar: QProgressBar, current: int, total: int, label: str):
+        current_value = max(0, int(current or 0))
+        total_value = max(0, int(total or 0))
+        fraction = min(1.0, current_value / total_value) if total_value else 0.0
+        bar.setValue(round(fraction * 1000))
+        bar.setFormat(label)
+
+    def _reset_training_monitor(self, epochs: int = 0):
+        self.phase_label.setText("Preparing training")
+        self.epoch_label.setText(f"Epoch — / {epochs}" if epochs else "Epoch — / —")
+        self.eta_label.setText("ETA —")
+        self.overall_progress.setValue(0)
+        self.overall_progress.setFormat("0%")
+        self.epoch_progress.setValue(0)
+        self.epoch_progress.setFormat("Waiting for batches")
+        for label in self.metric_values.values():
+            label.setText("—")
+        self.loss_detail_label.setText("Loss components will appear when training begins.")
+        self.history_table.setRowCount(0)
+        self.training_console = TrainingConsoleBuffer()
+
+    @staticmethod
+    def _numeric_mapping(payload) -> dict[str, float]:
+        if not isinstance(payload, dict):
+            return {}
+        result = {}
+        for key, value in payload.items():
+            try:
+                result[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _preferred_metric(self, metrics: dict[str, float], fragment: str) -> float | None:
+        matches = [
+            (key, value)
+            for key, value in metrics.items()
+            if fragment in key.lower()
+            and not (fragment == "map50" and "map50-95" in key.lower())
+        ]
+        if not matches:
+            return None
+        preferred_suffix = "(m)" if self.layer.model_task == "segment" else "(p)"
+        for key, value in matches:
+            if preferred_suffix in key.lower():
+                return value
+        for key, value in matches:
+            if "(b)" in key.lower():
+                return value
+        return matches[0][1]
+
+    @staticmethod
+    def _loss_total(losses: dict[str, float]) -> float | None:
+        values = [value for key, value in losses.items() if "loss" in key.lower()]
+        if not values:
+            values = list(losses.values())
+        return sum(values) if values else None
+
+    @staticmethod
+    def _metric_text(value: float | None) -> str:
+        return "—" if value is None else f"{value:.4f}"
+
+    def _update_metric_cards(
+        self,
+        losses: dict[str, float],
+        metrics: dict[str, float],
+        *,
+        memory_gb=None,
+    ):
+        primary_map = self._preferred_metric(metrics, "map50-95")
+        map50 = self._preferred_metric(metrics, "map50")
+        precision = self._preferred_metric(metrics, "precision")
+        recall = self._preferred_metric(metrics, "recall")
+        loss = self._loss_total(losses)
+        for key, value in (
+            ("primary_map", primary_map),
+            ("map50", map50),
+            ("precision", precision),
+            ("recall", recall),
+            ("loss", loss),
+        ):
+            if value is not None:
+                self.metric_values[key].setText(self._metric_text(value))
+        details = [
+            f"{key.removeprefix('train/').replace('_', ' ')} {value:.4f}"
+            for key, value in losses.items()
+        ]
+        try:
+            if memory_gb is not None:
+                details.append(f"device memory {float(memory_gb):.2f} GB")
+        except (TypeError, ValueError):
+            pass
+        if details:
+            self.loss_detail_label.setText("  •  ".join(details))
+
+    def _append_epoch_history(self, event: dict):
+        losses = self._numeric_mapping(event.get("losses"))
+        metrics = self._numeric_mapping(event.get("metrics"))
+        loss = self._loss_total(losses)
+        precision = self._preferred_metric(metrics, "precision")
+        recall = self._preferred_metric(metrics, "recall")
+        map50 = self._preferred_metric(metrics, "map50")
+        primary_map = self._preferred_metric(metrics, "map50-95")
+        best = event.get("best_fitness")
+        try:
+            best_text = f"{float(best):.4f}" if best is not None else "—"
+        except (TypeError, ValueError):
+            best_text = "—"
+        row = self.history_table.rowCount()
+        self.history_table.insertRow(row)
+        values = (
+            str(event.get("epoch") or "—"),
+            self._format_duration(event.get("epoch_seconds")),
+            self._metric_text(loss),
+            self._metric_text(precision),
+            self._metric_text(recall),
+            self._metric_text(map50),
+            self._metric_text(primary_map),
+            best_text,
+        )
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.history_table.setItem(row, column, item)
+        self.history_table.scrollToBottom()
+
+    def _update_training_monitor(self, event: dict):
+        event_type = str(event.get("event") or "")
+        epoch = max(0, int(event.get("epoch") or 0))
+        epochs = max(epoch, int(event.get("epochs") or epoch))
+        if event_type == "training_setup":
+            self.phase_label.setText("Initializing dataloaders and optimizer")
+            self.epoch_label.setText(f"Epoch {epoch} / {epochs}")
+            return
+        if event_type == "epoch_start":
+            self.phase_label.setText("Training")
+            self.epoch_label.setText(f"Epoch {epoch} / {epochs}")
+            self._set_fractional_progress(
+                self.overall_progress,
+                max(0, epoch - 1),
+                epochs,
+                f"{max(0, epoch - 1)}/{epochs} epochs complete",
+            )
+            self.epoch_progress.setValue(0)
+            self.epoch_progress.setFormat("Starting epoch")
+            return
+        if event_type == "batch_progress":
+            batch = max(0, int(event.get("batch") or 0))
+            batches = max(batch, int(event.get("batches") or batch))
+            self.phase_label.setText("Training batches")
+            self.epoch_label.setText(f"Epoch {epoch} / {epochs}")
+            self._set_fractional_progress(
+                self.epoch_progress,
+                batch,
+                batches,
+                f"{batch}/{batches} batches" if batches else f"Batch {batch}",
+            )
+            losses = self._numeric_mapping(event.get("losses"))
+            self._update_metric_cards(losses, {}, memory_gb=event.get("memory_gb"))
+            eta = event.get("eta_seconds")
+            self.eta_label.setText(f"Epoch ETA {self._format_duration(eta)}")
+            return
+        if event_type == "epoch_end":
+            self.phase_label.setText("Validation complete")
+            self.epoch_label.setText(f"Epoch {epoch} / {epochs}")
+            self._set_fractional_progress(
+                self.overall_progress,
+                epoch,
+                epochs,
+                f"{epoch}/{epochs} epochs complete",
+            )
+            self.epoch_progress.setValue(1000)
+            self.epoch_progress.setFormat("Epoch complete")
+            self.eta_label.setText(f"Training ETA {self._format_duration(event.get('eta_seconds'))}")
+            losses = self._numeric_mapping(event.get("losses"))
+            metrics = self._numeric_mapping(event.get("metrics"))
+            self._update_metric_cards(losses, metrics)
+            self._append_epoch_history(event)
+
     def _clean_training_output(self, text: str) -> str:
         cleaned = self.ANSI_ESCAPE_RE.sub("", text)
         cleaned = cleaned.replace("\x08", "")
         return cleaned.replace("\r", "\n").replace("\x1b", "")
 
     def _write_training_terminal_output(self, text: str):
-        cleaned = self._clean_training_output(text)
-        if cleaned:
-            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
-            self.log_view.insertPlainText(cleaned)
-            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
-            self.log_view.ensureCursorVisible()
+        for line in self.training_console.feed(text):
+            self.log_view.appendPlainText(line)
+        self.log_view.ensureCursorVisible()
         QApplication.processEvents()
 
     def _flush_training_terminal_output(self):
+        for line in self.training_console.finish():
+            self.log_view.appendPlainText(line)
         self.log_view.ensureCursorVisible()
 
     def _log(self, message: str):
@@ -628,6 +939,7 @@ class TrainDialog(QDialog):
                 epochs=epochs,
                 batch=batch,
                 project_runs_dir=self.project_runs_dir,
+                run_name=self.run_name_edit.text(),
             )
         except TrainingConfigError as exc:
             title = {
@@ -637,6 +949,7 @@ class TrainDialog(QDialog):
                 "resume_checkpoint": "Exact resume requires last.pt",
                 "mps_batch": "Batch size required",
                 "task_mismatch": "Dataset Task Mismatch",
+                "run_name": "Run name required",
             }.get(exc.code, "Invalid training configuration")
             QMessageBox.warning(self, title, str(exc))
             return
@@ -645,6 +958,8 @@ class TrainDialog(QDialog):
         task_value = plan.task
         model_cfg = plan.model_cfg
         self.log_view.clear()
+        self._reset_training_monitor(0 if use_exact_resume else epochs)
+        self.output_tabs.setCurrentIndex(0)
         self._set_training_status("Preparing", "running")
         if plan.model_notice:
             self._log(plan.model_notice)
@@ -672,6 +987,8 @@ class TrainDialog(QDialog):
             self._log(f"- batch size: {batch_display}")
         if task_value:
             self._log(f"- task: {task_value}")
+        if not use_exact_resume:
+            self._log(f"- run name: {plan.params.get('name', '')}")
         self._log("Running training in a child process.")
         self._log("")
 
@@ -792,6 +1109,9 @@ class TrainDialog(QDialog):
         elif event_type == "training":
             self._log(str(event.get("message") or "Training started"))
             self._set_training_status("Running", "running")
+        elif event_type in {"training_setup", "epoch_start", "batch_progress", "epoch_end"}:
+            self._update_training_monitor(event)
+            self._set_training_status("Running", "running")
         elif event_type == "result":
             self.train_result_event = event
         elif event_type == "error":
@@ -868,6 +1188,7 @@ class TrainDialog(QDialog):
 
         if cancel_requested and event is None:
             self._set_training_status("Canceled", "canceled")
+            self.phase_label.setText("Training canceled")
             self._log("Training canceled.")
             QMessageBox.information(
                 self, "Training canceled", "Training worker process was canceled."
@@ -877,6 +1198,7 @@ class TrainDialog(QDialog):
         if event is None:
             detail = stderr_text or f"Process exited with code {exit_code}."
             self._set_training_status("Failed", "failed")
+            self.phase_label.setText("Training failed")
             self._log(f"Training worker failed: {detail}")
             QMessageBox.critical(self, "Training error", f"Training worker failed:\n{detail}")
             return
@@ -888,6 +1210,7 @@ class TrainDialog(QDialog):
 
         if canceled and not had_error:
             self._set_training_status("Canceled", "canceled")
+            self.phase_label.setText("Training canceled")
             self._log("Training canceled.")
             QMessageBox.information(self, "Training canceled", "Training was canceled.")
             return
@@ -899,11 +1222,16 @@ class TrainDialog(QDialog):
             or result.state in {"failed", "start_failed"}
         ):
             self._set_training_status("Failed", "failed")
+            self.phase_label.setText("Training failed")
             self._log(f"Training failed: {error_message}")
             QMessageBox.critical(self, "Training error", f"Training failed:\n{error_message}")
             return
 
         self._set_training_status("Complete", "complete")
+        self.phase_label.setText("Training complete")
+        self.eta_label.setText("Complete")
+        self.overall_progress.setValue(1000)
+        self.overall_progress.setFormat("Training complete")
         if save_dir:
             self._log(f"Training complete. Artifacts saved to: {save_dir}")
         else:

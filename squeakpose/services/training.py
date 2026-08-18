@@ -21,6 +21,42 @@ class TrainingConfigError(ValueError):
         self.code = code
 
 
+class TrainingConsoleBuffer:
+    """Reduce terminal carriage-return animation to stable, readable log lines."""
+
+    ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+    def __init__(self) -> None:
+        self._current = ""
+
+    @property
+    def pending(self) -> str:
+        return self._current
+
+    def feed(self, text: str) -> list[str]:
+        """Consume a terminal chunk and return only newline-committed lines."""
+        cleaned = self.ANSI_ESCAPE_RE.sub("", str(text or "")).replace("\x1b", "")
+        completed: list[str] = []
+        for character in cleaned:
+            if character == "\r":
+                self._current = ""
+            elif character == "\n":
+                if self._current.strip():
+                    completed.append(self._current.rstrip())
+                self._current = ""
+            elif character == "\b":
+                self._current = self._current[:-1]
+            else:
+                self._current += character
+        return completed
+
+    def finish(self) -> list[str]:
+        """Return a final unterminated line and reset the buffer."""
+        final = self._current.rstrip()
+        self._current = ""
+        return [final] if final.strip() else []
+
+
 @dataclass(frozen=True, slots=True)
 class TrainingWorkerConfig:
     layer_id: str
@@ -57,6 +93,15 @@ def training_run_name(model_spec: str) -> str:
         value = os.path.basename(value)
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
     return cleaned or "model"
+
+
+def normalize_training_run_label(label: str) -> str:
+    """Return one portable, project-contained folder name for a user run label."""
+    value = str(label or "").strip()
+    value = re.sub(r"[\\/]+", "_", value)
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    cleaned = re.sub(r"_+", "_", cleaned)
+    return cleaned[:80].rstrip("._-")
 
 
 def resolve_dataset_yaml(path: str) -> str:
@@ -150,6 +195,7 @@ def build_training_run_plan(
     epochs: int,
     batch: int,
     project_runs_dir: str,
+    run_name: str = "",
 ) -> TrainingRunPlan:
     """Resolve all non-visual training choices into the existing worker parameters.
 
@@ -229,11 +275,19 @@ def build_training_run_plan(
         project_dir = os.path.join(os.path.abspath(project_runs_dir), "train", task_folder)
         if mode == "checkpoint":
             checkpoint_run = os.path.basename(os.path.dirname(os.path.dirname(model_cfg)))
-            run_name = training_run_name(checkpoint_run or model_cfg)
-            if not run_name.endswith("_continue"):
-                run_name = f"{run_name}_continue"
+            default_run_name = training_run_name(checkpoint_run or model_cfg)
+            if not default_run_name.endswith("_continue"):
+                default_run_name = f"{default_run_name}_continue"
         else:
-            run_name = training_run_name(model_cfg)
+            default_run_name = training_run_name(model_cfg)
+        requested_run_name = str(run_name or "").strip()
+        effective_run_name = normalize_training_run_label(requested_run_name)
+        if requested_run_name and not effective_run_name:
+            raise TrainingConfigError(
+                "run_name",
+                "Run name must contain at least one letter or number.",
+            )
+        effective_run_name = effective_run_name or default_run_name
         params = {
             "data": dataset_yaml,
             "epochs": int(epochs),
@@ -241,7 +295,7 @@ def build_training_run_plan(
             "exist_ok": False,
             "batch": -1 if int(batch) <= 0 else int(batch),
             "project": project_dir,
-            "name": run_name,
+            "name": effective_run_name,
         }
         if task:
             params["task"] = task
@@ -257,12 +311,14 @@ def build_training_run_plan(
 
 
 __all__ = [
+    "TrainingConsoleBuffer",
     "TrainingConfigError",
     "TrainingWorkerConfig",
     "TrainingRunPlan",
     "build_training_run_plan",
     "build_training_worker_config",
     "infer_training_task_from_yaml",
+    "normalize_training_run_label",
     "resolve_dataset_yaml",
     "resolve_model_config",
     "training_run_name",

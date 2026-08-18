@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
 from unittest.mock import Mock, patch
 
@@ -8,7 +9,7 @@ os.environ.setdefault("MPLCONFIGDIR", os.path.join(gettempdir(), "squeakpose-mpl
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(gettempdir(), "squeakpose-cache-tests"))
 
 from PyQt6.QtCore import QProcess
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION
 from squeakpose.ui.video_reviewer import APP_BASE_DIR, VideoReviewDialog
@@ -132,6 +133,30 @@ class VideoReviewerProcessTests(unittest.TestCase):
         dialog._review_run_canceled = False
         return dialog
 
+    def test_project_video_button_selects_available_library_link(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as sources:
+            dialog = self.make_dialog(tmp)
+            videos_dir = Path(tmp) / "videos"
+            videos_dir.mkdir()
+            source = Path(sources) / "session.mp4"
+            source.write_bytes(b"video")
+            link = videos_dir / source.name
+            link.symlink_to(source)
+            (videos_dir / "missing.mov").symlink_to(Path(sources) / "missing.mov")
+
+            with (
+                patch(
+                    "squeakpose.ui.video_reviewer.QInputDialog.getItem",
+                    return_value=(source.name, True),
+                ) as choose,
+                patch.object(dialog, "_open_video") as open_video,
+            ):
+                dialog._choose_project_video()
+
+            self.assertEqual(choose.call_args.args[3], [source.name])
+            self.assertIn("1 missing", choose.call_args.args[2])
+            open_video.assert_called_once_with(str(link))
+
     def test_controller_runs_passes_sequentially_and_merges_streamed_results(self):
         with TemporaryDirectory() as tmp:
             dialog = self.make_dialog(tmp)
@@ -234,6 +259,28 @@ class VideoReviewerProcessTests(unittest.TestCase):
             self.assertTrue(dialog._review_run_canceled)
             self.assertEqual(dialog.preds_by_layer[LAYER_KEYPOINTS], {2: {"ok": True}})
             finished.assert_called_once_with()
+            dialog.close()
+
+    def test_successful_completion_does_not_treat_progress_close_as_cancel(self):
+        with TemporaryDirectory() as tmp:
+            dialog = self.make_dialog(tmp)
+            progress = QProgressDialog("Predicting…", "Cancel", 0, 1, dialog)
+            progress.canceled.connect(dialog._cancel_review_prediction_process)
+            dialog._review_progress = progress
+            dialog._review_job_queue = []
+            dialog.preds_by_layer[LAYER_KEYPOINTS] = {0: {"ok": True, "confidence": 0.8}}
+
+            with (
+                patch.object(dialog, "_save_cache"),
+                patch.object(QMessageBox, "information") as information,
+                patch.object(QMessageBox, "warning") as warning,
+            ):
+                dialog._finish_project_review_prediction()
+
+            self.assertIsNone(dialog._review_progress)
+            self.assertFalse(dialog._review_run_canceled)
+            information.assert_not_called()
+            warning.assert_not_called()
             dialog.close()
 
     def test_reject_uses_controller_shutdown_and_suppresses_completion_ui(self):

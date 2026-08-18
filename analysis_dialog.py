@@ -17,6 +17,7 @@ from PyQt6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QPolygonF,
     QTextCursor,
 )
 from PyQt6.QtWidgets import (
@@ -47,6 +48,8 @@ from PyQt6.QtWidgets import (
 
 from layer_ops import layer_definition, normalize_layer_id
 from squeakpose.services.analysis import (
+    DEFAULT_ONE_EURO_BETA,
+    DEFAULT_ONE_EURO_MIN_CUTOFF,
     AnalysisConfigError,
     AnalysisRunConfig,
     analysis_csv_matches_layer,
@@ -54,6 +57,7 @@ from squeakpose.services.analysis import (
     default_analysis_output_dir,
     inspect_analysis_csv,
     latest_analysis_csv,
+    load_segmentation_preview,
     safe_analysis_stem,
 )
 from squeakpose.services.analysis_state import AnalysisAnnotationState
@@ -96,6 +100,7 @@ class FrameAnnotationView(QWidget):
     scaleDistanceChanged = pyqtSignal(float)
     scalePointsChanged = pyqtSignal(list)
     roiDrawn = pyqtSignal(dict)
+    zoomChanged = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -111,8 +116,14 @@ class FrameAnnotationView(QWidget):
         self._mode = "scale"
         self._scale_points: list[tuple[float, float]] = []
         self._rois: list[dict[str, Any]] = []
+        self._segmentation_polygons: list[list[tuple[float, float]]] = []
         self._drag_start: Optional[tuple[float, float]] = None
         self._drag_current: Optional[tuple[float, float]] = None
+        self._zoom = 1.0
+        self._pan = QPointF()
+        self._pan_drag_start: Optional[QPointF] = None
+        self._pan_drag_origin = QPointF()
+        self.setToolTip("Mouse wheel to zoom; right-drag to pan")
 
     def set_mode(self, mode: str) -> None:
         self._mode = "roi" if mode == "roi" else "scale"
@@ -122,6 +133,13 @@ class FrameAnnotationView(QWidget):
         self._pixmap = QPixmap(pixmap)
         self._image_width = float(width)
         self._image_height = float(height)
+        self.reset_zoom()
+        self.update()
+
+    def set_segmentation_polygons(self, polygons: list[list[tuple[float, float]]]) -> None:
+        self._segmentation_polygons = [
+            [(float(x), float(y)) for x, y in polygon] for polygon in polygons
+        ]
         self.update()
 
     def set_scale_points(self, points: list[tuple[float, float]]) -> None:
@@ -137,14 +155,84 @@ class FrameAnnotationView(QWidget):
         self._drag_current = None
         self.update()
 
-    def _content_rect(self) -> QRectF:
+    def _base_content_size(self) -> QSize:
         if self._pixmap.isNull() or self._image_width <= 0 or self._image_height <= 0:
-            return QRectF()
+            return QSize()
         target = QSize(int(self._image_width), int(self._image_height))
         target.scale(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-        width = float(target.width())
-        height = float(target.height())
-        return QRectF((self.width() - width) / 2.0, (self.height() - height) / 2.0, width, height)
+        return target
+
+    def _pan_limits(self) -> tuple[float, float]:
+        target = self._base_content_size()
+        width = float(target.width()) * self._zoom
+        height = float(target.height()) * self._zoom
+        return (max(0.0, (width - self.width()) / 2.0), max(0.0, (height - self.height()) / 2.0))
+
+    def _clamp_pan(self) -> None:
+        limit_x, limit_y = self._pan_limits()
+        self._pan = QPointF(
+            max(-limit_x, min(limit_x, self._pan.x())),
+            max(-limit_y, min(limit_y, self._pan.y())),
+        )
+
+    def _content_rect(self) -> QRectF:
+        target = self._base_content_size()
+        if target.isEmpty():
+            return QRectF()
+        width = float(target.width()) * self._zoom
+        height = float(target.height()) * self._zoom
+        return QRectF(
+            (self.width() - width) / 2.0 + self._pan.x(),
+            (self.height() - height) / 2.0 + self._pan.y(),
+            width,
+            height,
+        )
+
+    def set_zoom(self, zoom: float, anchor: Optional[QPointF] = None) -> None:
+        old_zoom = self._zoom
+        new_zoom = max(1.0, min(8.0, float(zoom)))
+        if math.isclose(old_zoom, new_zoom):
+            return
+
+        anchor_point = (
+            QPointF(anchor)
+            if anchor is not None
+            else QPointF(self.width() / 2.0, self.height() / 2.0)
+        )
+        image_point = self._widget_to_image(anchor_point)
+        if image_point is None:
+            image_point = (self._image_width / 2.0, self._image_height / 2.0)
+            anchor_point = QPointF(self.width() / 2.0, self.height() / 2.0)
+
+        self._zoom = new_zoom
+        target = self._base_content_size()
+        width = float(target.width()) * self._zoom
+        height = float(target.height()) * self._zoom
+        self._pan = QPointF(
+            anchor_point.x()
+            - (self.width() - width) / 2.0
+            - image_point[0] / self._image_width * width,
+            anchor_point.y()
+            - (self.height() - height) / 2.0
+            - image_point[1] / self._image_height * height,
+        )
+        self._clamp_pan()
+        self.zoomChanged.emit(int(round(self._zoom * 100)))
+        self.update()
+
+    def zoom_in(self) -> None:
+        self.set_zoom(self._zoom * 1.25)
+
+    def zoom_out(self) -> None:
+        self.set_zoom(self._zoom / 1.25)
+
+    def reset_zoom(self) -> None:
+        changed = not math.isclose(self._zoom, 1.0) or not self._pan.isNull()
+        self._zoom = 1.0
+        self._pan = QPointF()
+        if changed:
+            self.zoomChanged.emit(100)
+        self.update()
 
     def _widget_to_image(self, point: QPointF) -> Optional[tuple[float, float]]:
         rect = self._content_rect()
@@ -167,6 +255,12 @@ class FrameAnnotationView(QWidget):
         return QRectF(p1, p2).normalized()
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton and self._zoom > 1.0:
+            self._pan_drag_start = event.position()
+            self._pan_drag_origin = QPointF(self._pan)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         image_point = self._widget_to_image(event.position())
@@ -190,6 +284,13 @@ class FrameAnnotationView(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event) -> None:
+        if self._pan_drag_start is not None:
+            delta = event.position() - self._pan_drag_start
+            self._pan = self._pan_drag_origin + delta
+            self._clamp_pan()
+            self.update()
+            event.accept()
+            return
         if self._mode != "roi" or self._drag_start is None:
             return
         image_point = self._widget_to_image(event.position())
@@ -199,6 +300,11 @@ class FrameAnnotationView(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton and self._pan_drag_start is not None:
+            self._pan_drag_start = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            event.accept()
+            return
         if (
             event.button() != Qt.MouseButton.LeftButton
             or self._mode != "roi"
@@ -218,6 +324,18 @@ class FrameAnnotationView(QWidget):
             return
         self.roiDrawn.emit({"type": "rect", "x1": left, "y1": top, "x2": right, "y2": bottom})
 
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.25 if delta > 0 else 0.8
+        self.set_zoom(self._zoom * factor, event.position())
+        event.accept()
+
+    def resizeEvent(self, event) -> None:
+        self._clamp_pan()
+        super().resizeEvent(event)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -233,6 +351,16 @@ class FrameAnnotationView(QWidget):
         painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
         painter.setPen(QPen(QColor("#26313b"), 1))
         painter.drawRect(rect)
+
+        mask_pen = QPen(QColor("#ffe066"), 2)
+        mask_fill = QColor(0, 210, 255, 58)
+        for polygon in self._segmentation_polygons:
+            if len(polygon) < 3:
+                continue
+            widget_polygon = QPolygonF([self._image_to_widget(x, y) for x, y in polygon])
+            painter.setPen(mask_pen)
+            painter.setBrush(mask_fill)
+            painter.drawPolygon(widget_polygon)
 
         roi_pen = QPen(QColor("#f5b942"), 2)
         roi_fill = QColor(245, 185, 66, 34)
@@ -406,12 +534,12 @@ class AnalysisDialog(QDialog):
         self.min_cutoff_spin = QDoubleSpinBox()
         self.min_cutoff_spin.setRange(0.0001, 100.0)
         self.min_cutoff_spin.setDecimals(3)
-        self.min_cutoff_spin.setValue(1.0)
+        self.min_cutoff_spin.setValue(DEFAULT_ONE_EURO_MIN_CUTOFF)
         self.min_cutoff_spin.setPrefix("min ")
         self.beta_spin = QDoubleSpinBox()
         self.beta_spin.setRange(0.0, 100.0)
         self.beta_spin.setDecimals(3)
-        self.beta_spin.setValue(0.0)
+        self.beta_spin.setValue(DEFAULT_ONE_EURO_BETA)
         self.beta_spin.setPrefix("beta ")
         filter_row.addWidget(self.min_cutoff_spin)
         filter_row.addWidget(self.beta_spin)
@@ -571,6 +699,28 @@ class AnalysisDialog(QDialog):
         self.clear_rois_btn.clicked.connect(self._clear_rois)
         toolbar.addWidget(self.clear_rois_btn)
         toolbar.addStretch(1)
+
+        self.zoom_out_btn = QPushButton("−")
+        self.zoom_out_btn.setFixedWidth(34)
+        self.zoom_out_btn.setToolTip("Zoom out")
+        self.zoom_out_btn.clicked.connect(lambda: self.frame_view.zoom_out())
+        toolbar.addWidget(self.zoom_out_btn)
+        self.zoom_status_label = QLabel("100%")
+        self.zoom_status_label.setObjectName("AnalysisHintLabel")
+        self.zoom_status_label.setMinimumWidth(38)
+        self.zoom_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        toolbar.addWidget(self.zoom_status_label)
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setFixedWidth(34)
+        self.zoom_in_btn.setToolTip("Zoom in")
+        self.zoom_in_btn.clicked.connect(lambda: self.frame_view.zoom_in())
+        toolbar.addWidget(self.zoom_in_btn)
+        self.zoom_fit_btn = QPushButton("Fit")
+        self.zoom_fit_btn.setFixedWidth(44)
+        self.zoom_fit_btn.setToolTip("Fit the full frame")
+        self.zoom_fit_btn.clicked.connect(lambda: self.frame_view.reset_zoom())
+        toolbar.addWidget(self.zoom_fit_btn)
+
         self.scale_status_label = QLabel("")
         self.scale_status_label.setObjectName("AnalysisStatusLabel")
         toolbar.addWidget(self.scale_status_label)
@@ -580,6 +730,9 @@ class AnalysisDialog(QDialog):
         self.frame_view.scaleDistanceChanged.connect(self._apply_scale_distance)
         self.frame_view.scalePointsChanged.connect(self._set_scale_points)
         self.frame_view.roiDrawn.connect(self._add_roi_from_canvas)
+        self.frame_view.zoomChanged.connect(
+            lambda percent: self.zoom_status_label.setText(f"{percent}%")
+        )
         workspace_layout.addWidget(self.frame_view, 1)
 
         roi_row = QHBoxLayout()
@@ -775,7 +928,9 @@ class AnalysisDialog(QDialog):
         painter.end()
         return pixmap
 
-    def _load_video_pixmap(self, video_path: str) -> Optional[tuple[QPixmap, int, int]]:
+    def _load_video_pixmap(
+        self, video_path: str, frame_index: int = 0
+    ) -> Optional[tuple[QPixmap, int, int]]:
         if not video_path or not os.path.isfile(video_path):
             return None
         try:
@@ -784,6 +939,8 @@ class AnalysisDialog(QDialog):
             return None
         cap = cv2.VideoCapture(video_path)
         try:
+            if frame_index > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
             ok, frame = cap.read()
             if not ok:
                 return None
@@ -803,12 +960,30 @@ class AnalysisDialog(QDialog):
             if video_path:
                 self.video_edit.setText(video_path)
 
-        loaded = self._load_video_pixmap(video_path)
+        segmentation_preview = (
+            load_segmentation_preview(self.csv_edit.text().strip())
+            if self.layer_id == "segmentation"
+            else None
+        )
+        preview_frame = segmentation_preview.frame_index if segmentation_preview else 0
+        polygons = (
+            [list(polygon) for polygon in segmentation_preview.polygons]
+            if segmentation_preview
+            else []
+        )
+
+        loaded = self._load_video_pixmap(video_path, preview_frame)
         if loaded is not None:
             pixmap, width, height = loaded
             self.annotation_state.set_frame_dimensions(width, height)
             self.frame_view.set_frame(pixmap, width, height)
-            self.frame_info_label.setText(f"{width} x {height} | {os.path.basename(video_path)}")
+            self.frame_view.set_segmentation_polygons(polygons)
+            overlay_status = (
+                f" | frame {preview_frame} | {len(polygons)} mask(s)" if polygons else ""
+            )
+            self.frame_info_label.setText(
+                f"{width} x {height} | {os.path.basename(video_path)}{overlay_status}"
+            )
             return
 
         if video_path and not silent:
@@ -821,7 +996,9 @@ class AnalysisDialog(QDialog):
         width, height = self._frame_dimensions_from_csv()
         self.annotation_state.set_frame_dimensions(width, height)
         self.frame_view.set_frame(self._blank_frame_pixmap(width, height), width, height)
-        self.frame_info_label.setText(f"{width} x {height} | CSV coordinates")
+        self.frame_view.set_segmentation_polygons(polygons)
+        overlay_status = f" | frame {preview_frame} | {len(polygons)} mask(s)" if polygons else ""
+        self.frame_info_label.setText(f"{width} x {height} | CSV coordinates{overlay_status}")
 
     def _set_annotation_mode(self, mode: str) -> None:
         self.frame_view.set_mode(mode)

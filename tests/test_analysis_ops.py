@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import cv2
@@ -11,11 +12,15 @@ from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
     _open_h264_video_writer,
+    create_roi_outputs,
     render_annotated_video,
     run_analysis_workflow,
 )
 from analysis_worker import run_analysis_worker
-from segmentation_analysis_ops import render_segmentation_annotated_video
+from segmentation_analysis_ops import (
+    _mask_area_overlay_text,
+    render_segmentation_annotated_video,
+)
 
 
 def _write_demo_detections(path: str) -> None:
@@ -133,6 +138,43 @@ def _write_demo_segmentation(path: str) -> None:
 
 
 class AnalysisOpsTests(unittest.TestCase):
+    def test_segmentation_video_formats_calibrated_mask_area(self):
+        row = pd.Series({"mask_area_px2": 200, "mask_area_mm2": 12.54})
+
+        self.assertEqual(_mask_area_overlay_text(row), "Mask area: 12.5 mm^2")
+
+    def test_analysis_config_uses_low_latency_one_euro_defaults(self):
+        direct = AnalysisConfig(detections_csv="detections.csv", output_dir="analysis")
+        loaded = AnalysisConfig.from_dict(
+            {"detections_csv": "detections.csv", "output_dir": "analysis"}
+        )
+
+        for config in (direct, loaded):
+            self.assertEqual(config.min_cutoff, 1.0)
+            self.assertEqual(config.beta, 0.1)
+
+    def test_roi_transition_matrix_counts_adjacent_label_changes(self):
+        with TemporaryDirectory() as tmp:
+            features = pd.DataFrame(
+                {
+                    "frame_index": range(7),
+                    "roi_label": ["Center", "Left", "Left", "Center", "Right", "Right", "Center"],
+                    "dt_seconds": [0.1] * 7,
+                    "distance_mm": [0.0] * 7,
+                    "speed_mm_per_sec": [0.0] * 7,
+                }
+            )
+
+            outputs = create_roi_outputs(features, Path(tmp), 10.0)
+            transition = pd.read_csv(outputs["roi_transition_csv"], index_col=0)
+
+            self.assertEqual(transition.loc["Center", "Left"], 1)
+            self.assertEqual(transition.loc["Left", "Left"], 1)
+            self.assertEqual(transition.loc["Left", "Center"], 1)
+            self.assertEqual(transition.loc["Center", "Right"], 1)
+            self.assertEqual(transition.loc["Right", "Right"], 1)
+            self.assertEqual(transition.loc["Right", "Center"], 1)
+
     def test_pyav_h264_writer_encodes_mp4_and_pads_odd_dimensions(self):
         with TemporaryDirectory() as tmp:
             output_path = os.path.join(tmp, "output.mp4")
@@ -224,6 +266,7 @@ class AnalysisOpsTests(unittest.TestCase):
                         "bbox_center_y_euro": 20,
                         "mask_polygon": json.dumps([[10, 10], [30, 10], [30, 30]]),
                         "mask_area_px2": 200,
+                        "mask_area_mm2": 12.5,
                         "speed_mm_per_sec": 0.0,
                         "roi_label": "",
                     }

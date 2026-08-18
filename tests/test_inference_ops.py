@@ -370,6 +370,8 @@ class InferenceOpsTests(unittest.TestCase):
                 classes=["mouse"],
                 device="cpu",
                 total_frames=1,
+                model_path="segment.pt",
+                fps=10.0,
             )
 
             self.assertFalse(result.had_error)
@@ -378,6 +380,12 @@ class InferenceOpsTests(unittest.TestCase):
             with open(csv_path, "r", encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(rows[0]["class_name"], "mouse")
+            self.assertEqual(rows[0]["video_path"], "video.mp4")
+            self.assertEqual(rows[0]["model_path"], "segment.pt")
+            self.assertEqual(rows[0]["frame_index"], "0")
+            self.assertEqual(rows[0]["time_seconds"], "0.0")
+            self.assertEqual(rows[0]["image_width"], "40")
+            self.assertEqual(rows[0]["image_height"], "20")
             self.assertEqual(rows[0]["binary_mask"], "")
             self.assertEqual(rows[0]["mask_polygon"], "[[1, 2], [11, 2], [11, 12]]")
 
@@ -472,6 +480,38 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(result_event["rows_written"], 1)
             self.assertFalse(result_event["had_error"])
             self.assertTrue(Path(csv_path).exists())
+
+    def test_inference_worker_writes_segmentation_source_metadata(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "worker_segmentation.csv")
+            model = _SegModel([_Result(boxes=_Boxes(), orig_shape=(1080, 960))])
+            model.task = "segment"
+            events = []
+
+            exit_code = run_inference_worker(
+                {
+                    "mode": "segmentation",
+                    "layer_id": "segmentation",
+                    "model_path": "segment.pt",
+                    "video_path": "video.mp4",
+                    "csv_path": csv_path,
+                    "classes": ["mouse"],
+                    "device": "cpu",
+                    "total_frames": 1,
+                    "fps": 29.97,
+                },
+                model_factory=lambda _path: model,
+                event_writer=events.append,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(events[-1]["event"], "result")
+            with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["video_path"], "video.mp4")
+            self.assertEqual(row["model_path"], "segment.pt")
+            self.assertEqual(row["image_width"], "960")
+            self.assertEqual(row["image_height"], "1080")
 
     def test_inference_worker_runs_depth_config_and_reports_preview(self):
         with TemporaryDirectory() as tmp:

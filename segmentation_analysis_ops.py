@@ -355,13 +355,61 @@ def _line_plot(
 ) -> Optional[str]:
     if x_col not in df.columns or y_col not in df.columns:
         return None
-    clean = df[[x_col, y_col]].dropna()
+    columns = [x_col, y_col]
+    if "time_seconds" in df.columns:
+        columns.append("time_seconds")
+    clean = df[columns].copy()
+    clean[x_col] = pd.to_numeric(clean[x_col], errors="coerce")
+    clean[y_col] = pd.to_numeric(clean[y_col], errors="coerce")
+    clean = clean.dropna(subset=[x_col, y_col])
     if clean.empty:
         return None
     plt, sns = _setup_plotting()
     fig, ax = plt.subplots(figsize=(12, 4))
-    sns.lineplot(data=clean, x=x_col, y=y_col, ax=ax)
-    ax.set_xlabel("Frame")
+
+    if "time_seconds" in clean.columns:
+        elapsed = pd.to_numeric(clean["time_seconds"], errors="coerce")
+        use_time = elapsed.notna().any()
+    else:
+        elapsed = pd.Series(dtype=float)
+        use_time = False
+    x_values = elapsed / 60.0 if use_time else clean[x_col]
+    x_label = "Elapsed time (min)" if use_time else "Frame"
+
+    max_plot_points = 4000
+    step = max(1, int(math.ceil(len(clean) / max_plot_points)))
+    sampled = slice(None, None, step)
+    if len(clean) > 2000:
+        ax.plot(
+            x_values.iloc[sampled],
+            clean[y_col].iloc[sampled],
+            color="#4c72b0",
+            alpha=0.22,
+            linewidth=0.65,
+            label="Per-frame",
+        )
+        if use_time:
+            time_step = elapsed.diff().dropna()
+            time_step = time_step[time_step > 0]
+            rolling_window = (
+                max(3, int(round(1.0 / float(time_step.median())))) if not time_step.empty else 30
+            )
+            rolling_label = "1 s rolling mean"
+        else:
+            rolling_window = max(5, min(60, len(clean) // 300))
+            rolling_label = f"{rolling_window}-frame rolling mean"
+        rolling = clean[y_col].rolling(rolling_window, center=True, min_periods=1).mean()
+        ax.plot(
+            x_values.iloc[sampled],
+            rolling.iloc[sampled],
+            color="#1f5f99",
+            linewidth=1.35,
+            label=rolling_label,
+        )
+        ax.legend(frameon=False, loc="upper right")
+    else:
+        ax.plot(x_values, clean[y_col], color="#4c72b0", linewidth=1.2)
+    ax.set_xlabel(x_label)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     sns.despine(fig)
@@ -555,6 +603,13 @@ def create_segmentation_plots(
     return paths
 
 
+def _mask_area_overlay_text(row: Any) -> str:
+    area_val = row.get("mask_area_mm2")
+    if pd.isna(area_val):
+        return ""
+    return f"Mask area: {float(area_val):.1f} mm^2"
+
+
 def render_segmentation_annotated_video(
     primary: pd.DataFrame,
     video_path: str,
@@ -596,10 +651,31 @@ def render_segmentation_annotated_video(
                         int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
                     ]
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
+                    label = str(roi["name"])
+                    (label_width, label_height), _baseline = cv2.getTextSize(
+                        label,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        2,
+                    )
+                    label_x = max(2, min(width - label_width - 2, (x1 + x2 - label_width) // 2))
+                    label_y = max(
+                        label_height + 2,
+                        min(height - 2, (y1 + y2 + label_height) // 2),
+                    )
                     cv2.putText(
                         frame,
-                        str(roi["name"]),
-                        (x1 + 4, max(y1 + 18, 18)),
+                        label,
+                        (label_x, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (17, 24, 32),
+                        4,
+                    )
+                    cv2.putText(
+                        frame,
+                        label,
+                        (label_x, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
                         (66, 191, 245),
@@ -644,11 +720,11 @@ def render_segmentation_annotated_video(
                         frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
                     )
 
-                    area_val = row.get("mask_area_px2")
-                    if not pd.isna(area_val):
+                    area_text = _mask_area_overlay_text(row)
+                    if area_text:
                         cv2.putText(
                             frame,
-                            f"Mask area: {float(area_val):.0f} px^2",
+                            area_text,
                             (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.6,

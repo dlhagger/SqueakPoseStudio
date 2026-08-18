@@ -161,6 +161,8 @@ def run_inference_worker(
             classes=classes,
             device=device,
             total_frames=total_frames,
+            model_path=model_path,
+            fps=fps,
             progress_callback=progress,
             cancel_requested=_cancel_requested,
         )

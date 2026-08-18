@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from pathlib import Path
@@ -10,10 +11,29 @@ from squeakpose.services.analysis import (
     default_analysis_output_dir,
     inspect_analysis_csv,
     latest_analysis_csv,
+    load_segmentation_preview,
 )
 
 
 class AnalysisServiceTests(unittest.TestCase):
+    def test_segmentation_preview_uses_first_frame_with_valid_masks(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = Path(tmp, "segmentation.csv")
+            csv_path.write_text(
+                "frame,det,mask_polygon\n"
+                '0,-1,""\n'
+                '2,0,"[[1, 2], [11, 2], [11, 12]]"\n'
+                '2,1,"[[20, 20], [30, 20], [30, 30]]"\n'
+                '3,0,"[[40, 40], [50, 40], [50, 50]]"\n',
+                encoding="utf-8",
+            )
+
+            preview = load_segmentation_preview(str(csv_path))
+
+            self.assertEqual(preview.frame_index, 2)
+            self.assertEqual(len(preview.polygons), 2)
+            self.assertEqual(preview.polygons[0][0], (1.0, 2.0))
+
     def test_csv_layer_detection_and_output_path(self):
         with TemporaryDirectory() as tmp:
             pose = Path(tmp, "pose results.csv")
@@ -138,6 +158,53 @@ class AnalysisServiceTests(unittest.TestCase):
             self.assertEqual((context.width, context.height), (1280, 720))
             self.assertEqual(latest_analysis_csv([tmp], "keypoints"), str(newer))
             self.assertEqual(inspect_analysis_csv("missing.csv").width, 1280)
+
+    def test_csv_context_falls_back_to_matching_inference_manifest(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            output_root = project / "inference outputs"
+            segmentation_dir = output_root / "segmentation"
+            runs_dir = output_root / "runs"
+            segmentation_dir.mkdir(parents=True)
+            runs_dir.mkdir()
+            video = project / "videos" / "source.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            run_id = "source_20260818-122205_abcdef123456"
+            csv_path = segmentation_dir / f"{run_id}_segmentation.csv"
+            csv_path.write_text(
+                "frame,det,x1,y1,x2,y2,mask_polygon\n0,0,1,2,3,4,[]\n",
+                encoding="utf-8",
+            )
+            manifest = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "video_path": str(video),
+                "passes": [{"layer_id": "segmentation", "csv_path": str(csv_path)}],
+            }
+            (runs_dir / f"{run_id}.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            context = inspect_analysis_csv(str(csv_path))
+
+            self.assertEqual(context.video_path, str(video))
+
+    def test_csv_context_ignores_manifest_for_a_different_csv(self):
+        with TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "inference outputs"
+            segmentation_dir = output_root / "segmentation"
+            runs_dir = output_root / "runs"
+            segmentation_dir.mkdir(parents=True)
+            runs_dir.mkdir()
+            run_id = "source_20260818-122205_abcdef123456"
+            csv_path = segmentation_dir / f"{run_id}_segmentation.csv"
+            csv_path.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            manifest = {
+                "video_path": str(Path(tmp) / "video.mp4"),
+                "passes": [{"csv_path": str(segmentation_dir / "other.csv")}],
+            }
+            (runs_dir / f"{run_id}.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            self.assertEqual(inspect_analysis_csv(str(csv_path)).video_path, "")
 
 
 if __name__ == "__main__":

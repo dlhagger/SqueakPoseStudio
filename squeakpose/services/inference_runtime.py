@@ -70,6 +70,12 @@ POSE_BASE_FIELDNAMES = [
 ]
 
 SEGMENTATION_FIELDNAMES = [
+    "video_path",
+    "model_path",
+    "frame_index",
+    "time_seconds",
+    "image_width",
+    "image_height",
     "frame",
     "det",
     "class_id",
@@ -620,6 +626,8 @@ def run_segmentation_video_inference(
     classes: list[str],
     device: str,
     total_frames: int,
+    model_path: str = "",
+    fps: float = 0.0,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_requested: Optional[CancelCallback] = None,
 ) -> InferenceRunResult:
@@ -661,6 +669,21 @@ def run_segmentation_video_inference(
                 )
             for row in rows:
                 csv_row = dict(row)
+                shape = getattr(inference_result, "orig_shape", None) or (0, 0)
+                try:
+                    image_height, image_width = int(shape[0]), int(shape[1])
+                except (IndexError, TypeError, ValueError):
+                    image_height, image_width = 0, 0
+                csv_row.update(
+                    {
+                        "video_path": video_path,
+                        "model_path": model_path,
+                        "frame_index": frame_idx,
+                        "time_seconds": (frame_idx / fps) if fps > 0 else "",
+                        "image_width": image_width,
+                        "image_height": image_height,
+                    }
+                )
                 polygon = csv_row.get("mask_polygon")
                 csv_row["mask_polygon"] = json.dumps(polygon) if polygon else ""
                 csv_row["binary_mask"] = ""

@@ -17,6 +17,7 @@ import pandas as pd
 
 from squeakpose.core import commit_staged_paths, remove_path, staging_path_for
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
+from squeakpose.services.analysis import DEFAULT_ONE_EURO_BETA, DEFAULT_ONE_EURO_MIN_CUTOFF
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
@@ -35,8 +36,8 @@ class AnalysisConfig:
     pixel_distance: float = 1.0
     real_world_distance_mm: float = 1.0
     smooth: bool = True
-    min_cutoff: float = 1.0
-    beta: float = 0.0
+    min_cutoff: float = DEFAULT_ONE_EURO_MIN_CUTOFF
+    beta: float = DEFAULT_ONE_EURO_BETA
     d_cutoff: float = 1.0
     make_plots: bool = True
     make_annotated_video: bool = False
@@ -60,8 +61,8 @@ class AnalysisConfig:
             pixel_distance=float(raw.get("pixel_distance") or 1.0),
             real_world_distance_mm=float(raw.get("real_world_distance_mm") or 1.0),
             smooth=bool(raw.get("smooth", True)),
-            min_cutoff=float(raw.get("min_cutoff") or 1.0),
-            beta=float(raw.get("beta") or 0.0),
+            min_cutoff=float(raw.get("min_cutoff") or DEFAULT_ONE_EURO_MIN_CUTOFF),
+            beta=float(raw.get("beta") if raw.get("beta") is not None else DEFAULT_ONE_EURO_BETA),
             d_cutoff=float(raw.get("d_cutoff") or 1.0),
             make_plots=bool(raw.get("make_plots", True)),
             make_annotated_video=bool(raw.get("make_annotated_video", False)),
@@ -574,11 +575,13 @@ def _draw_roi_overlays(ax, rois: list[dict[str, Any]]) -> None:
         )
         ax.add_patch(rect)
         ax.text(
-            x1 + 4,
-            y1 + 14,
+            x1 + width / 2.0,
+            y1 + height / 2.0,
             str(roi["name"]),
             color="#111820",
             fontsize=8,
+            ha="center",
+            va="center",
             bbox={
                 "boxstyle": "round,pad=0.18",
                 "facecolor": "#f5b942",
@@ -625,7 +628,10 @@ def create_roi_outputs(df: pd.DataFrame, output_dir: Path, fps: float) -> dict[s
     transition = pd.DataFrame()
     if len(labels) > 1:
         transition = pd.crosstab(
-            labels.iloc[:-1], labels.iloc[1:], rownames=["from_roi"], colnames=["to_roi"]
+            labels.iloc[:-1].to_numpy(),
+            labels.iloc[1:].to_numpy(),
+            rownames=["from_roi"],
+            colnames=["to_roi"],
         )
         transition_path = output_dir / "roi_transition_matrix.csv"
         transition.to_csv(transition_path)

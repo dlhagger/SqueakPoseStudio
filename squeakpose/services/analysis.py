@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
+import math
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from squeakpose.json_io import JsonFileError, read_json_file
+from squeakpose.project.layers import LAYER_DEFINITIONS
+
+DEFAULT_ONE_EURO_MIN_CUTOFF = 1.0
+DEFAULT_ONE_EURO_BETA = 0.1
 
 
 class AnalysisConfigError(ValueError):
@@ -41,6 +49,65 @@ class AnalysisCsvContext:
     video_path: str = ""
     width: int = 1280
     height: int = 720
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentationPreview:
+    """First CSV frame containing segmentation polygons for the setup canvas."""
+
+    frame_index: int = 0
+    polygons: tuple[tuple[tuple[float, float], ...], ...] = ()
+
+
+def _existing_manifest_video_path(csv_path: str) -> str:
+    """Resolve an inference CSV's source video through its sibling run manifest."""
+
+    csv_file = Path(csv_path).absolute()
+    inference_root = csv_file.parent.parent
+    if inference_root.name != "inference outputs":
+        return ""
+
+    run_id = ""
+    for layer in LAYER_DEFINITIONS.values():
+        if csv_file.name.endswith(layer.inference_suffix):
+            run_id = csv_file.name[: -len(layer.inference_suffix)]
+            break
+    if not run_id:
+        return ""
+
+    manifest_path = inference_root / "runs" / f"{run_id}.json"
+    try:
+        manifest = read_json_file(str(manifest_path), max_bytes=1024 * 1024, require_object=True)
+    except JsonFileError:
+        return ""
+
+    expected_csv = os.path.normcase(os.path.abspath(csv_path))
+    matching_pass = False
+    passes = manifest.get("passes")
+    if isinstance(passes, list):
+        for item in passes:
+            if not isinstance(item, Mapping):
+                continue
+            recorded_csv = str(item.get("csv_path") or "").strip()
+            if recorded_csv and os.path.normcase(os.path.abspath(recorded_csv)) == expected_csv:
+                matching_pass = True
+                break
+    if not matching_pass:
+        return ""
+
+    candidate = str(manifest.get("video_path") or "").strip()
+    if candidate and not os.path.isabs(candidate):
+        candidate = str(inference_root.parent / candidate)
+    if candidate and os.path.isfile(candidate):
+        return candidate
+
+    # A project video link may have been retargeted after inference. Prefer the
+    # current link with the same filename when the manifest's original path is stale.
+    if candidate:
+        project_video = inference_root.parent / "videos" / os.path.basename(candidate)
+        if project_video.is_file():
+            return str(project_video)
+    return ""
 
 
 def safe_analysis_stem(path: str) -> str:
@@ -99,7 +166,50 @@ def inspect_analysis_csv(path: str, *, row_limit: int = 1000) -> AnalysisCsvCont
                     pass
     except (OSError, csv.Error):
         pass
+    if not video_path:
+        video_path = _existing_manifest_video_path(path)
     return AnalysisCsvContext(video_path, width or 1280, height or 720)
+
+
+def load_segmentation_preview(path: str, *, row_limit: int = 10_000) -> SegmentationPreview:
+    """Load polygons from the first frame containing a valid segmentation mask."""
+
+    selected_frame: int | None = None
+    polygons: list[tuple[tuple[float, float], ...]] = []
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            for index, row in enumerate(csv.DictReader(handle)):
+                if index >= max(0, int(row_limit)):
+                    break
+                try:
+                    frame_index = int(float(row.get("frame") or row.get("frame_index") or 0))
+                    raw_polygon = json.loads(str(row.get("mask_polygon") or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(raw_polygon, list):
+                    continue
+                points: list[tuple[float, float]] = []
+                for point in raw_polygon:
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    try:
+                        x, y = float(point[0]), float(point[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(x) and math.isfinite(y):
+                        points.append((x, y))
+                if len(points) < 3:
+                    continue
+                if selected_frame is None:
+                    selected_frame = frame_index
+                if frame_index != selected_frame:
+                    if frame_index > selected_frame:
+                        break
+                    continue
+                polygons.append(tuple(points))
+    except (OSError, csv.Error):
+        pass
+    return SegmentationPreview(selected_frame or 0, tuple(polygons))
 
 
 def latest_analysis_csv(directories: Iterable[str], layer_id: str) -> str:

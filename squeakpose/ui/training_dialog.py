@@ -684,8 +684,7 @@ class TrainDialog(QDialog):
         matches = [
             (key, value)
             for key, value in metrics.items()
-            if fragment in key.lower()
-            and not (fragment == "map50" and "map50-95" in key.lower())
+            if fragment in key.lower() and not (fragment == "map50" and "map50-95" in key.lower())
         ]
         if not matches:
             return None
@@ -820,7 +819,9 @@ class TrainDialog(QDialog):
             )
             self.epoch_progress.setValue(1000)
             self.epoch_progress.setFormat("Epoch complete")
-            self.eta_label.setText(f"Training ETA {self._format_duration(event.get('eta_seconds'))}")
+            self.eta_label.setText(
+                f"Training ETA {self._format_duration(event.get('eta_seconds'))}"
+            )
             losses = self._numeric_mapping(event.get("losses"))
             metrics = self._numeric_mapping(event.get("metrics"))
             self._update_metric_cards(losses, metrics)

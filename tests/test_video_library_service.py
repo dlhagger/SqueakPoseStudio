@@ -45,7 +45,11 @@ class VideoLibraryServiceTests(unittest.TestCase):
             self.assertTrue(second.exists())
 
     def test_duplicate_names_get_numbered_and_same_source_is_not_linked_twice(self):
-        with TemporaryDirectory() as project, TemporaryDirectory() as first_dir, TemporaryDirectory() as second_dir:
+        with (
+            TemporaryDirectory() as project,
+            TemporaryDirectory() as first_dir,
+            TemporaryDirectory() as second_dir,
+        ):
             videos_dir = Path(project) / "videos"
             first = Path(first_dir) / "session.mp4"
             second = Path(second_dir) / "session.mp4"

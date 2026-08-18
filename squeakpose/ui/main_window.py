@@ -3326,9 +3326,7 @@ class LabelingApp(QMainWindow):
         manage_videos_action.triggered.connect(self.open_video_library)
 
         add_videos_action = videos_menu.addAction("Add Video Links…")
-        add_videos_action.triggered.connect(
-            lambda: self.open_video_library(add_immediately=True)
-        )
+        add_videos_action.triggered.connect(lambda: self.open_video_library(add_immediately=True))
 
     def open_video_library(self, _checked: bool = False, *, add_immediately: bool = False):
         videos_dir = ProjectPaths.from_root(self.project_root).videos

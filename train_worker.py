@@ -123,9 +123,7 @@ def _register_training_callbacks(
         batch = int(state["batch"])
         now = time.monotonic()
         should_emit = (
-            batch == 1
-            or batch >= batches
-            or now - float(state.get("last_batch_emit", 0.0)) >= 0.2
+            batch == 1 or batch >= batches or now - float(state.get("last_batch_emit", 0.0)) >= 0.2
         )
         if not should_emit:
             return

@@ -150,7 +150,9 @@ class VideoLibraryDialog(QDialog):
             return
         self.refresh(created[-1].name if created else "")
         if not created:
-            QMessageBox.information(self, "Videos Already Linked", "Those videos are already linked.")
+            QMessageBox.information(
+                self, "Videos Already Linked", "Those videos are already linked."
+            )
 
     def _rename_selected(self) -> None:
         entry = self._selected_entry()

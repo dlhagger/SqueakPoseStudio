@@ -105,9 +105,7 @@ def add_video_links(videos_dir: str, source_paths: list[str]) -> list[VideoLibra
         name = _available_link_name(directory, os.path.basename(source))
         destination = _require_library_child(directory, name)
         os.symlink(source, destination)
-        created.append(
-            VideoLibraryEntry(name, destination, True, source, target_exists=True)
-        )
+        created.append(VideoLibraryEntry(name, destination, True, source, target_exists=True))
     return created
 
 

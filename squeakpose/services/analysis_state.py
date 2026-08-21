@@ -45,7 +45,11 @@ class AnalysisROI:
                 raise ValueError("polygon ROI points must be a sequence")
             points: list[tuple[float, float]] = []
             for point in raw_points:
-                if not isinstance(point, Sequence) or isinstance(point, (str, bytes)) or len(point) < 2:
+                if (
+                    not isinstance(point, Sequence)
+                    or isinstance(point, (str, bytes))
+                    or len(point) < 2
+                ):
                     raise ValueError("polygon ROI points must contain x/y pairs")
                 x, y = float(point[0]), float(point[1])
                 if not math.isfinite(x) or not math.isfinite(y):
@@ -62,8 +66,7 @@ class AnalysisROI:
             if len(set(points)) < 3:
                 raise ValueError("polygon ROI requires at least three unique vertices")
             twice_area = sum(
-                x1 * y2 - x2 * y1
-                for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
+                x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
             )
             if math.isclose(twice_area, 0.0, abs_tol=1e-6):
                 raise ValueError("polygon ROI must enclose an area")
@@ -119,14 +122,17 @@ class AnalysisROI:
     @property
     def area(self) -> float:
         if self.type == "polygon":
-            return abs(
-                sum(
-                    x1 * y2 - x2 * y1
-                    for (x1, y1), (x2, y2) in zip(
-                        self.points, self.points[1:] + self.points[:1]
+            return (
+                abs(
+                    sum(
+                        x1 * y2 - x2 * y1
+                        for (x1, y1), (x2, y2) in zip(
+                            self.points, self.points[1:] + self.points[:1]
+                        )
                     )
                 )
-            ) / 2.0
+                / 2.0
+            )
         return self.width * self.height
 
 

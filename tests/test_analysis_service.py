@@ -59,9 +59,7 @@ class AnalysisServiceTests(unittest.TestCase):
 
             options = project_analysis_inputs(tmp, "segmentation")
 
-            self.assertEqual(
-                [option.video_name for option in options], ["first.mp4", "second.mp4"]
-            )
+            self.assertEqual([option.video_name for option in options], ["first.mp4", "second.mp4"])
             self.assertEqual(options[0].csv_path, str(newer_csv))
             self.assertTrue(options[0].inference_ready)
             self.assertFalse(options[1].inference_ready)

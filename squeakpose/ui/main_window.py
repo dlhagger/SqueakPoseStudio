@@ -4619,9 +4619,7 @@ class LabelingApp(QMainWindow):
     def _inference_controller_job_started(self, job: InferenceJobPlan) -> None:
         video_prefix = ""
         if self._inference_batch_total > 1:
-            video_prefix = (
-                f"Video {self._inference_batch_index}/{self._inference_batch_total} · "
-            )
+            video_prefix = f"Video {self._inference_batch_index}/{self._inference_batch_total} · "
         progress = QProgressDialog(
             f"{video_prefix}Pass {job.job_index}/{job.job_total}: "
             f"running {job.display_name} inference…",
@@ -4650,9 +4648,7 @@ class LabelingApp(QMainWindow):
         detail = str(event.get("message") or f"Inferencing frame {processed}")
         video_prefix = ""
         if self._inference_batch_total > 1:
-            video_prefix = (
-                f"Video {self._inference_batch_index}/{self._inference_batch_total} · "
-            )
+            video_prefix = f"Video {self._inference_batch_index}/{self._inference_batch_total} · "
         progress.setLabelText(
             f"{video_prefix}Pass {job.job_index}/{job.job_total} · {job.display_name}\n{detail}"
         )

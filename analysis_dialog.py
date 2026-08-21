@@ -876,7 +876,9 @@ class AnalysisDialog(QDialog):
         self.raise_roi_btn.clicked.connect(lambda: self._move_selected_roi(-1))
         roi_actions.addWidget(self.raise_roi_btn)
         self.lower_roi_btn = QPushButton("Lower Priority")
-        self.lower_roi_btn.setToolTip("Move the selected ROI toward the bottom of the priority list")
+        self.lower_roi_btn.setToolTip(
+            "Move the selected ROI toward the bottom of the priority list"
+        )
         self.lower_roi_btn.clicked.connect(lambda: self._move_selected_roi(1))
         roi_actions.addWidget(self.lower_roi_btn)
         self.rename_roi_btn = QPushButton("Rename")
@@ -1010,7 +1012,9 @@ class AnalysisDialog(QDialog):
                 f"{option.video_name} — {self.layer.display_name} {suffix.lower()}",
                 Qt.ItemDataRole.ToolTipRole,
             )
-            if current_video and os.path.realpath(option.video_path) == os.path.realpath(current_video):
+            if current_video and os.path.realpath(option.video_path) == os.path.realpath(
+                current_video
+            ):
                 selected_index = index
             if option.inference_ready and option.created_at >= newest_created_at:
                 newest_created_at = option.created_at
@@ -1379,9 +1383,7 @@ class AnalysisDialog(QDialog):
             self.real_distance_spin.setValue(setup.real_world_distance_mm)
             self.frame_view.set_scale_points(list(setup.scale_points))
             if len(setup.scale_points) == 2:
-                self.pixel_distance_label.setText(
-                    f"{self.annotation_state.pixel_distance:.1f} px"
-                )
+                self.pixel_distance_label.setText(f"{self.annotation_state.pixel_distance:.1f} px")
             else:
                 self.pixel_distance_label.setText("Draw scale")
             self._update_scale_label()
@@ -1409,9 +1411,7 @@ class AnalysisDialog(QDialog):
         if not 0 <= row < len(self.annotation_state.rois):
             return
         current_name = self.annotation_state.rois[row].name
-        name, accepted = QInputDialog.getText(
-            self, "Rename ROI", "ROI name:", text=current_name
-        )
+        name, accepted = QInputDialog.getText(self, "Rename ROI", "ROI name:", text=current_name)
         if accepted and self.annotation_state.rename_roi(row, name):
             self._refresh_roi_list()
             self.roi_list.setCurrentRow(row)
@@ -1470,9 +1470,7 @@ class AnalysisDialog(QDialog):
                 detail = f"Polygon · {len(roi.points)} vertices · {roi.area:.0f}px²"
             else:
                 detail = f"Legacy rectangle · {roi.width:.0f} x {roi.height:.0f}px"
-            item = QListWidgetItem(
-                f"P{index} · {roi.name}  ·  {detail}"
-            )
+            item = QListWidgetItem(f"P{index} · {roi.name}  ·  {detail}")
             self.roi_list.addItem(item)
         count = len(state_rois)
         self.roi_count_label.setText(f"{count} ROI{'s' if count != 1 else ''}")

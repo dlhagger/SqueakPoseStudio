@@ -83,9 +83,7 @@ class PolygonRoiTests(unittest.TestCase):
 
     def test_polygon_normalization_rejects_degenerate_shapes(self):
         self.assertEqual(
-            normalize_rois(
-                [{"type": "polygon", "points": [[0, 0], [1, 1], [2, 2]]}]
-            ),
+            normalize_rois([{"type": "polygon", "points": [[0, 0], [1, 1], [2, 2]]}]),
             [],
         )
 

@@ -148,9 +148,9 @@ def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
     for raw in raw_rois:
         if not isinstance(raw, dict):
             continue
-        roi_type = str(
-            raw.get("type") or ("polygon" if raw.get("points") else "rect")
-        ).strip().lower()
+        roi_type = (
+            str(raw.get("type") or ("polygon" if raw.get("points") else "rect")).strip().lower()
+        )
         name = str(raw.get("name") or f"ROI {len(rois) + 1}").strip() or f"ROI {len(rois) + 1}"
         if roi_type == "polygon":
             raw_points = raw.get("points")
@@ -176,8 +176,7 @@ def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
             if len({(point[0], point[1]) for point in points}) < 3:
                 continue
             twice_area = sum(
-                x1 * y2 - x2 * y1
-                for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
+                x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
             )
             if math.isclose(twice_area, 0.0, abs_tol=1e-6):
                 continue
@@ -227,9 +226,7 @@ def _points_in_polygon(
         dx = x2 - x1
         dy = y2 - y1
         cross = (xs - x1) * dy - (ys - y1) * dx
-        on_segment = (
-            np.abs(cross) <= tolerance * max(1.0, abs(dx), abs(dy))
-        ) & (
+        on_segment = (np.abs(cross) <= tolerance * max(1.0, abs(dx), abs(dy))) & (
             (xs >= min(x1, x2) - tolerance)
             & (xs <= max(x1, x2) + tolerance)
             & (ys >= min(y1, y2) - tolerance)

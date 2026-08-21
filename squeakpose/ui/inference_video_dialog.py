@@ -184,7 +184,9 @@ class InferenceVideoDialog(QDialog):
         completed = set(status.successful_layers)
         configured = set(self.configured_layers)
         prefix = "Complete" if configured and configured.issubset(completed) else "Available"
-        names = ", ".join(layer_definition(layer_id).display_name for layer_id in status.successful_layers)
+        names = ", ".join(
+            layer_definition(layer_id).display_name for layer_id in status.successful_layers
+        )
         return f"{prefix} · {names}"
 
     def _status_tooltip(self, key: str) -> str:
@@ -242,7 +244,9 @@ class InferenceVideoDialog(QDialog):
         count = len(self.selected_video_paths)
         self.run_button.setEnabled(count > 0)
         self.selection_label.setText(
-            "No videos selected" if count == 0 else f"{count} video{'s' if count != 1 else ''} selected"
+            "No videos selected"
+            if count == 0
+            else f"{count} video{'s' if count != 1 else ''} selected"
         )
 
 

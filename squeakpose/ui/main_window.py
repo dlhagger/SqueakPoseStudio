@@ -245,6 +245,7 @@ from squeakpose.ui.dialog_launch import (
 )
 from squeakpose.ui.distillation_dialog import DistillationDialog
 from squeakpose.ui.inference_controller import InferenceController
+from squeakpose.ui.inference_video_dialog import InferenceVideoDialog
 from squeakpose.ui.navigation_panel import NavigationPanel, NavigationPanelCallbacks
 from squeakpose.ui.operation_panel import (
     AnalysisOperationsPanel,
@@ -3214,6 +3215,10 @@ class LabelingApp(QMainWindow):
 
         self._predict_busy = False
         self._inference_progress: Optional[QProgressDialog] = None
+        self._inference_plan_queue = []
+        self._inference_batch_summaries: list[InferenceRunSummary] = []
+        self._inference_batch_total = 0
+        self._inference_batch_index = 0
         self._prediction_depth_targets: Optional[dict[str, str]] = None
         self._active_depth_map = None
         self._depth_probes: list[dict] = []
@@ -4612,8 +4617,14 @@ class LabelingApp(QMainWindow):
             self.inference_btn.setEnabled(not busy)
 
     def _inference_controller_job_started(self, job: InferenceJobPlan) -> None:
+        video_prefix = ""
+        if self._inference_batch_total > 1:
+            video_prefix = (
+                f"Video {self._inference_batch_index}/{self._inference_batch_total} · "
+            )
         progress = QProgressDialog(
-            f"Pass {job.job_index}/{job.job_total}: running {job.display_name} inference…",
+            f"{video_prefix}Pass {job.job_index}/{job.job_total}: "
+            f"running {job.display_name} inference…",
             "Cancel",
             0,
             0 if job.total_frames <= 0 else job.total_frames,
@@ -4637,21 +4648,59 @@ class LabelingApp(QMainWindow):
         if total > 0:
             progress.setValue(min(processed, total))
         detail = str(event.get("message") or f"Inferencing frame {processed}")
+        video_prefix = ""
+        if self._inference_batch_total > 1:
+            video_prefix = (
+                f"Video {self._inference_batch_index}/{self._inference_batch_total} · "
+            )
         progress.setLabelText(
-            f"Pass {job.job_index}/{job.job_total} · {job.display_name}\n{detail}"
+            f"{video_prefix}Pass {job.job_index}/{job.job_total} · {job.display_name}\n{detail}"
         )
         QApplication.processEvents()
 
     def _inference_controller_pass_finished(self, result: InferencePassResult) -> None:
         if self._inference_progress is not None:
-            self._inference_progress.close()
+            progress = self._inference_progress
+            # Closing a QProgressDialog can emit ``canceled`` on some Qt/platform
+            # combinations. This close is a successful pass cleanup, not a user
+            # cancellation, so detach the destructive batch-cancel handler first.
+            try:
+                progress.canceled.disconnect(self._cancel_inference_process)
+            except (TypeError, RuntimeError):
+                pass
+            progress.close()
         self._inference_progress = None
 
     def _inference_controller_completed(self, summary: InferenceRunSummary) -> None:
         if not summary.results:
             return
-        message = "\n\n".join(summary.details)
-        if summary.failed_count:
+        self._inference_batch_summaries.append(summary)
+        if summary.canceled:
+            self._inference_plan_queue = []
+        if self._inference_plan_queue:
+            next_plan = self._inference_plan_queue.pop(0)
+            self._inference_batch_index += 1
+            self._inference_coordinator.start(next_plan)
+            return
+
+        summaries = tuple(self._inference_batch_summaries)
+        self._inference_batch_summaries = []
+        self._inference_batch_total = 0
+        self._inference_batch_index = 0
+        if len(summaries) == 1:
+            message = "\n\n".join(summary.details)
+        else:
+            lines = []
+            for item in summaries:
+                if item.canceled:
+                    state = "canceled"
+                elif item.failed_count:
+                    state = f"finished with {item.failed_count} failed pass(es)"
+                else:
+                    state = "complete"
+                lines.append(f"{os.path.basename(item.video_path)} — {state}")
+            message = "\n".join(lines)
+        if any(item.failed_count or item.canceled for item in summaries):
             QMessageBox.warning(self, "Project Inference Finished", message)
         else:
             QMessageBox.information(self, "Project Inference Complete", message)
@@ -4781,61 +4830,62 @@ class LabelingApp(QMainWindow):
             if not configured_layers:
                 return
 
-        video_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select video for inference",
-            ProjectPaths.from_root(self.project_root).videos,
-            "Video Files (*.mp4 *.mov *.avi *.mkv *.wmv *.mpg *.mpeg);;All Files (*)",
-        )
-        if not video_path:
-            return
-
-        metadata = probe_video_metadata(video_path, _cv2)
-        if not metadata.opened:
-            QMessageBox.warning(self, "Video Error", f"Unable to open video:\n{video_path}")
-            return
-
         device_name = str(getattr(self, "_device", "cpu")).lower()
         default_batch = 16 if device_name in {"cuda", "mps"} else 4
-        batch_size, ok = QInputDialog.getInt(
-            self,
-            "Batch Size",
-            "Frames per batch (larger uses more VRAM/RAM but speeds up inference):",
-            value=max(1, default_batch),
-            min=1,
-            max=256,
+        dialog = InferenceVideoDialog(
+            self.project_root,
+            configured_layers=configured_layers,
+            default_batch_size=default_batch,
+            parent=self,
         )
-        if not ok:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-
-        try:
-            plan = plan_inference_run(
-                project_root=self.project_root,
-                video_path=video_path,
-                active_layer=self.active_layer,
-                model_paths=self.layer_model_paths,
-                pose_classes=self.pose_classes,
-                segmentation_classes=self.seg_classes,
-                keypoint_names=self.pose_kp_names,
-                device=str(getattr(self, "_device", "cpu")),
-                batch_size=batch_size,
-                total_frames=metadata.total_frames,
-                fps=metadata.fps,
-            )
-            prepare_inference_run(plan)
-        except Exception as e:
+        video_paths = dialog.selected_video_paths
+        if not video_paths:
+            return
+        plans = []
+        errors = []
+        for video_path in video_paths:
+            metadata = probe_video_metadata(video_path, _cv2)
+            if not metadata.opened:
+                errors.append(f"{os.path.basename(video_path)}: unable to open video")
+                continue
+            try:
+                plan = plan_inference_run(
+                    project_root=self.project_root,
+                    video_path=video_path,
+                    active_layer=self.active_layer,
+                    model_paths=self.layer_model_paths,
+                    pose_classes=self.pose_classes,
+                    segmentation_classes=self.seg_classes,
+                    keypoint_names=self.pose_kp_names,
+                    device=str(getattr(self, "_device", "cpu")),
+                    batch_size=dialog.batch_size,
+                    total_frames=metadata.total_frames,
+                    fps=metadata.fps,
+                )
+                prepare_inference_run(plan)
+                plans.append(plan)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(video_path)}: {exc}")
+        if errors:
             QMessageBox.warning(
                 self,
-                "Output Error",
-                f"Could not prepare project inference outputs.\n\n{e}",
+                "Some Videos Could Not Be Prepared",
+                "\n".join(errors),
             )
+        if not plans:
             return
-
-        self._inference_coordinator.start(plan)
+        self._inference_plan_queue = list(plans[1:])
+        self._inference_batch_summaries = []
+        self._inference_batch_total = len(plans)
+        self._inference_batch_index = 1
+        self._inference_coordinator.start(plans[0])
 
     def _cancel_inference_process(self) -> None:
         coordinator = getattr(self, "_inference_coordinator", None)
         if coordinator is not None and coordinator.is_busy:
+            self._inference_plan_queue = []
             if coordinator.cancel() and self._inference_progress is not None:
                 self._inference_progress.setLabelText("Canceling inference process…")
 

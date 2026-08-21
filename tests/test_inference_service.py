@@ -15,10 +15,57 @@ from squeakpose.services.inference import (
     finalize_inference_run,
     plan_inference_run,
     prepare_inference_run,
+    project_video_inference_statuses,
+    video_identity,
 )
 
 
 class InferenceServiceTests(unittest.TestCase):
+    def test_project_video_statuses_combine_successful_layers_and_ignore_bad_manifests(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            source.write_bytes(b"video")
+            videos = root / "videos"
+            videos.mkdir()
+            link = videos / "session.mp4"
+            link.symlink_to(source)
+            runs = root / "inference outputs" / "runs"
+            runs.mkdir(parents=True)
+            (runs / "first.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": str(link),
+                        "created_at": "2026-08-19T10:00:00",
+                        "passes": [
+                            {"layer_id": "keypoints", "had_error": False, "canceled": False},
+                            {"layer_id": "depth", "had_error": True, "canceled": False},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runs / "second.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": str(source),
+                        "created_at": "2026-08-20T12:00:00",
+                        "passes": [
+                            {"layer_id": "segmentation", "had_error": False, "canceled": False}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runs / "damaged.json").write_text("not json", encoding="utf-8")
+
+            statuses = project_video_inference_statuses(tmp)
+
+            status = statuses[video_identity(str(link))]
+            self.assertEqual(status.successful_layers, ("keypoints", "segmentation"))
+            self.assertEqual(status.latest_created_at, "2026-08-20T12:00:00")
+            self.assertEqual(status.run_count, 2)
+
     def test_configured_layers_are_active_first_and_deduplicated(self):
         layers = configured_inference_layers(
             "segment",

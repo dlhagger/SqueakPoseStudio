@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import datetime as dt
 import json
@@ -13,7 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from squeakpose.json_io import JsonFileError, read_json_file
-from squeakpose.project.layers import LAYER_DEFINITIONS
+from squeakpose.project.layers import LAYER_DEFINITIONS, normalize_layer_id
+from squeakpose.services.video_library import list_project_videos
 
 DEFAULT_ONE_EURO_MIN_CUTOFF = 1.0
 DEFAULT_ONE_EURO_BETA = 0.1
@@ -38,7 +40,7 @@ class AnalysisRunConfig:
 
     def as_dict(self) -> dict[str, Any]:
         result = dict(self.payload)
-        result["rois"] = [dict(roi) for roi in self.payload.get("rois", ())]
+        result["rois"] = copy.deepcopy(list(self.payload.get("rois", ())))
         return result
 
 
@@ -57,6 +59,107 @@ class SegmentationPreview:
 
     frame_index: int = 0
     polygons: tuple[tuple[tuple[float, float], ...], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectAnalysisInput:
+    """One project video and its newest compatible inference CSV, when available."""
+
+    video_name: str
+    video_path: str
+    csv_path: str = ""
+    created_at: str = ""
+
+    @property
+    def inference_ready(self) -> bool:
+        return bool(self.csv_path)
+
+
+def _video_identity(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+
+
+def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAnalysisInput, ...]:
+    """Pair project-library videos with their newest successful layer inference output."""
+    root = os.path.abspath(project_root)
+    normalized_layer = normalize_layer_id(layer_id)
+    inference_root = os.path.join(root, "inference outputs")
+    videos = [
+        entry
+        for entry in list_project_videos(os.path.join(root, "videos"))
+        if entry.target_exists
+    ]
+    runs_dir = os.path.join(root, "inference outputs", "runs")
+    newest_by_identity: dict[str, tuple[str, float, str]] = {}
+    newest_by_name: dict[str, tuple[str, float, str]] = {}
+    try:
+        manifest_names = os.listdir(runs_dir)
+    except OSError:
+        manifest_names = []
+    for name in manifest_names:
+        if name.startswith(".") or not name.lower().endswith(".json"):
+            continue
+        manifest_path = os.path.join(runs_dir, name)
+        try:
+            manifest = read_json_file(
+                manifest_path, max_bytes=1024 * 1024, require_object=True
+            )
+            modified = os.path.getmtime(manifest_path)
+        except (JsonFileError, OSError):
+            continue
+        video_path = str(manifest.get("video_path") or "").strip()
+        passes = manifest.get("passes")
+        if not video_path or not isinstance(passes, list):
+            continue
+        candidates: list[str] = []
+        for item in passes:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("had_error") or item.get("canceled"):
+                continue
+            reported_layer = normalize_layer_id(item.get("layer_id"), default="")
+            if reported_layer and reported_layer != normalized_layer:
+                continue
+            csv_path = str(item.get("csv_path") or "").strip()
+            csv_path = os.path.abspath(csv_path) if csv_path else ""
+            try:
+                inside_project_outputs = bool(
+                    csv_path
+                    and os.path.commonpath((inference_root, csv_path)) == inference_root
+                )
+            except ValueError:
+                inside_project_outputs = False
+            if (
+                inside_project_outputs
+                and os.path.isfile(csv_path)
+                and analysis_csv_matches_layer(csv_path, normalized_layer)
+            ):
+                candidates.append(csv_path)
+        if not candidates:
+            continue
+        created_at = str(manifest.get("created_at") or "")
+        record = (created_at, modified, candidates[-1])
+        identity = _video_identity(video_path)
+        if record[:2] >= newest_by_identity.get(identity, ("", -1.0, ""))[:2]:
+            newest_by_identity[identity] = record
+        video_name = os.path.basename(video_path).casefold()
+        if record[:2] >= newest_by_name.get(video_name, ("", -1.0, ""))[:2]:
+            newest_by_name[video_name] = record
+
+    options: list[ProjectAnalysisInput] = []
+    for entry in videos:
+        record = newest_by_identity.get(_video_identity(entry.path))
+        if record is None:
+            record = newest_by_name.get(entry.name.casefold())
+        options.append(
+            ProjectAnalysisInput(
+                video_name=entry.name,
+                video_path=entry.path,
+                csv_path=record[2] if record else "",
+                created_at=record[0] if record else "",
+            )
+        )
+    return tuple(options)
 
 
 def _existing_manifest_video_path(csv_path: str) -> str:
@@ -305,7 +408,7 @@ def build_analysis_run_config(
         "hdbscan_min_cluster_size": int(hdbscan_min_cluster_size),
         "cluster_clip_length_sec": float(cluster_clip_length_sec),
         "samples_per_cluster": int(samples_per_cluster),
-        "rois": tuple(dict(roi) for roi in rois),
+        "rois": tuple(copy.deepcopy(dict(roi)) for roi in rois),
     }
     return AnalysisRunConfig(
         payload=payload,

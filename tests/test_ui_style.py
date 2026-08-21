@@ -39,6 +39,7 @@ class UiStyleTests(unittest.TestCase):
         self.assertIn("PrimaryLauncherButton", style.launcher_stylesheet())
         self.assertIn("SidebarContent", style.sidebar_stylesheet())
         self.assertIn("TrainStatusLabel", style.train_dialog_stylesheet())
+        self.assertIn("InferenceVideoTable", style.inference_dialog_stylesheet())
         self.assertIn("AnalysisPanel", style.analysis_dialog_stylesheet())
         self.assertIn(style.COLORS["input_bg"], style.combo_popup_stylesheet())
 

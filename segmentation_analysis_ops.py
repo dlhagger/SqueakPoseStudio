@@ -646,7 +646,31 @@ def render_segmentation_annotated_video(
                 if not ok:
                     break
 
-                for roi in normalized_rois:
+                for roi in reversed(normalized_rois):
+                    if roi["type"] == "polygon":
+                        contour = np.asarray(roi["points"], dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(frame, [contour], True, (66, 191, 245), 2)
+                        label = str(roi["name"])
+                        label_x, label_y = np.mean(contour[:, 0, :], axis=0).astype(int)
+                        cv2.putText(
+                            frame,
+                            label,
+                            (int(label_x), max(int(label_y), 18)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (17, 24, 32),
+                            4,
+                        )
+                        cv2.putText(
+                            frame,
+                            label,
+                            (int(label_x), max(int(label_y), 18)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (66, 191, 245),
+                            2,
+                        )
+                        continue
                     x1, y1, x2, y2 = [
                         int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
                     ]

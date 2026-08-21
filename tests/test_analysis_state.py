@@ -60,6 +60,49 @@ class AnalysisAnnotationStateTests(unittest.TestCase):
         self.assertTrue(state.delete_roi(0))
         self.assertEqual(state.worker_rois(), [])
 
+    def test_polygon_roi_is_clamped_exported_and_renamed(self):
+        state = AnalysisAnnotationState(frame_width=100, frame_height=80)
+
+        roi = state.add_roi(
+            {
+                "type": "polygon",
+                "points": [[-5, 10], [60, -4], [120, 70], [20, 90]],
+            }
+        )
+
+        self.assertEqual(roi.type, "polygon")
+        self.assertEqual(roi.points, ((0.0, 10.0), (60.0, 0.0), (100.0, 70.0), (20.0, 80.0)))
+        self.assertGreater(roi.area, 0)
+        self.assertTrue(state.rename_roi(0, "Nest"))
+        exported = state.worker_rois()
+        self.assertEqual(exported[0]["name"], "Nest")
+        self.assertEqual(exported[0]["type"], "polygon")
+        exported[0]["points"][0][0] = 999
+        self.assertEqual(state.rois[0].points[0], (0.0, 10.0))
+
+    def test_polygon_roi_rejects_degenerate_vertices(self):
+        state = AnalysisAnnotationState()
+        with self.assertRaisesRegex(ValueError, "three unique"):
+            state.add_roi({"type": "polygon", "points": [[0, 0], [1, 1], [0, 0]]})
+        with self.assertRaisesRegex(ValueError, "enclose an area"):
+            state.add_roi({"type": "polygon", "points": [[0, 0], [1, 1], [2, 2]]})
+
+    def test_roi_priority_can_be_reordered_independently_of_creation(self):
+        state = AnalysisAnnotationState()
+        shape = {"type": "polygon", "points": [[0, 0], [10, 0], [0, 10]]}
+        state.add_roi(shape, name="First")
+        state.add_roi(shape, name="Second")
+        state.add_roi(shape, name="Third")
+
+        self.assertEqual(state.move_roi(2, -1), 1)
+        self.assertEqual(state.move_roi(1, -1), 0)
+        self.assertEqual(
+            [roi["name"] for roi in state.worker_rois()],
+            ["Third", "First", "Second"],
+        )
+        self.assertEqual(state.move_roi(0, -1), 0)
+        self.assertEqual(state.move_roi(99, 1), -1)
+
     def test_snapshot_restore_captures_all_annotation_state(self):
         state = AnalysisAnnotationState(
             frame_width=640,

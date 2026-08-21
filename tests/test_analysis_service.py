@@ -12,10 +12,60 @@ from squeakpose.services.analysis import (
     inspect_analysis_csv,
     latest_analysis_csv,
     load_segmentation_preview,
+    project_analysis_inputs,
 )
 
 
 class AnalysisServiceTests(unittest.TestCase):
+    def test_project_analysis_inputs_pair_each_video_with_newest_layer_csv(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            videos = root / "videos"
+            videos.mkdir()
+            first_video = videos / "first.mp4"
+            second_video = videos / "second.mp4"
+            first_video.write_bytes(b"first")
+            second_video.write_bytes(b"second")
+            outputs = root / "inference outputs"
+            segment_dir = outputs / "segmentation"
+            runs = outputs / "runs"
+            segment_dir.mkdir(parents=True)
+            runs.mkdir()
+            older_csv = segment_dir / "older_segmentation.csv"
+            newer_csv = segment_dir / "newer_segmentation.csv"
+            for path in (older_csv, newer_csv):
+                path.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            for name, created_at, csv_path in (
+                ("older", "2026-08-19T12:00:00", older_csv),
+                ("newer", "2026-08-20T12:00:00", newer_csv),
+            ):
+                (runs / f"{name}.json").write_text(
+                    json.dumps(
+                        {
+                            "video_path": str(first_video),
+                            "created_at": created_at,
+                            "passes": [
+                                {
+                                    "layer_id": "segmentation",
+                                    "csv_path": str(csv_path),
+                                    "had_error": False,
+                                    "canceled": False,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            options = project_analysis_inputs(tmp, "segmentation")
+
+            self.assertEqual(
+                [option.video_name for option in options], ["first.mp4", "second.mp4"]
+            )
+            self.assertEqual(options[0].csv_path, str(newer_csv))
+            self.assertTrue(options[0].inference_ready)
+            self.assertFalse(options[1].inference_ready)
+
     def test_segmentation_preview_uses_first_frame_with_valid_masks(self):
         with TemporaryDirectory() as tmp:
             csv_path = Path(tmp, "segmentation.csv")

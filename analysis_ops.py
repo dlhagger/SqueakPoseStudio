@@ -141,14 +141,48 @@ def _mm_per_pixel(config: AnalysisConfig) -> float:
 
 
 def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
-    """Return validated rectangular ROIs in image-pixel coordinates."""
+    """Return validated polygon ROIs while accepting legacy rectangles."""
     if not isinstance(raw_rois, list):
         return []
     rois: list[dict[str, Any]] = []
     for raw in raw_rois:
         if not isinstance(raw, dict):
             continue
-        roi_type = str(raw.get("type") or "rect").strip().lower()
+        roi_type = str(
+            raw.get("type") or ("polygon" if raw.get("points") else "rect")
+        ).strip().lower()
+        name = str(raw.get("name") or f"ROI {len(rois) + 1}").strip() or f"ROI {len(rois) + 1}"
+        if roi_type == "polygon":
+            raw_points = raw.get("points")
+            if not isinstance(raw_points, (list, tuple)):
+                continue
+            points: list[list[float]] = []
+            for point in raw_points:
+                if not isinstance(point, (list, tuple)) or len(point) < 2:
+                    points = []
+                    break
+                try:
+                    x, y = float(point[0]), float(point[1])
+                except (TypeError, ValueError):
+                    points = []
+                    break
+                if not math.isfinite(x) or not math.isfinite(y):
+                    points = []
+                    break
+                if not points or [x, y] != points[-1]:
+                    points.append([x, y])
+            if len(points) > 1 and points[0] == points[-1]:
+                points.pop()
+            if len({(point[0], point[1]) for point in points}) < 3:
+                continue
+            twice_area = sum(
+                x1 * y2 - x2 * y1
+                for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
+            )
+            if math.isclose(twice_area, 0.0, abs_tol=1e-6):
+                continue
+            rois.append({"name": name, "type": "polygon", "points": points})
+            continue
         if roi_type != "rect":
             continue
         try:
@@ -164,7 +198,6 @@ def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
         top, bottom = sorted((y1, y2))
         if right - left <= 0 or bottom - top <= 0:
             continue
-        name = str(raw.get("name") or f"ROI {len(rois) + 1}").strip() or f"ROI {len(rois) + 1}"
         rois.append(
             {
                 "name": name,
@@ -178,6 +211,38 @@ def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
     return rois
 
 
+def _points_in_polygon(
+    x_values: pd.Series,
+    y_values: pd.Series,
+    points: list[list[float]],
+) -> np.ndarray:
+    """Vectorized even/odd containment with polygon boundaries treated as inside."""
+    xs = pd.to_numeric(x_values, errors="coerce").to_numpy(dtype=float)
+    ys = pd.to_numeric(y_values, errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(xs) & np.isfinite(ys)
+    inside = np.zeros(len(xs), dtype=bool)
+    boundary = np.zeros(len(xs), dtype=bool)
+    tolerance = 1e-7
+    for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1]):
+        dx = x2 - x1
+        dy = y2 - y1
+        cross = (xs - x1) * dy - (ys - y1) * dx
+        on_segment = (
+            np.abs(cross) <= tolerance * max(1.0, abs(dx), abs(dy))
+        ) & (
+            (xs >= min(x1, x2) - tolerance)
+            & (xs <= max(x1, x2) + tolerance)
+            & (ys >= min(y1, y2) - tolerance)
+            & (ys <= max(y1, y2) + tolerance)
+        )
+        boundary |= on_segment & valid
+        crosses = (y1 > ys) != (y2 > ys)
+        denominator = dy if not math.isclose(dy, 0.0) else 1.0
+        edge_x = x1 + (ys - y1) * dx / denominator
+        inside ^= crosses & (xs < edge_x) & valid
+    return (inside | boundary) & valid
+
+
 def assign_roi_labels(
     df: pd.DataFrame,
     rois: list[dict[str, Any]],
@@ -185,7 +250,7 @@ def assign_roi_labels(
     x_col: str = "bbox_center_x_euro",
     y_col: str = "bbox_center_y_euro",
 ) -> pd.DataFrame:
-    """Annotate each detection row with the rectangular ROI containing its center."""
+    """Label centers by ROI, with earlier list entries taking precedence."""
     out = df.copy()
     out["roi_label"] = "Outside"
     normalized = normalize_rois(rois)
@@ -195,10 +260,14 @@ def assign_roi_labels(
     x_values = pd.to_numeric(out[x_col], errors="coerce")
     y_values = pd.to_numeric(out[y_col], errors="coerce")
     for roi in normalized:
-        mask = x_values.between(
-            float(roi["x1"]), float(roi["x2"]), inclusive="both"
-        ) & y_values.between(float(roi["y1"]), float(roi["y2"]), inclusive="both")
-        out.loc[mask, "roi_label"] = roi["name"]
+        if roi["type"] == "polygon":
+            mask = _points_in_polygon(x_values, y_values, roi["points"])
+        else:
+            mask = x_values.between(
+                float(roi["x1"]), float(roi["x2"]), inclusive="both"
+            ) & y_values.between(float(roi["y1"]), float(roi["y2"]), inclusive="both")
+        unassigned = out["roi_label"].eq("Outside")
+        out.loc[mask & unassigned, "roi_label"] = roi["name"]
     return out
 
 
@@ -559,7 +628,35 @@ def _draw_roi_overlays(ax, rois: list[dict[str, Any]]) -> None:
         return
     import matplotlib.patches as patches
 
-    for roi in normalized:
+    for roi in reversed(normalized):
+        if roi["type"] == "polygon":
+            points = np.asarray(roi["points"], dtype=float)
+            patch = patches.Polygon(
+                points,
+                closed=True,
+                linewidth=1.6,
+                edgecolor="#f5b942",
+                facecolor="none",
+                alpha=0.95,
+            )
+            ax.add_patch(patch)
+            label_x, label_y = points.mean(axis=0)
+            ax.text(
+                label_x,
+                label_y,
+                str(roi["name"]),
+                color="#111820",
+                fontsize=8,
+                ha="center",
+                va="center",
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": "#f5b942",
+                    "edgecolor": "none",
+                    "alpha": 0.9,
+                },
+            )
+            continue
         x1 = float(roi["x1"])
         y1 = float(roi["y1"])
         width = float(roi["x2"]) - x1
@@ -854,7 +951,21 @@ def render_annotated_video(
                 ok, frame = cap.read()
                 if not ok:
                     break
-                for roi in normalized_rois:
+                for roi in reversed(normalized_rois):
+                    if roi["type"] == "polygon":
+                        points = np.asarray(roi["points"], dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(frame, [points], True, (66, 191, 245), 2)
+                        label_x, label_y = np.mean(points[:, 0, :], axis=0).astype(int)
+                        cv2.putText(
+                            frame,
+                            str(roi["name"]),
+                            (int(label_x), max(int(label_y), 18)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (66, 191, 245),
+                            2,
+                        )
+                        continue
                     x1, y1, x2, y2 = [
                         int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
                     ]

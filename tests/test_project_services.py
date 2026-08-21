@@ -40,6 +40,8 @@ class ProjectPathTests(unittest.TestCase):
 
             self.assertTrue(os.path.isdir(paths.distillation_unlabeled_images))
             self.assertTrue(os.path.isdir(paths.analysis_outputs))
+            self.assertTrue(os.path.isdir(paths.analysis_settings))
+            self.assertTrue(os.path.isdir(paths.analysis_video_settings))
             self.assertTrue(os.path.isdir(paths.analysis_keypoints))
             self.assertTrue(os.path.isdir(paths.analysis_segmentation))
             self.assertTrue(os.path.isdir(paths.inference_keypoints))

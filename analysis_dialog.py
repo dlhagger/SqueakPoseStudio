@@ -52,15 +52,20 @@ from squeakpose.services.analysis import (
     DEFAULT_ONE_EURO_MIN_CUTOFF,
     AnalysisConfigError,
     AnalysisRunConfig,
+    ProjectAnalysisInput,
     analysis_csv_matches_layer,
     build_analysis_run_config,
     default_analysis_output_dir,
     inspect_analysis_csv,
-    latest_analysis_csv,
     load_segmentation_preview,
+    project_analysis_inputs,
     safe_analysis_stem,
 )
 from squeakpose.services.analysis_state import AnalysisAnnotationState
+from squeakpose.services.video_analysis_setup import (
+    load_video_analysis_setup,
+    save_video_analysis_setup,
+)
 from squeakpose.workers.process import (
     WorkerJobController,
     WorkerJobResult,
@@ -69,7 +74,7 @@ from squeakpose.workers.process import (
     shutdown_qprocess,
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
-from ui_style import analysis_dialog_stylesheet
+from ui_style import ThemedComboBox, analysis_dialog_stylesheet
 
 
 def _remove_file_quietly(path: Optional[str]) -> None:
@@ -95,11 +100,12 @@ def _fmt_number(value: Any, decimals: int = 2) -> str:
 
 
 class FrameAnnotationView(QWidget):
-    """Frame viewer that supports clicked scale points and rectangular ROIs."""
+    """Frame viewer that supports clicked scale points and polygonal ROIs."""
 
     scaleDistanceChanged = pyqtSignal(float)
     scalePointsChanged = pyqtSignal(list)
     roiDrawn = pyqtSignal(dict)
+    polygonDraftChanged = pyqtSignal(int)
     zoomChanged = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -117,16 +123,21 @@ class FrameAnnotationView(QWidget):
         self._scale_points: list[tuple[float, float]] = []
         self._rois: list[dict[str, Any]] = []
         self._segmentation_polygons: list[list[tuple[float, float]]] = []
-        self._drag_start: Optional[tuple[float, float]] = None
-        self._drag_current: Optional[tuple[float, float]] = None
+        self._polygon_points: list[tuple[float, float]] = []
+        self._polygon_cursor: Optional[tuple[float, float]] = None
+        self._selected_roi_index = -1
         self._zoom = 1.0
         self._pan = QPointF()
         self._pan_drag_start: Optional[QPointF] = None
         self._pan_drag_origin = QPointF()
         self.setToolTip("Mouse wheel to zoom; right-drag to pan")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_mode(self, mode: str) -> None:
-        self._mode = "roi" if mode == "roi" else "scale"
+        next_mode = "roi" if mode == "roi" else "scale"
+        if self._mode == "roi" and next_mode != "roi":
+            self.cancel_polygon()
+        self._mode = next_mode
         self.update()
 
     def set_frame(self, pixmap: QPixmap, width: int, height: int) -> None:
@@ -150,9 +161,70 @@ class FrameAnnotationView(QWidget):
         self._rois = [dict(roi) for roi in rois]
         self.update()
 
+    def set_selected_roi(self, index: int) -> None:
+        self._selected_roi_index = int(index)
+        self.update()
+
+    def cancel_polygon(self) -> None:
+        self._polygon_points = []
+        self._polygon_cursor = None
+        self.polygonDraftChanged.emit(0)
+        self.update()
+
+    def undo_polygon_vertex(self) -> None:
+        if self._polygon_points:
+            self._polygon_points.pop()
+        if not self._polygon_points:
+            self._polygon_cursor = None
+        self.polygonDraftChanged.emit(len(self._polygon_points))
+        self.update()
+
+    def finish_polygon(self) -> bool:
+        if len(self._polygon_points) < 3:
+            return False
+        twice_area = sum(
+            x1 * y2 - x2 * y1
+            for (x1, y1), (x2, y2) in zip(
+                self._polygon_points,
+                self._polygon_points[1:] + self._polygon_points[:1],
+            )
+        )
+        if math.isclose(twice_area, 0.0, abs_tol=1e-6):
+            return False
+        points = list(self._polygon_points)
+        self.cancel_polygon()
+        self.roiDrawn.emit({"type": "polygon", "points": points})
+        return True
+
+    @property
+    def polygon_vertex_count(self) -> int:
+        return len(self._polygon_points)
+
     def clear_preview_roi(self) -> None:
-        self._drag_start = None
-        self._drag_current = None
+        """Compatibility alias for clearing an unfinished ROI."""
+        self.cancel_polygon()
+
+    def _near_first_polygon_vertex(self, point: QPointF) -> bool:
+        if len(self._polygon_points) < 3:
+            return False
+        first = self._image_to_widget(*self._polygon_points[0])
+        return math.hypot(point.x() - first.x(), point.y() - first.y()) <= 11.0
+
+    def keyPressEvent(self, event) -> None:
+        if self._mode == "roi":
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.finish_polygon()
+                event.accept()
+                return
+            if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self.undo_polygon_vertex()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self.cancel_polygon()
+                event.accept()
+                return
+        super().keyPressEvent(event)
         self.update()
 
     def _base_content_size(self) -> QSize:
@@ -279,8 +351,13 @@ class FrameAnnotationView(QWidget):
             self.update()
             return
 
-        self._drag_start = image_point
-        self._drag_current = image_point
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if self._near_first_polygon_vertex(event.position()):
+            self.finish_polygon()
+            return
+        self._polygon_points.append(image_point)
+        self._polygon_cursor = image_point
+        self.polygonDraftChanged.emit(len(self._polygon_points))
         self.update()
 
     def mouseMoveEvent(self, event) -> None:
@@ -291,13 +368,20 @@ class FrameAnnotationView(QWidget):
             self.update()
             event.accept()
             return
-        if self._mode != "roi" or self._drag_start is None:
+        if self._mode != "roi" or not self._polygon_points:
             return
         image_point = self._widget_to_image(event.position())
         if image_point is None:
             return
-        self._drag_current = image_point
+        self._polygon_cursor = image_point
         self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._mode == "roi":
+            if self.finish_polygon():
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.RightButton and self._pan_drag_start is not None:
@@ -305,24 +389,7 @@ class FrameAnnotationView(QWidget):
             self.setCursor(Qt.CursorShape.CrossCursor)
             event.accept()
             return
-        if (
-            event.button() != Qt.MouseButton.LeftButton
-            or self._mode != "roi"
-            or self._drag_start is None
-        ):
-            return
-        image_point = self._widget_to_image(event.position()) or self._drag_current
-        if image_point is None:
-            self.clear_preview_roi()
-            return
-        x1, y1 = self._drag_start
-        x2, y2 = image_point
-        left, right = sorted((x1, x2))
-        top, bottom = sorted((y1, y2))
-        self.clear_preview_roi()
-        if right - left < 5 or bottom - top < 5:
-            return
-        self.roiDrawn.emit({"type": "rect", "x1": left, "y1": top, "x2": right, "y2": bottom})
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
@@ -365,16 +432,32 @@ class FrameAnnotationView(QWidget):
         roi_pen = QPen(QColor("#f5b942"), 2)
         roi_fill = QColor(245, 185, 66, 34)
         painter.setFont(QFont("Arial", 10, QFont.Weight.DemiBold))
-        for roi in self._rois:
+        for roi_index in range(len(self._rois) - 1, -1, -1):
+            roi = self._rois[roi_index]
             try:
-                roi_rect = self._roi_to_widget_rect(roi)
+                roi_type = str(roi.get("type") or "rect")
+                if roi_type == "polygon":
+                    points = [
+                        self._image_to_widget(float(point[0]), float(point[1]))
+                        for point in roi.get("points", [])
+                    ]
+                    if len(points) < 3:
+                        continue
+                    polygon = QPolygonF(points)
+                    bounds = polygon.boundingRect()
+                else:
+                    bounds = self._roi_to_widget_rect(roi)
             except (KeyError, TypeError, ValueError):
                 continue
-            painter.setPen(roi_pen)
-            painter.fillRect(roi_rect, roi_fill)
-            painter.drawRect(roi_rect)
+            selected = roi_index == self._selected_roi_index
+            painter.setPen(QPen(QColor("#76c7ff") if selected else roi_pen.color(), 2))
+            painter.setBrush(QColor(118, 199, 255, 42) if selected else roi_fill)
+            if roi_type == "polygon":
+                painter.drawPolygon(polygon)
+            else:
+                painter.drawRect(bounds)
             label_rect = QRectF(
-                roi_rect.x() + 4, roi_rect.y() + 4, min(roi_rect.width() - 8, 180), 20
+                bounds.x() + 4, bounds.y() + 4, min(max(bounds.width() - 8, 40), 180), 20
             )
             painter.fillRect(label_rect, QColor(17, 24, 32, 190))
             painter.setPen(QColor("#f9d782"))
@@ -384,18 +467,17 @@ class FrameAnnotationView(QWidget):
                 str(roi.get("name", "ROI")),
             )
 
-        if self._drag_start is not None and self._drag_current is not None:
-            x1, y1 = self._drag_start
-            x2, y2 = self._drag_current
-            preview = {
-                "x1": min(x1, x2),
-                "y1": min(y1, y2),
-                "x2": max(x1, x2),
-                "y2": max(y1, y2),
-            }
+        if self._polygon_points:
+            widget_points = [self._image_to_widget(x, y) for x, y in self._polygon_points]
             painter.setPen(QPen(QColor("#76c7ff"), 2, Qt.PenStyle.DashLine))
-            painter.fillRect(self._roi_to_widget_rect(preview), QColor(118, 199, 255, 30))
-            painter.drawRect(self._roi_to_widget_rect(preview))
+            if len(widget_points) > 1:
+                painter.drawPolyline(QPolygonF(widget_points))
+            if self._polygon_cursor is not None:
+                painter.drawLine(widget_points[-1], self._image_to_widget(*self._polygon_cursor))
+            painter.setBrush(QColor("#76c7ff"))
+            for index, point in enumerate(widget_points):
+                radius = 6.0 if index == 0 and len(widget_points) >= 3 else 4.0
+                painter.drawEllipse(point, radius, radius)
 
         if self._scale_points:
             painter.setPen(QPen(QColor("#76c7ff"), 2))
@@ -432,6 +514,8 @@ class AnalysisDialog(QDialog):
         self.analysis_config_path: Optional[str] = None
         self.last_output_dir = ""
         self.annotation_state = AnalysisAnnotationState()
+        self._active_setup_video_name = ""
+        self._suspend_setup_persistence = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -469,26 +553,32 @@ class AnalysisDialog(QDialog):
         input_form.setHorizontalSpacing(8)
         input_form.setVerticalSpacing(7)
 
-        self.csv_edit = QLineEdit()
-        self.csv_edit.setPlaceholderText(
-            f"Select a {self.layer.display_name.lower()} inference CSV"
-        )
+        # Keep the path fields as the worker-facing source of truth, but drive
+        # them from one project-aware selector instead of two independent pickers.
+        self.csv_edit = QLineEdit(self)
+        self.csv_edit.hide()
         self.csv_edit.textChanged.connect(self._refresh_default_output_dir)
-        csv_browse = QPushButton("Browse...")
-        csv_browse.clicked.connect(self._browse_csv)
-        csv_row = QHBoxLayout()
-        csv_row.addWidget(self.csv_edit, 1)
-        csv_row.addWidget(csv_browse)
-        input_form.addRow(f"{self.layer.display_name} CSV:", csv_row)
+        self.video_edit = QLineEdit(self)
+        self.video_edit.hide()
 
-        self.video_edit = QLineEdit()
-        self.video_edit.setPlaceholderText("Optional; auto-detected from CSV when available")
-        video_browse = QPushButton("Browse...")
-        video_browse.clicked.connect(self._browse_video)
-        video_row = QHBoxLayout()
-        video_row.addWidget(self.video_edit, 1)
-        video_row.addWidget(video_browse)
-        input_form.addRow("Video file:", video_row)
+        self.project_video_combo = ThemedComboBox(self)
+        self.project_video_combo.setObjectName("AnalysisProjectVideoCombo")
+        self.project_video_combo.setMinimumWidth(260)
+        self.project_video_combo.currentIndexChanged.connect(self._project_video_changed)
+        self.other_inputs_btn = QPushButton("Other…", self)
+        self.other_inputs_btn.setToolTip(
+            "Choose an inference CSV outside the project; its video is detected automatically."
+        )
+        self.other_inputs_btn.clicked.connect(self._browse_other_inputs)
+        project_video_row = QHBoxLayout()
+        project_video_row.addWidget(self.project_video_combo, 1)
+        project_video_row.addWidget(self.other_inputs_btn)
+        input_form.addRow("Project video:", project_video_row)
+
+        self.input_detail_label = QLabel(self)
+        self.input_detail_label.setObjectName("AnalysisInputDetail")
+        self.input_detail_label.setWordWrap(True)
+        input_form.addRow("", self.input_detail_label)
 
         inputs_layout.addLayout(input_form)
         left_layout.addWidget(inputs_panel, 0)
@@ -520,7 +610,7 @@ class AnalysisDialog(QDialog):
         self.real_distance_spin.setDecimals(4)
         self.real_distance_spin.setValue(1.0)
         self.real_distance_spin.setMinimumWidth(130)
-        self.real_distance_spin.valueChanged.connect(self._update_scale_label)
+        self.real_distance_spin.valueChanged.connect(self._real_distance_changed)
         scale_row.addWidget(self.pixel_distance_label, 0)
         scale_row.addWidget(QLabel("equals"))
         scale_row.addWidget(self.real_distance_spin, 1)
@@ -547,6 +637,12 @@ class AnalysisDialog(QDialog):
         tracking_form.addRow("Filter:", filter_row)
 
         tracking_layout.addLayout(tracking_form)
+        self.setup_persistence_label = QLabel(
+            "Scale and ROIs save automatically for each project video."
+        )
+        self.setup_persistence_label.setObjectName("AnalysisInputDetail")
+        self.setup_persistence_label.setWordWrap(True)
+        tracking_layout.addWidget(self.setup_persistence_label)
         left_layout.addWidget(tracking_panel, 0)
 
         output_panel = QFrame()
@@ -679,7 +775,7 @@ class AnalysisDialog(QDialog):
         self.scale_mode_btn = QPushButton("Scale")
         self.scale_mode_btn.setCheckable(True)
         self.scale_mode_btn.setChecked(True)
-        self.roi_mode_btn = QPushButton("ROI")
+        self.roi_mode_btn = QPushButton("Polygon ROI")
         self.roi_mode_btn.setCheckable(True)
         self.mode_group.addButton(self.scale_mode_btn)
         self.mode_group.addButton(self.roi_mode_btn)
@@ -690,14 +786,12 @@ class AnalysisDialog(QDialog):
             lambda checked: checked and self._set_annotation_mode("roi")
         )
         toolbar.addWidget(self.scale_mode_btn)
-        toolbar.addWidget(self.roi_mode_btn)
 
         self.clear_scale_btn = QPushButton("Clear Scale")
         self.clear_scale_btn.clicked.connect(self._clear_scale)
         toolbar.addWidget(self.clear_scale_btn)
         self.clear_rois_btn = QPushButton("Clear ROIs")
         self.clear_rois_btn.clicked.connect(self._clear_rois)
-        toolbar.addWidget(self.clear_rois_btn)
         toolbar.addStretch(1)
 
         self.zoom_out_btn = QPushButton("−")
@@ -726,10 +820,36 @@ class AnalysisDialog(QDialog):
         toolbar.addWidget(self.scale_status_label)
         workspace_layout.addLayout(toolbar)
 
+        polygon_tools = QHBoxLayout()
+        polygon_tools.addWidget(self.roi_mode_btn)
+        self.polygon_help_label = QLabel(
+            "Polygon: click vertices, then click the first point or press Enter to finish."
+        )
+        self.polygon_help_label.setObjectName("AnalysisHintLabel")
+        polygon_tools.addStretch(1)
+        self.undo_vertex_btn = QPushButton("Undo")
+        self.undo_vertex_btn.setToolTip("Remove the last polygon vertex (Backspace)")
+        self.undo_vertex_btn.clicked.connect(lambda: self.frame_view.undo_polygon_vertex())
+        self.finish_roi_btn = QPushButton("Finish")
+        self.finish_roi_btn.setToolTip("Finish the polygon ROI (Enter)")
+        self.finish_roi_btn.clicked.connect(lambda: self.frame_view.finish_polygon())
+        self.cancel_roi_btn = QPushButton("Cancel")
+        self.cancel_roi_btn.setToolTip("Discard the unfinished polygon (Escape)")
+        self.cancel_roi_btn.clicked.connect(lambda: self.frame_view.cancel_polygon())
+        polygon_tools.addWidget(self.undo_vertex_btn)
+        polygon_tools.addWidget(self.finish_roi_btn)
+        polygon_tools.addWidget(self.cancel_roi_btn)
+        self.clear_rois_btn.setText("Clear All")
+        self.clear_rois_btn.setToolTip("Delete every completed ROI")
+        polygon_tools.addWidget(self.clear_rois_btn)
+        workspace_layout.addLayout(polygon_tools)
+        workspace_layout.addWidget(self.polygon_help_label)
+
         self.frame_view = FrameAnnotationView()
         self.frame_view.scaleDistanceChanged.connect(self._apply_scale_distance)
         self.frame_view.scalePointsChanged.connect(self._set_scale_points)
         self.frame_view.roiDrawn.connect(self._add_roi_from_canvas)
+        self.frame_view.polygonDraftChanged.connect(self._update_polygon_draft_controls)
         self.frame_view.zoomChanged.connect(
             lambda percent: self.zoom_status_label.setText(f"{percent}%")
         )
@@ -740,12 +860,28 @@ class AnalysisDialog(QDialog):
         roi_title = QLabel("ROIs")
         roi_title.setObjectName("AnalysisPanelTitle")
         roi_column.addWidget(roi_title)
+        self.roi_priority_hint = QLabel("Priority: top ROI wins wherever shapes overlap.")
+        self.roi_priority_hint.setObjectName("AnalysisHintLabel")
+        roi_column.addWidget(self.roi_priority_hint)
         self.roi_list = QListWidget()
         self.roi_list.setObjectName("AnalysisRoiList")
         self.roi_list.setMaximumHeight(120)
+        self.roi_list.currentRowChanged.connect(self._roi_selection_changed)
+        self.roi_list.itemDoubleClicked.connect(lambda _item: self._rename_selected_roi())
         roi_column.addWidget(self.roi_list)
         roi_row.addLayout(roi_column, 1)
         roi_actions = QVBoxLayout()
+        self.raise_roi_btn = QPushButton("Higher Priority")
+        self.raise_roi_btn.setToolTip("Move the selected ROI toward the top of the priority list")
+        self.raise_roi_btn.clicked.connect(lambda: self._move_selected_roi(-1))
+        roi_actions.addWidget(self.raise_roi_btn)
+        self.lower_roi_btn = QPushButton("Lower Priority")
+        self.lower_roi_btn.setToolTip("Move the selected ROI toward the bottom of the priority list")
+        self.lower_roi_btn.clicked.connect(lambda: self._move_selected_roi(1))
+        roi_actions.addWidget(self.lower_roi_btn)
+        self.rename_roi_btn = QPushButton("Rename")
+        self.rename_roi_btn.clicked.connect(self._rename_selected_roi)
+        roi_actions.addWidget(self.rename_roi_btn)
         self.delete_roi_btn = QPushButton("Delete Selected")
         self.delete_roi_btn.clicked.connect(self._delete_selected_roi)
         roi_actions.addWidget(self.delete_roi_btn)
@@ -811,6 +947,7 @@ class AnalysisDialog(QDialog):
         self._update_scale_label()
         self._refresh_roi_list()
         self._sync_output_settings()
+        self._update_polygon_draft_controls(0)
         self._load_preview_frame(silent=True)
 
     @property
@@ -848,9 +985,81 @@ class AnalysisDialog(QDialog):
         ]
 
     def _select_initial_csv(self) -> None:
-        newest = latest_analysis_csv(self._candidate_csv_dirs(), self.layer_id)
-        if newest:
-            self.csv_edit.setText(newest)
+        self._populate_project_video_selector()
+
+    def _populate_project_video_selector(self) -> None:
+        current_video = self.video_edit.text().strip()
+        options = project_analysis_inputs(self.project_root, self.layer_id)
+        self.project_video_combo.blockSignals(True)
+        self.project_video_combo.clear()
+        self.project_video_combo.addItem("Choose a project video…", None)
+        selected_index = 0
+        newest_index = 0
+        newest_created_at = ""
+        ready_count = 0
+        for option in options:
+            if option.inference_ready:
+                suffix = "Ready"
+                ready_count += 1
+            else:
+                suffix = "No inference"
+            self.project_video_combo.addItem(f"{option.video_name}  ·  {suffix}", option)
+            index = self.project_video_combo.count() - 1
+            self.project_video_combo.setItemData(
+                index,
+                f"{option.video_name} — {self.layer.display_name} {suffix.lower()}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+            if current_video and os.path.realpath(option.video_path) == os.path.realpath(current_video):
+                selected_index = index
+            if option.inference_ready and option.created_at >= newest_created_at:
+                newest_created_at = option.created_at
+                newest_index = index
+        if selected_index == 0:
+            selected_index = newest_index
+        self.project_video_combo.setCurrentIndex(selected_index)
+        self.project_video_combo.blockSignals(False)
+        self._project_video_changed(selected_index)
+        if not options:
+            self.input_detail_label.setText(
+                "No project videos found. Add videos from the Videos menu or use Other."
+            )
+        elif ready_count == 0 and selected_index == 0:
+            self.input_detail_label.setText(
+                f"No project videos have {self.layer.display_name.lower()} inference yet."
+            )
+
+    def _project_video_changed(self, index: int) -> None:
+        self._save_analysis_setup()
+        self._active_setup_video_name = ""
+        self._clear_annotations(persist=False)
+        option = self.project_video_combo.itemData(index)
+        if not isinstance(option, ProjectAnalysisInput):
+            self.csv_edit.clear()
+            self.video_edit.clear()
+            if self.project_video_combo.count() > 1:
+                self.input_detail_label.setText("Select a project video to load its inference.")
+            self.setup_persistence_label.setText(
+                "Select a project video to restore its saved scale and ROIs."
+            )
+            return
+        self.video_edit.setText(option.video_path)
+        if option.inference_ready:
+            self.csv_edit.setText(option.csv_path)
+            self.output_edit.setText(self._default_output_dir_for_csv(option.csv_path))
+            self.input_detail_label.setText(
+                f"{self.layer.display_name} inference ready · "
+                f"Using {os.path.basename(option.csv_path)}"
+            )
+        else:
+            self.csv_edit.clear()
+            self.output_edit.clear()
+            self.input_detail_label.setText(
+                f"Run {self.layer.display_name.lower()} inference for this video before analysis."
+            )
+        self._load_preview_frame(silent=True)
+        self._active_setup_video_name = option.video_name
+        self._restore_analysis_setup()
 
     def _csv_matches_active_layer(self, path: str) -> bool:
         return analysis_csv_matches_layer(path, self.layer_id)
@@ -877,6 +1086,8 @@ class AnalysisDialog(QDialog):
             "CSV files (*.csv);;All files (*.*)",
         )
         if path:
+            self._save_analysis_setup()
+            self._active_setup_video_name = ""
             self.csv_edit.setText(path)
             self.output_edit.setText(self._default_output_dir_for_csv(path))
             self._clear_annotations()
@@ -891,9 +1102,58 @@ class AnalysisDialog(QDialog):
             "Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)",
         )
         if path:
+            self._save_analysis_setup()
+            self._active_setup_video_name = ""
             self.video_edit.setText(path)
             self._clear_annotations()
             self._load_preview_frame(silent=False)
+
+    def _browse_other_inputs(self) -> None:
+        start = next(
+            (folder for folder in self._candidate_csv_dirs() if os.path.isdir(folder)),
+            self.project_root,
+        )
+        csv_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select {self.layer.display_name.lower()} inference CSV",
+            start,
+            "CSV files (*.csv);;All files (*.*)",
+        )
+        if not csv_path:
+            return
+        if not self._csv_matches_active_layer(csv_path):
+            QMessageBox.warning(
+                self,
+                "Wrong Inference Layer",
+                f"That CSV is not a {self.layer.display_name.lower()} inference output.",
+            )
+            return
+        video_path = inspect_analysis_csv(csv_path).video_path
+        if not video_path:
+            video_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select matching video file",
+                self.project_root,
+                "Video files (*.mp4 *.avi *.mov *.mkv *.m4v);;All files (*.*)",
+            )
+            if not video_path:
+                return
+        self.project_video_combo.blockSignals(True)
+        self.project_video_combo.setCurrentIndex(0)
+        self.project_video_combo.blockSignals(False)
+        self._save_analysis_setup()
+        self._active_setup_video_name = ""
+        self.csv_edit.setText(csv_path)
+        self.video_edit.setText(video_path)
+        self.output_edit.setText(self._default_output_dir_for_csv(csv_path))
+        self.input_detail_label.setText(
+            f"External files · {os.path.basename(video_path)} · {os.path.basename(csv_path)}"
+        )
+        self._clear_annotations()
+        self._load_preview_frame(silent=False)
+        self.setup_persistence_label.setText(
+            "External inputs are not attached to a project-video setup."
+        )
 
     def _browse_output_dir(self) -> None:
         start = self.output_edit.text().strip() or os.path.join(
@@ -1016,26 +1276,44 @@ class AnalysisDialog(QDialog):
     def _set_scale_points(self, points: list[tuple[float, float]]) -> None:
         self.annotation_state.set_scale_points(points)
         self._update_scale_label()
+        self._save_analysis_setup()
 
     def _apply_scale_distance(self, distance: float) -> None:
         if distance > 0:
             self.annotation_state.set_pixel_distance(distance)
             self.pixel_distance_label.setText(f"{distance:.1f} px")
         self._update_scale_label()
+        self._save_analysis_setup()
 
     def _clear_scale(self) -> None:
         self.annotation_state.clear_scale()
         self.pixel_distance_label.setText("Draw scale")
         self.frame_view.set_scale_points([])
         self._update_scale_label()
+        self._save_analysis_setup()
 
     def _clear_rois(self) -> None:
+        frame_view = getattr(self, "frame_view", None)
+        if frame_view is not None:
+            frame_view.cancel_polygon()
         self.annotation_state.clear_rois()
         self._refresh_roi_list()
+        self._save_analysis_setup()
 
-    def _clear_annotations(self) -> None:
-        self._clear_scale()
-        self._clear_rois()
+    def _clear_annotations(self, *, persist: bool = True) -> None:
+        previous = self._suspend_setup_persistence
+        self._suspend_setup_persistence = True
+        try:
+            self._clear_scale()
+            self._clear_rois()
+        finally:
+            self._suspend_setup_persistence = previous
+        if persist:
+            self._save_analysis_setup()
+
+    def _real_distance_changed(self, _value: float) -> None:
+        self._update_scale_label()
+        self._save_analysis_setup()
 
     def _update_scale_label(self) -> None:
         real_distance = self.real_distance_spin.value()
@@ -1048,31 +1326,162 @@ class AnalysisDialog(QDialog):
         else:
             self.scale_status_label.setText(f"Scale unset | {len(self.scale_points)}/2")
 
+    def _save_analysis_setup(self) -> None:
+        video_name = str(self._active_setup_video_name or "")
+        if self._suspend_setup_persistence or not video_name:
+            return
+        try:
+            save_video_analysis_setup(
+                self.project_root,
+                video_name,
+                frame_width=self.annotation_state.frame.width,
+                frame_height=self.annotation_state.frame.height,
+                scale_points=self.annotation_state.scale_points,
+                real_world_distance_mm=self.real_distance_spin.value(),
+                rois=self.annotation_state.worker_rois(),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self.setup_persistence_label.setText(f"Could not save video setup: {exc}")
+            return
+        self.setup_persistence_label.setText(f"Setup saved automatically for {video_name}.")
+
+    def _restore_analysis_setup(self) -> None:
+        video_name = str(self._active_setup_video_name or "")
+        if not video_name:
+            return
+        try:
+            setup = load_video_analysis_setup(self.project_root, video_name)
+        except (OSError, TypeError, ValueError) as exc:
+            self.setup_persistence_label.setText(f"Could not restore video setup: {exc}")
+            return
+        if setup is None:
+            self.setup_persistence_label.setText(
+                f"No saved setup for {video_name} yet · changes save automatically."
+            )
+            return
+        current_width = self.annotation_state.frame.width
+        current_height = self.annotation_state.frame.height
+        saved_size = (setup.frame_width, setup.frame_height)
+        current_size = (current_width, current_height)
+        if all(saved_size) and all(current_size) and saved_size != current_size:
+            self.setup_persistence_label.setText(
+                "Saved setup was not loaded because the video's frame size changed "
+                f"({setup.frame_width}×{setup.frame_height} → {current_width}×{current_height})."
+            )
+            return
+
+        previous = self._suspend_setup_persistence
+        self._suspend_setup_persistence = True
+        try:
+            self.annotation_state.clear()
+            self.annotation_state.set_scale_points(setup.scale_points)
+            self.annotation_state.replace_rois(setup.rois)
+            self.real_distance_spin.setValue(setup.real_world_distance_mm)
+            self.frame_view.set_scale_points(list(setup.scale_points))
+            if len(setup.scale_points) == 2:
+                self.pixel_distance_label.setText(
+                    f"{self.annotation_state.pixel_distance:.1f} px"
+                )
+            else:
+                self.pixel_distance_label.setText("Draw scale")
+            self._update_scale_label()
+            self._refresh_roi_list()
+        finally:
+            self._suspend_setup_persistence = previous
+        self.setup_persistence_label.setText(
+            f"Restored saved scale and {len(setup.rois)} ROI"
+            f"{'s' if len(setup.rois) != 1 else ''} for {video_name}."
+        )
+
     def _add_roi_from_canvas(self, roi: dict[str, Any]) -> None:
         default_name = f"ROI {len(self.rois) + 1}"
-        name, accepted = QInputDialog.getText(self, "Name ROI", "ROI name:", text=default_name)
-        if not accepted:
+        try:
+            self.annotation_state.add_roi(roi, name=default_name)
+        except (KeyError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Invalid ROI", str(exc))
             return
-        self.annotation_state.add_roi(roi, name=name.strip() or default_name)
         self._refresh_roi_list()
+        self.roi_list.setCurrentRow(self.roi_list.count() - 1)
+        self._save_analysis_setup()
+
+    def _rename_selected_roi(self) -> None:
+        row = self.roi_list.currentRow()
+        if not 0 <= row < len(self.annotation_state.rois):
+            return
+        current_name = self.annotation_state.rois[row].name
+        name, accepted = QInputDialog.getText(
+            self, "Rename ROI", "ROI name:", text=current_name
+        )
+        if accepted and self.annotation_state.rename_roi(row, name):
+            self._refresh_roi_list()
+            self.roi_list.setCurrentRow(row)
+            self._save_analysis_setup()
+
+    def _move_selected_roi(self, offset: int) -> None:
+        row = self.roi_list.currentRow()
+        new_row = self.annotation_state.move_roi(row, offset)
+        if new_row < 0:
+            return
+        self._refresh_roi_list()
+        self.roi_list.setCurrentRow(new_row)
+        self._save_analysis_setup()
+
+    def _roi_selection_changed(self, row: int) -> None:
+        self.frame_view.set_selected_roi(row)
+        count = len(self.annotation_state.rois)
+        valid = 0 <= row < count
+        self.raise_roi_btn.setEnabled(valid and row > 0)
+        self.lower_roi_btn.setEnabled(valid and row < count - 1)
+        self.rename_roi_btn.setEnabled(valid)
+        self.delete_roi_btn.setEnabled(valid)
+
+    def _update_polygon_draft_controls(self, vertex_count: int) -> None:
+        count = max(0, int(vertex_count))
+        drawing = count > 0
+        if hasattr(self, "undo_vertex_btn"):
+            self.undo_vertex_btn.setEnabled(drawing)
+            self.finish_roi_btn.setEnabled(count >= 3)
+            self.cancel_roi_btn.setEnabled(drawing)
+        if hasattr(self, "run_btn"):
+            self.run_btn.setEnabled(not drawing)
+        if hasattr(self, "polygon_help_label"):
+            if drawing:
+                self.polygon_help_label.setText(
+                    f"Drawing polygon · {count} vertex{'es' if count != 1 else ''} · "
+                    "Enter/first point finishes · Backspace undoes · Esc cancels"
+                )
+            else:
+                self.polygon_help_label.setText(
+                    "Polygon: click vertices, then click the first point or press Enter to finish."
+                )
 
     def _delete_selected_roi(self) -> None:
         row = self.roi_list.currentRow()
         if self.annotation_state.delete_roi(row):
             self._refresh_roi_list()
+            self._save_analysis_setup()
 
     def _refresh_roi_list(self) -> None:
+        selected_row = self.roi_list.currentRow()
         self.roi_list.clear()
-        rois = self.annotation_state.worker_rois()
-        for index, roi in enumerate(rois, start=1):
-            width = float(roi["x2"]) - float(roi["x1"])
-            height = float(roi["y2"]) - float(roi["y1"])
+        state_rois = self.annotation_state.rois
+        for index, roi in enumerate(state_rois, start=1):
+            if roi.type == "polygon":
+                detail = f"Polygon · {len(roi.points)} vertices · {roi.area:.0f}px²"
+            else:
+                detail = f"Legacy rectangle · {roi.width:.0f} x {roi.height:.0f}px"
             item = QListWidgetItem(
-                f"{index}. {roi.get('name', 'ROI')}  {width:.0f} x {height:.0f}px"
+                f"P{index} · {roi.name}  ·  {detail}"
             )
             self.roi_list.addItem(item)
-        self.roi_count_label.setText(f"{len(rois)} ROI{'s' if len(rois) != 1 else ''}")
-        self.frame_view.set_rois(rois)
+        count = len(state_rois)
+        self.roi_count_label.setText(f"{count} ROI{'s' if count != 1 else ''}")
+        self.frame_view.set_rois(self.annotation_state.worker_rois())
+        if count:
+            self.roi_list.setCurrentRow(min(max(selected_row, 0), count - 1))
+        else:
+            self.frame_view.set_selected_roi(-1)
+            self._roi_selection_changed(-1)
 
     def _append_log(self, text: str) -> None:
         if not text:
@@ -1083,7 +1492,7 @@ class AnalysisDialog(QDialog):
         self.log_view.ensureCursorVisible()
 
     def _set_running(self, running: bool) -> None:
-        self.run_btn.setEnabled(not running)
+        self.run_btn.setEnabled(not running and self.frame_view.polygon_vertex_count == 0)
         self.load_frame_btn.setEnabled(not running)
         if running:
             self.status_label.setText("Running")
@@ -1123,6 +1532,13 @@ class AnalysisDialog(QDialog):
         )
 
     def _validate_inputs(self) -> bool:
+        if self.frame_view.polygon_vertex_count:
+            QMessageBox.warning(
+                self,
+                "Finish ROI",
+                "Finish or cancel the polygon currently being drawn before running analysis.",
+            )
+            return False
         try:
             config = self._build_analysis_config()
         except AnalysisConfigError as exc:
@@ -1292,6 +1708,7 @@ class AnalysisDialog(QDialog):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
 
     def closeEvent(self, event):
+        self._save_analysis_setup()
         if self.analysis_controller is not None:
             self.analysis_controller.shutdown()
         else:

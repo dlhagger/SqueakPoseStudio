@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from squeakpose.core import atomic_write_text
+from squeakpose.json_io import read_json_file
 from squeakpose.project.layers import (
     LAYER_DEFINITIONS,
     LAYER_DEPTH,
@@ -145,6 +146,82 @@ class InferenceRunSummary:
         elif self.manifest_error:
             lines.append(f"Run manifest failed: {self.manifest_error}")
         return tuple(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class VideoInferenceStatus:
+    """Project inference history summarized for one source video."""
+
+    video_path: str
+    successful_layers: tuple[str, ...]
+    latest_created_at: str
+    run_count: int
+
+
+def video_identity(video_path: str) -> str:
+    """Return a stable comparison key for local files and project symlinks."""
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(video_path))))
+
+
+def project_video_inference_statuses(project_root: str) -> dict[str, VideoInferenceStatus]:
+    """Index successful inference layers from the project's persisted run manifests.
+
+    Invalid, incomplete, or unrelated files are ignored so a damaged manifest cannot
+    prevent the inference picker from opening.
+    """
+    runs_dir = os.path.join(os.path.abspath(project_root), "inference outputs", "runs")
+    if not os.path.isdir(runs_dir):
+        return {}
+
+    history: dict[str, dict[str, Any]] = {}
+    try:
+        names = sorted(os.listdir(runs_dir), key=str.casefold)
+    except OSError:
+        return {}
+    for name in names:
+        if name.startswith(".") or not name.lower().endswith(".json"):
+            continue
+        manifest_path = os.path.join(runs_dir, name)
+        try:
+            payload = read_json_file(manifest_path, require_object=True)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not str(payload.get("video_path") or ""):
+            continue
+        video_path = str(payload["video_path"])
+        key = video_identity(video_path)
+        record = history.setdefault(
+            key,
+            {"video_path": video_path, "layers": set(), "latest": "", "runs": 0},
+        )
+        record["runs"] += 1
+        created_at = str(payload.get("created_at") or "")
+        if created_at >= record["latest"]:
+            record["latest"] = created_at
+            record["video_path"] = video_path
+        passes = payload.get("passes")
+        if not isinstance(passes, list):
+            continue
+        for inference_pass in passes:
+            if not isinstance(inference_pass, dict):
+                continue
+            if inference_pass.get("had_error") or inference_pass.get("canceled"):
+                continue
+            layer_id = normalize_layer_id(inference_pass.get("layer_id"), default="")
+            if layer_id in LAYER_DEFINITIONS:
+                record["layers"].add(layer_id)
+
+    return {
+        key: VideoInferenceStatus(
+            video_path=str(record["video_path"]),
+            successful_layers=tuple(
+                layer_id for layer_id in LAYER_DEFINITIONS if layer_id in record["layers"]
+            ),
+            latest_created_at=str(record["latest"]),
+            run_count=int(record["runs"]),
+        )
+        for key, record in history.items()
+    }
 
 
 def configured_inference_layers(
@@ -499,6 +576,7 @@ __all__ = [
     "InferenceRunAccumulator",
     "InferenceRunPlan",
     "InferenceRunSummary",
+    "VideoInferenceStatus",
     "aggregate_inference_result",
     "build_inference_manifest",
     "configured_inference_layers",
@@ -506,4 +584,6 @@ __all__ = [
     "finalize_inference_run",
     "plan_inference_run",
     "prepare_inference_run",
+    "project_video_inference_statuses",
+    "video_identity",
 ]

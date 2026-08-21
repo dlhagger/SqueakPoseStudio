@@ -5,7 +5,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # This must be selected before importing PyQt or creating QApplication.
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -187,23 +187,25 @@ class MainWindowLifecycleTests(unittest.TestCase):
                         depth_targets=None,
                     )
                     window.layer_model_paths["keypoints"] = "pose.pt"
+                    inference_dialog = SimpleNamespace(
+                        exec=lambda: 1,
+                        selected_video_paths=(str(project_root / "video.mp4"),),
+                        batch_size=4,
+                    )
                     with (
                         patch(
-                            "squeakpose.ui.main_window.QFileDialog.getOpenFileName",
-                            return_value=(str(project_root / "video.mp4"), ""),
+                            "squeakpose.ui.main_window.InferenceVideoDialog",
+                            return_value=inference_dialog,
                         ),
                         patch(
                             "squeakpose.ui.main_window.probe_video_metadata",
                             return_value=SimpleNamespace(opened=True, total_frames=12, fps=30.0),
                         ),
-                        patch(
-                            "squeakpose.ui.main_window.QInputDialog.getInt",
-                            return_value=(4, True),
-                        ),
                         patch.object(window._inference_coordinator, "start") as start,
                     ):
                         window.run_video_inference()
                     inference_plan = start.call_args.args[0]
+                    start.assert_called_once()
                     self.assertEqual(inference_plan.jobs[0].worker_config()["batch_size"], 4)
                     self.assertTrue(lock_path.is_file())
                 finally:
@@ -212,6 +214,60 @@ class MainWindowLifecycleTests(unittest.TestCase):
                         self.qt_app.processEvents()
 
             self.assertFalse(lock_path.exists())
+
+    def test_finished_progress_dialog_cannot_cancel_remaining_video_batch(self):
+        callbacks = []
+
+        class FakeSignal:
+            def disconnect(self, callback):
+                callbacks.remove(callback)
+
+        class FakeProgress:
+            canceled = FakeSignal()
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                for callback in list(callbacks):
+                    callback()
+
+        cancel = Mock()
+        progress = FakeProgress()
+        callbacks.append(cancel)
+        window = SimpleNamespace(
+            _inference_progress=progress,
+            _cancel_inference_process=cancel,
+        )
+
+        studio.LabelingApp._inference_controller_pass_finished(window, SimpleNamespace())
+
+        self.assertTrue(progress.closed)
+        self.assertIsNone(window._inference_progress)
+        cancel.assert_not_called()
+
+    def test_intermediate_video_completion_starts_next_without_message(self):
+        next_plan = object()
+        coordinator = SimpleNamespace(start=Mock())
+        window = SimpleNamespace(
+            _inference_batch_summaries=[],
+            _inference_plan_queue=[next_plan],
+            _inference_batch_index=1,
+            _inference_batch_total=2,
+            _inference_coordinator=coordinator,
+        )
+        summary = SimpleNamespace(results=(object(),), canceled=False)
+
+        with (
+            patch("squeakpose.ui.main_window.QMessageBox.information") as information,
+            patch("squeakpose.ui.main_window.QMessageBox.warning") as warning,
+        ):
+            studio.LabelingApp._inference_controller_completed(window, summary)
+
+        coordinator.start.assert_called_once_with(next_plan)
+        information.assert_not_called()
+        warning.assert_not_called()
 
 
 if __name__ == "__main__":

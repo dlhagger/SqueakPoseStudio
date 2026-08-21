@@ -48,6 +48,8 @@ class ProjectPaths(Mapping[str, str]):
     inference_segmentation: str
     inference_depth: str
     analysis_outputs: str
+    analysis_settings: str
+    analysis_video_settings: str
     analysis_keypoints: str
     analysis_segmentation: str
     analysis_depth: str
@@ -86,6 +88,8 @@ class ProjectPaths(Mapping[str, str]):
             inference_segmentation=os.path.join(root, "inference outputs", "segmentation"),
             inference_depth=os.path.join(root, "inference outputs", "depth"),
             analysis_outputs=os.path.join(root, "analysis outputs"),
+            analysis_settings=os.path.join(root, "analysis settings"),
+            analysis_video_settings=os.path.join(root, "analysis settings", "videos"),
             analysis_keypoints=os.path.join(root, "analysis outputs", "keypoints"),
             analysis_segmentation=os.path.join(root, "analysis outputs", "segmentation"),
             analysis_depth=os.path.join(root, "analysis outputs", "depth"),
@@ -140,6 +144,8 @@ PROJECT_DIRECTORY_FIELDS = (
     "inference_segmentation",
     "inference_depth",
     "analysis_outputs",
+    "analysis_settings",
+    "analysis_video_settings",
     "analysis_keypoints",
     "analysis_segmentation",
     "analysis_depth",

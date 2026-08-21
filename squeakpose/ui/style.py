@@ -692,6 +692,11 @@ def analysis_dialog_stylesheet() -> str:
         color: {COLORS["text_muted"]};
         font-size: 9pt;
     }}
+    QLabel#AnalysisInputDetail {{
+        color: #b9c8d4;
+        font-size: 9pt;
+        padding: 2px 1px;
+    }}
     QLabel#AnalysisValuePill {{
         background-color: {COLORS["input_bg"]};
         border: 1px solid {COLORS["input_border"]};
@@ -705,7 +710,7 @@ def analysis_dialog_stylesheet() -> str:
         border: 1px solid {COLORS["panel_border_soft"]};
         border-radius: 6px;
     }}
-    QLineEdit, QDoubleSpinBox, QSpinBox {{
+    QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {{
         background-color: {COLORS["input_bg"]};
         border: 1px solid {COLORS["input_border"]};
         border-radius: 6px;
@@ -810,5 +815,60 @@ def analysis_dialog_stylesheet() -> str:
         border-radius: 6px;
         padding: 8px;
         selection-background-color: {COLORS["accent"]};
+    }}
+    """
+
+
+def inference_dialog_stylesheet() -> str:
+    """Stylesheet for the project-aware inference video picker."""
+    return f"""
+    QLabel#InferencePickerTitle {{
+        color: {COLORS["text"]};
+        font-size: 17pt;
+        font-weight: 800;
+    }}
+    QLabel#InferencePickerSubtitle {{
+        color: {COLORS["text_muted"]};
+        font-size: 10pt;
+    }}
+    QTableWidget#InferenceVideoTable {{
+        background-color: {COLORS["terminal_bg"]};
+        alternate-background-color: #11161a;
+        border: 1px solid {COLORS["panel_border"]};
+        border-radius: 7px;
+        color: {COLORS["text"]};
+    }}
+    QTableWidget#InferenceVideoTable::item {{
+        padding: 8px 7px;
+        border-bottom: 1px solid #252d33;
+    }}
+    QTableWidget#InferenceVideoTable::item:hover {{
+        background-color: #1f2c36;
+        color: {COLORS["text"]};
+    }}
+    QTableWidget#InferenceVideoTable QHeaderView::section {{
+        background-color: {COLORS["panel_bg_alt"]};
+        color: {COLORS["text_muted"]};
+        border: none;
+        border-bottom: 1px solid {COLORS["panel_border"]};
+        padding: 7px;
+        font-weight: 700;
+    }}
+    QFrame#InferencePickerFooter {{
+        background-color: {COLORS["panel_bg"]};
+        border: 1px solid {COLORS["panel_border"]};
+        border-radius: 7px;
+    }}
+    QLabel#InferenceSelectionSummary {{
+        color: #c7e5ff;
+        font-weight: 700;
+    }}
+    QPushButton#InferenceBrowseButton {{
+        border-color: {COLORS["accent"]};
+    }}
+    QPushButton#InferenceRunButton {{
+        background-color: #2f5f91;
+        border-color: #6f9dca;
+        min-width: 125px;
     }}
     """

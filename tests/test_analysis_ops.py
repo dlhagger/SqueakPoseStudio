@@ -12,7 +12,9 @@ from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
     _open_h264_video_writer,
+    assign_roi_labels,
     create_roi_outputs,
+    normalize_rois,
     render_annotated_video,
     run_analysis_workflow,
 )
@@ -51,6 +53,53 @@ def _write_demo_detections(path: str) -> None:
             }
         )
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+class PolygonRoiTests(unittest.TestCase):
+    def test_polygon_normalization_and_center_containment_include_boundary(self):
+        rois = normalize_rois(
+            [
+                {
+                    "name": "Triangle",
+                    "type": "polygon",
+                    "points": [[0, 0], [10, 0], [0, 10]],
+                }
+            ]
+        )
+        detections = pd.DataFrame(
+            {
+                "x": [2.0, 8.0, 5.0, np.nan],
+                "y": [2.0, 8.0, 5.0, 2.0],
+            }
+        )
+
+        labeled = assign_roi_labels(detections, rois, x_col="x", y_col="y")
+
+        self.assertEqual(rois[0]["type"], "polygon")
+        self.assertEqual(
+            labeled["roi_label"].tolist(),
+            ["Triangle", "Outside", "Triangle", "Outside"],
+        )
+
+    def test_polygon_normalization_rejects_degenerate_shapes(self):
+        self.assertEqual(
+            normalize_rois(
+                [{"type": "polygon", "points": [[0, 0], [1, 1], [2, 2]]}]
+            ),
+            [],
+        )
+
+    def test_first_roi_has_explicit_precedence_when_polygons_overlap(self):
+        detections = pd.DataFrame({"x": [5.0], "y": [5.0]})
+        shared_shape = [[0, 0], [10, 0], [10, 10], [0, 10]]
+        rois = [
+            {"name": "Highest", "type": "polygon", "points": shared_shape},
+            {"name": "Lower", "type": "polygon", "points": shared_shape},
+        ]
+
+        labeled = assign_roi_labels(detections, rois, x_col="x", y_col="y")
+
+        self.assertEqual(labeled.loc[0, "roi_label"], "Highest")
 
 
 def _write_demo_segmentation(path: str) -> None:
@@ -249,7 +298,19 @@ class AnalysisOpsTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(
-                render_annotated_video(pose_rows, source_path, pose_path, 10.0),
+                render_annotated_video(
+                    pose_rows,
+                    source_path,
+                    pose_path,
+                    10.0,
+                    rois=[
+                        {
+                            "name": "Arena",
+                            "type": "polygon",
+                            "points": [[5, 5], [90, 5], [90, 70], [5, 70]],
+                        }
+                    ],
+                ),
                 pose_path,
             )
 
@@ -278,6 +339,13 @@ class AnalysisOpsTests(unittest.TestCase):
                     source_path,
                     segmentation_path,
                     10.0,
+                    rois=[
+                        {
+                            "name": "Arena",
+                            "type": "polygon",
+                            "points": [[5, 5], [90, 5], [90, 70], [5, 70]],
+                        }
+                    ],
                 ),
                 segmentation_path,
             )
@@ -326,11 +394,8 @@ class AnalysisOpsTests(unittest.TestCase):
                     rois=[
                         {
                             "name": "Start Zone",
-                            "type": "rect",
-                            "x1": 18,
-                            "y1": 28,
-                            "x2": 24,
-                            "y2": 36,
+                            "type": "polygon",
+                            "points": [[18, 28], [28, 28], [28, 36], [18, 36]],
                         }
                     ],
                 )

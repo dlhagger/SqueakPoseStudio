@@ -3,6 +3,7 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -11,6 +12,8 @@ import pandas as pd
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
+    _FFmpegNVENCH264VideoWriter,
+    _PyAVH264VideoWriter,
     _open_h264_video_writer,
     assign_roi_labels,
     create_roi_outputs,
@@ -185,6 +188,26 @@ def _write_demo_segmentation(path: str) -> None:
 
 
 class AnalysisOpsTests(unittest.TestCase):
+    def test_video_writer_prefers_nvenc_and_falls_back_to_software(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp, "output.mp4")
+            sentinel = object()
+            with (
+                patch("analysis_ops._nvenc_available", return_value=True),
+                patch("analysis_ops._FFmpegNVENCH264VideoWriter", return_value=sentinel),
+            ):
+                self.assertIs(_open_h264_video_writer(output, 8.0, 100, 80), sentinel)
+
+            with (
+                patch("analysis_ops._nvenc_available", return_value=True),
+                patch(
+                    "analysis_ops._FFmpegNVENCH264VideoWriter",
+                    side_effect=AnalysisError("NVENC unavailable"),
+                ),
+                patch("analysis_ops._PyAVH264VideoWriter", return_value=sentinel),
+            ):
+                self.assertIs(_open_h264_video_writer(output, 8.0, 100, 80), sentinel)
+
     def test_segmentation_video_formats_calibrated_mask_area(self):
         row = pd.Series({"mask_area_px2": 200, "mask_area_mm2": 12.54})
 

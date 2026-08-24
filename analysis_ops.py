@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -587,17 +589,214 @@ class _PyAVH264VideoWriter:
             self.stderr_file.close()
 
 
+@lru_cache(maxsize=1)
+def _nvenc_available() -> bool:
+    """Return whether system FFmpeg can use the NVIDIA H.264 encoder now."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    probe_width = 256
+    probe_height = 256
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-video_size",
+        f"{probe_width}x{probe_height}",
+        "-framerate",
+        "1",
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-an",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            input=bytes(probe_width * probe_height * 3),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+class _FFmpegNVENCH264VideoWriter:
+    """Stream BGR frames to FFmpeg's hardware NVIDIA H.264 encoder."""
+
+    def __init__(self, output_path: Path, fps: float, width: int, height: int) -> None:
+        self.output_path = os.path.abspath(os.fspath(output_path))
+        self.source_width = int(width)
+        self.source_height = int(height)
+        self.staged_path = staging_path_for(self.output_path)
+        self.stderr_file = tempfile.TemporaryFile(mode="w+b")
+        self.process = None
+        self.closed = False
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self._discard()
+            raise AnalysisError("FFmpeg is required for NVIDIA video encoding.")
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-video_size",
+            f"{self.source_width}x{self.source_height}",
+            "-framerate",
+            repr(float(fps)),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-tune",
+            "hq",
+            "-rc",
+            "vbr",
+            "-cq",
+            "21",
+            "-b:v",
+            "0",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-y",
+            self.staged_path,
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self.stderr_file,
+                bufsize=0,
+            )
+        except Exception as exc:
+            self._discard()
+            raise AnalysisError(f"Could not start NVIDIA video encoder: {exc}") from exc
+
+    def __enter__(self) -> "_FFmpegNVENCH264VideoWriter":
+        return self
+
+    def __exit__(self, exc_type, _exc, _traceback) -> bool:
+        if exc_type is None:
+            self.close()
+        else:
+            self._discard()
+        return False
+
+    def write(self, frame: Any) -> None:
+        if self.closed or self.process is None or self.process.stdin is None:
+            raise AnalysisError("Cannot write to a closed video export.")
+        array = np.asarray(frame)
+        expected_shape = (self.source_height, self.source_width, 3)
+        if array.shape != expected_shape or array.dtype != np.uint8:
+            raise AnalysisError(
+                "Video frame does not match the export format: "
+                f"expected uint8 BGR {expected_shape}, got {array.dtype} {array.shape}."
+            )
+        try:
+            self.process.stdin.write(array.tobytes(order="C"))
+        except (BrokenPipeError, OSError) as exc:
+            self.process.wait()
+            raise AnalysisError(self._worker_error("NVIDIA video encoding failed")) from exc
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            if self.process is None or self.process.stdin is None:
+                raise AnalysisError("The NVIDIA video encoder was not initialized.")
+            self.process.stdin.close()
+            return_code = self.process.wait()
+            if return_code != 0:
+                raise AnalysisError(self._worker_error("NVIDIA video encoding failed"))
+            self._close_handles()
+            commit_staged_paths([(self.staged_path, self.output_path)])
+            self.closed = True
+        except Exception:
+            self._discard()
+            raise
+
+    def _worker_error(self, fallback: str) -> str:
+        try:
+            self.stderr_file.flush()
+            self.stderr_file.seek(0)
+            detail = self.stderr_file.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            detail = ""
+        return detail or fallback
+
+    def _close_handles(self) -> None:
+        if self.process is not None and self.process.stdin is not None:
+            if not self.process.stdin.closed:
+                self.process.stdin.close()
+        if not self.stderr_file.closed:
+            self.stderr_file.close()
+
+    def _discard(self) -> None:
+        if self.closed:
+            return
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+                except Exception:
+                    pass
+        self._close_handles()
+        try:
+            remove_path(self.staged_path)
+        except Exception:
+            pass
+        self.closed = True
+
+
 def _open_h264_video_writer(
     output_path: Path,
     fps: float,
     width: int,
     height: int,
-) -> _PyAVH264VideoWriter:
-    """Open the bundled PyAV/libx264 encoder or fail with an actionable error."""
+) -> _PyAVH264VideoWriter | _FFmpegNVENCH264VideoWriter:
+    """Prefer NVIDIA hardware encoding and retain portable software fallback."""
     if width <= 0 or height <= 0:
         raise AnalysisError(f"Cannot export video with invalid frame size {width}x{height}.")
     if not math.isfinite(float(fps)) or float(fps) <= 0:
         raise AnalysisError(f"Cannot export video with invalid frame rate {fps}.")
+    if _nvenc_available():
+        try:
+            return _FFmpegNVENCH264VideoWriter(output_path, fps, width, height)
+        except AnalysisError:
+            # The probe and actual process startup can race a driver reset or
+            # resource limit. The established software writer remains safe.
+            pass
     return _PyAVH264VideoWriter(output_path, fps, width, height)
 
 

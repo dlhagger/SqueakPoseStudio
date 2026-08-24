@@ -18,7 +18,7 @@ from dataclasses import replace
 from typing import List, Optional
 
 import yaml
-from PyQt6.QtCore import QLibraryInfo, QPoint, QPointF, QProcess, QRectF, Qt, QTimer
+from PyQt6.QtCore import QLibraryInfo, QPoint, QPointF, QProcess, QRectF, QSettings, Qt, QTimer
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -3096,6 +3096,10 @@ class LabelingApp(QMainWindow):
         )
         self._force_initial_setup = bool(force_initial_setup)
         self._schema_recoveries: list[tuple[str, str, str]] = []
+        self._analysis_dialog = None
+        self._analysis_read_only = False
+        self._analysis_lock_widget_states: dict[QWidget, bool] = {}
+        self._analysis_previous_mode = "panzoom"
 
         self.image_dir_queue = image_dir or os.path.join(self.project_root, "images_to_label")
         # Backward-compatible alias used by some dialogs/tools.
@@ -3287,6 +3291,11 @@ class LabelingApp(QMainWindow):
             QTimer.singleShot(0, self._maybe_prompt_class_manager)
 
     def closeEvent(self, event):
+        analysis_dialog = getattr(self, "_analysis_dialog", None)
+        if analysis_dialog is not None:
+            analysis_dialog.close()
+            self._analysis_dialog = None
+            self._set_analysis_read_only(False)
         inference_coordinator = getattr(self, "_inference_coordinator", None)
         if inference_coordinator is not None and inference_coordinator.is_busy:
             try:
@@ -3313,13 +3322,13 @@ class LabelingApp(QMainWindow):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
 
-        open_project_action = file_menu.addAction("Open Project…")
-        open_project_action.setShortcut(QKeySequence.StandardKey.Open)
-        open_project_action.triggered.connect(self.open_project_command)
+        self.open_project_action = file_menu.addAction("Open Project…")
+        self.open_project_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.open_project_action.triggered.connect(self.open_project_command)
 
-        close_project_action = file_menu.addAction("Close Project")
-        close_project_action.setShortcut(QKeySequence.StandardKey.Close)
-        close_project_action.triggered.connect(self.close_project_command)
+        self.close_project_action = file_menu.addAction("Close Project")
+        self.close_project_action.setShortcut(QKeySequence.StandardKey.Close)
+        self.close_project_action.triggered.connect(self.close_project_command)
 
         file_menu.addSeparator()
         quit_action = file_menu.addAction("Quit")
@@ -3327,11 +3336,13 @@ class LabelingApp(QMainWindow):
         quit_action.triggered.connect(QApplication.instance().quit)
 
         videos_menu = menu_bar.addMenu("&Videos")
-        manage_videos_action = videos_menu.addAction("Manage Video Links…")
-        manage_videos_action.triggered.connect(self.open_video_library)
+        self.manage_videos_action = videos_menu.addAction("Manage Video Links…")
+        self.manage_videos_action.triggered.connect(self.open_video_library)
 
-        add_videos_action = videos_menu.addAction("Add Video Links…")
-        add_videos_action.triggered.connect(lambda: self.open_video_library(add_immediately=True))
+        self.add_videos_action = videos_menu.addAction("Add Video Links…")
+        self.add_videos_action.triggered.connect(
+            lambda: self.open_video_library(add_immediately=True)
+        )
 
     def open_video_library(self, _checked: bool = False, *, add_immediately: bool = False):
         videos_dir = ProjectPaths.from_root(self.project_root).videos
@@ -3747,6 +3758,13 @@ class LabelingApp(QMainWindow):
         # Status bar
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
+        self.analysis_lock_label = QLabel("Analysis open · project editing paused")
+        self.analysis_lock_label.setObjectName("AnalysisLockStatus")
+        self.analysis_lock_label.setStyleSheet(
+            "QLabel { color: #f4bf75; font-weight: 600; padding: 2px 8px; }"
+        )
+        self.analysis_lock_label.hide()
+        self.status.addPermanentWidget(self.analysis_lock_label)
 
         # Shortcuts
         self._bind_shortcuts()
@@ -4895,6 +4913,9 @@ class LabelingApp(QMainWindow):
                 pass
 
     def set_mode(self, mode: str):
+        if self._analysis_read_only and mode != "panzoom":
+            self.update_status_bar("Project editing is paused while Analysis is open.")
+            return
         if self._is_depth_layer() and mode not in {"panzoom", "predict"}:
             self.update_status_bar("The Depth layer supports Pan/Zoom and Predict modes.")
             return
@@ -5260,6 +5281,7 @@ class LabelingApp(QMainWindow):
     # ---------- Shortcuts & input ----------
 
     def _bind_shortcuts(self):
+        self._project_edit_shortcuts: list[QShortcut] = []
         # modes & core actions
         mapping = {
             "1": lambda: self.set_mode("panzoom"),
@@ -5280,8 +5302,12 @@ class LabelingApp(QMainWindow):
             Qt.Key.Key_P: self.prev_index,
             Qt.Key.Key_N: self.next_index,
         }
+        view_only_keys = {"1", "R", "P", "N"}
         for key, func in mapping.items():
-            QShortcut(QKeySequence(key), self).activated.connect(func)
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(func)
+            if key not in view_only_keys:
+                self._project_edit_shortcuts.append(shortcut)
 
         # cancel drawing
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(self.view._cancel_draw)
@@ -5300,23 +5326,22 @@ class LabelingApp(QMainWindow):
         )
 
         # Invisible keypoints
-        QShortcut(QKeySequence("0"), self).activated.connect(self.mark_current_kp_invisible)
-        QShortcut(QKeySequence("Shift+0"), self).activated.connect(self.set_selected_invisible)
+        invisible_shortcut = QShortcut(QKeySequence("0"), self)
+        invisible_shortcut.activated.connect(self.mark_current_kp_invisible)
+        self._project_edit_shortcuts.append(invisible_shortcut)
+        selected_invisible_shortcut = QShortcut(QKeySequence("Shift+0"), self)
+        selected_invisible_shortcut.activated.connect(self.set_selected_invisible)
+        self._project_edit_shortcuts.append(selected_invisible_shortcut)
 
         # Workflow jumps
-        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(
-            self.complete_and_next_unlabeled
-        )
-        QShortcut(QKeySequence("Ctrl+Enter"), self).activated.connect(
-            self.complete_and_next_unlabeled
-        )
+        for sequence in ("Ctrl+Return", "Ctrl+Enter", "Meta+Return"):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(self.complete_and_next_unlabeled)
+            self._project_edit_shortcuts.append(shortcut)
         QShortcut(QKeySequence("K"), self).activated.connect(self.skip_to_next_unlabeled)
-        QShortcut(QKeySequence("Meta+Return"), self).activated.connect(
-            self.complete_and_next_unlabeled
-        )  # optional: macOS
-        QShortcut(QKeySequence("Shift+Return"), self).activated.connect(
-            self._accept_segmentation_preview
-        )
+        accept_shortcut = QShortcut(QKeySequence("Shift+Return"), self)
+        accept_shortcut.activated.connect(self._accept_segmentation_preview)
+        self._project_edit_shortcuts.append(accept_shortcut)
 
     def keyPressEvent(self, event):
         # Space = temporary pan
@@ -6697,6 +6722,15 @@ class LabelingApp(QMainWindow):
         dlg.exec()
 
     def open_analysis_dialog(self):
+        existing = self._analysis_dialog
+        if existing is not None:
+            if existing.isMinimized():
+                existing.showNormal()
+            else:
+                existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
         try:
             plan = plan_analysis_dialog(
                 project_root=self.project_root,
@@ -6712,7 +6746,94 @@ class LabelingApp(QMainWindow):
             app_base_dir=plan.app_base_dir,
             layer_id=plan.layer_id,
         )
-        dlg.exec()
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        geometry = QSettings().value("analysis_window/geometry")
+        if geometry is not None:
+            dlg.restoreGeometry(geometry)
+        dlg.finished.connect(self._analysis_dialog_finished)
+        self._analysis_dialog = dlg
+        self._set_analysis_read_only(True)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _analysis_lock_widgets(self) -> list[QWidget]:
+        names = (
+            "annotation_panel",
+            "workflow_selector",
+            "complete_btn",
+            "save_btn",
+            "delete_image_btn",
+            "top_right_frame",
+            "bottom_left_frame",
+            "bottom_right_frame",
+            "seg_tools_frame",
+            "depth_assistant_frame",
+        )
+        return [
+            widget
+            for name in names
+            if isinstance((widget := getattr(self, name, None)), QWidget)
+        ]
+
+    def _set_analysis_read_only(self, locked: bool) -> None:
+        locked = bool(locked)
+        if locked == self._analysis_read_only:
+            return
+        if locked:
+            self._analysis_previous_mode = self.mode
+            self.set_mode("panzoom")
+            widgets = self._analysis_lock_widgets()
+            self._analysis_lock_widget_states = {
+                widget: widget.isEnabled() for widget in widgets
+            }
+            for widget in widgets:
+                widget.setEnabled(False)
+            for action_name in (
+                "open_project_action",
+                "close_project_action",
+                "manage_videos_action",
+                "add_videos_action",
+            ):
+                action = getattr(self, action_name, None)
+                if action is not None:
+                    action.setEnabled(False)
+            for shortcut in getattr(self, "_project_edit_shortcuts", ()):
+                shortcut.setEnabled(False)
+            self._analysis_read_only = True
+            self.analysis_lock_label.show()
+            self.update_status_bar("Analysis open: project editing is paused.")
+            return
+
+        for widget, was_enabled in self._analysis_lock_widget_states.items():
+            try:
+                widget.setEnabled(was_enabled)
+            except RuntimeError:
+                pass
+        self._analysis_lock_widget_states = {}
+        for action_name in (
+            "open_project_action",
+            "close_project_action",
+            "manage_videos_action",
+            "add_videos_action",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(True)
+        for shortcut in getattr(self, "_project_edit_shortcuts", ()):
+            shortcut.setEnabled(True)
+        self._analysis_read_only = False
+        self.analysis_lock_label.hide()
+        self.set_mode(self._analysis_previous_mode)
+        self.update_status_bar("Analysis closed: project editing restored.")
+
+    def _analysis_dialog_finished(self, _result: int = 0) -> None:
+        dialog = self._analysis_dialog
+        if dialog is not None:
+            QSettings().setValue("analysis_window/geometry", dialog.saveGeometry())
+        self._analysis_dialog = None
+        self._set_analysis_read_only(False)
 
     def open_video_reviewer(self):
         if _cv2 is None:

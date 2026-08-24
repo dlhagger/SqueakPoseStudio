@@ -64,6 +64,41 @@ class AnalysisServiceTests(unittest.TestCase):
             self.assertTrue(options[0].inference_ready)
             self.assertFalse(options[1].inference_ready)
 
+    def test_project_analysis_inputs_relocates_stale_absolute_csv_path(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "videos" / "session.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            outputs = root / "inference outputs"
+            csv_path = outputs / "segmentation" / "session_run_segmentation.csv"
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            runs = outputs / "runs"
+            runs.mkdir()
+            (runs / "session_run.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": "/Users/old/project/videos/session.mp4",
+                        "created_at": "2026-08-20T12:00:00",
+                        "passes": [
+                            {
+                                "layer_id": "segmentation",
+                                "csv_path": (
+                                    "/Users/old/project/inference outputs/segmentation/"
+                                    "session_run_segmentation.csv"
+                                ),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            options = project_analysis_inputs(tmp, "segmentation")
+
+            self.assertEqual(options[0].csv_path, str(csv_path))
+
     def test_segmentation_preview_uses_first_frame_with_valid_masks(self):
         with TemporaryDirectory() as tmp:
             csv_path = Path(tmp, "segmentation.csv")
@@ -235,6 +270,37 @@ class AnalysisServiceTests(unittest.TestCase):
             context = inspect_analysis_csv(str(csv_path))
 
             self.assertEqual(context.video_path, str(video))
+
+    def test_csv_context_relocates_stale_manifest_csv_reference(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            output_root = project / "inference outputs"
+            segmentation_dir = output_root / "segmentation"
+            runs_dir = output_root / "runs"
+            segmentation_dir.mkdir(parents=True)
+            runs_dir.mkdir()
+            video = project / "videos" / "source.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            run_id = "source_20260818-122205_abcdef123456"
+            csv_path = segmentation_dir / f"{run_id}_segmentation.csv"
+            csv_path.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            (runs_dir / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": "/Users/old/project/videos/source.mp4",
+                        "passes": [
+                            {
+                                "layer_id": "segmentation",
+                                "csv_path": f"/Users/old/project/{csv_path.name}",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(inspect_analysis_csv(str(csv_path)).video_path, str(video))
 
     def test_csv_context_ignores_manifest_for_a_different_csv(self):
         with TemporaryDirectory() as tmp:

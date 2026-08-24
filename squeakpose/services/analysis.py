@@ -79,6 +79,31 @@ def _video_identity(path: str) -> str:
     return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
 
 
+def _relocated_inference_csv(
+    inference_root: str, recorded_path: str, layer_id: str
+) -> str:
+    """Resolve an inference CSV after its project directory has moved."""
+    raw = str(recorded_path or "").strip()
+    if not raw:
+        return ""
+    candidate = os.path.abspath(raw)
+    try:
+        inside_outputs = os.path.commonpath((inference_root, candidate)) == inference_root
+    except ValueError:
+        inside_outputs = False
+    if inside_outputs and os.path.isfile(candidate):
+        return candidate
+
+    # Run manifests written before project paths became portable contain the
+    # original absolute path. The output filename is run-specific, so it is a
+    # safe and unambiguous relocation key within the active layer directory.
+    filename = Path(raw).name
+    if not filename:
+        return ""
+    relocated = os.path.join(inference_root, layer_id, filename)
+    return relocated if os.path.isfile(relocated) else ""
+
+
 def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAnalysisInput, ...]:
     """Pair project-library videos with their newest successful layer inference output."""
     root = os.path.abspath(project_root)
@@ -116,17 +141,11 @@ def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAn
             reported_layer = normalize_layer_id(item.get("layer_id"), default="")
             if reported_layer and reported_layer != normalized_layer:
                 continue
-            csv_path = str(item.get("csv_path") or "").strip()
-            csv_path = os.path.abspath(csv_path) if csv_path else ""
-            try:
-                inside_project_outputs = bool(
-                    csv_path and os.path.commonpath((inference_root, csv_path)) == inference_root
-                )
-            except ValueError:
-                inside_project_outputs = False
+            csv_path = _relocated_inference_csv(
+                inference_root, str(item.get("csv_path") or ""), normalized_layer
+            )
             if (
-                inside_project_outputs
-                and os.path.isfile(csv_path)
+                csv_path
                 and analysis_csv_matches_layer(csv_path, normalized_layer)
             ):
                 candidates.append(csv_path)
@@ -187,7 +206,10 @@ def _existing_manifest_video_path(csv_path: str) -> str:
             if not isinstance(item, Mapping):
                 continue
             recorded_csv = str(item.get("csv_path") or "").strip()
-            if recorded_csv and os.path.normcase(os.path.abspath(recorded_csv)) == expected_csv:
+            relocated_csv = _relocated_inference_csv(
+                str(inference_root), recorded_csv, csv_file.parent.name
+            )
+            if relocated_csv and os.path.normcase(relocated_csv) == expected_csv:
                 matching_pass = True
                 break
     if not matching_pass:

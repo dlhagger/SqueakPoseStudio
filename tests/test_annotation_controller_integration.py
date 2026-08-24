@@ -381,7 +381,19 @@ class AnnotationControllerIntegrationTests(unittest.TestCase):
                         app_base_dir="/planned/app",
                         layer_id=layers.LAYER_SEGMENTATION,
                     )
-                    dialog_type.return_value.exec.assert_called_once_with()
+                    dialog_type.return_value.exec.assert_not_called()
+                    dialog_type.return_value.show.assert_called_once_with()
+                    self.assertTrue(window._analysis_read_only)
+                    self.assertFalse(window.annotation_panel.isEnabled())
+                    self.assertFalse(window.save_btn.isEnabled())
+                    self.assertFalse(window.open_project_action.isEnabled())
+                    self.assertTrue(window.view.isEnabled())
+                    window._analysis_dialog = None
+                    window._set_analysis_read_only(False)
+                    self.assertFalse(window._analysis_read_only)
+                    self.assertTrue(window.annotation_panel.isEnabled())
+                    self.assertTrue(window.save_btn.isEnabled())
+                    self.assertTrue(window.open_project_action.isEnabled())
 
                     training_plan = SimpleNamespace(
                         default_dataset="/planned/dataset",

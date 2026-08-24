@@ -505,6 +505,7 @@ class AnalysisDialog(QDialog):
         self.layer_id = normalize_layer_id(layer_id)
         self.layer = layer_definition(self.layer_id)
         self.setWindowTitle(f"Analysis — {self.layer.display_name} Layer")
+        self.setSizeGripEnabled(True)
         self.resize(1240, 900)
         self.setMinimumSize(1040, 680)
         self.project_root = os.path.abspath(project_root)
@@ -1302,7 +1303,7 @@ class AnalysisDialog(QDialog):
             frame_view.cancel_polygon()
         self.annotation_state.clear_rois()
         self._refresh_roi_list()
-        self._save_analysis_setup()
+        self._save_analysis_setup(rois_cleared=True)
 
     def _clear_annotations(self, *, persist: bool = True) -> None:
         previous = self._suspend_setup_persistence
@@ -1330,7 +1331,7 @@ class AnalysisDialog(QDialog):
         else:
             self.scale_status_label.setText(f"Scale unset | {len(self.scale_points)}/2")
 
-    def _save_analysis_setup(self) -> None:
+    def _save_analysis_setup(self, *, rois_cleared: bool = False) -> None:
         video_name = str(self._active_setup_video_name or "")
         if self._suspend_setup_persistence or not video_name:
             return
@@ -1343,6 +1344,7 @@ class AnalysisDialog(QDialog):
                 scale_points=self.annotation_state.scale_points,
                 real_world_distance_mm=self.real_distance_spin.value(),
                 rois=self.annotation_state.worker_rois(),
+                rois_cleared=rois_cleared,
             )
         except (OSError, TypeError, ValueError) as exc:
             self.setup_persistence_label.setText(f"Could not save video setup: {exc}")

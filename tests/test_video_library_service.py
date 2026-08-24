@@ -75,6 +75,29 @@ class VideoLibraryServiceTests(unittest.TestCase):
                 remove_video_link(str(videos_dir), regular.name)
             self.assertTrue(regular.exists())
 
+    def test_copied_macos_alias_relocates_to_neighboring_source_video(self):
+        with TemporaryDirectory() as imported:
+            import_root = Path(imported)
+            project = import_root / "Studio Project"
+            videos_dir = project / "videos"
+            videos_dir.mkdir(parents=True)
+            source = import_root / "C12345" / "C12345_trimmed.mp4"
+            source.parent.mkdir()
+            source.write_bytes(b"real video")
+            alias = videos_dir / source.name
+            alias.write_bytes(
+                b"XSym\n0070\ndigest\n"
+                b"/Users/old/GPe_Terminal_Reanalysis/C12345/C12345_trimmed.mp4\n"
+            )
+
+            entries = list_project_videos(str(videos_dir))
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].path, str(source))
+            self.assertEqual(entries[0].target, str(source))
+            self.assertTrue(entries[0].is_link)
+            self.assertTrue(entries[0].target_exists)
+
     def test_rename_rejects_paths_and_collisions(self):
         with TemporaryDirectory() as project, TemporaryDirectory() as sources:
             videos_dir = Path(project) / "videos"

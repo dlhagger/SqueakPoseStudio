@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 VIDEO_EXTENSIONS = (
     ".mp4",
@@ -37,6 +38,46 @@ def _require_library_child(videos_dir: str, name: str) -> str:
     return path
 
 
+def _legacy_macos_alias_target(videos_dir: str, path: str) -> str:
+    """Resolve a copied Finder alias when its original Mac path is stale."""
+    try:
+        if os.path.getsize(path) > 64 * 1024:
+            return ""
+        with open(path, "rb") as handle:
+            payload = handle.read(64 * 1024)
+    except OSError:
+        return ""
+    if not payload.startswith(b"XSym\n"):
+        return ""
+    text = payload.decode("utf-8", errors="ignore")
+    recorded = next(
+        (line.strip() for line in text.splitlines() if line.strip().startswith("/")), ""
+    )
+    if not recorded:
+        return ""
+    if os.path.isfile(recorded):
+        return os.path.abspath(recorded)
+
+    # Finder aliases copied with a project retain the old absolute prefix. In
+    # this project layout the source video remains beside the project folder,
+    # under its animal/session directory. Require the expected filename and a
+    # unique nearby match rather than searching arbitrary filesystem roots.
+    filename = os.path.basename(recorded)
+    if filename.casefold() != os.path.basename(path).casefold():
+        return ""
+    import_root = Path(videos_dir).resolve().parent.parent
+    session_name = Path(recorded).parent.name
+    direct = import_root / session_name / filename
+    if direct.is_file():
+        return str(direct)
+    matches = [
+        candidate
+        for candidate in import_root.glob(f"*/{filename}")
+        if candidate.is_file() and candidate.parent != Path(videos_dir)
+    ]
+    return str(matches[0]) if len(matches) == 1 else ""
+
+
 def list_project_videos(videos_dir: str) -> list[VideoLibraryEntry]:
     """List video files and links, including broken video links."""
     directory = os.path.abspath(videos_dir)
@@ -49,20 +90,22 @@ def list_project_videos(videos_dir: str) -> list[VideoLibraryEntry]:
                 continue
             path = os.path.abspath(item.path)
             is_link = item.is_symlink()
+            alias_target = ""
             if is_link:
                 raw_target = os.readlink(path)
                 target = os.path.abspath(os.path.join(directory, raw_target))
                 target_exists = os.path.isfile(path)
             elif item.is_file(follow_symlinks=False):
-                target = path
-                target_exists = True
+                alias_target = _legacy_macos_alias_target(directory, path)
+                target = alias_target or path
+                target_exists = os.path.isfile(target)
             else:
                 continue
             entries.append(
                 VideoLibraryEntry(
                     name=item.name,
-                    path=path,
-                    is_link=is_link,
+                    path=target if alias_target else path,
+                    is_link=is_link or bool(alias_target),
                     target=target,
                     target_exists=target_exists,
                 )

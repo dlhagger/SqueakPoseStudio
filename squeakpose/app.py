@@ -41,6 +41,8 @@ def run(argv: list[str] | None = None) -> int:
 
     app.setApplicationName("SqueakPose Studio")
     app.setApplicationDisplayName("SqueakPose Studio")
+    if sys.platform.startswith("linux"):
+        app.setDesktopFileName("squeakpose-studio")
     icon_path = os.path.join(app_base, "squeakpose_studio_logo.png")
     app.setWindowIcon(QIcon(icon_path))
 

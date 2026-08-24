@@ -61,6 +61,14 @@ Launch the application:
 uv run python squeakpose_studio.py
 ```
 
+On Linux, optionally install a user-level application launcher and dock icon:
+
+```bash
+uv run python scripts/install_linux_desktop.py
+```
+
+Remove it with the same command plus `--uninstall`.
+
 This is a dependency-only uv project; the repository itself is run directly and
 is not installed as a Python package.
 

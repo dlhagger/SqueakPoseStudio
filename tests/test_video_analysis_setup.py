@@ -59,6 +59,55 @@ class VideoAnalysisSetupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different project video"):
                 load_video_analysis_setup(tmp, "session.mp4")
 
+    def test_empty_legacy_setup_recovers_rois_from_moved_analysis_summary_once(self):
+        with TemporaryDirectory() as tmp:
+            setup_path = Path(video_analysis_setup_path(tmp, "session.mp4"))
+            setup_path.parent.mkdir(parents=True)
+            setup_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "video_name": "session.mp4",
+                        "frame": {"width": 100, "height": 80},
+                        "scale": {"points": [], "real_world_distance_mm": 1},
+                        "rois": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary = Path(tmp, "analysis outputs", "segmentation", "old-run")
+            summary.mkdir(parents=True)
+            (summary / "analysis_summary.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": "/Users/old/project/videos/session.mp4",
+                        "rois": [
+                            {
+                                "name": "Center",
+                                "type": "polygon",
+                                "points": [[10, 10], [30, 10], [30, 30], [10, 30]],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recovered = load_video_analysis_setup(tmp, "session.mp4")
+            self.assertEqual([roi["name"] for roi in recovered.rois], ["Center"])
+
+            save_video_analysis_setup(
+                tmp,
+                "session.mp4",
+                frame_width=100,
+                frame_height=80,
+                scale_points=[],
+                real_world_distance_mm=1,
+                rois=[],
+                rois_cleared=True,
+            )
+            self.assertEqual(load_video_analysis_setup(tmp, "session.mp4").rois, ())
+
 
 if __name__ == "__main__":
     unittest.main()

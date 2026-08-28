@@ -8,6 +8,7 @@ from squeakpose.services.video_library import (
     list_project_videos,
     remove_video_link,
     rename_video_link,
+    resolve_project_video_paths,
     retarget_video_link,
 )
 
@@ -43,6 +44,18 @@ class VideoLibraryServiceTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(renamed))
             self.assertTrue(first.exists())
             self.assertTrue(second.exists())
+
+    def test_project_video_resolution_preserves_non_library_paths(self):
+        with TemporaryDirectory() as project, TemporaryDirectory() as sources:
+            videos_dir = Path(project) / "videos"
+            videos_dir.mkdir()
+            source = Path(sources) / "external.mp4"
+            source.write_bytes(b"video")
+
+            self.assertEqual(
+                resolve_project_video_paths(str(videos_dir), [str(source)]),
+                [str(source)],
+            )
 
     def test_duplicate_names_get_numbered_and_same_source_is_not_linked_twice(self):
         with (
@@ -97,6 +110,10 @@ class VideoLibraryServiceTests(unittest.TestCase):
             self.assertEqual(entries[0].target, str(source))
             self.assertTrue(entries[0].is_link)
             self.assertTrue(entries[0].target_exists)
+            self.assertEqual(
+                resolve_project_video_paths(str(videos_dir), [str(alias)]),
+                [str(source)],
+            )
 
     def test_rename_rejects_paths_and_collisions(self):
         with TemporaryDirectory() as project, TemporaryDirectory() as sources:

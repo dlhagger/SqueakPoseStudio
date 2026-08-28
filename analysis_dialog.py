@@ -47,18 +47,21 @@ from PyQt6.QtWidgets import (
 )
 
 from layer_ops import layer_definition, normalize_layer_id
+from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION
 from squeakpose.services.analysis import (
     DEFAULT_ONE_EURO_BETA,
     DEFAULT_ONE_EURO_MIN_CUTOFF,
     AnalysisConfigError,
     AnalysisRunConfig,
-    ProjectAnalysisInput,
+    ProjectAnalysisBundle,
     analysis_csv_matches_layer,
-    build_analysis_run_config,
+    build_analysis_job_config,
     default_analysis_output_dir,
+    default_combined_analysis_output_dir,
     inspect_analysis_csv,
+    load_pose_preview,
     load_segmentation_preview,
-    project_analysis_inputs,
+    project_analysis_bundles,
     safe_analysis_stem,
 )
 from squeakpose.services.analysis_state import AnalysisAnnotationState
@@ -75,6 +78,14 @@ from squeakpose.workers.process import (
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from ui_style import ThemedComboBox, analysis_dialog_stylesheet
+
+POSE_PREVIEW_CONNECTIONS = (
+    ("nose", "head"),
+    ("head", "left_ear"),
+    ("head", "right_ear"),
+    ("head", "back"),
+    ("back", "tail_base"),
+)
 
 
 def _remove_file_quietly(path: Optional[str]) -> None:
@@ -123,6 +134,8 @@ class FrameAnnotationView(QWidget):
         self._scale_points: list[tuple[float, float]] = []
         self._rois: list[dict[str, Any]] = []
         self._segmentation_polygons: list[list[tuple[float, float]]] = []
+        self._tracking_bbox: tuple[float, float, float, float] = ()
+        self._pose_keypoints: list[dict[str, Any]] = []
         self._polygon_points: list[tuple[float, float]] = []
         self._polygon_cursor: Optional[tuple[float, float]] = None
         self._selected_roi_index = -1
@@ -151,6 +164,16 @@ class FrameAnnotationView(QWidget):
         self._segmentation_polygons = [
             [(float(x), float(y)) for x, y in polygon] for polygon in polygons
         ]
+        self.update()
+
+    def set_pose_overlay(
+        self,
+        bbox: tuple[float, float, float, float],
+        keypoints: list[dict[str, Any]],
+    ) -> None:
+        """Display pose points plus the caller-selected tracking box."""
+        self._tracking_bbox = tuple(float(value) for value in bbox) if len(bbox) == 4 else ()
+        self._pose_keypoints = [dict(keypoint) for keypoint in keypoints]
         self.update()
 
     def set_scale_points(self, points: list[tuple[float, float]]) -> None:
@@ -429,6 +452,95 @@ class FrameAnnotationView(QWidget):
             painter.setBrush(mask_fill)
             painter.drawPolygon(widget_polygon)
 
+        pose_points: dict[str, QPointF] = {}
+        for keypoint in self._pose_keypoints:
+            try:
+                name = str(keypoint["name"])
+                pose_points[name] = self._image_to_widget(
+                    float(keypoint["x"]), float(keypoint["y"])
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        painter.setPen(QPen(QColor("#d98cff"), 2))
+        for first_name, second_name in POSE_PREVIEW_CONNECTIONS:
+            first = pose_points.get(first_name)
+            second = pose_points.get(second_name)
+            if first is not None and second is not None:
+                painter.drawLine(first, second)
+
+        if self._tracking_bbox:
+            x1, y1, x2, y2 = self._tracking_bbox
+            pose_bounds = QRectF(
+                self._image_to_widget(x1, y1), self._image_to_widget(x2, y2)
+            ).normalized()
+            painter.setPen(QPen(QColor("#54d6ff"), 2))
+            painter.setBrush(QColor(0, 0, 0, 0))
+            painter.drawRect(pose_bounds)
+
+        keypoint_colors = (
+            QColor("#ff5d8f"),
+            QColor("#ffca3a"),
+            QColor("#8ac926"),
+            QColor("#4cc9f0"),
+            QColor("#b892ff"),
+            QColor("#ff924c"),
+        )
+        painter.setFont(QFont("Arial", 8, QFont.Weight.DemiBold))
+        for index, keypoint in enumerate(self._pose_keypoints):
+            point = pose_points.get(str(keypoint.get("name") or ""))
+            if point is None:
+                continue
+            confidence = keypoint.get("confidence")
+            try:
+                low_confidence = math.isfinite(float(confidence)) and float(confidence) < 0.25
+            except (TypeError, ValueError):
+                low_confidence = False
+            color = keypoint_colors[index % len(keypoint_colors)]
+            pen = QPen(color, 2)
+            if low_confidence:
+                pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setBrush(QColor(0, 0, 0, 0))
+            else:
+                painter.setBrush(color)
+            painter.setPen(pen)
+            painter.drawEllipse(point, 4.0, 4.0)
+
+        if pose_points:
+            legend_width = 126.0
+            legend_height = 8.0 + 17.0 * len(pose_points)
+            available_right = self.width() - rect.right()
+            legend_x = (
+                rect.right() + 10.0
+                if available_right >= legend_width + 18.0
+                else rect.right() - legend_width - 8.0
+            )
+            legend_rect = QRectF(
+                legend_x,
+                rect.top() + 8.0,
+                legend_width,
+                legend_height,
+            )
+            painter.setPen(QPen(QColor(84, 214, 255, 150), 1))
+            painter.setBrush(QColor(12, 18, 24, 215))
+            painter.drawRoundedRect(legend_rect, 4.0, 4.0)
+            painter.setFont(QFont("Arial", 8, QFont.Weight.DemiBold))
+            legend_row = 0
+            for index, keypoint in enumerate(self._pose_keypoints):
+                name = str(keypoint.get("name") or "")
+                if name not in pose_points:
+                    continue
+                color = keypoint_colors[index % len(keypoint_colors)]
+                center = QPointF(
+                    legend_rect.left() + 10.0,
+                    legend_rect.top() + 12.0 + legend_row * 17.0,
+                )
+                painter.setPen(QPen(color, 1))
+                painter.setBrush(color)
+                painter.drawEllipse(center, 3.0, 3.0)
+                painter.drawText(center + QPointF(8.0, 3.0), name)
+                legend_row += 1
+
         roi_pen = QPen(QColor("#f5b942"), 2)
         roi_fill = QColor(245, 185, 66, 34)
         painter.setFont(QFont("Arial", 10, QFont.Weight.DemiBold))
@@ -504,7 +616,7 @@ class AnalysisDialog(QDialog):
         super().__init__(parent)
         self.layer_id = normalize_layer_id(layer_id)
         self.layer = layer_definition(self.layer_id)
-        self.setWindowTitle(f"Analysis — {self.layer.display_name} Layer")
+        self.setWindowTitle("Analysis — Project Video")
         self.setSizeGripEnabled(True)
         self.resize(1240, 900)
         self.setMinimumSize(1040, 680)
@@ -515,6 +627,8 @@ class AnalysisDialog(QDialog):
         self.analysis_config_path: Optional[str] = None
         self.last_output_dir = ""
         self.annotation_state = AnalysisAnnotationState()
+        self.analysis_inputs = {LAYER_KEYPOINTS: "", LAYER_SEGMENTATION: ""}
+        self._selected_bundle: Optional[ProjectAnalysisBundle] = None
         self._active_setup_video_name = ""
         self._suspend_setup_persistence = False
 
@@ -575,6 +689,11 @@ class AnalysisDialog(QDialog):
         project_video_row.addWidget(self.project_video_combo, 1)
         project_video_row.addWidget(self.other_inputs_btn)
         input_form.addRow("Project video:", project_video_row)
+
+        self.analysis_mode_combo = ThemedComboBox(self)
+        self.analysis_mode_combo.setObjectName("AnalysisModeCombo")
+        self.analysis_mode_combo.currentIndexChanged.connect(self._analysis_mode_changed)
+        input_form.addRow("Analyze:", self.analysis_mode_combo)
 
         self.input_detail_label = QLabel(self)
         self.input_detail_label.setObjectName("AnalysisInputDetail")
@@ -982,7 +1101,8 @@ class AnalysisDialog(QDialog):
 
     def _candidate_csv_dirs(self) -> list[str]:
         return [
-            os.path.join(self.project_root, "inference outputs", self.layer_id),
+            os.path.join(self.project_root, "inference outputs", LAYER_KEYPOINTS),
+            os.path.join(self.project_root, "inference outputs", LAYER_SEGMENTATION),
             os.path.join(self.project_root, "inference outputs"),
             os.path.join(self.app_base_dir, "analysis_toolset", "inference outputs"),
         ]
@@ -992,7 +1112,7 @@ class AnalysisDialog(QDialog):
 
     def _populate_project_video_selector(self) -> None:
         current_video = self.video_edit.text().strip()
-        options = project_analysis_inputs(self.project_root, self.layer_id)
+        options = project_analysis_bundles(self.project_root)
         self.project_video_combo.blockSignals(True)
         self.project_video_combo.clear()
         self.project_video_combo.addItem("Choose a project video…", None)
@@ -1001,8 +1121,14 @@ class AnalysisDialog(QDialog):
         newest_created_at = ""
         ready_count = 0
         for option in options:
-            if option.inference_ready:
-                suffix = "Ready"
+            if option.both_ready:
+                suffix = "Pose + Segmentation"
+                ready_count += 1
+            elif option.keypoints_csv:
+                suffix = "Pose only"
+                ready_count += 1
+            elif option.segmentation_csv:
+                suffix = "Segmentation only"
                 ready_count += 1
             else:
                 suffix = "No inference"
@@ -1010,15 +1136,16 @@ class AnalysisDialog(QDialog):
             index = self.project_video_combo.count() - 1
             self.project_video_combo.setItemData(
                 index,
-                f"{option.video_name} — {self.layer.display_name} {suffix.lower()}",
+                f"{option.video_name} — {suffix}",
                 Qt.ItemDataRole.ToolTipRole,
             )
             if current_video and os.path.realpath(option.video_path) == os.path.realpath(
                 current_video
             ):
                 selected_index = index
-            if option.inference_ready and option.created_at >= newest_created_at:
-                newest_created_at = option.created_at
+            created_at = max(option.keypoints_created_at, option.segmentation_created_at)
+            if option.inference_ready and created_at >= newest_created_at:
+                newest_created_at = created_at
                 newest_index = index
         if selected_index == 0:
             selected_index = newest_index
@@ -1030,16 +1157,17 @@ class AnalysisDialog(QDialog):
                 "No project videos found. Add videos from the Videos menu or use Other."
             )
         elif ready_count == 0 and selected_index == 0:
-            self.input_detail_label.setText(
-                f"No project videos have {self.layer.display_name.lower()} inference yet."
-            )
+            self.input_detail_label.setText("No project videos have analysis-ready inference yet.")
 
     def _project_video_changed(self, index: int) -> None:
         self._save_analysis_setup()
         self._active_setup_video_name = ""
         self._clear_annotations(persist=False)
         option = self.project_video_combo.itemData(index)
-        if not isinstance(option, ProjectAnalysisInput):
+        if not isinstance(option, ProjectAnalysisBundle):
+            self._selected_bundle = None
+            self.analysis_inputs = {LAYER_KEYPOINTS: "", LAYER_SEGMENTATION: ""}
+            self.analysis_mode_combo.clear()
             self.csv_edit.clear()
             self.video_edit.clear()
             if self.project_video_combo.count() > 1:
@@ -1048,29 +1176,83 @@ class AnalysisDialog(QDialog):
                 "Select a project video to restore its saved scale and ROIs."
             )
             return
+        self._selected_bundle = option
+        self.analysis_inputs = {
+            LAYER_KEYPOINTS: option.keypoints_csv,
+            LAYER_SEGMENTATION: option.segmentation_csv,
+        }
         self.video_edit.setText(option.video_path)
-        if option.inference_ready:
-            self.csv_edit.setText(option.csv_path)
-            self.output_edit.setText(self._default_output_dir_for_csv(option.csv_path))
-            self.input_detail_label.setText(
-                f"{self.layer.display_name} inference ready · "
-                f"Using {os.path.basename(option.csv_path)}"
-            )
-        else:
-            self.csv_edit.clear()
-            self.output_edit.clear()
-            self.input_detail_label.setText(
-                f"Run {self.layer.display_name.lower()} inference for this video before analysis."
-            )
+        self._populate_analysis_modes(option.available_layers)
+        details: list[str] = []
+        if option.keypoints_csv:
+            details.append(f"Pose: {os.path.basename(option.keypoints_csv)}")
+        if option.segmentation_csv:
+            details.append(f"Segmentation: {os.path.basename(option.segmentation_csv)}")
+        self.input_detail_label.setText(
+            " · ".join(details) if details else "Run inference for this video before analysis."
+        )
         self._load_preview_frame(silent=True)
         self._active_setup_video_name = option.video_name
         self._restore_analysis_setup()
+
+    def _populate_analysis_modes(self, available_layers: tuple[str, ...]) -> None:
+        self.analysis_mode_combo.blockSignals(True)
+        self.analysis_mode_combo.clear()
+        available = set(available_layers)
+        if {LAYER_KEYPOINTS, LAYER_SEGMENTATION}.issubset(available):
+            self.analysis_mode_combo.addItem("Both — Pose + Segmentation", "both")
+        if LAYER_KEYPOINTS in available:
+            self.analysis_mode_combo.addItem("Pose only", LAYER_KEYPOINTS)
+        if LAYER_SEGMENTATION in available:
+            self.analysis_mode_combo.addItem("Segmentation only", LAYER_SEGMENTATION)
+        preferred_index = self.analysis_mode_combo.findData(self.layer_id)
+        if self.analysis_mode_combo.findData("both") >= 0:
+            preferred_index = self.analysis_mode_combo.findData("both")
+        self.analysis_mode_combo.setCurrentIndex(max(preferred_index, 0))
+        self.analysis_mode_combo.blockSignals(False)
+        self._analysis_mode_changed(self.analysis_mode_combo.currentIndex())
+
+    def _analysis_mode(self) -> str:
+        return str(self.analysis_mode_combo.currentData() or self.layer_id)
+
+    def _analysis_mode_changed(self, _index: int) -> None:
+        mode = self._analysis_mode()
+        csv_layer = LAYER_SEGMENTATION if mode == LAYER_SEGMENTATION else LAYER_KEYPOINTS
+        csv_path = self.analysis_inputs.get(csv_layer) or next(
+            (path for path in self.analysis_inputs.values() if path), ""
+        )
+        self.csv_edit.setText(csv_path)
+        bundle = self._selected_bundle
+        if mode == "both" and bundle is not None:
+            output = default_combined_analysis_output_dir(self.project_root, bundle.video_name)
+        elif csv_path:
+            output = default_analysis_output_dir(
+                self.project_root,
+                csv_layer,
+                csv_path,
+                video_name=bundle.video_name if bundle is not None else self.video_edit.text(),
+            )
+        else:
+            output = ""
+        self.output_edit.setText(output)
+        if hasattr(self, "frame_view"):
+            self._load_preview_frame(silent=True)
 
     def _csv_matches_active_layer(self, path: str) -> bool:
         return analysis_csv_matches_layer(path, self.layer_id)
 
     def _default_output_dir_for_csv(self, csv_path: str) -> str:
-        return default_analysis_output_dir(self.project_root, self.layer_id, csv_path)
+        layer_id = (
+            LAYER_SEGMENTATION
+            if analysis_csv_matches_layer(csv_path, LAYER_SEGMENTATION)
+            else LAYER_KEYPOINTS
+        )
+        return default_analysis_output_dir(
+            self.project_root,
+            layer_id,
+            csv_path,
+            video_name=self.video_edit.text().strip(),
+        )
 
     def _refresh_default_output_dir(self) -> None:
         if self.output_edit.text().strip():
@@ -1148,6 +1330,10 @@ class AnalysisDialog(QDialog):
         self.project_video_combo.blockSignals(False)
         self._save_analysis_setup()
         self._active_setup_video_name = ""
+        self._selected_bundle = None
+        self.analysis_inputs = {LAYER_KEYPOINTS: "", LAYER_SEGMENTATION: ""}
+        self.analysis_inputs[self.layer_id] = csv_path
+        self._populate_analysis_modes((self.layer_id,))
         self.csv_edit.setText(csv_path)
         self.video_edit.setText(video_path)
         self.output_edit.setText(self._default_output_dir_for_csv(csv_path))
@@ -1169,10 +1355,16 @@ class AnalysisDialog(QDialog):
             self.output_edit.setText(path)
 
     def _video_path_from_csv(self) -> str:
-        return inspect_analysis_csv(self.csv_edit.text().strip()).video_path
+        csv_path = next((path for path in self.analysis_inputs.values() if path), "")
+        return inspect_analysis_csv(csv_path or self.csv_edit.text().strip()).video_path
 
     def _frame_dimensions_from_csv(self) -> tuple[int, int]:
-        context = inspect_analysis_csv(self.csv_edit.text().strip())
+        csv_path = (
+            self.analysis_inputs.get(LAYER_SEGMENTATION)
+            or self.analysis_inputs.get(LAYER_KEYPOINTS)
+            or self.csv_edit.text().strip()
+        )
+        context = inspect_analysis_csv(csv_path)
         return (context.width, context.height)
 
     def _blank_frame_pixmap(self, width: int, height: int) -> QPixmap:
@@ -1225,15 +1417,51 @@ class AnalysisDialog(QDialog):
             if video_path:
                 self.video_edit.setText(video_path)
 
+        segmentation_csv = self.analysis_inputs.get(LAYER_SEGMENTATION) or ""
         segmentation_preview = (
-            load_segmentation_preview(self.csv_edit.text().strip())
-            if self.layer_id == "segmentation"
-            else None
+            load_segmentation_preview(segmentation_csv) if segmentation_csv else None
         )
-        preview_frame = segmentation_preview.frame_index if segmentation_preview else 0
         polygons = (
             [list(polygon) for polygon in segmentation_preview.polygons]
             if segmentation_preview
+            else []
+        )
+        pose_csv = self.analysis_inputs.get(LAYER_KEYPOINTS) or ""
+        pose_preview = (
+            load_pose_preview(
+                pose_csv,
+                frame_index=segmentation_preview.frame_index if polygons else None,
+            )
+            if pose_csv
+            else None
+        )
+        preview_frame = (
+            segmentation_preview.frame_index
+            if polygons and segmentation_preview is not None
+            else pose_preview.frame_index
+            if pose_preview is not None
+            else 0
+        )
+        pose_bbox = pose_preview.bbox if pose_preview is not None else ()
+        segmentation_bbox = (
+            segmentation_preview.primary_bbox if segmentation_preview is not None else ()
+        )
+        tracking_bbox = (
+            segmentation_bbox
+            if self._analysis_mode() in {"both", LAYER_SEGMENTATION} and segmentation_bbox
+            else pose_bbox
+        )
+        pose_keypoints = (
+            [
+                {
+                    "name": keypoint.name,
+                    "x": keypoint.x,
+                    "y": keypoint.y,
+                    "confidence": keypoint.confidence,
+                }
+                for keypoint in pose_preview.keypoints
+            ]
+            if pose_preview is not None
             else []
         )
 
@@ -1243,11 +1471,15 @@ class AnalysisDialog(QDialog):
             self.annotation_state.set_frame_dimensions(width, height)
             self.frame_view.set_frame(pixmap, width, height)
             self.frame_view.set_segmentation_polygons(polygons)
-            overlay_status = (
-                f" | frame {preview_frame} | {len(polygons)} mask(s)" if polygons else ""
-            )
+            self.frame_view.set_pose_overlay(tracking_bbox, pose_keypoints)
+            overlay_parts = [f"frame {preview_frame}"]
+            if polygons:
+                overlay_parts.append(f"{len(polygons)} mask(s)")
+            if pose_keypoints:
+                overlay_parts.append(f"{len(pose_keypoints)} keypoints")
             self.frame_info_label.setText(
-                f"{width} x {height} | {os.path.basename(video_path)}{overlay_status}"
+                f"{width} x {height} | {os.path.basename(video_path)} | "
+                + " | ".join(overlay_parts)
             )
             return
 
@@ -1262,7 +1494,12 @@ class AnalysisDialog(QDialog):
         self.annotation_state.set_frame_dimensions(width, height)
         self.frame_view.set_frame(self._blank_frame_pixmap(width, height), width, height)
         self.frame_view.set_segmentation_polygons(polygons)
-        overlay_status = f" | frame {preview_frame} | {len(polygons)} mask(s)" if polygons else ""
+        self.frame_view.set_pose_overlay(tracking_bbox, pose_keypoints)
+        overlay_status = f" | frame {preview_frame}"
+        if polygons:
+            overlay_status += f" | {len(polygons)} mask(s)"
+        if pose_keypoints:
+            overlay_status += f" | {len(pose_keypoints)} keypoints"
         self.frame_info_label.setText(f"{width} x {height} | CSV coordinates{overlay_status}")
 
     def _set_annotation_mode(self, mode: str) -> None:
@@ -1509,9 +1746,9 @@ class AnalysisDialog(QDialog):
             if len(self.annotation_state.scale_points) >= 2
             else 0.0
         )
-        return build_analysis_run_config(
-            layer_id=self.layer_id,
-            detections_csv=self.csv_edit.text(),
+        return build_analysis_job_config(
+            analysis_mode=self._analysis_mode(),
+            analysis_inputs=self.analysis_inputs,
             video_path=self.video_edit.text(),
             output_dir=self.output_edit.text(),
             pixel_distance=pixel_distance,
@@ -1585,7 +1822,9 @@ class AnalysisDialog(QDialog):
         self.log_view.clear()
         self.summary_view.clear()
         self._append_log(f"Detections: {payload['detections_csv']}")
-        self._append_log(f"Layer: {self.layer.display_name}")
+        self._append_log(f"Mode: {payload.get('analysis_mode', self._analysis_mode())}")
+        for layer_id, csv_path in payload.get("analysis_inputs", {}).items():
+            self._append_log(f"{layer_id}: {csv_path}")
         self._append_log(f"Output: {payload['output_dir']}")
         self._append_log(f"ROIs: {len(self.rois)}")
 
@@ -1629,6 +1868,31 @@ class AnalysisDialog(QDialog):
                     f"Coverage: {_fmt_number(float(summary.get('detection_coverage_fraction') or 0.0) * 100.0)}%",
                 ]
             )
+        elif summary.get("analysis_kind") in {"combined", "pose_and_segmentation"}:
+            source_counts = summary.get("centroid_source_counts") or {}
+            qc_counts = summary.get("prediction_qc_status_counts") or {}
+            qc_reasons = summary.get("prediction_qc_reason_counts") or {}
+            lines.extend(
+                [
+                    f"Pose-valid frames: {int(summary.get('pose_valid_frames') or 0)}",
+                    "Segmentation-valid frames: "
+                    f"{int(summary.get('segmentation_valid_frames') or 0)}",
+                    "Centroid sources: "
+                    + ", ".join(
+                        f"{source}={int(count)}" for source, count in source_counts.items()
+                    ),
+                    "Prediction QC: "
+                    + ", ".join(
+                        f"{status}={int(qc_counts.get(status) or 0)}"
+                        for status in ("good", "warning", "bad")
+                    ),
+                ]
+            )
+            if qc_reasons:
+                lines.append(
+                    "QC reasons: "
+                    + ", ".join(f"{reason}={int(count)}" for reason, count in qc_reasons.items())
+                )
         roi_summary = event.get("roi_summary") or summary.get("roi_summary") or []
         if roi_summary:
             lines.append("")
@@ -1678,12 +1942,18 @@ class AnalysisDialog(QDialog):
                     )
                 )
             self._append_log(f"Feature CSV: {event.get('feature_csv', '')}")
+            for layer_id, result in (event.get("results_by_layer") or {}).items():
+                self._append_log(f"{layer_id} features: {result.get('feature_csv', '')}")
+            for layer_id, error in (event.get("errors_by_layer") or {}).items():
+                self._append_log(f"{layer_id} warning: {error}")
             if event.get("segmentation_detections_csv"):
                 self._append_log(
                     f"Segmentation detections: {event.get('segmentation_detections_csv')}"
                 )
             if event.get("roi_summary_csv"):
                 self._append_log(f"ROI summary: {event.get('roi_summary_csv')}")
+            if event.get("prediction_qc_csv"):
+                self._append_log(f"Prediction QC: {event.get('prediction_qc_csv')}")
             self._show_result_summary(event)
             self.open_output_btn.setEnabled(bool(self.last_output_dir))
         elif kind == "error":

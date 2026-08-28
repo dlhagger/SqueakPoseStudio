@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QProgressDialog,
@@ -44,6 +45,8 @@ from squeakpose.services.distillation import (
     plan_distillation_corpus,
     student_task_mismatch,
 )
+from squeakpose.services.video_library import resolve_project_video_paths
+from squeakpose.ui.project_video_picker import ProjectVideoPickerDialog
 from squeakpose.ui.style import (
     ThemedComboBox,
     style_combo_popup,
@@ -340,18 +343,27 @@ class DistillationDialog(QDialog):
         _refresh_qt_style(self.status_label)
 
     def _add_videos(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select project videos",
+        selected_names = {os.path.basename(path) for path in self.video_paths}
+        picker = ProjectVideoPickerDialog(
             self.paths["videos"],
-            "Videos (*.mp4 *.mov *.avi *.mkv *.m4v *.mpg *.mpeg *.wmv);;All files (*)",
+            selected_names=selected_names,
+            title="Select Videos for Distillation",
+            description=(
+                "Choose from videos already linked to this project. Missing sources are shown "
+                "but cannot be selected."
+            ),
+            parent=self,
         )
-        for path in paths:
-            normalized = os.path.abspath(path)
-            if normalized in self.video_paths:
-                continue
-            self.video_paths.append(normalized)
-            self.video_list.addItem(normalized)
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.video_paths = [
+            os.path.join(self.paths["videos"], entry.name) for entry in picker.selected_entries
+        ]
+        self.video_list.clear()
+        for entry in picker.selected_entries:
+            item = QListWidgetItem(entry.name)
+            item.setToolTip(f"Source: {entry.target}")
+            self.video_list.addItem(item)
 
     def _remove_selected_videos(self) -> None:
         rows = sorted(
@@ -391,15 +403,16 @@ class DistillationDialog(QDialog):
         maximum = self.max_frames_spin.value()
         probes: list[tuple[str, int, int]] = []
         errors: list[str] = []
-        for path in self.video_paths:
+        resolved_paths = resolve_project_video_paths(self.paths["videos"], self.video_paths)
+        for selected_path, path in zip(self.video_paths, resolved_paths):
             cap = _cv2.VideoCapture(path)
             try:
                 if not cap or not cap.isOpened():
-                    errors.append(f"{os.path.basename(path)}: could not open")
+                    errors.append(f"{os.path.basename(selected_path)}: could not open")
                     continue
                 total = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
                 if total <= 0:
-                    errors.append(f"{os.path.basename(path)}: frame count unavailable")
+                    errors.append(f"{os.path.basename(selected_path)}: frame count unavailable")
                     continue
                 probes.append((path, total, _distillation_sample_count(total, stride, maximum)))
             finally:

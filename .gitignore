@@ -25,18 +25,33 @@ htmlcov/
 # OS-generated files
 .DS_Store
 
-# Local model artifacts
-/sam3.pt
-/yolo26*-depth.pt
+# Local model artifacts downloaded into the repository root
+/*.pt
+/*.pth
+/*.onnx
+/*.engine
 
 # App runtime data created when the repository root is used as a project
 /annotations/
+/analysis outputs/
+/analysis settings/
+/cache/
 /datasets/
+/depth maps/
+/distillation/unlabeled_images/
 /images_all/
 /images_to_label/
 /labels_all/
+/labels_seg_all/
+/inference outputs/
+/logs/
 /runs/
+/templates/
+/videos/
 /class_keypoints.json
 /classes.txt
+/classes_seg.txt
 /keypoints.txt
+/.squeakpose.lock
+/squeakpose_project.json
 *.sqp_preds.json

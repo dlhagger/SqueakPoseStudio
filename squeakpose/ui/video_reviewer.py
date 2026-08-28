@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -292,22 +293,45 @@ class VideoReviewDialog(QDialog):
         controls_row_1.addStretch(1)
         self.btn_predict = QPushButton("Predict Range")
         self.btn_predict.setEnabled(False)
+        self.predict_layer_actions = {}
         if not self.review_layers:
             self.btn_predict.setToolTip(
                 "Configure a Keypoints or Segmentation project model to enable predictions."
             )
         elif len(self.review_layers) > 1:
-            self.btn_predict.setText("Predict Both Layers")
+            self.btn_predict.setText("Predict Layers…")
             self.btn_predict.setToolTip(
-                "Run the configured Keypoints and Segmentation models sequentially over the selected frame range."
+                "Choose which configured model to run over the selected frame range."
             )
+            predict_menu = QMenu(self.btn_predict)
+            choices = (
+                ("keypoints", "Predict Keypoints", (LAYER_KEYPOINTS,)),
+                ("segmentation", "Predict Segmentation", (LAYER_SEGMENTATION,)),
+                (
+                    "both",
+                    "Predict Both Layers",
+                    (LAYER_KEYPOINTS, LAYER_SEGMENTATION),
+                ),
+            )
+            for action_id, label, layers in choices:
+                if action_id == "both":
+                    predict_menu.addSeparator()
+                action = predict_menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, selected=layers: self._start_range_prediction(selected)
+                )
+                self.predict_layer_actions[action_id] = action
+            self.btn_predict.setMenu(predict_menu)
         elif self._is_seg_workflow():
             self.btn_predict.setToolTip(
                 "Run segmentation predictions over the selected frame range."
             )
         else:
             self.btn_predict.setToolTip("Run pose predictions over the selected frame range.")
-        self.btn_predict.clicked.connect(self._start_range_prediction)
+        if len(self.review_layers) <= 1:
+            self.btn_predict.clicked.connect(
+                lambda _checked=False: self._start_range_prediction(self.review_layers)
+            )
         controls_row_1.addWidget(self.btn_predict)
         top.addLayout(controls_row_1)
 
@@ -736,7 +760,7 @@ class VideoReviewDialog(QDialog):
     def _create_review_job_controller(self) -> WorkerJobController:
         return WorkerJobController(self)
 
-    def _start_range_prediction(self):
+    def _start_range_prediction(self, requested_layers=None):
         if self.cap is None or not self.path:
             QMessageBox.information(self, "No video", "Load a video first.")
             return
@@ -750,6 +774,19 @@ class VideoReviewDialog(QDialog):
         if self._review_prediction_is_running():
             QMessageBox.information(
                 self, "Prediction running", "Video prediction is already running."
+            )
+            return
+
+        if requested_layers is None:
+            prediction_layers = list(self.review_layers)
+        else:
+            requested = {normalize_layer_id(layer) for layer in requested_layers}
+            prediction_layers = [layer for layer in self.review_layers if layer in requested]
+        if not prediction_layers:
+            QMessageBox.information(
+                self,
+                "Model not configured",
+                "Configure the selected prediction model in Project Models first.",
             )
             return
 
@@ -774,7 +811,7 @@ class VideoReviewDialog(QDialog):
         run_plan = plan_video_review_run(
             video_signature=self._video_signature(),
             model_paths=self.model_paths,
-            review_layers=self.review_layers,
+            review_layers=prediction_layers,
             layer_schemas=self.layer_schemas,
             start=start,
             end=end,
@@ -788,7 +825,12 @@ class VideoReviewDialog(QDialog):
             total=self.total,
             fps=self.fps,
         )
-        prog = QProgressDialog("Preparing project models…", "Cancel", 0, run_plan.total_steps, self)
+        preparing = (
+            f"Preparing {layer_definition(prediction_layers[0]).display_name} model…"
+            if len(prediction_layers) == 1
+            else "Preparing project models…"
+        )
+        prog = QProgressDialog(preparing, "Cancel", 0, run_plan.total_steps, self)
         prog.setWindowTitle("Project Video Review")
         prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         prog.setMinimumDuration(0)
@@ -801,11 +843,11 @@ class VideoReviewDialog(QDialog):
         self._review_cancel_requested = False
         self._review_run_canceled = False
         self._review_run_errors = []
-        self._review_job_queue = list(self.review_layers)
-        self._review_pass_total = len(self.review_layers)
+        self._review_job_queue = list(prediction_layers)
+        self._review_pass_total = len(prediction_layers)
         self._review_pass_index = 0
         self._review_steps_per_pass = run_plan.steps_per_pass
-        for layer in self.review_layers:
+        for layer in prediction_layers:
             self.preds_by_layer[layer] = {}
         self.preds = self.preds_by_layer[self.layer_id]
         self.btn_predict.setEnabled(False)

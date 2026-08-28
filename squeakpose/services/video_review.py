@@ -113,6 +113,7 @@ def plan_video_review_run(
     normalized_stride = max(1, int(stride))
     steps = max(1, ((int(end) - int(start)) // normalized_stride) + 1)
     layers = [str(layer) for layer in review_layers]
+    configured_layers = [str(layer) for layer, path in model_paths.items() if path]
     settings = {
         "start": int(start),
         "end": int(end),
@@ -125,7 +126,9 @@ def plan_video_review_run(
     }
     meta = {
         "video": dict(video_signature),
-        "model_paths": {layer: model_paths[layer] for layer in layers},
+        # Cache identity covers every configured model, including a preserved
+        # layer that was not selected for this particular prediction pass.
+        "model_paths": {layer: model_paths[layer] for layer in configured_layers},
         "layers": layers,
         "imgsz": int(imgsz),
         "conf": float(conf),
@@ -138,7 +141,7 @@ def plan_video_review_run(
         "initial_effective_batch": int(effective_batch),
         "total": int(total),
         "fps": float(fps),
-        "schemas": {layer: layer_schemas.get(layer, {}) for layer in layers},
+        "schemas": {layer: layer_schemas.get(layer, {}) for layer in configured_layers},
     }
     return VideoReviewRunPlan(
         meta=meta,

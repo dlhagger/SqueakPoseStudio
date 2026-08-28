@@ -83,6 +83,17 @@ class _Progress:
         self.maximum = 0
         self.value = 0
         self.closed = False
+        self.shown = False
+        self.canceled = _Signal()
+
+    def setWindowTitle(self, _title):
+        pass
+
+    def setWindowModality(self, _modality):
+        pass
+
+    def setMinimumDuration(self, _duration):
+        pass
 
     def setLabelText(self, text):
         self.label = text
@@ -95,6 +106,9 @@ class _Progress:
 
     def close(self):
         self.closed = True
+
+    def show(self):
+        self.shown = True
 
 
 class _Capture:
@@ -227,6 +241,44 @@ class VideoReviewerProcessTests(unittest.TestCase):
 
             self.assertEqual(set(dialog.preds_by_layer[LAYER_SEGMENTATION]), {4})
             finished.assert_called_once_with()
+            dialog.close()
+
+    def test_prediction_menu_can_run_keypoints_without_clearing_segmentation(self):
+        with TemporaryDirectory() as tmp:
+            dialog = self.make_dialog(tmp)
+            dialog.cap = _Capture()
+            dialog.total = 1
+            dialog.fps = 30.0
+            dialog.preds_by_layer[LAYER_KEYPOINTS] = {0: {"old": "pose"}}
+            existing_segmentation = {0: {"old": "segmentation"}}
+            dialog.preds_by_layer[LAYER_SEGMENTATION] = existing_segmentation
+            progress = _Progress()
+
+            self.assertEqual(
+                [action.text() for action in dialog.predict_layer_actions.values()],
+                ["Predict Keypoints", "Predict Segmentation", "Predict Both Layers"],
+            )
+            with patch.object(dialog, "_start_range_prediction") as selected_prediction:
+                dialog.predict_layer_actions["keypoints"].trigger()
+            selected_prediction.assert_called_once_with((LAYER_KEYPOINTS,))
+
+            with (
+                patch(
+                    "squeakpose.ui.video_reviewer.QProgressDialog",
+                    return_value=progress,
+                ),
+                patch.object(dialog, "_start_next_review_prediction_pass") as start_pass,
+            ):
+                dialog._start_range_prediction([LAYER_KEYPOINTS])
+
+            self.assertEqual(dialog._review_job_queue, [LAYER_KEYPOINTS])
+            self.assertEqual(dialog._review_pass_total, 1)
+            self.assertEqual(dialog._review_run_meta["layers"], [LAYER_KEYPOINTS])
+            self.assertEqual(dialog.preds_by_layer[LAYER_KEYPOINTS], {})
+            self.assertEqual(dialog.preds_by_layer[LAYER_SEGMENTATION], existing_segmentation)
+            self.assertTrue(progress.shown)
+            start_pass.assert_called_once_with()
+            dialog.cap = None
             dialog.close()
 
     def test_cancel_delegates_escalation_and_stops_remaining_passes(self):

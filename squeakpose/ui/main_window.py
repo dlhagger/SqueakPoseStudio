@@ -4857,9 +4857,14 @@ class LabelingApp(QMainWindow):
         video_paths = dialog.selected_video_paths
         if not video_paths:
             return
+        selected_settings = {
+            selection.video_path: selection
+            for selection in getattr(dialog, "selected_video_settings", ())
+        }
         plans = []
         errors = []
         for video_path in video_paths:
+            video_settings = selected_settings.get(video_path)
             metadata = probe_video_metadata(video_path, _cv2)
             if not metadata.opened:
                 errors.append(f"{os.path.basename(video_path)}: unable to open video")
@@ -4877,6 +4882,12 @@ class LabelingApp(QMainWindow):
                     batch_size=dialog.batch_size,
                     total_frames=metadata.total_frames,
                     fps=metadata.fps,
+                    expected_animal_count=(
+                        video_settings.expected_animal_count if video_settings is not None else 1
+                    ),
+                    requested_tracker=(
+                        video_settings.requested_tracker if video_settings is not None else "auto"
+                    ),
                 )
                 prepare_inference_run(plan)
                 plans.append(plan)
@@ -6772,9 +6783,7 @@ class LabelingApp(QMainWindow):
             "depth_assistant_frame",
         )
         return [
-            widget
-            for name in names
-            if isinstance((widget := getattr(self, name, None)), QWidget)
+            widget for name in names if isinstance((widget := getattr(self, name, None)), QWidget)
         ]
 
     def _set_analysis_read_only(self, locked: bool) -> None:
@@ -6785,9 +6794,7 @@ class LabelingApp(QMainWindow):
             self._analysis_previous_mode = self.mode
             self.set_mode("panzoom")
             widgets = self._analysis_lock_widgets()
-            self._analysis_lock_widget_states = {
-                widget: widget.isEnabled() for widget in widgets
-            }
+            self._analysis_lock_widget_states = {widget: widget.isEnabled() for widget in widgets}
             for widget in widgets:
                 widget.setEnabled(False)
             for action_name in (

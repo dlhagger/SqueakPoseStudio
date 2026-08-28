@@ -831,6 +831,28 @@ def inference_dialog_stylesheet() -> str:
         color: {COLORS["text_muted"]};
         font-size: 10pt;
     }}
+    QFrame#InferenceTrackingDefaults {{
+        background-color: #20272d;
+        border: 1px solid {COLORS["panel_border"]};
+        border-radius: 7px;
+    }}
+    QLabel#InferenceTrackingTitle {{
+        color: {COLORS["text"]};
+        font-weight: 750;
+    }}
+    QLabel#InferenceTrackingHint,
+    QLabel#InferenceSequentialHint {{
+        color: {COLORS["text_muted"]};
+        font-size: 9pt;
+    }}
+    QWidget#InferenceDefaultAnimals,
+    QComboBox#InferenceDefaultTracker {{
+        min-height: 30px;
+    }}
+    QPushButton#InferenceApplyDefaults {{
+        min-height: 30px;
+        min-width: 135px;
+    }}
     QTableWidget#InferenceVideoTable {{
         background-color: {COLORS["terminal_bg"]};
         alternate-background-color: #11161a;
@@ -839,7 +861,7 @@ def inference_dialog_stylesheet() -> str:
         color: {COLORS["text"]};
     }}
     QTableWidget#InferenceVideoTable::item {{
-        padding: 8px 7px;
+        padding: 9px 8px;
         border-bottom: 1px solid #252d33;
     }}
     QTableWidget#InferenceVideoTable::item:hover {{
@@ -851,8 +873,70 @@ def inference_dialog_stylesheet() -> str:
         color: {COLORS["text_muted"]};
         border: none;
         border-bottom: 1px solid {COLORS["panel_border"]};
-        padding: 7px;
+        min-height: 34px;
+        padding: 7px 8px;
         font-weight: 700;
+    }}
+    QTableWidget#InferenceVideoTable::indicator {{
+        background-color: #11161a;
+        border: 1px solid #687783;
+        border-radius: 4px;
+        height: 17px;
+        width: 17px;
+    }}
+    QTableWidget#InferenceVideoTable::indicator:hover {{
+        border-color: {COLORS["accent_hover"]};
+    }}
+    QTableWidget#InferenceVideoTable::indicator:checked {{
+        background-color: {COLORS["accent"]};
+        border-color: #8eb6db;
+    }}
+    QWidget#InferenceDefaultAnimals,
+    QWidget#InferenceRowAnimals,
+    QComboBox#InferenceRowTracker {{
+        background-color: #171d22;
+        border: 1px solid #53616c;
+        border-radius: 6px;
+        min-height: 30px;
+    }}
+    QWidget#InferenceRowAnimals,
+    QComboBox#InferenceRowTracker {{
+        margin: 5px 8px;
+    }}
+    QComboBox#InferenceRowTracker {{
+        padding-left: 9px;
+        padding-right: 8px;
+    }}
+    QWidget#InferenceDefaultAnimals:hover,
+    QWidget#InferenceRowAnimals:hover,
+    QComboBox#InferenceRowTracker:hover {{
+        border-color: {COLORS["accent_hover"]};
+    }}
+    QLabel#AnimalCountValue {{
+        color: {COLORS["text"]};
+        font-weight: 700;
+        min-width: 18px;
+    }}
+    QToolButton#AnimalCountButton {{
+        background: transparent;
+        border: none;
+        border-radius: 4px;
+        color: #c7e5ff;
+        font-size: 13pt;
+        font-weight: 700;
+        min-height: 22px;
+        min-width: 22px;
+        max-height: 22px;
+        max-width: 22px;
+        padding: 0;
+    }}
+    QToolButton#AnimalCountButton:hover {{
+        background-color: #304352;
+        color: #ffffff;
+    }}
+    QToolButton#AnimalCountButton:disabled {{
+        color: #56616b;
+        background: transparent;
     }}
     QFrame#InferencePickerFooter {{
         background-color: {COLORS["panel_bg"]};

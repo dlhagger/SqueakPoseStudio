@@ -104,6 +104,13 @@ from squeakpose.services.prediction_serialization import (
     serialize_prediction_result,
     top_prediction_from_payload,
 )
+from squeakpose.services.tracking import (
+    TRACKER_AUTO,
+    TRACKER_BOTSORT,
+    TRACKER_BYTETRACK,
+    TrackingConfig,
+    resolve_tracking_config,
+)
 from squeakpose.services.video_review import (
     VideoReviewCacheDecision,
     VideoReviewPassCompletion,
@@ -182,6 +189,11 @@ __all__ = [
     "run_pose_video_inference",
     "run_segmentation_video_inference",
     "segmentation_rows_from_result",
+    "TRACKER_AUTO",
+    "TRACKER_BOTSORT",
+    "TRACKER_BYTETRACK",
+    "TrackingConfig",
+    "resolve_tracking_config",
     "queue_progress",
     "scan_image_queue",
     "DepthApplicationPlan",

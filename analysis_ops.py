@@ -24,6 +24,20 @@ from squeakpose.services.analysis import DEFAULT_ONE_EURO_BETA, DEFAULT_ONE_EURO
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
 
+def prepare_analysis_output_dir(
+    output_dir: Path,
+    *,
+    generated_files: tuple[str, ...],
+    generated_directories: tuple[str, ...],
+) -> None:
+    """Clear only app-owned artifacts before rebuilding a stable analysis folder."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in (*generated_files, *generated_directories):
+        if not name or Path(name).name != name:
+            raise AnalysisError(f"Unsafe generated analysis artifact name: {name!r}")
+        remove_path(str(output_dir / name))
+
+
 class AnalysisError(RuntimeError):
     """Raised when an analysis workflow cannot be completed."""
 
@@ -412,6 +426,313 @@ def summarize_features(df: pd.DataFrame, fps: float, mm_per_pixel: float) -> dic
     }
 
 
+def _prefixed_frame_table(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Prefix one primary-detection table while retaining its frame join key."""
+    table = df.copy()
+    table["frame_index"] = pd.to_numeric(table["frame_index"], errors="coerce")
+    table = table.dropna(subset=["frame_index"])
+    table["frame_index"] = table["frame_index"].astype(int)
+    table = table.sort_values("frame_index").drop_duplicates("frame_index", keep="first")
+    return table.rename(
+        columns={
+            column: f"{prefix}_{column}" for column in table.columns if column != "frame_index"
+        }
+    )
+
+
+def _first_complete_pair(
+    table: pd.DataFrame,
+    candidates: list[tuple[str, str, str]],
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Choose the first available x/y pair per row and record its source."""
+    x_values = pd.Series(np.nan, index=table.index, dtype=float)
+    y_values = pd.Series(np.nan, index=table.index, dtype=float)
+    sources = pd.Series("missing", index=table.index, dtype=object)
+    for x_col, y_col, source in candidates:
+        if x_col not in table.columns or y_col not in table.columns:
+            continue
+        x_candidate = pd.to_numeric(table[x_col], errors="coerce")
+        y_candidate = pd.to_numeric(table[y_col], errors="coerce")
+        use = x_values.isna() & y_values.isna() & x_candidate.notna() & y_candidate.notna()
+        x_values.loc[use] = x_candidate.loc[use]
+        y_values.loc[use] = y_candidate.loc[use]
+        sources.loc[use] = source
+    return x_values, y_values, sources
+
+
+def _first_complete_bbox(
+    table: pd.DataFrame,
+    candidates: list[tuple[str, str, str, str, str]],
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Choose the first complete bounding box per row and record its source."""
+    values = [pd.Series(np.nan, index=table.index, dtype=float) for _ in range(4)]
+    sources = pd.Series("missing", index=table.index, dtype=object)
+    for x1_col, y1_col, x2_col, y2_col, source in candidates:
+        columns = (x1_col, y1_col, x2_col, y2_col)
+        if any(column not in table.columns for column in columns):
+            continue
+        candidate_values = [pd.to_numeric(table[column], errors="coerce") for column in columns]
+        complete = candidate_values[0].notna()
+        for candidate in candidate_values[1:]:
+            complete &= candidate.notna()
+        use = sources.eq("missing") & complete
+        for output, candidate in zip(values, candidate_values):
+            output.loc[use] = candidate.loc[use]
+        sources.loc[use] = source
+    return values[0], values[1], values[2], values[3], sources
+
+
+def build_combined_analysis_outputs(
+    *,
+    pose_feature_csv: str,
+    segmentation_feature_csv: str,
+    output_dir: str,
+    fps: float,
+    mm_per_pixel: float,
+    rois: Any = None,
+) -> dict[str, Any]:
+    """Outer-join primary pose/mask tracks and write a provenance-rich frame table."""
+    pose = pd.read_csv(pose_feature_csv).dropna(axis=1, how="all")
+    segmentation = pd.read_csv(segmentation_feature_csv).dropna(axis=1, how="all")
+    _require_columns(pose, ["frame_index", "bbox_center_x", "bbox_center_y"])
+    _require_columns(segmentation, ["frame_index", "bbox_center_x", "bbox_center_y"])
+
+    pose = _prefixed_frame_table(pose, "pose")
+    segmentation = _prefixed_frame_table(segmentation, "seg")
+    combined = pose.merge(segmentation, on="frame_index", how="outer", validate="one_to_one")
+    combined = combined.sort_values("frame_index").reset_index(drop=True)
+    if not combined.empty:
+        observed_last_frame = int(combined["frame_index"].max())
+        reported_frame_count = pd.to_numeric(
+            combined.get(
+                "seg_segmentation_total_frames",
+                pd.Series(np.nan, index=combined.index),
+            ),
+            errors="coerce",
+        ).max()
+        reported_last_frame = (
+            int(reported_frame_count) - 1 if pd.notna(reported_frame_count) else -1
+        )
+        combined = (
+            combined.set_index("frame_index")
+            .reindex(range(0, max(observed_last_frame, reported_last_frame) + 1))
+            .rename_axis("frame_index")
+            .reset_index()
+        )
+
+    combined["pose_valid"] = (
+        combined.get("pose_bbox_center_x", pd.Series(np.nan, index=combined.index)).notna()
+        & combined.get("pose_bbox_center_y", pd.Series(np.nan, index=combined.index)).notna()
+    )
+    combined["segmentation_valid"] = (
+        combined.get("seg_bbox_center_x", pd.Series(np.nan, index=combined.index)).notna()
+        & combined.get("seg_bbox_center_y", pd.Series(np.nan, index=combined.index)).notna()
+    )
+
+    centroid_x, centroid_y, centroid_source = _first_complete_pair(
+        combined,
+        [
+            ("seg_mask_centroid_x", "seg_mask_centroid_y", "segmentation_mask"),
+            ("seg_bbox_center_x", "seg_bbox_center_y", "segmentation_bbox"),
+            ("pose_bbox_center_x", "pose_bbox_center_y", "pose_bbox"),
+        ],
+    )
+    combined["centroid_x"] = centroid_x
+    combined["centroid_y"] = centroid_y
+    combined["centroid_source"] = centroid_source
+
+    bbox_x1, bbox_y1, bbox_x2, bbox_y2, bbox_source = _first_complete_bbox(
+        combined,
+        [
+            (
+                "seg_bbox_x1",
+                "seg_bbox_y1",
+                "seg_bbox_x2",
+                "seg_bbox_y2",
+                "segmentation_bbox",
+            ),
+            (
+                "pose_bbox_x1",
+                "pose_bbox_y1",
+                "pose_bbox_x2",
+                "pose_bbox_y2",
+                "pose_bbox",
+            ),
+        ],
+    )
+    combined["bbox_x1"] = bbox_x1
+    combined["bbox_y1"] = bbox_y1
+    combined["bbox_x2"] = bbox_x2
+    combined["bbox_y2"] = bbox_y2
+    combined["bbox_source"] = bbox_source
+    combined["bbox_width"] = combined["bbox_x2"] - combined["bbox_x1"]
+    combined["bbox_height"] = combined["bbox_y2"] - combined["bbox_y1"]
+    combined["bbox_area_px2"] = combined["bbox_width"] * combined["bbox_height"]
+
+    smooth_x, smooth_y, _smooth_source = _first_complete_pair(
+        combined,
+        [
+            ("seg_bbox_center_x_euro", "seg_bbox_center_y_euro", "segmentation"),
+            ("pose_bbox_center_x_euro", "pose_bbox_center_y_euro", "pose"),
+            ("centroid_x", "centroid_y", "raw"),
+        ],
+    )
+    combined["centroid_x_smooth"] = smooth_x
+    combined["centroid_y_smooth"] = smooth_y
+    # The canonical box is segmentation-owned in combined mode. Centroid
+    # tracking remains mask-owned and intentionally independent of box center.
+    combined["bbox_center_x"] = (combined["bbox_x1"] + combined["bbox_x2"]) / 2.0
+    combined["bbox_center_y"] = (combined["bbox_y1"] + combined["bbox_y2"]) / 2.0
+    combined["bbox_center_x"] = combined["bbox_center_x"].where(
+        combined["bbox_center_x"].notna(), combined["centroid_x"]
+    )
+    combined["bbox_center_y"] = combined["bbox_center_y"].where(
+        combined["bbox_center_y"].notna(), combined["centroid_y"]
+    )
+    combined["bbox_center_x_euro"] = combined["centroid_x_smooth"]
+    combined["bbox_center_y_euro"] = combined["centroid_y_smooth"]
+
+    frame_delta = combined["frame_index"].diff()
+    combined["dt_frames"] = frame_delta.fillna(1).replace(0, 1)
+    clean_fps = float(fps or 30.0)
+    combined["time_seconds"] = combined["frame_index"] / clean_fps
+    combined["dt_seconds"] = combined["dt_frames"] / clean_fps
+    combined["dx"] = combined["centroid_x_smooth"].diff()
+    combined["dy"] = combined["centroid_y_smooth"].diff()
+    combined["distance_px"] = np.sqrt(combined["dx"] ** 2 + combined["dy"] ** 2)
+    combined["vx_px_per_sec"] = combined["dx"] / combined["dt_seconds"]
+    combined["vy_px_per_sec"] = combined["dy"] / combined["dt_seconds"]
+    combined["speed_px_per_sec"] = combined["distance_px"] / combined["dt_seconds"]
+    combined["distance"] = combined["distance_px"]
+    combined["vx"] = combined["vx_px_per_sec"]
+    combined["vy"] = combined["vy_px_per_sec"]
+    combined["speed_px_per_frame"] = combined["distance_px"] / combined["dt_frames"]
+    combined["acceleration"] = combined["speed_px_per_sec"].diff() / combined["dt_seconds"]
+    combined["distance_mm"] = combined["distance_px"] * float(mm_per_pixel)
+    combined["vx_mm_per_sec"] = combined["vx_px_per_sec"] * float(mm_per_pixel)
+    combined["vy_mm_per_sec"] = combined["vy_px_per_sec"] * float(mm_per_pixel)
+    combined["vx_mm"] = combined["vx_mm_per_sec"]
+    combined["vy_mm"] = combined["vy_mm_per_sec"]
+    combined["speed_mm_per_sec"] = combined["speed_px_per_sec"] * float(mm_per_pixel)
+    combined["acceleration_mm_per_sec2"] = (
+        combined["speed_mm_per_sec"].diff() / combined["dt_seconds"]
+    )
+    movement_radians = np.arctan2(combined["vy_px_per_sec"], combined["vx_px_per_sec"])
+    combined["heading"] = movement_radians
+    combined["movement_heading_deg"] = (-np.degrees(movement_radians) + 360) % 360
+    combined["heading_deg"] = combined["movement_heading_deg"]
+    combined["cumulative_distance_mm"] = combined["distance_mm"].fillna(0).cumsum()
+    combined["width"] = combined["bbox_width"]
+    combined["height"] = combined["bbox_height"]
+    combined["area"] = combined["bbox_area_px2"]
+    combined["aspect_ratio"] = combined["width"] / combined["height"].replace(0, np.nan)
+    combined["area_change"] = combined["area"].diff()
+    combined["aspect_change"] = combined["aspect_ratio"].diff()
+    combined["width_mm"] = combined["width"] * float(mm_per_pixel)
+    combined["height_mm"] = combined["height"] * float(mm_per_pixel)
+    combined["area_mm2"] = combined["area"] * float(mm_per_pixel) ** 2
+
+    normalized_rois = normalize_rois(rois or [])
+    keypoint_roi_columns: list[str] = []
+    if normalized_rois:
+        combined = assign_roi_labels(
+            combined,
+            normalized_rois,
+            x_col="centroid_x_smooth",
+            y_col="centroid_y_smooth",
+        )
+        keypoint_names = sorted(
+            column[len("pose_kp_") : -len("_x")]
+            for column in combined.columns
+            if column.startswith("pose_kp_")
+            and column.endswith("_x")
+            and f"{column[:-2]}_y" in combined.columns
+        )
+        for name in keypoint_names:
+            labels = assign_roi_labels(
+                combined,
+                normalized_rois,
+                x_col=f"pose_kp_{name}_x",
+                y_col=f"pose_kp_{name}_y",
+            )
+            roi_column = f"roi_{name}"
+            combined[roi_column] = labels["roi_label"]
+            keypoint_roi_columns.append(roi_column)
+    else:
+        combined["roi_label"] = "Outside"
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    feature_csv = destination / "combined_features.csv"
+    summary_json = destination / "combined_summary.json"
+    keypoint_roi_summary_csv = destination / "keypoint_roi_summary.csv"
+    combined.to_csv(feature_csv, index=False)
+
+    keypoint_roi_rows: list[dict[str, Any]] = []
+    for column in keypoint_roi_columns:
+        keypoint_name = column[len("roi_") :]
+        counts = combined[column].fillna("Outside").value_counts(dropna=False)
+        for roi_label, frames in counts.items():
+            keypoint_roi_rows.append(
+                {
+                    "keypoint": keypoint_name,
+                    "roi_label": str(roi_label),
+                    "frames": int(frames),
+                    "duration_s": float(frames) / clean_fps,
+                }
+            )
+    if keypoint_roi_rows:
+        pd.DataFrame(keypoint_roi_rows).to_csv(keypoint_roi_summary_csv, index=False)
+
+    source_counts = {
+        str(source): int(count)
+        for source, count in combined["centroid_source"].value_counts(dropna=False).items()
+    }
+    bbox_source_counts = {
+        str(source): int(count)
+        for source, count in combined["bbox_source"].value_counts(dropna=False).items()
+    }
+    total_distance_mm = float(combined["distance_mm"].sum(skipna=True))
+    summary: dict[str, Any] = {
+        "analysis_kind": "combined",
+        "frames": int(len(combined)),
+        "fps": clean_fps,
+        "duration_s": float(combined["time_seconds"].max()) if len(combined) else 0.0,
+        "mm_per_pixel": float(mm_per_pixel),
+        "total_distance_mm": total_distance_mm,
+        "total_distance_m": total_distance_mm / 1000.0,
+        "average_speed_mm_per_sec": float(combined["speed_mm_per_sec"].mean(skipna=True)),
+        "average_acceleration_mm_per_sec2": float(
+            combined["acceleration_mm_per_sec2"].mean(skipna=True)
+        ),
+        "pose_valid_frames": int(combined["pose_valid"].sum()),
+        "segmentation_valid_frames": int(combined["segmentation_valid"].sum()),
+        "missing_centroid_frames": int(combined["centroid_source"].eq("missing").sum()),
+        "centroid_source_counts": source_counts,
+        "bbox_source_counts": bbox_source_counts,
+        "roi_count": len(normalized_rois),
+        "pose_feature_csv": os.path.abspath(pose_feature_csv),
+        "segmentation_feature_csv": os.path.abspath(segmentation_feature_csv),
+    }
+    roi_outputs: dict[str, Any] = {}
+    if normalized_rois:
+        roi_outputs = create_roi_outputs(combined, destination, clean_fps)
+        summary["roi_summary"] = roi_outputs.get("roi_summary", [])
+    summary_json.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    return {
+        "layer_id": "combined",
+        "feature_csv": str(feature_csv),
+        "summary_json": str(summary_json),
+        "summary": summary,
+        "output_dir": str(destination),
+        "roi_summary_csv": roi_outputs.get("roi_summary_csv", ""),
+        "roi_transition_csv": roi_outputs.get("roi_transition_csv", ""),
+        "roi_summary": roi_outputs.get("roi_summary", []),
+        "keypoint_roi_summary_csv": (str(keypoint_roi_summary_csv) if keypoint_roi_rows else ""),
+        "plot_paths": roi_outputs.get("roi_plot_paths", []),
+    }
+
+
 def _setup_plotting():
     import matplotlib
 
@@ -790,7 +1111,12 @@ def _open_h264_video_writer(
         raise AnalysisError(f"Cannot export video with invalid frame size {width}x{height}.")
     if not math.isfinite(float(fps)) or float(fps) <= 0:
         raise AnalysisError(f"Cannot export video with invalid frame rate {fps}.")
-    if _nvenc_available():
+    # Some NVIDIA drivers advertise NVENC even when the requested frame is
+    # below the encoder's minimum supported dimensions. Keep those tiny
+    # exports on the portable writer so failure cannot arrive after frames
+    # have already been submitted.
+    nvenc_dimensions_supported = width >= 256 and height >= 256
+    if nvenc_dimensions_supported and _nvenc_available():
         try:
             return _FFmpegNVENCH264VideoWriter(output_path, fps, width, height)
         except AnalysisError:
@@ -966,16 +1292,29 @@ def create_roi_outputs(df: pd.DataFrame, output_dir: Path, fps: float) -> dict[s
 
 
 def create_plots(
-    df: pd.DataFrame, output_dir: Path, video_path: str = "", rois: Any = None
+    df: pd.DataFrame,
+    output_dir: Path,
+    video_path: str = "",
+    rois: Any = None,
+    *,
+    include_motion_diagnostics: bool = True,
 ) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     plt, sns = _setup_plotting()
     paths: list[str] = []
+    plot_df = df.copy()
+    if "time_seconds" in plot_df.columns:
+        plot_df["time_minutes"] = pd.to_numeric(plot_df["time_seconds"], errors="coerce") / 60.0
+        time_column = "time_minutes"
+        time_label = "Time (min)"
+    else:
+        time_column = "frame_index"
+        time_label = "Frame"
 
-    if "confidence" in df.columns:
+    if "confidence" in plot_df.columns:
         fig, ax = plt.subplots(figsize=(12, 4))
-        sns.scatterplot(data=df, x="frame_index", y="confidence", edgecolor=None, s=5, ax=ax)
-        ax.set_xlabel("Frame")
+        sns.scatterplot(data=plot_df, x=time_column, y="confidence", edgecolor=None, s=5, ax=ax)
+        ax.set_xlabel(time_label)
         ax.set_ylabel("Confidence")
         ax.set_title("Detection Confidence by Frame")
         sns.despine(fig)
@@ -1014,29 +1353,68 @@ def create_plots(
         plt.close(fig)
         paths.append(str(path))
 
-    for y_col, ylabel, title, filename in [
-        ("distance_mm", "Distance (mm)", "Distance Traveled by Frame", "distance_mm.png"),
-        ("speed_mm_per_sec", "Speed (mm/s)", "Speed by Frame", "speed_mm_per_sec.png"),
-        (
-            "acceleration_mm_per_sec2",
-            "Acceleration (mm/s^2)",
-            "Acceleration by Frame",
-            "acceleration_mm_per_sec2.png",
-        ),
-    ]:
-        plot_path = _plot_if_column(df, "frame_index", y_col, output_dir / filename, ylabel, title)
-        if plot_path:
-            paths.append(plot_path)
+    if include_motion_diagnostics:
+        for y_col, ylabel, title, filename in [
+            ("distance_mm", "Distance (mm)", "Distance Traveled", "distance_mm.png"),
+            ("speed_mm_per_sec", "Speed (mm/s)", "Speed", "speed_mm_per_sec.png"),
+        ]:
+            plot_path = _plot_if_column(
+                plot_df,
+                time_column,
+                y_col,
+                output_dir / filename,
+                ylabel,
+                title,
+            )
+            if plot_path:
+                paths.append(plot_path)
+
+        if "acceleration_mm_per_sec2" in plot_df.columns:
+            acceleration = pd.to_numeric(plot_df["acceleration_mm_per_sec2"], errors="coerce").abs()
+            dt = pd.to_numeric(
+                plot_df.get("dt_seconds", pd.Series(np.nan, index=plot_df.index)),
+                errors="coerce",
+            ).median()
+            window = max(1, int(round(1.0 / dt))) if pd.notna(dt) and dt > 0 else 1
+            fig, ax = plt.subplots(figsize=(12, 4))
+            ax.plot(
+                plot_df[time_column],
+                acceleration,
+                alpha=0.25,
+                linewidth=0.5,
+                label="Instantaneous magnitude",
+            )
+            ax.plot(
+                plot_df[time_column],
+                acceleration.rolling(window, min_periods=1).mean(),
+                linewidth=1.0,
+                label="1 s mean magnitude",
+            )
+            ax.set(
+                title="Acceleration Magnitude",
+                xlabel=time_label,
+                ylabel="Absolute acceleration (mm/s²)",
+            )
+            ax.legend()
+            sns.despine(fig)
+            fig.tight_layout()
+            path = output_dir / "acceleration_mm_per_sec2.png"
+            fig.savefig(path, dpi=140)
+            plt.close(fig)
+            paths.append(str(path))
 
     if "heading" in df.columns:
-        clean_heading = df["heading"].dropna()
+        heading_mask = df["heading"].notna()
+        if "speed_mm_per_sec" in df.columns:
+            heading_mask &= pd.to_numeric(df["speed_mm_per_sec"], errors="coerce").ge(5.0)
+        clean_heading = df.loc[heading_mask, "heading"]
         if not clean_heading.empty:
             fig = plt.figure(figsize=(6, 6))
             ax = fig.add_subplot(111, polar=True)
             ax.hist(clean_heading, bins=60, density=True)
             ax.set_theta_zero_location("E")
             ax.set_theta_direction(1)
-            ax.set_title("Heading Direction Distribution", y=1.1)
+            ax.set_title("Movement Heading (speed ≥ 5 mm/s)", y=1.1)
             ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
             fig.tight_layout()
             path = output_dir / "heading_polar.png"
@@ -1055,10 +1433,16 @@ def create_plots(
             if width > 0 and height > 0:
                 ax.set_xlim(0, width)
                 ax.set_ylim(height, 0)
+        color_values = (
+            pd.to_numeric(df["time_seconds"], errors="coerce") / 60.0
+            if "time_seconds" in df.columns
+            else df["frame_index"]
+        )
+        color_label = "Time (min)" if "time_seconds" in df.columns else "Frame"
         scatter = ax.scatter(
             df["bbox_center_x_euro"],
             df["bbox_center_y_euro"],
-            c=df["frame_index"],
+            c=color_values,
             cmap="viridis",
             s=2,
         )
@@ -1067,7 +1451,7 @@ def create_plots(
         ax.set_xlabel("X position (pixels)")
         ax.set_ylabel("Y position (pixels)")
         ax.set_aspect("equal", adjustable="box")
-        fig.colorbar(scatter, ax=ax, label="Frame")
+        fig.colorbar(scatter, ax=ax, label=color_label)
         fig.tight_layout()
         path = output_dir / "trajectory.png"
         fig.savefig(path, dpi=140)
@@ -1112,6 +1496,78 @@ def create_plots(
     return paths
 
 
+def draw_antialiased_polyline(
+    frame: Any,
+    points: Any,
+    color: tuple[int, int, int],
+    cv2: Any,
+    *,
+    thickness: int = 2,
+    closed: bool = True,
+    shift: int = 4,
+) -> None:
+    """Draw fractional polygon coordinates with subpixel antialiasing."""
+    coordinates = np.asarray(points, dtype=np.float64).reshape((-1, 2))
+    if len(coordinates) < 2 or not np.isfinite(coordinates).all():
+        return
+    fixed = np.rint(coordinates * (1 << shift)).astype(np.int32).reshape((-1, 1, 2))
+    cv2.polylines(
+        frame,
+        [fixed],
+        closed,
+        color,
+        thickness,
+        lineType=cv2.LINE_AA,
+        shift=shift,
+    )
+
+
+def draw_supersampled_polygon_overlay(
+    frame: Any,
+    points: Any,
+    color: tuple[int, int, int],
+    cv2: Any,
+    *,
+    alpha: float = 0.28,
+    supersample: int = 2,
+    outline_thickness: int = 2,
+) -> None:
+    """Composite a supersampled mask fill and an antialiased subpixel outline."""
+    coordinates = np.asarray(points, dtype=np.float64).reshape((-1, 2))
+    if len(coordinates) < 3 or not np.isfinite(coordinates).all():
+        return
+    height, width = frame.shape[:2]
+    padding = max(2, int(outline_thickness) + 1)
+    x1 = max(0, int(math.floor(coordinates[:, 0].min())) - padding)
+    y1 = max(0, int(math.floor(coordinates[:, 1].min())) - padding)
+    x2 = min(width, int(math.ceil(coordinates[:, 0].max())) + padding + 1)
+    y2 = min(height, int(math.ceil(coordinates[:, 1].max())) + padding + 1)
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    scale = max(2, int(supersample))
+    local = coordinates - np.asarray([x1, y1], dtype=np.float64)
+    scaled = np.rint(local * scale).astype(np.int32).reshape((-1, 1, 2))
+    mask_high = np.zeros(((y2 - y1) * scale, (x2 - x1) * scale), dtype=np.uint8)
+    cv2.fillPoly(mask_high, [scaled], 255, lineType=cv2.LINE_AA)
+    mask = cv2.resize(mask_high, (x2 - x1, y2 - y1), interpolation=cv2.INTER_AREA)
+    opacity = (mask.astype(np.float32) * (float(alpha) / 255.0))[..., None]
+    crop = frame[y1:y2, x1:x2]
+    blended = (
+        crop.astype(np.float32) * (1.0 - opacity)
+        + np.asarray(color, dtype=np.float32).reshape((1, 1, 3)) * opacity
+    )
+    crop[:] = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+    draw_antialiased_polyline(
+        frame,
+        coordinates,
+        color,
+        cv2,
+        thickness=outline_thickness,
+        closed=True,
+    )
+
+
 def render_annotated_video(
     df: pd.DataFrame,
     video_path: str,
@@ -1149,9 +1605,9 @@ def render_annotated_video(
                     break
                 for roi in reversed(normalized_rois):
                     if roi["type"] == "polygon":
-                        points = np.asarray(roi["points"], dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(frame, [points], True, (66, 191, 245), 2)
-                        label_x, label_y = np.mean(points[:, 0, :], axis=0).astype(int)
+                        points = np.asarray(roi["points"], dtype=np.float64).reshape((-1, 2))
+                        draw_antialiased_polyline(frame, points, (66, 191, 245), cv2, thickness=2)
+                        label_x, label_y = np.mean(points, axis=0).astype(int)
                         cv2.putText(
                             frame,
                             str(roi["name"]),
@@ -1160,12 +1616,20 @@ def render_annotated_video(
                             0.55,
                             (66, 191, 245),
                             2,
+                            lineType=cv2.LINE_AA,
                         )
                         continue
                     x1, y1, x2, y2 = [
                         int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
                     ]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (66, 191, 245),
+                        2,
+                        lineType=cv2.LINE_AA,
+                    )
                     cv2.putText(
                         frame,
                         str(roi["name"]),
@@ -1174,6 +1638,7 @@ def render_annotated_video(
                         0.55,
                         (66, 191, 245),
                         2,
+                        lineType=cv2.LINE_AA,
                     )
                 row = rows_by_frame.get(frame_idx)
                 if row is not None:
@@ -1185,7 +1650,14 @@ def render_annotated_video(
                     ]
                     if not any(pd.isna(v) for v in bbox_vals):
                         x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            (255, 0, 0),
+                            2,
+                            lineType=cv2.LINE_AA,
+                        )
                     cx = row.get("bbox_center_x_euro")
                     cy = row.get("bbox_center_y_euro")
                     if not pd.isna(cx) and not pd.isna(cy):
@@ -1195,12 +1667,20 @@ def render_annotated_video(
                             4,
                             (0, 0, 255),
                             -1,
+                            lineType=cv2.LINE_AA,
                         )
                     text = f"Frame: {frame_idx}"
                     if not pd.isna(row.get("cumulative_distance_mm")):
                         text += f" | Distance: {float(row['cumulative_distance_mm']):.1f} mm"
                     cv2.putText(
-                        frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
+                        frame,
+                        text,
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                        lineType=cv2.LINE_AA,
                     )
                     speed_val = row.get("speed_mm_per_sec")
                     if not pd.isna(speed_val):
@@ -1212,6 +1692,7 @@ def render_annotated_video(
                             0.6,
                             (255, 255, 255),
                             2,
+                            lineType=cv2.LINE_AA,
                         )
                     roi_label = row.get("roi_label")
                     if isinstance(roi_label, str) and roi_label:
@@ -1223,6 +1704,7 @@ def render_annotated_video(
                             0.6,
                             (255, 255, 255),
                             2,
+                            lineType=cv2.LINE_AA,
                         )
                 writer.write(frame)
                 frame_idx += 1
@@ -1408,7 +1890,19 @@ def run_analysis_workflow(
 
     total_steps = 8
     output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_analysis_output_dir(
+        output_dir,
+        generated_files=(
+            "analysis_features.csv",
+            "analysis_summary.json",
+            "annotated_output.mp4",
+            "roi_summary.csv",
+            "roi_transition_matrix.csv",
+            "roi_time_seconds.png",
+            "roi_transition_matrix.png",
+        ),
+        generated_directories=("plots", "cluster_clips"),
+    )
 
     _progress(progress_callback, 1, total_steps, "Loading detections CSV")
     raw = pd.read_csv(config.detections_csv).dropna(axis=1, how="all")

@@ -3,6 +3,7 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 
@@ -39,12 +40,12 @@ class _Tensor:
 
 
 class _Boxes:
-    def __init__(self, xyxy=None, xywh=None, conf=None, cls=None):
+    def __init__(self, xyxy=None, xywh=None, conf=None, cls=None, ids=None):
         self.xyxy = _Tensor(xyxy or [])
         self.xywh = _Tensor(xywh or [])
         self.conf = _Tensor(conf or []) if conf is not None else None
         self.cls = _Tensor(cls or []) if cls is not None else None
-        self.id = None
+        self.id = _Tensor(ids) if ids is not None else None
         self._n = len(xyxy or [])
 
     def __len__(self):
@@ -160,6 +161,10 @@ class _PoseModel:
         self.results = self.results[count:]
         return out
 
+    def track(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self.results)
+
 
 class _SegModel:
     def __init__(self, results):
@@ -167,6 +172,10 @@ class _SegModel:
         self.calls = []
 
     def predict(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return iter(self.results)
+
+    def track(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return iter(self.results)
 
@@ -314,6 +323,60 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(result.processed_frames, 0)
             self.assertIn("1 results for 2 input frames", result.error_message)
 
+    def test_run_pose_tracking_streams_ids_and_qc_metadata(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pose_tracked.csv")
+            model = _PoseModel(
+                [
+                    _Result(
+                        boxes=_Boxes(
+                            xyxy=[[1, 2, 11, 12], [20, 2, 30, 12]],
+                            xywh=[[6, 7, 10, 10], [25, 7, 10, 10]],
+                            conf=[0.9, 0.8],
+                            cls=[0, 0],
+                            ids=[4, 9],
+                        ),
+                        orig_shape=(20, 40),
+                    ),
+                    _Result(boxes=_Boxes(), orig_shape=(20, 40)),
+                ]
+            )
+
+            result = run_pose_video_inference(
+                model=model,
+                cv2_module=None,
+                video_path="video.mp4",
+                csv_path=csv_path,
+                model_path="pose.pt",
+                classes=["mouse"],
+                kp_names=[],
+                device="cpu",
+                batch_size=8,
+                total_frames=2,
+                fps=10.0,
+                tracking_enabled=True,
+                expected_animal_count=2,
+                tracker_type="botsort",
+                tracker_profile="fixed_camera_v1",
+            )
+
+            self.assertFalse(result.had_error)
+            self.assertEqual(result.unique_track_ids, (4, 9))
+            self.assertEqual(result.frames_with_track_count_mismatch, 1)
+            self.assertEqual(result.frames_without_track_ids, 1)
+            self.assertEqual(model.calls[0]["source"], "video.mp4")
+            self.assertTrue(model.calls[0]["stream"])
+            self.assertTrue(model.calls[0]["persist"])
+            self.assertIn("fixed_camera_botsort.yaml", model.calls[0]["tracker"])
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["track_id"], "4")
+            self.assertEqual(rows[0]["tracks_in_frame"], "2")
+            self.assertEqual(rows[0]["expected_animal_count"], "2")
+            self.assertEqual(rows[0]["tracker_type"], "botsort")
+            self.assertEqual(rows[-1]["detection_index"], "-1")
+            self.assertEqual(rows[-1]["tracks_in_frame"], "0")
+
     def test_pose_inference_cancellation_preserves_completed_rows(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "pose.csv")
@@ -420,6 +483,51 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(rows[0]["median_depth"], "2.5")
             self.assertEqual(rows[0]["scale_status"], "model_default")
 
+    def test_run_segmentation_tracking_serializes_track_columns(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "seg_tracked.csv")
+            model = _SegModel(
+                [
+                    _Result(
+                        boxes=_Boxes(
+                            xyxy=[[1, 2, 11, 12]],
+                            conf=[0.95],
+                            cls=[0],
+                            ids=[7],
+                        ),
+                        masks=_Masks(xy=[[[1, 2], [11, 2], [11, 12]]]),
+                    )
+                ]
+            )
+
+            result = run_segmentation_video_inference(
+                model=model,
+                video_path="video.mp4",
+                csv_path=csv_path,
+                classes=["mouse"],
+                device="cpu",
+                total_frames=1,
+                model_path="segment.pt",
+                fps=10.0,
+                tracking_enabled=True,
+                expected_animal_count=1,
+                tracker_type="bytetrack",
+                tracker_profile="fixed_camera_v1",
+            )
+
+            self.assertFalse(result.had_error)
+            self.assertEqual(result.unique_track_ids, (7,))
+            self.assertEqual(result.frames_with_track_count_mismatch, 0)
+            self.assertEqual(model.calls[0][1]["source"], "video.mp4")
+            self.assertTrue(model.calls[0][1]["persist"])
+            self.assertIn("fixed_camera_bytetrack.yaml", model.calls[0][1]["tracker"])
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                row = next(csv.DictReader(fh))
+            self.assertEqual(row["track_id"], "7")
+            self.assertEqual(row["tracks_in_frame"], "1")
+            self.assertEqual(row["expected_animal_count"], "1")
+            self.assertEqual(row["tracker_type"], "bytetrack")
+
     def test_segmentation_inference_cancellation_preserves_completed_rows(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "seg.csv")
@@ -512,6 +620,59 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(row["model_path"], "segment.pt")
             self.assertEqual(row["image_width"], "960")
             self.assertEqual(row["image_height"], "1080")
+
+    def test_inference_worker_forwards_tracking_and_emits_qc(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "worker_tracked_pose.csv")
+            model = _PoseModel(
+                [
+                    _Result(
+                        boxes=_Boxes(
+                            xyxy=[[1, 2, 11, 12]],
+                            xywh=[[6, 7, 10, 10]],
+                            conf=[0.9],
+                            cls=[0],
+                            ids=[12],
+                        )
+                    )
+                ]
+            )
+            model.task = "pose"
+            events = []
+
+            exit_code = run_inference_worker(
+                {
+                    "mode": "pose",
+                    "model_path": "pose.pt",
+                    "video_path": "video.mp4",
+                    "csv_path": csv_path,
+                    "classes": ["mouse"],
+                    "tracking_enabled": True,
+                    "expected_animal_count": 1,
+                    "requested_tracker": "auto",
+                    "resolved_tracker": "bytetrack",
+                    "tracker_profile": "fixed_camera_v1",
+                    "total_frames": 1,
+                    "fps": 10.0,
+                },
+                model_factory=lambda _path: model,
+                cv2_module=_FakeCv2([]),
+                event_writer=events.append,
+            )
+
+            self.assertEqual(exit_code, 0)
+            result_event = events[-1]
+            self.assertTrue(result_event["tracking_enabled"])
+            self.assertEqual(result_event["tracker_type"], "bytetrack")
+            self.assertEqual(result_event["unique_track_ids"], [12])
+            self.assertEqual(result_event["frames_with_track_count_mismatch"], 0)
+
+    def test_missing_lap_dependency_has_actionable_error(self):
+        with patch.object(inference_runtime.importlib.util, "find_spec", return_value=None):
+            message = inference_runtime.tracking_dependency_error()
+
+        self.assertIn("lap>=0.5.12", message)
+        self.assertIn("Ultralytics tracking", message)
 
     def test_inference_worker_runs_depth_config_and_reports_preview(self):
         with TemporaryDirectory() as tmp:

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import csv
 import gc
+import importlib.util
 import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from squeakpose.core import InferenceCsvWriter, build_segmentation_inference_rows
@@ -33,6 +35,10 @@ class InferenceRunResult:
     canceled: bool = False
     had_error: bool = False
     error_message: str = ""
+    tracking_enabled: bool = False
+    unique_track_ids: tuple[int, ...] = ()
+    frames_with_track_count_mismatch: int = 0
+    frames_without_track_ids: int = 0
 
 
 POSE_BASE_FIELDNAMES = [
@@ -43,6 +49,10 @@ POSE_BASE_FIELDNAMES = [
     "detections_in_frame",
     "detection_index",
     "track_id",
+    "tracks_in_frame",
+    "expected_animal_count",
+    "tracker_type",
+    "tracker_profile",
     "class_id",
     "class_name",
     "confidence",
@@ -78,6 +88,11 @@ SEGMENTATION_FIELDNAMES = [
     "image_height",
     "frame",
     "det",
+    "track_id",
+    "tracks_in_frame",
+    "expected_animal_count",
+    "tracker_type",
+    "tracker_profile",
     "class_id",
     "class_name",
     "conf",
@@ -88,6 +103,13 @@ SEGMENTATION_FIELDNAMES = [
     "mask_polygon",
     "binary_mask",
 ]
+
+
+_TRACKER_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "resources" / "trackers"
+_TRACKER_RESOURCE_FILES = {
+    "bytetrack": "fixed_camera_bytetrack.yaml",
+    "botsort": "fixed_camera_botsort.yaml",
+}
 
 DEPTH_FIELDNAMES = [
     "video_path",
@@ -148,6 +170,98 @@ def pose_inference_fieldnames(kp_names: list[str]) -> list[str]:
             ]
         )
     return POSE_BASE_FIELDNAMES + kp_columns
+
+
+def tracker_resource_path(tracker_type: str) -> str:
+    """Return the bundled Ultralytics tracker profile for a resolved tracker."""
+    normalized = str(tracker_type or "").strip().lower()
+    filename = _TRACKER_RESOURCE_FILES.get(normalized)
+    if not filename:
+        raise ValueError(f"Unsupported tracker '{tracker_type}'. Choose ByteTrack or BoT-SORT.")
+    path = _TRACKER_RESOURCE_DIR / filename
+    if not path.is_file():
+        raise RuntimeError(f"Bundled tracker profile is missing: {path}")
+    return str(path)
+
+
+def tracking_dependency_error() -> str:
+    """Explain a missing optional Ultralytics tracking runtime dependency."""
+    if importlib.util.find_spec("lap") is None:
+        return (
+            "Ultralytics tracking requires the 'lap' package, but it is not installed. "
+            "Install the project tracking dependency (lap>=0.5.12) and retry inference."
+        )
+    return ""
+
+
+def _normalized_track_id(value: Any) -> Any:
+    if value is None or value == "":
+        return ""
+    try:
+        numeric = float(value)
+        if numeric.is_integer():
+            return int(numeric)
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _track_metadata(
+    boxes: Any,
+    *,
+    tracking_enabled: bool,
+    expected_animal_count: int,
+    tracker_type: str,
+    tracker_profile: str,
+) -> tuple[list[Any], dict[str, Any]]:
+    detections = int(len(boxes) if boxes is not None else 0)
+    raw_ids = _to_list(getattr(boxes, "id", None)) if boxes is not None else []
+    ids = [
+        _normalized_track_id(raw_ids[idx]) if idx < len(raw_ids) else ""
+        for idx in range(detections)
+    ]
+    unique_ids = {track_id for track_id in ids if track_id != ""}
+    return ids, {
+        "tracks_in_frame": len(unique_ids) if tracking_enabled else "",
+        "expected_animal_count": int(expected_animal_count) if tracking_enabled else "",
+        "tracker_type": tracker_type if tracking_enabled else "",
+        "tracker_profile": tracker_profile if tracking_enabled else "",
+    }
+
+
+def _record_tracking_qc(
+    result: InferenceRunResult,
+    rows: list[dict[str, Any]],
+    *,
+    expected_animal_count: int,
+) -> None:
+    if not result.tracking_enabled:
+        return
+    ids: set[int] = set(result.unique_track_ids)
+    frame_ids: set[int] = set()
+    for row in rows:
+        track_id = row.get("track_id", "")
+        try:
+            if track_id != "":
+                normalized = int(float(track_id))
+                ids.add(normalized)
+                frame_ids.add(normalized)
+        except (TypeError, ValueError):
+            continue
+    result.unique_track_ids = tuple(sorted(ids))
+    if len(frame_ids) != max(1, int(expected_animal_count)):
+        result.frames_with_track_count_mismatch += 1
+    if rows and not frame_ids:
+        result.frames_without_track_ids += 1
+
+
+def _tracking_error_message(exc: Exception) -> str:
+    text = str(exc)
+    if "lap" in text.lower():
+        dependency_message = tracking_dependency_error()
+        if dependency_message:
+            return dependency_message
+    return text
 
 
 def _to_list(value: Any) -> list:
@@ -225,6 +339,7 @@ def _blank_pose_row(
     img_h: int,
     speed: dict[str, Any],
     kp_columns: list[str],
+    track_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     row = {
         "video_path": video_path,
@@ -234,6 +349,7 @@ def _blank_pose_row(
         "detections_in_frame": detections,
         "detection_index": -1,
         "track_id": "",
+        **track_metadata,
         "class_id": "",
         "class_name": "",
         "confidence": "",
@@ -273,6 +389,10 @@ def pose_inference_rows_from_result(
     fps: float,
     kp_names: list[str],
     classes: list[str],
+    tracking_enabled: bool = False,
+    expected_animal_count: int = 1,
+    tracker_type: str = "",
+    tracker_profile: str = "",
 ) -> list[dict[str, Any]]:
     """Build streamed pose/detection inference CSV rows for one result."""
     img_h, img_w = _result_shape(result)
@@ -280,6 +400,13 @@ def pose_inference_rows_from_result(
     speed = getattr(result, "speed", {}) or {}
     fieldnames = pose_inference_fieldnames(kp_names)
     kp_columns = [col for col in fieldnames if col.startswith("kp_")]
+    ids_list, tracking_metadata = _track_metadata(
+        getattr(result, "boxes", None),
+        tracking_enabled=tracking_enabled,
+        expected_animal_count=expected_animal_count,
+        tracker_type=tracker_type,
+        tracker_profile=tracker_profile,
+    )
 
     if detections == 0:
         return [
@@ -293,6 +420,7 @@ def pose_inference_rows_from_result(
                 img_h=img_h,
                 speed=speed,
                 kp_columns=kp_columns,
+                track_metadata=tracking_metadata,
             )
         ]
 
@@ -301,7 +429,6 @@ def pose_inference_rows_from_result(
     xywh = _to_list(getattr(boxes, "xywh", None))
     confs = _to_list(getattr(boxes, "conf", None)) or [None] * detections
     cls_list = _to_list(getattr(boxes, "cls", None)) or [0] * detections
-    ids_list = _to_list(getattr(boxes, "id", None)) or [None] * detections
 
     kp_abs: list = []
     kp_norm: list = []
@@ -354,8 +481,9 @@ def pose_inference_rows_from_result(
             "detections_in_frame": detections,
             "detection_index": det_idx,
             "track_id": ids_list[det_idx]
-            if det_idx < len(ids_list) and ids_list[det_idx] is not None
+            if det_idx < len(ids_list) and ids_list[det_idx] != ""
             else "",
+            **tracking_metadata,
             "class_id": cls_id,
             "class_name": _class_name(result, cls_id, classes),
             "confidence": confs[det_idx]
@@ -405,15 +533,29 @@ def segmentation_rows_from_result(
     classes: list[str],
     include_binary_mask: bool = True,
     numpy_module: Any = None,
+    tracking_enabled: bool = False,
+    expected_animal_count: int = 1,
+    tracker_type: str = "",
+    tracker_profile: str = "",
 ) -> list[dict[str, Any]]:
     """Build segmentation inference rows for one result without retaining masks."""
+    ids_list, tracking_metadata = _track_metadata(
+        getattr(result, "boxes", None),
+        tracking_enabled=tracking_enabled,
+        expected_animal_count=expected_animal_count,
+        tracker_type=tracker_type,
+        tracker_profile=tracker_profile,
+    )
     if result.boxes is None or len(result.boxes) == 0:
-        return build_segmentation_inference_rows(
+        rows = build_segmentation_inference_rows(
             frame_index=frame_idx,
             detections=[],
             class_names=getattr(result, "names", None) or classes,
             include_binary_mask=include_binary_mask,
         )
+        for row in rows:
+            row.update({"track_id": "", **tracking_metadata})
+        return rows
 
     try:
         boxes = _to_list(result.boxes.xyxy)
@@ -453,6 +595,7 @@ def segmentation_rows_from_result(
         detections.append(
             {
                 "det": det_idx,
+                "track_id": ids_list[det_idx] if det_idx < len(ids_list) else "",
                 "class_id": cls_id,
                 "class_name": _class_name(result, cls_id, classes),
                 "conf": float(confs[det_idx]) if det_idx < len(confs) else 0.0,
@@ -461,12 +604,20 @@ def segmentation_rows_from_result(
                 "binary_mask": binary_mask,
             }
         )
-    return build_segmentation_inference_rows(
+    rows = build_segmentation_inference_rows(
         frame_index=frame_idx,
         detections=detections,
         class_names=getattr(result, "names", None) or classes,
         include_binary_mask=include_binary_mask,
     )
+    for row, detection in zip(rows, detections):
+        row.update(
+            {
+                "track_id": detection.get("track_id", ""),
+                **tracking_metadata,
+            }
+        )
+    return rows
 
 
 def run_pose_video_inference(
@@ -484,9 +635,14 @@ def run_pose_video_inference(
     fps: float,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_requested: Optional[CancelCallback] = None,
+    tracking_enabled: bool = False,
+    expected_animal_count: int = 1,
+    tracker_type: str = "bytetrack",
+    tracker_profile: str = "fixed_camera_v1",
+    tracker_path: str = "",
 ) -> InferenceRunResult:
-    """Run synchronous batched pose/detection video inference and stream CSV rows."""
-    result = InferenceRunResult(csv_path=csv_path)
+    """Run pose inference, optionally associating detections sequentially."""
+    result = InferenceRunResult(csv_path=csv_path, tracking_enabled=tracking_enabled)
     csv_handle = None
     cap = None
     try:
@@ -495,6 +651,63 @@ def run_pose_video_inference(
         writer = csv.DictWriter(csv_handle, fieldnames=fieldnames)
         writer.writeheader()
         stream = InferenceCsvWriter(writer)
+
+        def write_inference_result(frame_index: int, inference_result: Any) -> None:
+            rows = pose_inference_rows_from_result(
+                inference_result,
+                frame_index=frame_index,
+                video_path=video_path,
+                model_path=model_path,
+                fps=fps,
+                kp_names=kp_names,
+                classes=classes,
+                tracking_enabled=tracking_enabled,
+                expected_animal_count=expected_animal_count,
+                tracker_type=tracker_type,
+                tracker_profile=tracker_profile,
+            )
+            for row in rows:
+                stream.write_row(row)
+            _record_tracking_qc(
+                result,
+                rows,
+                expected_animal_count=expected_animal_count,
+            )
+            result.rows_written = stream.rows_written
+            result.processed_frames += 1
+            if progress_callback:
+                progress_callback(
+                    result.processed_frames,
+                    total_frames,
+                    _progress_message(result.processed_frames, total_frames),
+                )
+            if result.processed_frames % 100 == 0:
+                csv_handle.flush()
+
+        if tracking_enabled:
+            resolved_path = tracker_path or tracker_resource_path(tracker_type)
+            try:
+                results_iter = model.track(
+                    source=video_path,
+                    stream=True,
+                    persist=True,
+                    tracker=resolved_path,
+                    imgsz=640,
+                    conf=0.10,
+                    iou=0.5,
+                    end2end=False,
+                    device=device,
+                    verbose=False,
+                )
+                for frame_idx, inference_result in enumerate(results_iter):
+                    if cancel_requested and cancel_requested():
+                        result.canceled = True
+                        break
+                    write_inference_result(frame_idx, inference_result)
+            except Exception as exc:
+                result.had_error = True
+                result.error_message = _tracking_error_message(exc)
+            return result
 
         cap = cv2_module.VideoCapture(video_path)
         if cap is None or not cap.isOpened():
@@ -546,26 +759,7 @@ def run_pose_video_inference(
                     if cancel_requested and cancel_requested():
                         result.canceled = True
                         break
-                    for row in pose_inference_rows_from_result(
-                        inference_result,
-                        frame_index=fi,
-                        video_path=video_path,
-                        model_path=model_path,
-                        fps=fps,
-                        kp_names=kp_names,
-                        classes=classes,
-                    ):
-                        stream.write_row(row)
-                    result.rows_written = stream.rows_written
-                    result.processed_frames += 1
-                    if progress_callback:
-                        progress_callback(
-                            result.processed_frames,
-                            total_frames,
-                            _progress_message(result.processed_frames, total_frames),
-                        )
-                    if result.processed_frames % 100 == 0:
-                        csv_handle.flush()
+                    write_inference_result(fi, inference_result)
             finally:
                 del batch_frames
                 del batch_indices
@@ -630,28 +824,43 @@ def run_segmentation_video_inference(
     fps: float = 0.0,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_requested: Optional[CancelCallback] = None,
+    tracking_enabled: bool = False,
+    expected_animal_count: int = 1,
+    tracker_type: str = "bytetrack",
+    tracker_profile: str = "fixed_camera_v1",
+    tracker_path: str = "",
 ) -> InferenceRunResult:
-    """Run synchronous streaming segmentation inference and stream CSV rows."""
-    result = InferenceRunResult(csv_path=csv_path)
+    """Run streaming segmentation inference, optionally with track association."""
+    result = InferenceRunResult(csv_path=csv_path, tracking_enabled=tracking_enabled)
     csv_handle = None
     try:
         csv_handle = open(csv_path, "w", newline="", encoding="utf-8")
         writer = csv.DictWriter(csv_handle, fieldnames=SEGMENTATION_FIELDNAMES)
         writer.writeheader()
 
-        results_iter = model.predict(
-            video_path,
-            stream=True,
-            imgsz=640,
-            conf=0.25,
-            iou=0.5,
+        inference_args = {
+            "source": video_path,
+            "stream": True,
+            "imgsz": 640,
+            "conf": 0.10 if tracking_enabled else 0.25,
+            "iou": 0.5,
             # YOLO26 end-to-end output bypasses NMS and can emit multiple,
             # strongly overlapping masks for the same animal. Use the
             # one-to-many head plus standard NMS for instance tracking.
-            end2end=False,
-            device=device,
-            verbose=False,
-        )
+            "end2end": False,
+            "device": device,
+            "verbose": False,
+        }
+        if tracking_enabled:
+            inference_args.update(
+                {
+                    "persist": True,
+                    "tracker": tracker_path or tracker_resource_path(tracker_type),
+                }
+            )
+            results_iter = model.track(**inference_args)
+        else:
+            results_iter = model.predict(**inference_args)
         for frame_idx, inference_result in enumerate(results_iter):
             if cancel_requested and cancel_requested():
                 result.canceled = True
@@ -662,6 +871,10 @@ def run_segmentation_video_inference(
                 frame_idx,
                 classes=classes,
                 include_binary_mask=False,
+                tracking_enabled=tracking_enabled,
+                expected_animal_count=expected_animal_count,
+                tracker_type=tracker_type,
+                tracker_profile=tracker_profile,
             )
             if not rows:
                 raise RuntimeError(
@@ -690,6 +903,12 @@ def run_segmentation_video_inference(
                 writer.writerow(csv_row)
                 result.rows_written += 1
 
+            _record_tracking_qc(
+                result,
+                rows,
+                expected_animal_count=expected_animal_count,
+            )
+
             result.processed_frames = frame_idx + 1
             if result.processed_frames % 100 == 0:
                 csv_handle.flush()
@@ -701,7 +920,7 @@ def run_segmentation_video_inference(
                 )
     except Exception as exc:
         result.had_error = True
-        result.error_message = str(exc)
+        result.error_message = _tracking_error_message(exc) if tracking_enabled else str(exc)
     finally:
         if csv_handle is not None:
             try:

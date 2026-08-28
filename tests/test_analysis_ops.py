@@ -12,20 +12,23 @@ import pandas as pd
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
-    _FFmpegNVENCH264VideoWriter,
-    _PyAVH264VideoWriter,
     _open_h264_video_writer,
     assign_roi_labels,
+    build_combined_analysis_outputs,
     create_roi_outputs,
+    draw_supersampled_polygon_overlay,
     normalize_rois,
+    prepare_analysis_output_dir,
     render_annotated_video,
     run_analysis_workflow,
 )
 from analysis_worker import run_analysis_worker
 from segmentation_analysis_ops import (
     _mask_area_overlay_text,
+    compute_segmentation_detection_features,
     render_segmentation_annotated_video,
 )
+from unified_analysis_ops import render_unified_annotated_video
 
 
 def _write_demo_detections(path: str) -> None:
@@ -188,6 +191,158 @@ def _write_demo_segmentation(path: str) -> None:
 
 
 class AnalysisOpsTests(unittest.TestCase):
+    def test_supersampled_polygon_overlay_has_antialiased_edges(self):
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+        draw_supersampled_polygon_overlay(
+            frame,
+            [(10.25, 10.25), (52.5, 18.75), (20.5, 53.25)],
+            (255, 255, 255),
+            cv2,
+            alpha=1.0,
+            supersample=2,
+        )
+
+        values = np.unique(frame)
+        self.assertTrue(np.any((values > 0) & (values < 255)))
+        self.assertTrue(np.any(values == 255))
+        self.assertEqual(frame[0, 0].tolist(), [0, 0, 0])
+
+    def test_stable_output_cleanup_removes_only_generated_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp, "analysis outputs", "session", "combined")
+            plots = output / "plots"
+            plots.mkdir(parents=True)
+            (plots / "stale.png").write_bytes(b"old")
+            (output / "analysis.csv").write_text("old", encoding="utf-8")
+            (output / "research_notes.txt").write_text("keep", encoding="utf-8")
+
+            prepare_analysis_output_dir(
+                output,
+                generated_files=("analysis.csv",),
+                generated_directories=("plots",),
+            )
+
+            self.assertFalse((output / "analysis.csv").exists())
+            self.assertFalse(plots.exists())
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_segmentation_geometry_uses_mask_bounds_and_retains_inference_box(self):
+        raw = pd.DataFrame(
+            [
+                {
+                    "frame": 0,
+                    "det": 0,
+                    "class_id": 0,
+                    "class_name": "mouse",
+                    "conf": 0.9,
+                    "x1": 12,
+                    "y1": 12,
+                    "x2": 18,
+                    "y2": 18,
+                    "mask_polygon": json.dumps([[10, 10], [20, 10], [20, 20], [10, 20]]),
+                }
+            ]
+        )
+
+        features = compute_segmentation_detection_features(raw, 0.5)
+        row = features.iloc[0]
+
+        self.assertEqual(
+            [row["bbox_x1"], row["bbox_y1"], row["bbox_x2"], row["bbox_y2"]],
+            [10.0, 10.0, 20.0, 20.0],
+        )
+        self.assertEqual(
+            [
+                row["inference_bbox_x1"],
+                row["inference_bbox_y1"],
+                row["inference_bbox_x2"],
+                row["inference_bbox_y2"],
+            ],
+            [12.0, 12.0, 18.0, 18.0],
+        )
+        self.assertEqual(row["bbox_source"], "segmentation_mask_bounds")
+        self.assertEqual(row["mask_fill_ratio"], 1.0)
+
+    def test_combined_outputs_prefer_mask_centroid_and_retain_keypoint_rois(self):
+        with TemporaryDirectory() as tmp:
+            pose_csv = Path(tmp, "pose_features.csv")
+            segment_csv = Path(tmp, "segmentation_features.csv")
+            output_dir = Path(tmp, "combined")
+            pd.DataFrame(
+                {
+                    "frame_index": [0, 1, 2],
+                    "bbox_center_x": [10.0, 11.0, 12.0],
+                    "bbox_center_y": [10.0, 10.0, 10.0],
+                    "bbox_x1": [8.0, 9.0, 10.0],
+                    "bbox_y1": [8.0, 8.0, 8.0],
+                    "bbox_x2": [12.0, 13.0, 14.0],
+                    "bbox_y2": [12.0, 12.0, 12.0],
+                    "bbox_center_x_euro": [10.0, 11.0, 12.0],
+                    "bbox_center_y_euro": [10.0, 10.0, 10.0],
+                    "kp_nose_x": [5.0, 6.0, 7.0],
+                    "kp_nose_y": [5.0, 5.0, 5.0],
+                    "kp_tail_base_x": [25.0, 26.0, 27.0],
+                    "kp_tail_base_y": [25.0, 25.0, 25.0],
+                }
+            ).to_csv(pose_csv, index=False)
+            pd.DataFrame(
+                {
+                    "frame_index": [0, 2],
+                    "bbox_center_x": [5.0, 25.0],
+                    "bbox_center_y": [5.0, 25.0],
+                    "bbox_x1": [1.0, 21.0],
+                    "bbox_y1": [1.0, 21.0],
+                    "bbox_x2": [9.0, 29.0],
+                    "bbox_y2": [9.0, 29.0],
+                    "bbox_center_x_euro": [5.0, 25.0],
+                    "bbox_center_y_euro": [5.0, 25.0],
+                    "mask_centroid_x": [5.0, 25.0],
+                    "mask_centroid_y": [5.0, 25.0],
+                }
+            ).to_csv(segment_csv, index=False)
+
+            result = build_combined_analysis_outputs(
+                pose_feature_csv=str(pose_csv),
+                segmentation_feature_csv=str(segment_csv),
+                output_dir=str(output_dir),
+                fps=10.0,
+                mm_per_pixel=0.5,
+                rois=[
+                    {
+                        "name": "Center",
+                        "type": "rect",
+                        "x1": 0,
+                        "y1": 0,
+                        "x2": 20,
+                        "y2": 20,
+                    }
+                ],
+            )
+
+            combined = pd.read_csv(result["feature_csv"])
+            self.assertEqual(len(combined), 3)
+            self.assertEqual(
+                combined["centroid_source"].tolist(),
+                ["segmentation_mask", "pose_bbox", "segmentation_mask"],
+            )
+            self.assertEqual(combined["centroid_x"].tolist(), [5.0, 11.0, 25.0])
+            self.assertEqual(
+                combined["bbox_source"].tolist(),
+                ["segmentation_bbox", "pose_bbox", "segmentation_bbox"],
+            )
+            self.assertEqual(combined["bbox_x1"].tolist(), [1.0, 9.0, 21.0])
+            self.assertEqual(combined["roi_label"].tolist(), ["Center", "Center", "Outside"])
+            self.assertEqual(combined["roi_nose"].tolist(), ["Center"] * 3)
+            self.assertEqual(combined["roi_tail_base"].tolist(), ["Outside"] * 3)
+            self.assertIn("movement_heading_deg", combined.columns)
+            self.assertIn("heading_deg", combined.columns)
+            self.assertIn("acceleration_mm_per_sec2", combined.columns)
+            self.assertEqual(result["summary"]["pose_valid_frames"], 3)
+            self.assertEqual(result["summary"]["segmentation_valid_frames"], 2)
+            self.assertTrue(Path(result["summary_json"]).is_file())
+            self.assertTrue(Path(result["keypoint_roi_summary_csv"]).is_file())
+
     def test_video_writer_prefers_nvenc_and_falls_back_to_software(self):
         with TemporaryDirectory() as tmp:
             output = Path(tmp, "output.mp4")
@@ -196,7 +351,7 @@ class AnalysisOpsTests(unittest.TestCase):
                 patch("analysis_ops._nvenc_available", return_value=True),
                 patch("analysis_ops._FFmpegNVENCH264VideoWriter", return_value=sentinel),
             ):
-                self.assertIs(_open_h264_video_writer(output, 8.0, 100, 80), sentinel)
+                self.assertIs(_open_h264_video_writer(output, 8.0, 640, 480), sentinel)
 
             with (
                 patch("analysis_ops._nvenc_available", return_value=True),
@@ -204,6 +359,12 @@ class AnalysisOpsTests(unittest.TestCase):
                     "analysis_ops._FFmpegNVENCH264VideoWriter",
                     side_effect=AnalysisError("NVENC unavailable"),
                 ),
+                patch("analysis_ops._PyAVH264VideoWriter", return_value=sentinel),
+            ):
+                self.assertIs(_open_h264_video_writer(output, 8.0, 640, 480), sentinel)
+
+            with (
+                patch("analysis_ops._nvenc_available", return_value=True),
                 patch("analysis_ops._PyAVH264VideoWriter", return_value=sentinel),
             ):
                 self.assertIs(_open_h264_video_writer(output, 8.0, 100, 80), sentinel)
@@ -371,7 +532,40 @@ class AnalysisOpsTests(unittest.TestCase):
                 segmentation_path,
             )
 
-            for output_path in (pose_path, segmentation_path):
+            unified_path = os.path.join(tmp, "unified.mp4")
+            unified_rows = segmentation_rows.assign(
+                centroid_x_smooth=20.0,
+                centroid_y_smooth=20.0,
+                cumulative_distance_mm=0.0,
+                kp_nose_x=18.0,
+                kp_nose_y=14.0,
+                kp_head_x=20.0,
+                kp_head_y=18.0,
+                kp_back_x=22.0,
+                kp_back_y=23.0,
+                kp_tail_base_x=24.0,
+                kp_tail_base_y=27.0,
+            )
+            self.assertEqual(
+                render_unified_annotated_video(
+                    unified_rows,
+                    source_path,
+                    Path(unified_path),
+                    10.0,
+                    normalize_rois(
+                        [
+                            {
+                                "name": "Arena",
+                                "type": "polygon",
+                                "points": [[5, 5], [90, 5], [90, 70], [5, 70]],
+                            }
+                        ]
+                    ),
+                ),
+                unified_path,
+            )
+
+            for output_path in (pose_path, segmentation_path, unified_path):
                 capture = cv2.VideoCapture(output_path)
                 try:
                     self.assertTrue(capture.isOpened())
@@ -466,6 +660,73 @@ class AnalysisOpsTests(unittest.TestCase):
             self.assertIn("result", event_names)
             result = next(event for event in events if event["event"] == "result")
             self.assertTrue(os.path.isfile(result["feature_csv"]))
+
+    def test_analysis_worker_runs_both_layers_as_one_authoritative_analysis(self):
+        with TemporaryDirectory() as tmp:
+            pose_csv = os.path.join(tmp, "pose.csv")
+            segment_csv = os.path.join(tmp, "segmentation.csv")
+            out_dir = os.path.join(tmp, "analysis")
+            _write_demo_detections(pose_csv)
+            pose = pd.read_csv(pose_csv)
+            pose["kp_nose_x"] = pose["bbox_center_x"]
+            pose["kp_nose_y"] = pose["bbox_center_y"]
+            pose.to_csv(pose_csv, index=False)
+            _write_demo_segmentation(segment_csv)
+            events = []
+
+            code = run_analysis_worker(
+                {
+                    "analysis_mode": "both",
+                    "analysis_inputs": {
+                        "keypoints": pose_csv,
+                        "segmentation": segment_csv,
+                    },
+                    "selected_layers": ["keypoints", "segmentation"],
+                    "output_dir": out_dir,
+                    "fps": 10.0,
+                    "pixel_distance": 2.0,
+                    "real_world_distance_mm": 4.0,
+                    "smooth": False,
+                    "make_plots": False,
+                    "make_annotated_video": False,
+                    "run_clustering": False,
+                    "export_cluster_clips": False,
+                    "rois": [
+                        {
+                            "name": "Arena",
+                            "type": "rect",
+                            "x1": 0,
+                            "y1": 0,
+                            "x2": 100,
+                            "y2": 80,
+                        }
+                    ],
+                },
+                event_writer=events.append,
+            )
+
+            self.assertEqual(code, 0)
+            result = next(event for event in events if event["event"] == "result")
+            self.assertEqual(result["analysis_mode"], "both")
+            self.assertEqual(Path(result["feature_csv"]).name, "analysis.csv")
+            self.assertTrue(Path(result["feature_csv"]).is_file())
+            self.assertTrue(Path(result["manifest_path"]).is_file())
+            self.assertFalse(Path(out_dir, "keypoints").exists())
+            self.assertFalse(Path(out_dir, "segmentation").exists())
+            combined = pd.read_csv(result["feature_csv"])
+            self.assertIn("roi_nose", combined.columns)
+            self.assertIn("mask_polygon", combined.columns)
+            self.assertEqual(len(combined), 6)
+            self.assertEqual(
+                combined["bbox_source"].value_counts().to_dict(),
+                {"segmentation_bbox": 4, "pose_bbox": 2},
+            )
+            self.assertEqual(
+                combined["centroid_source"].value_counts().to_dict(),
+                {"segmentation_mask": 4, "pose_bbox": 2},
+            )
+            transitions = pd.read_csv(result["roi_transition_csv"])
+            self.assertTrue(transitions.empty)
 
     def test_run_analysis_workflow_routes_segmentation_csv(self):
         with TemporaryDirectory() as tmp:

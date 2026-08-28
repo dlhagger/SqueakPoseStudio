@@ -113,6 +113,26 @@ def list_project_videos(videos_dir: str) -> list[VideoLibraryEntry]:
     return sorted(entries, key=lambda entry: entry.name.casefold())
 
 
+def resolve_project_video_paths(videos_dir: str, paths: list[str]) -> list[str]:
+    """Resolve project-library links and imported Finder aliases in one scan."""
+    directory = os.path.abspath(videos_dir)
+    resolved_by_path: dict[str, str] = {}
+    for entry in list_project_videos(directory):
+        resolved = os.path.abspath(entry.target if entry.target_exists else entry.path)
+        candidates = (
+            os.path.join(directory, entry.name),
+            entry.path,
+            entry.target,
+        )
+        for candidate in candidates:
+            if candidate:
+                resolved_by_path[os.path.abspath(candidate)] = resolved
+    return [
+        resolved_by_path.get(os.path.abspath(os.fspath(path)), os.path.abspath(os.fspath(path)))
+        for path in paths
+    ]
+
+
 def _available_link_name(videos_dir: str, preferred_name: str) -> str:
     stem, extension = os.path.splitext(preferred_name)
     candidate = preferred_name

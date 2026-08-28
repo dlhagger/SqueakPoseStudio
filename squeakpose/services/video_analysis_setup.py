@@ -113,8 +113,10 @@ def load_video_analysis_setup(
         raise ValueError("unsupported video analysis setup schema")
     if str(payload.get("video_name") or "") != clean_name:
         raise ValueError("video analysis setup belongs to a different project video")
-    frame = payload.get("frame") if isinstance(payload.get("frame"), Mapping) else {}
-    scale = payload.get("scale") if isinstance(payload.get("scale"), Mapping) else {}
+    raw_frame = payload.get("frame")
+    frame: Mapping[str, Any] = raw_frame if isinstance(raw_frame, Mapping) else {}
+    raw_scale = payload.get("scale")
+    scale: Mapping[str, Any] = raw_scale if isinstance(raw_scale, Mapping) else {}
     width = max(0, int(frame.get("width") or 0))
     height = max(0, int(frame.get("height") or 0))
     real_distance = float(scale.get("real_world_distance_mm") or 1.0)

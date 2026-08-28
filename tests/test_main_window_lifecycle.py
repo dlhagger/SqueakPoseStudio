@@ -190,6 +190,13 @@ class MainWindowLifecycleTests(unittest.TestCase):
                     inference_dialog = SimpleNamespace(
                         exec=lambda: 1,
                         selected_video_paths=(str(project_root / "video.mp4"),),
+                        selected_video_settings=(
+                            SimpleNamespace(
+                                video_path=str(project_root / "video.mp4"),
+                                expected_animal_count=2,
+                                requested_tracker="botsort",
+                            ),
+                        ),
                         batch_size=4,
                     )
                     with (
@@ -207,6 +214,12 @@ class MainWindowLifecycleTests(unittest.TestCase):
                     inference_plan = start.call_args.args[0]
                     start.assert_called_once()
                     self.assertEqual(inference_plan.jobs[0].worker_config()["batch_size"], 4)
+                    self.assertEqual(
+                        inference_plan.jobs[0].worker_config()["expected_animal_count"], 2
+                    )
+                    self.assertEqual(
+                        inference_plan.jobs[0].worker_config()["resolved_tracker"], "botsort"
+                    )
                     self.assertTrue(lock_path.is_file())
                 finally:
                     if window is not None:

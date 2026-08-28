@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import csv
-import datetime as dt
 import json
 import math
 import os
@@ -14,7 +13,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from squeakpose.json_io import JsonFileError, read_json_file
-from squeakpose.project.layers import LAYER_DEFINITIONS, normalize_layer_id
+from squeakpose.project.layers import (
+    LAYER_DEFINITIONS,
+    LAYER_KEYPOINTS,
+    LAYER_SEGMENTATION,
+    normalize_layer_id,
+)
 from squeakpose.services.video_library import list_project_videos
 
 DEFAULT_ONE_EURO_MIN_CUTOFF = 1.0
@@ -59,6 +63,28 @@ class SegmentationPreview:
 
     frame_index: int = 0
     polygons: tuple[tuple[tuple[float, float], ...], ...] = ()
+    primary_bbox: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PosePreviewKeypoint:
+    """One named pose keypoint from the primary preview detection."""
+
+    name: str
+    x: float
+    y: float
+    confidence: float = math.nan
+
+
+@dataclass(frozen=True, slots=True)
+class PosePreview:
+    """Primary pose detection to overlay on one analysis setup frame."""
+
+    frame_index: int = 0
+    bbox: tuple[float, ...] = ()
+    keypoints: tuple[PosePreviewKeypoint, ...] = ()
+    class_name: str = ""
+    confidence: float = math.nan
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,13 +101,44 @@ class ProjectAnalysisInput:
         return bool(self.csv_path)
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectAnalysisBundle:
+    """All analysis-ready inference inputs discovered for one project video."""
+
+    video_name: str
+    video_path: str
+    keypoints_csv: str = ""
+    segmentation_csv: str = ""
+    keypoints_created_at: str = ""
+    segmentation_created_at: str = ""
+
+    @property
+    def available_layers(self) -> tuple[str, ...]:
+        layers: list[str] = []
+        if self.keypoints_csv:
+            layers.append(LAYER_KEYPOINTS)
+        if self.segmentation_csv:
+            layers.append(LAYER_SEGMENTATION)
+        return tuple(layers)
+
+    @property
+    def inference_ready(self) -> bool:
+        return bool(self.available_layers)
+
+    @property
+    def both_ready(self) -> bool:
+        return len(self.available_layers) == 2
+
+    def csv_for_layer(self, layer_id: str) -> str:
+        normalized = normalize_layer_id(layer_id)
+        return self.keypoints_csv if normalized == LAYER_KEYPOINTS else self.segmentation_csv
+
+
 def _video_identity(path: str) -> str:
     return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
 
 
-def _relocated_inference_csv(
-    inference_root: str, recorded_path: str, layer_id: str
-) -> str:
+def _relocated_inference_csv(inference_root: str, recorded_path: str, layer_id: str) -> str:
     """Resolve an inference CSV after its project directory has moved."""
     raw = str(recorded_path or "").strip()
     if not raw:
@@ -144,10 +201,7 @@ def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAn
             csv_path = _relocated_inference_csv(
                 inference_root, str(item.get("csv_path") or ""), normalized_layer
             )
-            if (
-                csv_path
-                and analysis_csv_matches_layer(csv_path, normalized_layer)
-            ):
+            if csv_path and analysis_csv_matches_layer(csv_path, normalized_layer):
                 candidates.append(csv_path)
         if not candidates:
             continue
@@ -174,6 +228,35 @@ def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAn
             )
         )
     return tuple(options)
+
+
+def project_analysis_bundles(project_root: str) -> tuple[ProjectAnalysisBundle, ...]:
+    """Discover pose and segmentation inputs together for every project video."""
+    keypoints = {
+        item.video_name: item for item in project_analysis_inputs(project_root, LAYER_KEYPOINTS)
+    }
+    segmentation = {
+        item.video_name: item for item in project_analysis_inputs(project_root, LAYER_SEGMENTATION)
+    }
+    names = sorted(set(keypoints) | set(segmentation), key=str.casefold)
+    bundles: list[ProjectAnalysisBundle] = []
+    for name in names:
+        pose = keypoints.get(name)
+        segment = segmentation.get(name)
+        source = pose or segment
+        if source is None:
+            continue
+        bundles.append(
+            ProjectAnalysisBundle(
+                video_name=name,
+                video_path=source.video_path,
+                keypoints_csv=pose.csv_path if pose else "",
+                segmentation_csv=segment.csv_path if segment else "",
+                keypoints_created_at=pose.created_at if pose else "",
+                segmentation_created_at=segment.created_at if segment else "",
+            )
+        )
+    return tuple(bundles)
 
 
 def _existing_manifest_video_path(csv_path: str) -> str:
@@ -241,14 +324,28 @@ def default_analysis_output_dir(
     layer_id: str,
     csv_path: str,
     *,
-    timestamp: str | None = None,
+    video_name: str = "",
 ) -> str:
-    stamp = timestamp or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    source_video = video_name or _existing_manifest_video_path(csv_path)
+    video_stem = safe_analysis_stem(source_video or csv_path)
     return os.path.join(
         os.path.abspath(project_root),
         "analysis outputs",
+        video_stem,
         layer_id,
-        f"{safe_analysis_stem(csv_path)}_{stamp}",
+    )
+
+
+def default_combined_analysis_output_dir(
+    project_root: str,
+    video_name: str,
+) -> str:
+    """Return the stable combined-analysis folder for one project video."""
+    return os.path.join(
+        os.path.abspath(project_root),
+        "analysis outputs",
+        safe_analysis_stem(video_name),
+        "combined",
     )
 
 
@@ -296,6 +393,8 @@ def load_segmentation_preview(path: str, *, row_limit: int = 10_000) -> Segmenta
 
     selected_frame: int | None = None
     polygons: list[tuple[tuple[float, float], ...]] = []
+    primary_bbox: tuple[float, ...] = ()
+    primary_score = (-math.inf, -math.inf)
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
             for index, row in enumerate(csv.DictReader(handle)):
@@ -327,9 +426,129 @@ def load_segmentation_preview(path: str, *, row_limit: int = 10_000) -> Segmenta
                         break
                     continue
                 polygons.append(tuple(points))
+                confidence = _finite_csv_float(row, "confidence", "conf")
+                polygon_area = (
+                    abs(
+                        sum(
+                            x1 * y2 - x2 * y1
+                            for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])
+                        )
+                    )
+                    / 2.0
+                )
+                score = (
+                    confidence if math.isfinite(confidence) else 0.0,
+                    polygon_area,
+                )
+                bbox_values = tuple(
+                    _finite_csv_float(row, canonical, legacy)
+                    for canonical, legacy in (
+                        ("bbox_x1", "x1"),
+                        ("bbox_y1", "y1"),
+                        ("bbox_x2", "x2"),
+                        ("bbox_y2", "y2"),
+                    )
+                )
+                if score > primary_score and all(math.isfinite(value) for value in bbox_values):
+                    primary_score = score
+                    primary_bbox = bbox_values
     except (OSError, csv.Error):
         pass
-    return SegmentationPreview(selected_frame or 0, tuple(polygons))
+    return SegmentationPreview(selected_frame or 0, tuple(polygons), primary_bbox)
+
+
+def _finite_csv_float(row: Mapping[str, Any], *names: str) -> float:
+    for name in names:
+        try:
+            value = float(row.get(name) or "")
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return math.nan
+
+
+def load_pose_preview(
+    path: str,
+    *,
+    frame_index: int | None = None,
+    row_limit: int = 10_000,
+) -> PosePreview:
+    """Load the highest-confidence animal pose on a requested or first valid frame."""
+    requested_frame = int(frame_index) if frame_index is not None else None
+    best_frame: int | None = None
+    best_score = -math.inf
+    best_preview = PosePreview(frame_index=max(0, requested_frame or 0))
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = tuple(reader.fieldnames or ())
+            keypoint_names = tuple(
+                match.group(1)
+                for field in fieldnames
+                if (match := re.fullmatch(r"kp_(.+)_x", field)) is not None
+            )
+            for index, row in enumerate(reader):
+                if index >= max(0, int(row_limit)):
+                    break
+                raw_frame = _finite_csv_float(row, "frame_index", "frame")
+                if not math.isfinite(raw_frame):
+                    continue
+                row_frame = int(raw_frame)
+                if requested_frame is not None and row_frame != requested_frame:
+                    continue
+                detection_index = _finite_csv_float(row, "detection_index", "det")
+                if math.isfinite(detection_index) and detection_index < 0:
+                    continue
+                if requested_frame is None and best_frame is not None and row_frame > best_frame:
+                    break
+
+                bbox_values = tuple(
+                    _finite_csv_float(row, canonical, legacy)
+                    for canonical, legacy in (
+                        ("bbox_x1", "x1"),
+                        ("bbox_y1", "y1"),
+                        ("bbox_x2", "x2"),
+                        ("bbox_y2", "y2"),
+                    )
+                )
+                bbox = bbox_values if all(math.isfinite(value) for value in bbox_values) else ()
+                keypoints: list[PosePreviewKeypoint] = []
+                for name in keypoint_names:
+                    x = _finite_csv_float(row, f"kp_{name}_x")
+                    y = _finite_csv_float(row, f"kp_{name}_y")
+                    if not (math.isfinite(x) and math.isfinite(y)):
+                        continue
+                    keypoints.append(
+                        PosePreviewKeypoint(
+                            name=name,
+                            x=x,
+                            y=y,
+                            confidence=_finite_csv_float(row, f"kp_{name}_conf"),
+                        )
+                    )
+                if not bbox and not keypoints:
+                    continue
+
+                confidence = _finite_csv_float(row, "confidence", "conf")
+                score = confidence if math.isfinite(confidence) else 0.0
+                if best_frame is None or row_frame < best_frame:
+                    best_frame = row_frame
+                    best_score = score
+                elif row_frame == best_frame and score <= best_score:
+                    continue
+                else:
+                    best_score = score
+                best_preview = PosePreview(
+                    frame_index=row_frame,
+                    bbox=bbox,
+                    keypoints=tuple(keypoints),
+                    class_name=str(row.get("class_name") or ""),
+                    confidence=confidence,
+                )
+    except (OSError, csv.Error):
+        return PosePreview(frame_index=max(0, requested_frame or 0))
+    return best_preview
 
 
 def latest_analysis_csv(directories: Iterable[str], layer_id: str) -> str:
@@ -431,3 +650,91 @@ def build_analysis_run_config(
         payload=payload,
         video_fallback_notice=bool(make_annotated_video and not clean_video_path),
     )
+
+
+def build_analysis_job_config(
+    *,
+    analysis_mode: str,
+    analysis_inputs: Mapping[str, str],
+    video_path: str,
+    output_dir: str,
+    pixel_distance: float,
+    real_world_distance_mm: float,
+    smooth: bool,
+    min_cutoff: float,
+    beta: float,
+    make_plots: bool,
+    make_annotated_video: bool,
+    run_clustering: bool,
+    export_cluster_clips: bool,
+    umap_neighbors: int,
+    umap_min_dist: float,
+    hdbscan_min_cluster_size: int,
+    cluster_clip_length_sec: float,
+    samples_per_cluster: int,
+    rois: Iterable[Mapping[str, Any]],
+) -> AnalysisRunConfig:
+    """Validate a single- or dual-layer analysis job using the existing worker contract."""
+    clean_mode = str(analysis_mode or "").strip().lower()
+    if clean_mode not in {"both", LAYER_KEYPOINTS, LAYER_SEGMENTATION}:
+        raise AnalysisConfigError(
+            "invalid_mode", "Analysis mode", "Choose Pose, Segmentation, or Both."
+        )
+    selected_layers = (
+        (LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+        if clean_mode == "both"
+        else (normalize_layer_id(clean_mode),)
+    )
+
+    normalized_inputs = {
+        layer: str(analysis_inputs.get(layer) or "").strip()
+        for layer in (LAYER_KEYPOINTS, LAYER_SEGMENTATION)
+    }
+    for layer in selected_layers:
+        csv_path = normalized_inputs[layer]
+        if not os.path.isfile(csv_path):
+            label = "Pose" if layer == LAYER_KEYPOINTS else "Segmentation"
+            raise AnalysisConfigError(
+                "csv_required",
+                f"{label} CSV required",
+                f"No readable {label.lower()} inference CSV is available for this video.",
+            )
+        if not analysis_csv_matches_layer(csv_path, layer):
+            raise AnalysisConfigError(
+                "wrong_layer",
+                "Wrong inference layer",
+                f"{os.path.basename(csv_path)} is not a valid {layer} inference CSV.",
+            )
+
+    first_layer = selected_layers[0]
+    base = build_analysis_run_config(
+        layer_id=first_layer,
+        detections_csv=normalized_inputs[first_layer],
+        video_path=video_path,
+        output_dir=output_dir,
+        pixel_distance=pixel_distance,
+        real_world_distance_mm=real_world_distance_mm,
+        smooth=smooth,
+        min_cutoff=min_cutoff,
+        beta=beta,
+        make_plots=make_plots,
+        make_annotated_video=make_annotated_video,
+        run_clustering=run_clustering,
+        export_cluster_clips=export_cluster_clips,
+        umap_neighbors=umap_neighbors,
+        umap_min_dist=umap_min_dist,
+        hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+        cluster_clip_length_sec=cluster_clip_length_sec,
+        samples_per_cluster=samples_per_cluster,
+        rois=rois,
+    )
+    payload = base.as_dict()
+    payload.update(
+        {
+            "analysis_mode": "both" if len(selected_layers) == 2 else first_layer,
+            "analysis_inputs": {layer: normalized_inputs[layer] for layer in selected_layers},
+            "selected_layers": list(selected_layers),
+            "layer_id": first_layer if len(selected_layers) == 1 else "",
+        }
+    )
+    return AnalysisRunConfig(payload, base.video_fallback_notice)

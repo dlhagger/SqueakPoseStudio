@@ -13,7 +13,9 @@ from squeakpose.services.inference_runtime import (
     run_depth_video_inference,
     run_pose_video_inference,
     run_segmentation_video_inference,
+    tracking_dependency_error,
 )
+from squeakpose.services.tracking import resolve_tracking_config
 from squeakpose.workers.protocol import read_config, write_event
 
 _CANCEL_REQUESTED = False
@@ -59,6 +61,21 @@ def run_inference_worker(
     batch_size = int(config.get("batch_size") or 1)
     total_frames = int(config.get("total_frames") or 0)
     fps = float(config.get("fps") or 0.0)
+    requested_tracker = str(config.get("requested_tracker") or "auto")
+    expected_animal_count = int(config.get("expected_animal_count") or 1)
+    tracker_profile = str(config.get("tracker_profile") or "fixed_camera_v1")
+    tracking_enabled = bool(config.get("tracking_enabled", False)) and mode != "depth"
+    tracking_config = resolve_tracking_config(
+        expected_animal_count,
+        requested_tracker,
+        enabled=tracking_enabled,
+        tracker_profile=tracker_profile,
+    )
+    resolved_tracker = str(
+        config.get("resolved_tracker")
+        or config.get("tracker_type")
+        or tracking_config.resolved_tracker
+    )
 
     if not model_path:
         _emit_event(event_writer, {"event": "error", "error_message": "model_path is required"})
@@ -70,6 +87,7 @@ def run_inference_worker(
         _emit_event(event_writer, {"event": "error", "error_message": "csv_path is required"})
         return 1
 
+    using_default_model_factory = model_factory is None
     if model_factory is None:
         try:
             from ultralytics import YOLO
@@ -80,6 +98,12 @@ def run_inference_worker(
             )
             return 1
         model_factory = YOLO
+
+    if tracking_enabled and using_default_model_factory:
+        dependency_error = tracking_dependency_error()
+        if dependency_error:
+            _emit_event(event_writer, {"event": "error", "error_message": dependency_error})
+            return 1
 
     if cv2_module is None and mode in {"pose", "depth"}:
         try:
@@ -165,6 +189,10 @@ def run_inference_worker(
             fps=fps,
             progress_callback=progress,
             cancel_requested=_cancel_requested,
+            tracking_enabled=tracking_enabled,
+            expected_animal_count=expected_animal_count,
+            tracker_type=resolved_tracker,
+            tracker_profile=tracker_profile,
         )
     else:
         result = run_pose_video_inference(
@@ -181,6 +209,10 @@ def run_inference_worker(
             fps=fps,
             progress_callback=progress,
             cancel_requested=_cancel_requested,
+            tracking_enabled=tracking_enabled,
+            expected_animal_count=expected_animal_count,
+            tracker_type=resolved_tracker,
+            tracker_profile=tracker_profile,
         )
 
     _emit_event(
@@ -196,6 +228,13 @@ def run_inference_worker(
             "error_message": str(result.error_message or ""),
             "mode": mode,
             "layer_id": layer_id,
+            "tracking_enabled": bool(result.tracking_enabled),
+            "tracker_type": resolved_tracker if result.tracking_enabled else "none",
+            "tracker_profile": tracker_profile if result.tracking_enabled else "",
+            "expected_animal_count": (expected_animal_count if result.tracking_enabled else None),
+            "unique_track_ids": list(result.unique_track_ids),
+            "frames_with_track_count_mismatch": int(result.frames_with_track_count_mismatch),
+            "frames_without_track_ids": int(result.frames_without_track_ids),
         },
     )
     return 1 if result.had_error else 0

@@ -70,6 +70,36 @@ class VideoReviewServiceTests(unittest.TestCase):
         self.assertEqual(plan.meta["schemas"][LAYER_SEGMENTATION], {})
         self.assertEqual(plan.meta["initial_effective_batch"], 8)
 
+    def test_single_layer_run_keeps_all_configured_model_cache_identities(self):
+        plan = plan_video_review_run(
+            video_signature={"path": "/video.mp4", "size": 10},
+            model_paths={LAYER_KEYPOINTS: "pose.pt", LAYER_SEGMENTATION: "seg.pt"},
+            review_layers=[LAYER_KEYPOINTS],
+            layer_schemas={
+                LAYER_KEYPOINTS: {"classes": ["mouse"]},
+                LAYER_SEGMENTATION: {"classes": ["mouse"]},
+            },
+            start=2,
+            end=10,
+            stride=3,
+            imgsz=640,
+            conf=0.25,
+            iou=0.7,
+            kpvis=0.4,
+            requested_batch=0,
+            effective_batch=8,
+            total=100,
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.meta["layers"], [LAYER_KEYPOINTS])
+        self.assertEqual(
+            plan.meta["model_paths"],
+            {LAYER_KEYPOINTS: "pose.pt", LAYER_SEGMENTATION: "seg.pt"},
+        )
+        self.assertIn(LAYER_SEGMENTATION, plan.meta["schemas"])
+        self.assertEqual(plan.total_steps, 3)
+
     def test_pass_config_keeps_worker_protocol(self):
         config = build_video_review_pass_config(
             layer_id=LAYER_SEGMENTATION,

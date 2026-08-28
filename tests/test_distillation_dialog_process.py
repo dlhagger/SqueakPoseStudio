@@ -1,15 +1,31 @@
 import os
 import unittest
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QProcess
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtWidgets import QApplication, QDialog, QWidget
 
+from squeakpose.services.video_library import VideoLibraryEntry
 from squeakpose.ui.distillation_dialog import DistillationDialog
 from squeakpose.workers.process import WorkerJobResult
+
+
+class _VideoCapture:
+    def __init__(self, total_frames=90):
+        self.total_frames = total_frames
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def get(self, _property):
+        return self.total_frames
+
+    def release(self):
+        self.released = True
 
 
 class DistillationDialogProcessTests(unittest.TestCase):
@@ -45,6 +61,57 @@ class DistillationDialogProcessTests(unittest.TestCase):
             QProcess.ProcessChannelMode.MergedChannels,
         )
         process.deleteLater()
+
+    def test_video_probe_resolves_project_alias_before_opening(self):
+        selected = os.path.join(self.temp_dir.name, "videos", "session.mp4")
+        resolved = os.path.join(self.temp_dir.name, "session", "session.mp4")
+        capture = _VideoCapture()
+        self.dialog.video_paths = [selected]
+
+        with (
+            patch(
+                "squeakpose.ui.distillation_dialog.resolve_project_video_paths",
+                return_value=[resolved],
+            ) as resolve_paths,
+            patch(
+                "squeakpose.ui.distillation_dialog._cv2.VideoCapture",
+                return_value=capture,
+            ) as open_video,
+        ):
+            probes, errors = self.dialog._probe_selected_videos()
+
+        resolve_paths.assert_called_once_with(self.dialog.paths["videos"], [selected])
+        open_video.assert_called_once_with(resolved)
+        self.assertEqual(probes, [(resolved, 90, 3)])
+        self.assertEqual(errors, [])
+        self.assertTrue(capture.released)
+
+    def test_project_picker_selection_keeps_library_paths_for_late_resolution(self):
+        videos_dir = self.dialog.paths["videos"]
+        entry = VideoLibraryEntry(
+            name="session.mp4",
+            path=os.path.join(self.temp_dir.name, "source", "session.mp4"),
+            is_link=True,
+            target=os.path.join(self.temp_dir.name, "source", "session.mp4"),
+            target_exists=True,
+        )
+        picker = Mock()
+        picker.exec.return_value = QDialog.DialogCode.Accepted
+        picker.selected_entries = (entry,)
+
+        with patch(
+            "squeakpose.ui.distillation_dialog.ProjectVideoPickerDialog",
+            return_value=picker,
+        ) as picker_class:
+            self.dialog._add_videos()
+
+        picker_class.assert_called_once()
+        self.assertEqual(
+            self.dialog.video_paths,
+            [os.path.join(videos_dir, entry.name)],
+        )
+        self.assertEqual(self.dialog.video_list.item(0).text(), entry.name)
+        self.assertIn(entry.target, self.dialog.video_list.item(0).toolTip())
 
     def test_success_result_restores_controls_and_preserves_completion_message(self):
         self.dialog.run_btn.setEnabled(False)

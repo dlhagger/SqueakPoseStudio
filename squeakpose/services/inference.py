@@ -22,6 +22,13 @@ from squeakpose.project.layers import (
     normalize_layer_id,
 )
 from squeakpose.project.safety import ProjectPathError, require_path_within_project
+from squeakpose.services.tracking import (
+    DEFAULT_TRACKER_PROFILE,
+    TRACKER_AUTO,
+    TrackingConfig,
+    normalize_tracker_choice,
+    resolve_tracking_config,
+)
 
 ManifestWriter = Callable[[str, str], None]
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -44,6 +51,7 @@ class InferenceJobPlan:
     batch_size: int
     total_frames: int
     fps: float
+    tracking: TrackingConfig
 
     @property
     def display_name(self) -> str:
@@ -64,6 +72,11 @@ class InferenceJobPlan:
             "batch_size": self.batch_size,
             "total_frames": self.total_frames,
             "fps": self.fps,
+            "tracking_enabled": self.tracking.enabled,
+            "expected_animal_count": self.tracking.expected_animal_count,
+            "requested_tracker": self.tracking.requested_tracker,
+            "resolved_tracker": self.tracking.resolved_tracker,
+            "tracker_profile": self.tracking.tracker_profile,
         }
 
 
@@ -75,6 +88,16 @@ class InferenceRunPlan:
     video_path: str
     manifest_path: str
     jobs: tuple[InferenceJobPlan, ...]
+
+    @property
+    def tracking(self) -> TrackingConfig:
+        """Return the source video's tracking settings from any planned job."""
+        if not self.jobs:
+            return resolve_tracking_config(enabled=False)
+        for job in self.jobs:
+            if job.tracking.enabled:
+                return job.tracking
+        return self.jobs[0].tracking
 
     @property
     def output_directories(self) -> tuple[str, ...]:
@@ -95,6 +118,13 @@ class InferencePassResult:
     canceled: bool = False
     had_error: bool = False
     error_message: str = ""
+    tracking_enabled: bool = False
+    expected_animal_count: int | None = None
+    tracker_type: str = "none"
+    tracker_profile: str = ""
+    unique_track_ids: tuple[int, ...] = ()
+    frames_with_track_count_mismatch: int = 0
+    frames_without_track_ids: int = 0
 
     @property
     def discard_paths(self) -> tuple[str, ...]:
@@ -156,6 +186,10 @@ class VideoInferenceStatus:
     successful_layers: tuple[str, ...]
     latest_created_at: str
     run_count: int
+    expected_animal_count: int = 1
+    requested_tracker: str = TRACKER_AUTO
+    resolved_tracker: str = "bytetrack"
+    tracker_profile: str = DEFAULT_TRACKER_PROFILE
 
 
 def video_identity(video_path: str) -> str:
@@ -192,13 +226,20 @@ def project_video_inference_statuses(project_root: str) -> dict[str, VideoInfere
         key = video_identity(video_path)
         record = history.setdefault(
             key,
-            {"video_path": video_path, "layers": set(), "latest": "", "runs": 0},
+            {
+                "video_path": video_path,
+                "layers": set(),
+                "latest": "",
+                "runs": 0,
+                "tracking": resolve_tracking_config(),
+            },
         )
         record["runs"] += 1
         created_at = str(payload.get("created_at") or "")
         if created_at >= record["latest"]:
             record["latest"] = created_at
             record["video_path"] = video_path
+            record["tracking"] = _tracking_from_manifest(payload)
         passes = payload.get("passes")
         if not isinstance(passes, list):
             continue
@@ -219,6 +260,10 @@ def project_video_inference_statuses(project_root: str) -> dict[str, VideoInfere
             ),
             latest_created_at=str(record["latest"]),
             run_count=int(record["runs"]),
+            expected_animal_count=record["tracking"].expected_animal_count,
+            requested_tracker=record["tracking"].requested_tracker,
+            resolved_tracker=record["tracking"].resolved_tracker,
+            tracker_profile=record["tracking"].tracker_profile,
         )
         for key, record in history.items()
     }
@@ -269,6 +314,9 @@ def plan_inference_run(
     fps: float = 0.0,
     created_at: datetime.datetime | None = None,
     run_id: str | None = None,
+    expected_animal_count: int = 1,
+    requested_tracker: str = TRACKER_AUTO,
+    tracker_profile: str = DEFAULT_TRACKER_PROFILE,
 ) -> InferenceRunPlan:
     """Plan ordered per-layer worker jobs with project-contained output paths."""
     root = os.path.abspath(project_root)
@@ -276,6 +324,11 @@ def plan_inference_run(
         raise ValueError("video_path must not be empty")
     if int(batch_size) < 1:
         raise ValueError("batch_size must be at least 1")
+    video_tracking = resolve_tracking_config(
+        expected_animal_count,
+        requested_tracker,
+        tracker_profile=tracker_profile,
+    )
 
     timestamp = created_at or datetime.datetime.now()
     resolved_run_id = run_id or create_inference_run_id(video_path, created_at=timestamp)
@@ -346,6 +399,16 @@ def plan_inference_run(
                 batch_size=int(batch_size),
                 total_frames=max(0, int(total_frames)),
                 fps=max(0.0, float(fps)),
+                tracking=(
+                    video_tracking
+                    if layer_id in {LAYER_KEYPOINTS, LAYER_SEGMENTATION}
+                    else resolve_tracking_config(
+                        expected_animal_count,
+                        requested_tracker,
+                        enabled=False,
+                        tracker_profile=tracker_profile,
+                    )
+                ),
             )
         )
     return InferenceRunPlan(
@@ -426,6 +489,14 @@ def aggregate_inference_result(
         had_error = True
         error_message = f"{error_message}; {unsafe_error}".strip("; ")
 
+    unique_track_ids: list[int] = []
+    for raw_track_id in payload.get("unique_track_ids") or ():
+        try:
+            unique_track_ids.append(int(raw_track_id))
+        except (TypeError, ValueError):
+            continue
+    tracking_enabled = bool(payload.get("tracking_enabled", job.tracking.enabled))
+
     return InferencePassResult(
         layer_id=job.layer_id,
         workflow=job.workflow,
@@ -437,6 +508,21 @@ def aggregate_inference_result(
         canceled=canceled,
         had_error=had_error,
         error_message=error_message,
+        tracking_enabled=tracking_enabled,
+        expected_animal_count=(job.tracking.expected_animal_count if tracking_enabled else None),
+        tracker_type=str(
+            payload.get("tracker_type")
+            or (job.tracking.resolved_tracker if tracking_enabled else "none")
+        ),
+        tracker_profile=str(
+            payload.get("tracker_profile")
+            or (job.tracking.tracker_profile if tracking_enabled else "")
+        ),
+        unique_track_ids=tuple(sorted(set(unique_track_ids))),
+        frames_with_track_count_mismatch=max(
+            0, int(payload.get("frames_with_track_count_mismatch") or 0)
+        ),
+        frames_without_track_ids=max(0, int(payload.get("frames_without_track_ids") or 0)),
     )
 
 
@@ -448,13 +534,34 @@ def build_inference_manifest(
 ) -> dict[str, Any]:
     """Build the schema-compatible project inference manifest payload."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": plan.run_id,
         "created_at": plan.created_at,
         "video_path": plan.video_path,
         "canceled": bool(canceled),
+        "expected_animal_count": plan.tracking.expected_animal_count,
+        "tracking": plan.tracking.as_dict(),
         "passes": [result.as_dict() for result in results],
     }
+
+
+def _tracking_from_manifest(payload: Mapping[str, Any]) -> TrackingConfig:
+    """Read schema-v2 tracking data while accepting legacy manifests."""
+    raw_tracking = payload.get("tracking")
+    tracking = raw_tracking if isinstance(raw_tracking, Mapping) else {}
+    count = tracking.get("expected_animal_count", payload.get("expected_animal_count", 1))
+    requested = tracking.get("requested_tracker", TRACKER_AUTO)
+    profile = tracking.get("tracker_profile", DEFAULT_TRACKER_PROFILE)
+    enabled = bool(tracking.get("enabled", True))
+    try:
+        return resolve_tracking_config(
+            int(count),
+            normalize_tracker_choice(requested),
+            enabled=enabled,
+            tracker_profile=str(profile or DEFAULT_TRACKER_PROFILE),
+        )
+    except (TypeError, ValueError):
+        return resolve_tracking_config()
 
 
 def finalize_inference_run(

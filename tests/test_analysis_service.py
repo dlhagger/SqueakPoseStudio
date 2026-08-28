@@ -7,16 +7,109 @@ from tempfile import TemporaryDirectory
 from squeakpose.services.analysis import (
     AnalysisConfigError,
     analysis_csv_matches_layer,
+    build_analysis_job_config,
     build_analysis_run_config,
     default_analysis_output_dir,
+    default_combined_analysis_output_dir,
     inspect_analysis_csv,
     latest_analysis_csv,
+    load_pose_preview,
     load_segmentation_preview,
+    project_analysis_bundles,
     project_analysis_inputs,
 )
 
 
 class AnalysisServiceTests(unittest.TestCase):
+    def test_project_analysis_bundles_detect_both_layers_per_video(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "videos" / "session.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            output_root = root / "inference outputs"
+            pose_csv = output_root / "keypoints" / "run_pose.csv"
+            segment_csv = output_root / "segmentation" / "run_segmentation.csv"
+            pose_csv.parent.mkdir(parents=True)
+            segment_csv.parent.mkdir(parents=True)
+            pose_csv.write_text("frame,det,kp_nose_x,kp_nose_y\n", encoding="utf-8")
+            segment_csv.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            runs = output_root / "runs"
+            runs.mkdir()
+            (runs / "run.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": str(video),
+                        "created_at": "2026-08-27T12:00:00",
+                        "passes": [
+                            {"layer_id": "keypoints", "csv_path": str(pose_csv)},
+                            {"layer_id": "segmentation", "csv_path": str(segment_csv)},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bundles = project_analysis_bundles(tmp)
+
+            self.assertEqual(len(bundles), 1)
+            self.assertTrue(bundles[0].both_ready)
+            self.assertEqual(bundles[0].keypoints_csv, str(pose_csv))
+            self.assertEqual(bundles[0].segmentation_csv, str(segment_csv))
+
+    def test_dual_layer_job_config_preserves_both_inputs_and_shared_settings(self):
+        with TemporaryDirectory() as tmp:
+            pose_csv = Path(tmp, "pose.csv")
+            segment_csv = Path(tmp, "segmentation.csv")
+            pose_csv.write_text("frame,det,kp_nose_x,kp_nose_y\n", encoding="utf-8")
+            segment_csv.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            output_dir = default_combined_analysis_output_dir(tmp, "session.mp4")
+            self.assertEqual(
+                output_dir,
+                os.path.join(tmp, "analysis outputs", "session", "combined"),
+            )
+
+            config = build_analysis_job_config(
+                analysis_mode="both",
+                analysis_inputs={
+                    "keypoints": str(pose_csv),
+                    "segmentation": str(segment_csv),
+                },
+                video_path="",
+                output_dir=output_dir,
+                pixel_distance=50,
+                real_world_distance_mm=25,
+                smooth=True,
+                min_cutoff=1.0,
+                beta=0.1,
+                make_plots=False,
+                make_annotated_video=False,
+                run_clustering=False,
+                export_cluster_clips=False,
+                umap_neighbors=10,
+                umap_min_dist=0.1,
+                hdbscan_min_cluster_size=5,
+                cluster_clip_length_sec=2,
+                samples_per_cluster=2,
+                rois=[
+                    {
+                        "name": "Center",
+                        "type": "rect",
+                        "x1": 0,
+                        "y1": 0,
+                        "x2": 10,
+                        "y2": 10,
+                    }
+                ],
+            ).as_dict()
+
+            self.assertEqual(config["analysis_mode"], "both")
+            self.assertEqual(config["selected_layers"], ["keypoints", "segmentation"])
+            self.assertEqual(config["analysis_inputs"]["keypoints"], str(pose_csv))
+            self.assertEqual(config["analysis_inputs"]["segmentation"], str(segment_csv))
+            self.assertEqual(config["layer_id"], "")
+            self.assertEqual(config["rois"][0]["name"], "Center")
+
     def test_project_analysis_inputs_pair_each_video_with_newest_layer_csv(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -117,6 +210,44 @@ class AnalysisServiceTests(unittest.TestCase):
             self.assertEqual(len(preview.polygons), 2)
             self.assertEqual(preview.polygons[0][0], (1.0, 2.0))
 
+    def test_segmentation_preview_uses_primary_segmentation_bbox(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = Path(tmp, "segmentation.csv")
+            csv_path.write_text(
+                "frame,det,conf,x1,y1,x2,y2,mask_polygon\n"
+                '0,0,0.70,10,11,30,31,"[[10, 11], [30, 11], [30, 31]]"\n'
+                '0,1,0.95,40,41,70,71,"[[40, 41], [70, 41], [70, 71]]"\n',
+                encoding="utf-8",
+            )
+
+            preview = load_segmentation_preview(str(csv_path))
+
+            self.assertEqual(preview.primary_bbox, (40.0, 41.0, 70.0, 71.0))
+
+    def test_pose_preview_selects_primary_detection_on_requested_frame(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = Path(tmp, "pose.csv")
+            csv_path.write_text(
+                "frame_index,detection_index,class_name,confidence,"
+                "bbox_x1,bbox_y1,bbox_x2,bbox_y2,"
+                "kp_nose_x,kp_nose_y,kp_nose_conf,kp_tail_base_x,kp_tail_base_y\n"
+                "0,0,mouse,0.99,1,2,11,12,5,6,0.9,8,9\n"
+                "2,0,mouse,0.70,20,21,30,31,22,23,0.8,28,29\n"
+                "2,1,mouse,0.95,40,41,50,51,42,43,0.9,48,49\n",
+                encoding="utf-8",
+            )
+
+            preview = load_pose_preview(str(csv_path), frame_index=2)
+
+            self.assertEqual(preview.frame_index, 2)
+            self.assertEqual(preview.bbox, (40.0, 41.0, 50.0, 51.0))
+            self.assertEqual(preview.class_name, "mouse")
+            self.assertAlmostEqual(preview.confidence, 0.95)
+            self.assertEqual(
+                [(keypoint.name, keypoint.x, keypoint.y) for keypoint in preview.keypoints],
+                [("nose", 42.0, 43.0), ("tail_base", 48.0, 49.0)],
+            )
+
     def test_csv_layer_detection_and_output_path(self):
         with TemporaryDirectory() as tmp:
             pose = Path(tmp, "pose results.csv")
@@ -132,13 +263,13 @@ class AnalysisServiceTests(unittest.TestCase):
                     tmp,
                     "keypoints",
                     str(pose),
-                    timestamp="20260815-120000",
+                    video_name="session.mp4",
                 ),
                 os.path.join(
                     tmp,
                     "analysis outputs",
+                    "session",
                     "keypoints",
-                    "pose_results_20260815-120000",
                 ),
             )
 

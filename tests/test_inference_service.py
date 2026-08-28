@@ -65,6 +65,40 @@ class InferenceServiceTests(unittest.TestCase):
             self.assertEqual(status.successful_layers, ("keypoints", "segmentation"))
             self.assertEqual(status.latest_created_at, "2026-08-20T12:00:00")
             self.assertEqual(status.run_count, 2)
+            self.assertEqual(status.expected_animal_count, 1)
+            self.assertEqual(status.requested_tracker, "auto")
+            self.assertEqual(status.resolved_tracker, "bytetrack")
+
+    def test_project_video_status_uses_latest_tracking_settings(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            runs = root / "inference outputs" / "runs"
+            runs.mkdir(parents=True)
+            (runs / "tracked.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "video_path": str(video),
+                        "created_at": "2026-08-21T12:00:00",
+                        "tracking": {
+                            "expected_animal_count": 3,
+                            "requested_tracker": "botsort",
+                            "resolved_tracker": "botsort",
+                            "tracker_profile": "fixed_camera_v1",
+                        },
+                        "passes": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = project_video_inference_statuses(tmp)[video_identity(str(video))]
+
+            self.assertEqual(status.expected_animal_count, 3)
+            self.assertEqual(status.requested_tracker, "botsort")
+            self.assertEqual(status.resolved_tracker, "botsort")
 
     def test_configured_layers_are_active_first_and_deduplicated(self):
         layers = configured_inference_layers(
@@ -117,6 +151,10 @@ class InferenceServiceTests(unittest.TestCase):
             self.assertEqual(plan.jobs[1].keypoint_names, ("nose", "tail"))
             self.assertEqual(plan.jobs[2].classes, ())
             self.assertTrue(plan.jobs[2].preview_path.endswith("_depth_preview.mp4"))
+            self.assertEqual(plan.jobs[0].worker_config()["resolved_tracker"], "bytetrack")
+            self.assertTrue(plan.jobs[0].worker_config()["tracking_enabled"])
+            self.assertFalse(plan.jobs[2].worker_config()["tracking_enabled"])
+            self.assertEqual(plan.jobs[2].worker_config()["resolved_tracker"], "none")
             self.assertFalse(os.path.exists(os.path.join(tmp, "inference outputs")))
 
             prepare_inference_run(plan)
@@ -177,6 +215,40 @@ class InferenceServiceTests(unittest.TestCase):
             self.assertEqual(result.processed_frames, 9)
             self.assertEqual(result.csv_path, job.csv_path)
             self.assertEqual(result.discard_paths, ())
+
+    def test_tracking_qc_from_worker_is_retained_in_manifest_pass(self):
+        with TemporaryDirectory() as tmp:
+            plan = plan_inference_run(
+                project_root=tmp,
+                video_path="/videos/mice.mp4",
+                active_layer=LAYER_SEGMENTATION,
+                model_paths={LAYER_SEGMENTATION: "segment.pt"},
+                expected_animal_count=2,
+                requested_tracker="botsort",
+                run_id="mice_20260828-120000_test",
+            )
+            result = aggregate_inference_result(
+                plan.jobs[0],
+                {
+                    "event": "result",
+                    "rows_written": 40,
+                    "processed_frames": 20,
+                    "tracking_enabled": True,
+                    "tracker_type": "botsort",
+                    "tracker_profile": "fixed_camera_v1",
+                    "unique_track_ids": [4, "7", 4, "bad"],
+                    "frames_with_track_count_mismatch": 3,
+                    "frames_without_track_ids": 1,
+                },
+                project_root=tmp,
+            )
+
+            self.assertEqual(result.expected_animal_count, 2)
+            self.assertEqual(result.unique_track_ids, (4, 7))
+            self.assertEqual(result.frames_with_track_count_mismatch, 3)
+            manifest = finalize_inference_run(plan, (result,))
+            payload = json.loads(Path(manifest.manifest_path).read_text(encoding="utf-8"))
+            self.assertEqual(payload["passes"][0]["unique_track_ids"], [4, 7])
 
     def test_failed_empty_result_identifies_discardable_outputs(self):
         with TemporaryDirectory() as tmp:
@@ -242,9 +314,11 @@ class InferenceServiceTests(unittest.TestCase):
             self.assertFalse(summary.canceled)
             self.assertTrue(any("bad model" in detail for detail in summary.details))
             manifest = json.loads(Path(summary.manifest_path).read_text(encoding="utf-8"))
-            self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["schema_version"], 2)
             self.assertEqual(manifest["run_id"], plan.run_id)
             self.assertEqual(len(manifest["passes"]), 2)
+            self.assertEqual(manifest["expected_animal_count"], 1)
+            self.assertEqual(manifest["tracking"]["resolved_tracker"], "bytetrack")
 
     def test_manifest_write_failure_is_returned_not_raised(self):
         with TemporaryDirectory() as tmp:

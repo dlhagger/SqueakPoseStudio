@@ -25,8 +25,11 @@ from analysis_ops import (
     _smooth_centers,
     assign_roi_labels,
     create_roi_outputs,
+    draw_antialiased_polyline,
+    draw_supersampled_polygon_overlay,
     export_cluster_clips,
     normalize_rois,
+    prepare_analysis_output_dir,
     run_behavior_clustering,
 )
 
@@ -75,6 +78,10 @@ def _parse_polygon(raw: Any) -> list[tuple[float, float]]:
 def _polygon_metrics(points: list[tuple[float, float]]) -> dict[str, float]:
     if len(points) < 3:
         return {
+            "mask_bbox_x1": math.nan,
+            "mask_bbox_y1": math.nan,
+            "mask_bbox_x2": math.nan,
+            "mask_bbox_y2": math.nan,
             "mask_area_px2": math.nan,
             "mask_perimeter_px": math.nan,
             "mask_centroid_x": math.nan,
@@ -124,6 +131,10 @@ def _polygon_metrics(points: list[tuple[float, float]]) -> dict[str, float]:
             pass
 
     return {
+        "mask_bbox_x1": float(xs.min()),
+        "mask_bbox_y1": float(ys.min()),
+        "mask_bbox_x2": float(xs.max()),
+        "mask_bbox_y2": float(ys.max()),
         "mask_area_px2": float(area),
         "mask_perimeter_px": perimeter,
         "mask_centroid_x": centroid_x,
@@ -164,10 +175,19 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
     )
     detections = pd.concat([detections, metrics], axis=1)
 
-    detections["bbox_x1"] = pd.to_numeric(detections["x1"], errors="coerce")
-    detections["bbox_y1"] = pd.to_numeric(detections["y1"], errors="coerce")
-    detections["bbox_x2"] = pd.to_numeric(detections["x2"], errors="coerce")
-    detections["bbox_y2"] = pd.to_numeric(detections["y2"], errors="coerce")
+    for suffix, source in (("x1", "x1"), ("y1", "y1"), ("x2", "x2"), ("y2", "y2")):
+        detections[f"inference_bbox_{suffix}"] = pd.to_numeric(detections[source], errors="coerce")
+    valid_mask_bounds = detections["mask_area_px2"].gt(0)
+    for suffix in ("x1", "y1", "x2", "y2"):
+        detections[f"bbox_{suffix}"] = detections[f"mask_bbox_{suffix}"].where(
+            valid_mask_bounds,
+            detections[f"inference_bbox_{suffix}"],
+        )
+    detections["bbox_source"] = np.where(
+        valid_mask_bounds,
+        "segmentation_mask_bounds",
+        "inference_bbox",
+    )
     detections["bbox_width"] = detections["bbox_x2"] - detections["bbox_x1"]
     detections["bbox_height"] = detections["bbox_y2"] - detections["bbox_y1"]
     detections["bbox_area_px2"] = detections["bbox_width"] * detections["bbox_height"]
@@ -206,6 +226,14 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
         "class_id",
         "class_name",
         "confidence",
+        "inference_bbox_x1",
+        "inference_bbox_y1",
+        "inference_bbox_x2",
+        "inference_bbox_y2",
+        "mask_bbox_x1",
+        "mask_bbox_y1",
+        "mask_bbox_x2",
+        "mask_bbox_y2",
         "bbox_x1",
         "bbox_y1",
         "bbox_x2",
@@ -215,6 +243,7 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
         "bbox_area_px2",
         "bbox_center_x",
         "bbox_center_y",
+        "bbox_source",
         "mask_centroid_x",
         "mask_centroid_y",
         "mask_area_px2",
@@ -648,10 +677,10 @@ def render_segmentation_annotated_video(
 
                 for roi in reversed(normalized_rois):
                     if roi["type"] == "polygon":
-                        contour = np.asarray(roi["points"], dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(frame, [contour], True, (66, 191, 245), 2)
+                        contour = np.asarray(roi["points"], dtype=np.float64).reshape((-1, 2))
+                        draw_antialiased_polyline(frame, contour, (66, 191, 245), cv2, thickness=2)
                         label = str(roi["name"])
-                        label_x, label_y = np.mean(contour[:, 0, :], axis=0).astype(int)
+                        label_x, label_y = np.mean(contour, axis=0).astype(int)
                         cv2.putText(
                             frame,
                             label,
@@ -660,6 +689,7 @@ def render_segmentation_annotated_video(
                             0.55,
                             (17, 24, 32),
                             4,
+                            lineType=cv2.LINE_AA,
                         )
                         cv2.putText(
                             frame,
@@ -669,12 +699,20 @@ def render_segmentation_annotated_video(
                             0.55,
                             (66, 191, 245),
                             2,
+                            lineType=cv2.LINE_AA,
                         )
                         continue
                     x1, y1, x2, y2 = [
                         int(round(float(roi[key]))) for key in ("x1", "y1", "x2", "y2")
                     ]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (66, 191, 245), 2)
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (66, 191, 245),
+                        2,
+                        lineType=cv2.LINE_AA,
+                    )
                     label = str(roi["name"])
                     (label_width, label_height), _baseline = cv2.getTextSize(
                         label,
@@ -695,6 +733,7 @@ def render_segmentation_annotated_video(
                         0.55,
                         (17, 24, 32),
                         4,
+                        lineType=cv2.LINE_AA,
                     )
                     cv2.putText(
                         frame,
@@ -704,6 +743,7 @@ def render_segmentation_annotated_video(
                         0.55,
                         (66, 191, 245),
                         2,
+                        lineType=cv2.LINE_AA,
                     )
 
                 row = rows_by_frame.get(frame_idx)
@@ -716,13 +756,25 @@ def render_segmentation_annotated_video(
                     ]
                     if not any(pd.isna(v) for v in bbox_vals):
                         x1, y1, x2, y2 = [int(round(float(v))) for v in bbox_vals]
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            (255, 0, 0),
+                            2,
+                            lineType=cv2.LINE_AA,
+                        )
 
                     points = _parse_polygon(row.get("mask_polygon"))
                     if len(points) >= 3:
-                        contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(
-                            frame, [contour], isClosed=True, color=(0, 255, 255), thickness=2
+                        draw_supersampled_polygon_overlay(
+                            frame,
+                            points,
+                            (0, 255, 255),
+                            cv2,
+                            alpha=0.22,
+                            supersample=2,
+                            outline_thickness=2,
                         )
 
                     cx = row.get("bbox_center_x_euro")
@@ -734,6 +786,7 @@ def render_segmentation_annotated_video(
                             4,
                             (0, 0, 255),
                             -1,
+                            lineType=cv2.LINE_AA,
                         )
 
                     text = f"Frame: {frame_idx}"
@@ -741,7 +794,14 @@ def render_segmentation_annotated_video(
                     if not pd.isna(speed_val):
                         text += f" | Speed: {float(speed_val):.1f} mm/s"
                     cv2.putText(
-                        frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
+                        frame,
+                        text,
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                        lineType=cv2.LINE_AA,
                     )
 
                     area_text = _mask_area_overlay_text(row)
@@ -754,6 +814,7 @@ def render_segmentation_annotated_video(
                             0.6,
                             (255, 255, 255),
                             2,
+                            lineType=cv2.LINE_AA,
                         )
 
                     roi_label = row.get("roi_label")
@@ -766,6 +827,7 @@ def render_segmentation_annotated_video(
                             0.6,
                             (255, 255, 255),
                             2,
+                            lineType=cv2.LINE_AA,
                         )
 
                 writer.write(frame)
@@ -788,7 +850,20 @@ def run_segmentation_analysis_workflow(
 
     total_steps = 8
     output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_analysis_output_dir(
+        output_dir,
+        generated_files=(
+            "analysis_features.csv",
+            "segmentation_detections.csv",
+            "analysis_summary.json",
+            "annotated_output.mp4",
+            "roi_summary.csv",
+            "roi_transition_matrix.csv",
+            "roi_time_seconds.png",
+            "roi_transition_matrix.png",
+        ),
+        generated_directories=("plots", "cluster_clips"),
+    )
 
     if raw is None:
         _progress(progress_callback, 1, total_steps, "Loading segmentation CSV")

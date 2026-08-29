@@ -1107,16 +1107,16 @@ wheels = [
 
 [[package]]
 name = "hydra-core"
-version = "1.3.5"
+version = "1.3.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "antlr4-python3-runtime" },
     { name = "omegaconf" },
     { name = "packaging" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/e4/69a522676faf88994d93d8a5e69e0666c61cae7f73d1bbcc483222023e74/hydra_core-1.3.5.tar.gz", hash = "sha256:71c441eabbde086062045e4d3fce9e26015244f1a4ac721cf3e444c7edf10633", size = 3264337, upload-time = "2026-08-05T18:33:21.394Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/03/adfa2bf3a9eef568a85f2e7cf18ce1938e7aa0b5257c432e5eb48f89960a/hydra_core-1.3.6.tar.gz", hash = "sha256:8c4c215b6cfba68e9a4e76f565bd7399fc2a86b93cfe8cb7328b046834dfbee5", size = 3272413, upload-time = "2026-08-29T14:36:08.092Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9c/97/f9d463a6f3c7d0955753eca5cbbf35b596ac471dd13fe357211a53fd37be/hydra_core-1.3.5-py3-none-any.whl", hash = "sha256:a3ff35b4ea6794e4c83d993016f4bde4ac35797ebe7a08f30e83ed9341880331", size = 155768, upload-time = "2026-08-05T18:33:19.834Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/fd/612cc7905787100dc9225ae6ad71b42b60cbc23cd56ca55afcdd1e000f81/hydra_core-1.3.6-py3-none-any.whl", hash = "sha256:55951f49c7e19c29f4281cce2eeaa6e73ef6c5620093a4efb402a7e4b839fc38", size = 163055, upload-time = "2026-08-29T14:36:06.385Z" },
 ]
 
 [[package]]
@@ -3426,6 +3426,7 @@ dependencies = [
     { name = "av" },
     { name = "clip" },
     { name = "hdbscan" },
+    { name = "huggingface-hub" },
     { name = "iprogress" },
     { name = "ipykernel" },
     { name = "ipywidgets" },
@@ -3471,6 +3472,7 @@ requires-dist = [
     { name = "av", specifier = ">=18.0.0" },
     { name = "clip", git = "https://github.com/ultralytics/CLIP/?rev=488e81a6711eea7346872b46ea928b367da8889d" },
     { name = "hdbscan", specifier = ">=0.8.44" },
+    { name = "huggingface-hub", specifier = ">=1.0.0" },
     { name = "iprogress", specifier = ">=0.4" },
     { name = "ipykernel", specifier = ">=7.3.0" },
     { name = "ipywidgets", specifier = ">=8.1.8" },
@@ -3895,7 +3897,7 @@ wheels = [
 
 [[package]]
 name = "ultralytics"
-version = "8.4.131"
+version = "8.4.134"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -3913,21 +3915,21 @@ dependencies = [
     { name = "ultralytics-platform" },
     { name = "ultralytics-thop" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/fb/5e4ccda5585524dd162db6644759f56f3c76c5ae8b0878d0a413fb0bcbb6/ultralytics-8.4.131.tar.gz", hash = "sha256:548ab7ed5ee53551d8e46334fc45c751746eef7f3273869e2f2357f23edb7f25", size = 1219587, upload-time = "2026-08-27T17:36:44.821Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9f/ca/3947b7f5ea1546fd26405466661627b18723b567e9b626ea720b58fdfeac/ultralytics-8.4.134.tar.gz", hash = "sha256:a85473bd0016ef944c4f9de00a951bfa49762480f5ac1f421824870820061451", size = 1220639, upload-time = "2026-08-29T18:07:51.804Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/88/f73413ed5fdbb029a2a8dd007c8f9068c5f98238ae1804fc298bd99922a1/ultralytics-8.4.131-py3-none-any.whl", hash = "sha256:19ce4e38546c2d1c8b97c6e39a053eb62df38dc21b12945d5274015ad00ae0c6", size = 1437613, upload-time = "2026-08-27T17:36:39.688Z" },
+    { url = "https://files.pythonhosted.org/packages/95/1e/bca55f924b3e713cc8a4d35ac6e3599b777bafe39325ba9437250fef086b/ultralytics-8.4.134-py3-none-any.whl", hash = "sha256:16c677bffe171dc7431ee582e4da7198470c7957df1d7db8a8ad513af12b2db8", size = 1437776, upload-time = "2026-08-29T18:07:47.246Z" },
 ]
 
 [[package]]
 name = "ultralytics-platform"
-version = "0.1.18"
+version = "0.1.19"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9f/57/971992ed295cbf32723f72f16ab7f3aceb7876461777c0919780a91e4f85/ultralytics_platform-0.1.18.tar.gz", hash = "sha256:0bcedb8379466aef576cb66d15ffeb9df6fcf70a0e77cbd341107dadc09a0c97", size = 54687, upload-time = "2026-08-27T01:40:37.964Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bd/94/9407e8897dac4d01856216f776e3383fad3951f19e35f97eb46bc4b80172/ultralytics_platform-0.1.19.tar.gz", hash = "sha256:ba33d5715c25182b59ae4727c12db76d0705c3d9ed02d1841c59c6fafd3a8025", size = 54899, upload-time = "2026-08-29T00:33:25.777Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/4b/b3de98da370a15efba580848050c32605e5354436dfe49d077444aa03604/ultralytics_platform-0.1.18-py3-none-any.whl", hash = "sha256:0e6727aac7a672e7c97df84ee67d0ce0fa29105e3d8dc05d8e84d7bb66b41df9", size = 65983, upload-time = "2026-08-27T01:40:36.638Z" },
+    { url = "https://files.pythonhosted.org/packages/71/f1/4a79acadef57def992ae8f7da592a1a3678962ab74ac12f67389b76853d1/ultralytics_platform-0.1.19-py3-none-any.whl", hash = "sha256:0a0b9d3901e3f5fbeef718bf3abb8a1832b6240d906aa401f50dae0bb37bdeae", size = 66195, upload-time = "2026-08-29T00:33:24.493Z" },
 ]
 
 [[package]]
@@ -3971,11 +3973,11 @@ wheels = [
 
 [[package]]
 name = "wcwidth"
-version = "0.8.2"
+version = "0.8.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/34/74/c6428f875774288bec1396f5bfcbc2d925700a4dad61727fd5f2b12f249d/wcwidth-0.8.2.tar.gz", hash = "sha256:91fbef97204b96a3d4d421609b80340b760cf33e26da123ff243d76b1fda8dda", size = 1466253, upload-time = "2026-06-29T18:11:11.601Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/36/57/ed58088fafdf4c55a0ad6bde846502567645424d7ebf325230b9237f4085/wcwidth-0.8.3.tar.gz", hash = "sha256:d128512515fbf4612e0ff21fd6380399210318b7b54a9af59dff8454cf9730eb", size = 1458450, upload-time = "2026-08-28T18:10:06.875Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/42/3e5985a0a7e57de470b320c6d6a1a67c844f6737a587f3d44dd13d1819e7/wcwidth-0.8.2-py3-none-any.whl", hash = "sha256:d63947694a0539a1d51e01eda7caf800c291020e6cdd7e28ad7b14dd33ad4f85", size = 323166, upload-time = "2026-06-29T18:11:09.888Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/0e/57f6bb3024a597b2e8ec4aee710ffe62ddc95af2e2bb1ee7a7abdc22c68c/wcwidth-0.8.3-py3-none-any.whl", hash = "sha256:d5b73dba6158a595ec9370350e7f2637bcac8d6c5e4fde34f30fcffb6103a5e4", size = 331669, upload-time = "2026-08-28T18:10:04.909Z" },
 ]
 
 [[package]]

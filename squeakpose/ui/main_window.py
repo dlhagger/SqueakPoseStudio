@@ -206,6 +206,10 @@ from squeakpose.services.inference import (
     prepare_inference_run,
 )
 from squeakpose.services.inference_runtime import probe_video_metadata
+from squeakpose.services.model_download import (
+    SAM3_MODEL_URL,
+    sam3_download_error_message,
+)
 from squeakpose.services.prediction import (
     DepthPredictionTargets,
     plan_prediction_application,
@@ -272,7 +276,12 @@ from squeakpose.ui.style import (
 from squeakpose.ui.training_dialog import TrainDialog
 from squeakpose.ui.video_library_dialog import VideoLibraryDialog
 from squeakpose.ui.video_reviewer import VideoReviewDialog
-from squeakpose.workers.process import remove_file_quietly, shutdown_qprocess
+from squeakpose.workers.process import (
+    WorkerJobController,
+    WorkerJobResult,
+    remove_file_quietly,
+    shutdown_qprocess,
+)
 
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logger = logging.getLogger(__name__)
@@ -1523,6 +1532,7 @@ class LabelingApp(QMainWindow):
         self.predict_btn.setEnabled(True)
         self.seg_edit_btn.setEnabled(is_segmentation)
         self.sam_load_btn.setEnabled(is_segmentation)
+        self.sam_download_btn.setEnabled(is_segmentation)
         self.sam_run_btn.setEnabled(is_segmentation)
         self.sam_accept_btn.setEnabled(is_segmentation)
         self.sam_clear_btn.setEnabled(is_segmentation)
@@ -2435,6 +2445,8 @@ class LabelingApp(QMainWindow):
         in_segment_mode = self.mode == "segment"
         model_loaded = bool(self.__dict__.get("_sam_model_ready", False))
         model_loading = bool(self.__dict__.get("_sam_model_loading", False))
+        download_job = self.__dict__.get("_sam_download_job")
+        download_busy = bool(download_job is not None and download_job.is_running)
         sam_controller = self.__dict__.get("_sam_assistant_controller")
         model_busy = bool(sam_controller is not None and sam_controller.is_busy)
 
@@ -2452,7 +2464,9 @@ class LabelingApp(QMainWindow):
         )
         accept_enabled = has_preview and not model_busy
         clear_enabled = (has_preview or total_prompts > 0) and not model_busy
-        load_enabled = not model_loaded and not model_loading and not model_busy
+        load_enabled = (
+            not model_loaded and not model_loading and not model_busy and not download_busy
+        )
         if hasattr(self, "sam_load_btn"):
             self.sam_load_btn.setEnabled(load_enabled)
             self.sam_load_btn.setText(
@@ -2460,6 +2474,16 @@ class LabelingApp(QMainWindow):
             )
             self.sam_load_btn.setProperty("tone", "load" if load_enabled else "")
             _refresh_qt_style(self.sam_load_btn)
+        if hasattr(self, "sam_download_btn"):
+            downloaded = os.path.isfile(os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS))
+            self.sam_download_btn.setEnabled(
+                not downloaded and not download_busy and not model_loading and not model_busy
+            )
+            self.sam_download_btn.setText(
+                "Downloading SAM 3…"
+                if download_busy
+                else ("SAM 3 Downloaded" if downloaded else "Download SAM 3")
+            )
         self.sam_run_btn.setEnabled(run_enabled)
         self.sam_accept_btn.setEnabled(accept_enabled)
         self.sam_clear_btn.setEnabled(clear_enabled)
@@ -2516,6 +2540,73 @@ class LabelingApp(QMainWindow):
         if not self._is_seg_workflow():
             self._switch_workflow(WORKFLOW_SEG)
         self._ensure_sam_model_loaded()
+        self._refresh_sam_controls()
+
+    def _download_sam3_from_hugging_face(self) -> None:
+        """Download the gated official checkpoint without blocking the Qt thread."""
+        target = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
+        if os.path.isfile(target):
+            self._warm_sam_model(target)
+            return
+        current = self.__dict__.get("_sam_download_job")
+        if current is not None and current.is_running:
+            self.update_status_bar("SAM 3 is already downloading from Hugging Face.")
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Download SAM 3",
+            "Download the official SAM 3 checkpoint (about 3.45 GB) into this project?\n\n"
+            "The model is gated. You must first accept its terms at\n"
+            f"{SAM3_MODEL_URL}\n"
+            "and sign in with `hf auth login` or HF_TOKEN.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._sam_download_result_path = ""
+        job = WorkerJobController(self)
+        self._sam_download_job = job
+        job.event_received.connect(self._sam3_download_event)
+        job.terminal.connect(self._sam3_download_finished)
+        started = job.start(
+            sys.executable,
+            [
+                "-m",
+                "squeakpose.workers.sam3_download",
+                "--destination",
+                self.project_root,
+            ],
+            working_directory=APP_BASE_DIR,
+            start_timeout_ms=3000,
+        )
+        if started:
+            self.update_status_bar("Downloading sam3.pt from Hugging Face (about 3.45 GB)…")
+        self._refresh_sam_controls()
+
+    def _sam3_download_event(self, event: dict) -> None:
+        if str(event.get("event") or "") == "result":
+            self._sam_download_result_path = str(event.get("model_path") or "")
+
+    def _sam3_download_finished(self, result: WorkerJobResult) -> None:
+        self._sam_download_job = None
+        target = os.path.abspath(
+            self.__dict__.pop("_sam_download_result_path", "")
+            or os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
+        )
+        if result.succeeded and os.path.isfile(target):
+            self.update_status_bar("Downloaded sam3.pt. Loading SAM 3…")
+            self._warm_sam_model(target)
+        elif result.state != "cancelled":
+            detail = result.stderr.strip() or result.error_message
+            QMessageBox.warning(
+                self,
+                "SAM 3 download failed",
+                sam3_download_error_message(detail),
+            )
+            self.update_status_bar("SAM 3 download failed.")
         self._refresh_sam_controls()
 
     def _draw_seg_prompt_marker(self, x: float, y: float, positive: bool):
@@ -3177,6 +3268,8 @@ class LabelingApp(QMainWindow):
         self.layer_visibility: dict[str, bool] = {layer_id: True for layer_id in LAYER_DEFINITIONS}
         self.predict_model_path: Optional[str] = None
         self.sam_model_path = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
+        self._sam_download_job: WorkerJobController | None = None
+        self._sam_download_result_path = ""
         self._sam_worker_model_path = ""
         self._sam_model_ready = False
         self._sam_model_loading = False
@@ -3313,6 +3406,9 @@ class LabelingApp(QMainWindow):
             process = getattr(session, "process", None) if session is not None else None
             if process is not None:
                 _shutdown_qprocess(process, terminate_timeout_ms=1000, kill_timeout_ms=1000)
+        sam_download_job = self.__dict__.get("_sam_download_job")
+        if sam_download_job is not None:
+            sam_download_job.shutdown(terminate_timeout_ms=1000, kill_timeout_ms=1000)
         self._restore_sam_wait_cursor()
         self._cleanup_prediction_depth_staging()
         self._project_lock.release()
@@ -3711,6 +3807,7 @@ class LabelingApp(QMainWindow):
         self.seg_tools_frame = SegmentationToolsPanel(
             callbacks=SegmentationToolsCallbacks(
                 load_model=self._load_sam_model_interactive,
+                download_model=self._download_sam3_from_hugging_face,
                 run=self._run_sam_segmentation,
                 accept=self._accept_segmentation_preview,
                 reset=self._clear_seg_prompt_state,
@@ -3720,6 +3817,7 @@ class LabelingApp(QMainWindow):
         )
         self.seg_brush_size_label = self.seg_tools_frame.brush_size_label
         self.sam_load_btn = self.seg_tools_frame.load_btn
+        self.sam_download_btn = self.seg_tools_frame.download_btn
         self.sam_run_btn = self.seg_tools_frame.run_btn
         self.sam_accept_btn = self.seg_tools_frame.accept_btn
         self.sam_clear_btn = self.seg_tools_frame.reset_btn

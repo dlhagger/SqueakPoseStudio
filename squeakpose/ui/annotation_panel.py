@@ -309,6 +309,7 @@ class AnnotationPanel(QFrame):
 @dataclass(frozen=True, slots=True)
 class SegmentationToolsCallbacks:
     load_model: Callable[[], None] = _ignore_action
+    download_model: Callable[[], None] = _ignore_action
     run: Callable[[], None] = _ignore_action
     accept: Callable[[], None] = _ignore_action
     reset: Callable[[], None] = _ignore_action
@@ -352,6 +353,10 @@ class SegmentationToolsPanel(QFrame):
             "Load SAM",
             tooltip="Load a SAM model file for segmentation prompts",
         )
+        self.download_btn = _panel_button(
+            "Download SAM 3",
+            tooltip="Download the official sam3.pt from Hugging Face into this project",
+        )
         self.run_btn = _panel_button(
             "Run (G)",
             tooltip="Run SAM using current positive/negative prompts",
@@ -367,6 +372,7 @@ class SegmentationToolsPanel(QFrame):
         )
         for button, callback in (
             (self.load_btn, self.callbacks.load_model),
+            (self.download_btn, self.callbacks.download_model),
             (self.run_btn, self.callbacks.run),
             (self.accept_btn, self.callbacks.accept),
             (self.reset_btn, self.callbacks.reset),
@@ -377,6 +383,7 @@ class SegmentationToolsPanel(QFrame):
         grid.addWidget(self.run_btn, 0, 1)
         grid.addWidget(self.accept_btn, 1, 0)
         grid.addWidget(self.reset_btn, 1, 1)
+        grid.addWidget(self.download_btn, 2, 0, 1, 2)
         layout.addLayout(grid)
         self.helper_label = QLabel("")
         self.helper_label.setWordWrap(True)
@@ -398,6 +405,7 @@ class SegmentationToolsPanel(QFrame):
     ) -> None:
         count = max(0, int(prompt_count))
         self.load_btn.setEnabled(not busy)
+        self.download_btn.setEnabled(not busy)
         self.run_btn.setEnabled(model_loaded and count > 0 and not busy)
         self.accept_btn.setEnabled(has_preview and not busy)
         self.reset_btn.setEnabled((count > 0 or has_preview) and not busy)

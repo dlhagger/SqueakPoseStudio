@@ -61,14 +61,6 @@ Launch the application:
 uv run python squeakpose_studio.py
 ```
 
-On Linux, optionally install a user-level application launcher and dock icon:
-
-```bash
-uv run python scripts/install_linux_desktop.py
-```
-
-Remove it with the same command plus `--uninstall`.
-
 This is a dependency-only uv project; the repository itself is run directly and
 is not installed as a Python package.
 
@@ -213,8 +205,9 @@ included in this repository.
 
 To use segmentation:
 
-1. Put a compatible `sam3*.pt` or `sam3*.pth` file in the project root, or
-   select one from the segmentation controls.
+1. Click **Download SAM 3** to fetch the official `facebook/sam3/sam3.pt`
+   checkpoint from Hugging Face, put a compatible `sam3*.pt` or `sam3*.pth`
+   file in the project root, or select one from the segmentation controls.
 2. Use left-click prompts for foreground and right-click prompts for
    background.
 3. Run SAM to generate a preview.
@@ -224,6 +217,9 @@ To use segmentation:
 The application automatically looks for SAM weights in the project root and
 prioritizes `sam3.pt`. Accepted polygons are written in YOLO segmentation
 format to `labels_seg_all/<image-stem>.txt`.
+
+The official checkpoint is gated. Accept its terms on Hugging Face and sign in
+with `hf auth login` (or set `HF_TOKEN`) before downloading it in the app.
 
 SAM model loading and prompt inference run in a persistent child process rather
 than the Qt process. The worker keeps one model warm, correlates replies to the

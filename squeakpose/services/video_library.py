@@ -65,7 +65,10 @@ def _legacy_macos_alias_target(videos_dir: str, path: str) -> str:
     filename = os.path.basename(recorded)
     if filename.casefold() != os.path.basename(path).casefold():
         return ""
-    import_root = Path(videos_dir).resolve().parent.parent
+    # Preserve the caller's absolute path spelling. On macOS, ``Path.resolve``
+    # rewrites /var to /private/var, which made an otherwise valid relocated
+    # alias differ from the rest of the library's abspath-based results.
+    import_root = Path(os.path.abspath(videos_dir)).parent.parent
     session_name = Path(recorded).parent.name
     direct = import_root / session_name / filename
     if direct.is_file():

@@ -75,6 +75,7 @@ class UiPanelTests(unittest.TestCase):
         panel = annotation_panel.SegmentationToolsPanel(
             callbacks=annotation_panel.SegmentationToolsCallbacks(
                 load_model=lambda: events.append("load"),
+                download_model=lambda: events.append("download"),
                 run=lambda: events.append("run"),
                 accept=lambda: events.append("accept"),
                 reset=lambda: events.append("reset"),
@@ -87,6 +88,7 @@ class UiPanelTests(unittest.TestCase):
         self.assertFalse(panel.run_btn.isEnabled())
         self.assertFalse(panel.accept_btn.isEnabled())
         panel.load_btn.click()
+        panel.download_btn.click()
 
         panel.set_state(model_loaded=True, prompt_count=2, has_preview=False)
         self.assertTrue(panel.run_btn.isEnabled())
@@ -97,7 +99,7 @@ class UiPanelTests(unittest.TestCase):
         self.assertTrue(panel.accept_btn.isEnabled())
         panel.accept_btn.click()
         panel.reset_btn.click()
-        self.assertEqual(events, ["load", "run", "accept", "reset"])
+        self.assertEqual(events, ["load", "download", "run", "accept", "reset"])
         panel.close()
 
     def test_operation_panels_preserve_layer_aware_controls_and_callbacks(self):

@@ -108,7 +108,9 @@ class ProjectLauncherDialog(QDialog):
 
         self.setWindowTitle("SqueakPose Studio")
         self.setModal(True)
+        self.setSizeGripEnabled(True)
         self.setMinimumSize(640, 500)
+        self.resize(720, 600)
         self.setStyleSheet(launcher_stylesheet())
 
         layout = QVBoxLayout(self)

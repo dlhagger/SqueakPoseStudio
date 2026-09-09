@@ -249,6 +249,7 @@ from squeakpose.ui.dialog_launch import (
 )
 from squeakpose.ui.distillation_dialog import DistillationDialog
 from squeakpose.ui.inference_controller import InferenceController
+from squeakpose.ui.inference_review_dialog import InferenceReviewDialog
 from squeakpose.ui.inference_video_dialog import InferenceVideoDialog
 from squeakpose.ui.navigation_panel import NavigationPanel, NavigationPanelCallbacks
 from squeakpose.ui.operation_panel import (
@@ -687,6 +688,9 @@ class CongratsPopup(QDialog):
         super().__init__()
         self.setWindowTitle("🎉 SqueakPose Studio")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(320, 240)
+        self.resize(420, 320)
 
         layout = QVBoxLayout()
         emoji = QLabel("🐭🧀🎉")
@@ -705,7 +709,6 @@ class CongratsPopup(QDialog):
         layout.addWidget(message)
         layout.addWidget(ok_btn)
         self.setLayout(layout)
-        self.setFixedSize(350, 300)
 
 
 # =========================
@@ -1998,6 +2001,11 @@ class LabelingApp(QMainWindow):
         QTimer.singleShot(200, self._launch_class_manager_initial)
 
     def _launch_class_manager_initial(self):
+        # ``QTimer.singleShot`` retains this bound method even if a project
+        # window is closed before the delayed setup prompt fires. Never open a
+        # modal dialog for a hidden or stale window.
+        if not self.isVisible():
+            return
         dlg = ClassManagerDialog(
             self.classes,
             self.class_keypoints,
@@ -3440,11 +3448,23 @@ class LabelingApp(QMainWindow):
             lambda: self.open_video_library(add_immediately=True)
         )
 
+        videos_menu.addSeparator()
+        self.inference_review_action = videos_menu.addAction("Review Inference Quality…")
+        self.inference_review_action.triggered.connect(self.open_inference_quality_review)
+
     def open_video_library(self, _checked: bool = False, *, add_immediately: bool = False):
         videos_dir = ProjectPaths.from_root(self.project_root).videos
         dialog = VideoLibraryDialog(videos_dir, self)
         if add_immediately:
             QTimer.singleShot(0, dialog.add_video_links)
+        dialog.exec()
+
+    def open_inference_quality_review(self, _checked: bool = False) -> None:
+        dialog = InferenceReviewDialog(
+            self.project_root,
+            self,
+            preferred_model_paths=getattr(self, "layer_model_paths", {}),
+        )
         dialog.exec()
 
     def _confirm_project_change(self, message: str) -> bool:

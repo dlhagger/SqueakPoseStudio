@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,6 +15,7 @@ import pandas as pd
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
+    AnalysisOutputTransaction,
     ProgressCallback,
     _draw_roi_overlays,
     _first_video_frame,
@@ -21,6 +23,7 @@ from analysis_ops import (
     _mm_per_pixel,
     _open_h264_video_writer,
     _progress,
+    _published_analysis_result,
     _setup_plotting,
     _smooth_centers,
     assign_roi_labels,
@@ -29,7 +32,6 @@ from analysis_ops import (
     draw_supersampled_polygon_overlay,
     export_cluster_clips,
     normalize_rois,
-    prepare_analysis_output_dir,
     run_behavior_clustering,
 )
 
@@ -837,7 +839,7 @@ def render_segmentation_annotated_video(
     return str(output_path)
 
 
-def run_segmentation_analysis_workflow(
+def _run_segmentation_analysis_workflow_unpublished(
     config: AnalysisConfig,
     progress_callback: ProgressCallback = None,
     *,
@@ -850,20 +852,6 @@ def run_segmentation_analysis_workflow(
 
     total_steps = 8
     output_dir = Path(config.output_dir)
-    prepare_analysis_output_dir(
-        output_dir,
-        generated_files=(
-            "analysis_features.csv",
-            "segmentation_detections.csv",
-            "analysis_summary.json",
-            "annotated_output.mp4",
-            "roi_summary.csv",
-            "roi_transition_matrix.csv",
-            "roi_time_seconds.png",
-            "roi_transition_matrix.png",
-        ),
-        generated_directories=("plots", "cluster_clips"),
-    )
 
     if raw is None:
         _progress(progress_callback, 1, total_steps, "Loading segmentation CSV")
@@ -966,3 +954,27 @@ def run_segmentation_analysis_workflow(
         "roi_transition_csv": roi_outputs.get("roi_transition_csv", ""),
         "roi_summary": roi_outputs.get("roi_summary", []),
     }
+
+
+def run_segmentation_analysis_workflow(
+    config: AnalysisConfig,
+    progress_callback: ProgressCallback = None,
+    *,
+    raw: Optional[pd.DataFrame] = None,
+) -> dict[str, Any]:
+    """Run segmentation analysis and publish its outputs on success."""
+    if not config.output_dir:
+        raise AnalysisError("Select an output directory.")
+    output_dir = Path(config.output_dir)
+    with AnalysisOutputTransaction(output_dir) as staging_dir:
+        staged_config = replace(config, output_dir=str(staging_dir))
+        result = _run_segmentation_analysis_workflow_unpublished(
+            staged_config,
+            progress_callback=progress_callback,
+            raw=raw,
+        )
+    return _published_analysis_result(
+        result,
+        staging_dir=staging_dir,
+        output_dir=output_dir,
+    )

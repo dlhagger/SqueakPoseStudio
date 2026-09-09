@@ -1,5 +1,8 @@
 import os
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -122,6 +125,37 @@ class AnalysisDialogInputTests(unittest.TestCase):
             text = dialog.summary_view.toPlainText()
             self.assertIn("Prediction QC: good=8, warning=2, bad=0", text)
             self.assertIn("extra_pose_detection=2", text)
+            dialog.close()
+
+    def test_start_analysis_reports_invalid_output_directory(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            invalid_parent = Path(tmp) / "not-a-directory"
+            invalid_parent.write_text("occupied", encoding="utf-8")
+            output_dir = invalid_parent / "analysis"
+            dialog = AnalysisDialog(
+                None,
+                project_root=tmp,
+                app_base_dir=tmp,
+                layer_id="keypoints",
+            )
+            dialog._validated_analysis_config = SimpleNamespace(
+                as_dict=lambda: {"output_dir": str(output_dir)}
+            )
+
+            with (
+                patch.object(dialog, "_validate_inputs", return_value=True),
+                patch("analysis_dialog.create_worker_config") as create_config,
+                patch("analysis_dialog.QMessageBox.warning") as warning,
+            ):
+                dialog._start_analysis()
+
+            create_config.assert_not_called()
+            warning.assert_called_once()
+            self.assertEqual(warning.call_args.args[1], "Analysis failed")
+            self.assertIn("analysis output directory", warning.call_args.args[2])
+            self.assertIsNone(dialog.analysis_controller)
             dialog.close()
 
     def test_project_video_selector_sets_both_video_and_inference_csv(self):

@@ -35,7 +35,9 @@ class ProjectModelsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Project Models")
-        self.setMinimumWidth(760)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(700, 300)
+        self.resize(980, 400)
         self._paths = {
             layer_id: str(model_paths.get(layer_id) or "")
             for layer_id in (LAYER_KEYPOINTS, LAYER_SEGMENTATION)

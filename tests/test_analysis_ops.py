@@ -12,6 +12,7 @@ import pandas as pd
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
+    AnalysisOutputTransaction,
     _open_h264_video_writer,
     assign_roi_labels,
     build_combined_analysis_outputs,
@@ -27,8 +28,9 @@ from segmentation_analysis_ops import (
     _mask_area_overlay_text,
     compute_segmentation_detection_features,
     render_segmentation_annotated_video,
+    run_segmentation_analysis_workflow,
 )
-from unified_analysis_ops import render_unified_annotated_video
+from unified_analysis_ops import render_unified_annotated_video, run_unified_analysis_workflow
 
 
 def _write_demo_detections(path: str) -> None:
@@ -226,6 +228,207 @@ class AnalysisOpsTests(unittest.TestCase):
             self.assertFalse((output / "analysis.csv").exists())
             self.assertFalse(plots.exists())
             self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_analysis_output_transaction_publishes_owned_artifacts_and_preserves_user_files(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp, "analysis")
+            (output / "plots").mkdir(parents=True)
+            (output / "analysis_features.csv").write_text("old", encoding="utf-8")
+            (output / "plots" / "stale.png").write_bytes(b"old plot")
+            (output / "research_notes.txt").write_text("keep", encoding="utf-8")
+
+            with AnalysisOutputTransaction(output) as staging:
+                self.assertEqual(
+                    (staging / "research_notes.txt").read_text(encoding="utf-8"),
+                    "keep",
+                )
+                (staging / "analysis_features.csv").write_text("new", encoding="utf-8")
+
+            self.assertEqual(
+                (output / "analysis_features.csv").read_text(encoding="utf-8"),
+                "new",
+            )
+            self.assertFalse((output / "plots").exists())
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_analysis_output_transaction_rolls_back_and_cleans_staging_on_failure(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp, "analysis")
+            output.mkdir()
+            (output / "analysis_features.csv").write_text("old", encoding="utf-8")
+            (output / "research_notes.txt").write_text("keep", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                with AnalysisOutputTransaction(output) as staging:
+                    (staging / "analysis_features.csv").write_text("new", encoding="utf-8")
+                    raise RuntimeError("injected failure")
+
+            self.assertEqual(
+                (output / "analysis_features.csv").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(Path(tmp).glob(".analysis.analysis-*.tmp")), [])
+
+    def test_analysis_output_transaction_preserves_symlinked_output_directory(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp, "real-analysis")
+            target.mkdir()
+            (target / "analysis_features.csv").write_text("old", encoding="utf-8")
+            (target / "research_notes.txt").write_text("keep", encoding="utf-8")
+            output_link = Path(tmp, "analysis-link")
+            output_link.symlink_to(target, target_is_directory=True)
+
+            with AnalysisOutputTransaction(output_link) as staging:
+                (staging / "analysis_features.csv").write_text("new", encoding="utf-8")
+
+            self.assertTrue(output_link.is_symlink())
+            self.assertEqual(output_link.resolve(), target.resolve())
+            self.assertEqual(
+                (target / "analysis_features.csv").read_text(encoding="utf-8"),
+                "new",
+            )
+            self.assertEqual((target / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_failed_pose_rerun_keeps_previous_successful_outputs(self):
+        with TemporaryDirectory() as tmp:
+            detections_csv = Path(tmp, "detections.csv")
+            output = Path(tmp, "analysis")
+            _write_demo_detections(str(detections_csv))
+            (output / "plots").mkdir(parents=True)
+            (output / "analysis_features.csv").write_text("previous", encoding="utf-8")
+            (output / "plots" / "previous.png").write_bytes(b"previous plot")
+            (output / "research_notes.txt").write_text("keep", encoding="utf-8")
+            config = AnalysisConfig(
+                detections_csv=str(detections_csv),
+                output_dir=str(output),
+                fps=10.0,
+                smooth=False,
+                make_plots=True,
+            )
+
+            with (
+                patch("analysis_ops.create_plots", side_effect=RuntimeError("injected failure")),
+                self.assertRaisesRegex(RuntimeError, "injected failure"),
+            ):
+                run_analysis_workflow(config)
+
+            self.assertEqual(
+                (output / "analysis_features.csv").read_text(encoding="utf-8"),
+                "previous",
+            )
+            self.assertEqual((output / "plots" / "previous.png").read_bytes(), b"previous plot")
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(Path(tmp).glob(".analysis.analysis-*.tmp")), [])
+
+            result = run_analysis_workflow(
+                AnalysisConfig(
+                    **{
+                        **config.__dict__,
+                        "make_plots": False,
+                    }
+                )
+            )
+            self.assertNotEqual(Path(result["feature_csv"]).read_text(encoding="utf-8"), "previous")
+            self.assertFalse((output / "plots").exists())
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_canceled_pose_rerun_keeps_previous_successful_outputs(self):
+        with TemporaryDirectory() as tmp:
+            detections_csv = Path(tmp, "detections.csv")
+            output = Path(tmp, "analysis")
+            _write_demo_detections(str(detections_csv))
+            output.mkdir()
+            (output / "analysis_features.csv").write_text("previous", encoding="utf-8")
+
+            def cancel_after_feature_write(step, _total, _message):
+                if step == 6:
+                    raise SystemExit(130)
+
+            with self.assertRaises(SystemExit):
+                run_analysis_workflow(
+                    AnalysisConfig(
+                        detections_csv=str(detections_csv),
+                        output_dir=str(output),
+                        fps=10.0,
+                        smooth=False,
+                        make_plots=True,
+                    ),
+                    progress_callback=cancel_after_feature_write,
+                )
+
+            self.assertEqual(
+                (output / "analysis_features.csv").read_text(encoding="utf-8"),
+                "previous",
+            )
+            self.assertEqual(list(Path(tmp).glob(".analysis.analysis-*.tmp")), [])
+
+    def test_failed_segmentation_rerun_keeps_previous_successful_outputs(self):
+        with TemporaryDirectory() as tmp:
+            detections_csv = Path(tmp, "segmentation.csv")
+            output = Path(tmp, "analysis")
+            _write_demo_segmentation(str(detections_csv))
+            output.mkdir()
+            (output / "segmentation_detections.csv").write_text("previous", encoding="utf-8")
+            (output / "research_notes.txt").write_text("keep", encoding="utf-8")
+            config = AnalysisConfig(
+                detections_csv=str(detections_csv),
+                output_dir=str(output),
+                fps=10.0,
+                smooth=False,
+                make_plots=True,
+            )
+
+            with (
+                patch(
+                    "segmentation_analysis_ops.create_segmentation_plots",
+                    side_effect=RuntimeError("injected failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected failure"),
+            ):
+                run_segmentation_analysis_workflow(config)
+
+            self.assertEqual(
+                (output / "segmentation_detections.csv").read_text(encoding="utf-8"),
+                "previous",
+            )
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(Path(tmp).glob(".analysis.analysis-*.tmp")), [])
+
+    def test_failed_unified_rerun_keeps_previous_successful_outputs(self):
+        with TemporaryDirectory() as tmp:
+            pose_csv = Path(tmp, "pose.csv")
+            segmentation_csv = Path(tmp, "segmentation.csv")
+            output = Path(tmp, "analysis")
+            _write_demo_detections(str(pose_csv))
+            _write_demo_segmentation(str(segmentation_csv))
+            output.mkdir()
+            (output / "analysis.csv").write_text("previous", encoding="utf-8")
+            (output / "research_notes.txt").write_text("keep", encoding="utf-8")
+            config = AnalysisConfig(
+                detections_csv=str(pose_csv),
+                output_dir=str(output),
+                fps=10.0,
+                smooth=False,
+                make_plots=True,
+            )
+
+            with (
+                patch(
+                    "unified_analysis_ops._create_unified_plots",
+                    side_effect=RuntimeError("injected failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected failure"),
+            ):
+                run_unified_analysis_workflow(
+                    config,
+                    pose_csv=str(pose_csv),
+                    segmentation_csv=str(segmentation_csv),
+                )
+
+            self.assertEqual((output / "analysis.csv").read_text(encoding="utf-8"), "previous")
+            self.assertEqual((output / "research_notes.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(Path(tmp).glob(".analysis.analysis-*.tmp")), [])
 
     def test_segmentation_geometry_uses_mask_bounds_and_retains_inference_box(self):
         raw = pd.DataFrame(

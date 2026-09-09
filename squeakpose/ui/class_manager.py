@@ -25,6 +25,9 @@ class AddClassDialog(QDialog):
     def __init__(self, existing_keypoints: list[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Class")
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(360, 300)
+        self.resize(520, 440)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -80,7 +83,9 @@ class ClassManagerDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Manage Classes & Keypoints")
-        self.resize(420, 480)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(420, 420)
+        self.resize(560, 600)
 
         self._classes = classes[:]
         self._kp_map = {name: keypoint_map.get(name, canonical[:])[:] for name in self._classes}

@@ -163,6 +163,10 @@ class MainWindowLifecycleTests(unittest.TestCase):
                         window.model_inference_title.text(),
                         "Project Models & Inference",
                     )
+                    self.assertEqual(
+                        window.inference_review_action.text(),
+                        "Review Inference Quality…",
+                    )
                     self.assertFalse(hasattr(window, "sam_model"))
                     self.assertIsInstance(
                         window._sam_assistant_controller,
@@ -227,6 +231,17 @@ class MainWindowLifecycleTests(unittest.TestCase):
                         self.qt_app.processEvents()
 
             self.assertFalse(lock_path.exists())
+
+    def test_deferred_class_setup_does_not_open_for_a_hidden_window(self):
+        window = studio.LabelingApp.__new__(studio.LabelingApp)
+        with (
+            patch.object(studio.LabelingApp, "isVisible", return_value=False),
+            patch(
+                "squeakpose.ui.main_window.ClassManagerDialog",
+                side_effect=AssertionError("hidden windows must not open setup dialogs"),
+            ),
+        ):
+            window._launch_class_manager_initial()
 
     def test_finished_progress_dialog_cannot_cancel_remaining_video_batch(self):
         callbacks = []

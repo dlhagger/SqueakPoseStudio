@@ -30,6 +30,7 @@ htmlcov/
 /*.pth
 /*.onnx
 /*.engine
+/weights/
 
 # App runtime data created when the repository root is used as a project
 /annotations/

@@ -125,6 +125,7 @@ class TrainDialog(QDialog):
         self.layer_id = normalize_layer_id(layer_id or default_task)
         self.layer = layer_definition(self.layer_id)
         self.setWindowTitle(f"Train {self.layer.display_name} Layer Model")
+        self.setSizeGripEnabled(True)
         self.resize(1100, 720)
         self.setMinimumSize(760, 520)
 

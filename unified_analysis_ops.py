@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +15,13 @@ import pandas as pd
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
+    AnalysisOutputTransaction,
     ProgressCallback,
     _infer_fps,
     _mm_per_pixel,
     _open_h264_video_writer,
     _progress,
+    _published_analysis_result,
     _read_video_metadata,
     _setup_plotting,
     _smooth_centers,
@@ -28,7 +31,6 @@ from analysis_ops import (
     draw_supersampled_polygon_overlay,
     export_cluster_clips,
     normalize_rois,
-    prepare_analysis_output_dir,
     run_behavior_clustering,
 )
 from segmentation_analysis_ops import _parse_polygon, compute_segmentation_detection_features
@@ -1394,11 +1396,12 @@ def render_unified_annotated_video(
     return str(output_path)
 
 
-def run_unified_analysis_workflow(
+def _run_unified_analysis_workflow_unpublished(
     config: AnalysisConfig,
     *,
     pose_csv: str,
     segmentation_csv: str,
+    published_output_dir: Path,
     progress_callback: ProgressCallback = None,
 ) -> dict[str, Any]:
     """Run both inference layers without producing intermediate layer analyses."""
@@ -1406,16 +1409,6 @@ def run_unified_analysis_workflow(
         if not path or not os.path.isfile(path):
             raise AnalysisError(f"Select a valid {label} inference CSV.")
     output_dir = Path(config.output_dir)
-    prepare_analysis_output_dir(
-        output_dir,
-        generated_files=(
-            "analysis.csv",
-            "summary.json",
-            "analysis_manifest.json",
-            "annotated_video.mp4",
-        ),
-        generated_directories=("tables", "plots", "clustering"),
-    )
     tables_dir = output_dir / "tables"
     plots_dir = output_dir / "plots"
     clustering_dir = output_dir / "clustering"
@@ -1591,7 +1584,7 @@ def run_unified_analysis_workflow(
     manifest = {
         "schema_version": 5,
         "analysis_kind": "pose_and_segmentation",
-        "authoritative_table": str(analysis_csv),
+        "authoritative_table": str(published_output_dir / "analysis.csv"),
         "video_path": os.path.abspath(video_path) if video_path else "",
         "pose_inference_csv": os.path.abspath(pose_csv),
         "segmentation_inference_csv": os.path.abspath(segmentation_csv),
@@ -1630,3 +1623,30 @@ def run_unified_analysis_workflow(
         "output_dir": str(output_dir),
         **roi_outputs,
     }
+
+
+def run_unified_analysis_workflow(
+    config: AnalysisConfig,
+    *,
+    pose_csv: str,
+    segmentation_csv: str,
+    progress_callback: ProgressCallback = None,
+) -> dict[str, Any]:
+    """Run combined analysis and publish its outputs on success."""
+    if not config.output_dir:
+        raise AnalysisError("Select an output directory.")
+    output_dir = Path(config.output_dir)
+    with AnalysisOutputTransaction(output_dir) as staging_dir:
+        staged_config = replace(config, output_dir=str(staging_dir))
+        result = _run_unified_analysis_workflow_unpublished(
+            staged_config,
+            pose_csv=pose_csv,
+            segmentation_csv=segmentation_csv,
+            published_output_dir=output_dir,
+            progress_callback=progress_callback,
+        )
+    return _published_analysis_result(
+        result,
+        staging_dir=staging_dir,
+        output_dir=output_dir,
+    )

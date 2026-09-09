@@ -192,6 +192,43 @@ class AnalysisServiceTests(unittest.TestCase):
 
             self.assertEqual(options[0].csv_path, str(csv_path))
 
+    def test_project_analysis_inputs_rejects_retargeted_same_name_video(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_dir = root / "original"
+            replacement_dir = root / "replacement"
+            original_dir.mkdir()
+            replacement_dir.mkdir()
+            original = original_dir / "session.mp4"
+            replacement = replacement_dir / "session.mp4"
+            original.write_bytes(b"original")
+            replacement.write_bytes(b"replacement")
+            videos = root / "videos"
+            videos.mkdir()
+            (videos / "session.mp4").symlink_to(replacement)
+            outputs = root / "inference outputs"
+            csv_path = outputs / "segmentation" / "old_segmentation.csv"
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text("frame,det,mask_polygon\n", encoding="utf-8")
+            runs = outputs / "runs"
+            runs.mkdir()
+            (runs / "old.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": str(original),
+                        "created_at": "2026-08-20T12:00:00",
+                        "passes": [{"layer_id": "segmentation", "csv_path": str(csv_path)}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            options = project_analysis_inputs(tmp, "segmentation")
+
+            self.assertEqual(len(options), 1)
+            self.assertEqual(options[0].video_path, str(videos / "session.mp4"))
+            self.assertFalse(options[0].inference_ready)
+
     def test_segmentation_preview_uses_first_frame_with_valid_masks(self):
         with TemporaryDirectory() as tmp:
             csv_path = Path(tmp, "segmentation.csv")

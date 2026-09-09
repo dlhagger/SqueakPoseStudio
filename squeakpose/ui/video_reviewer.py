@@ -185,6 +185,8 @@ class VideoReviewDialog(QDialog):
         else:
             layer_title = "Segmentation" if self._is_seg_workflow() else "Keypoints"
             self.setWindowTitle(f"Video Review ({layer_title} Layer)")
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(760, 560)
         self.resize(1080, 760)
 
         # runtime state

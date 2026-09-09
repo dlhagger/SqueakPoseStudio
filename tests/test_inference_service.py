@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from squeakpose.project.layers import LAYER_DEPTH, LAYER_KEYPOINTS, LAYER_SEGMENTATION
 from squeakpose.project.safety import ProjectPathError
+from squeakpose.services.analysis import project_analysis_inputs
 from squeakpose.services.inference import (
     InferenceRunAccumulator,
     aggregate_inference_result,
@@ -21,6 +22,51 @@ from squeakpose.services.inference import (
 
 
 class InferenceServiceTests(unittest.TestCase):
+    def test_plan_snapshots_symlink_target_and_retarget_does_not_reuse_output(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_dir = root / "original"
+            replacement_dir = root / "replacement"
+            original_dir.mkdir()
+            replacement_dir.mkdir()
+            original = original_dir / "session.mp4"
+            replacement = replacement_dir / "session.mp4"
+            original.write_bytes(b"original")
+            replacement.write_bytes(b"replacement")
+            videos = root / "videos"
+            videos.mkdir()
+            link = videos / "session.mp4"
+            link.symlink_to(original)
+
+            plan = plan_inference_run(
+                project_root=tmp,
+                video_path=str(link),
+                active_layer=LAYER_KEYPOINTS,
+                model_paths={LAYER_KEYPOINTS: "pose.pt"},
+                run_id="session-run",
+            )
+            self.assertEqual(plan.video_path, str(original))
+            self.assertEqual(plan.jobs[0].video_path, str(original))
+            prepare_inference_run(plan)
+            Path(plan.jobs[0].csv_path).write_text(
+                "frame_index,detection_index,model_path\n0,0,pose.pt\n",
+                encoding="utf-8",
+            )
+            accumulator = InferenceRunAccumulator(plan)
+            accumulator.record(plan.jobs[0], {"event": "result", "rows_written": 1})
+            summary = accumulator.finalize()
+            manifest = json.loads(Path(summary.manifest_path).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["video_path"], str(original))
+            self.assertIn(video_identity(str(link)), project_video_inference_statuses(tmp))
+
+            link.unlink()
+            link.symlink_to(replacement)
+
+            inputs = project_analysis_inputs(tmp, LAYER_KEYPOINTS)
+            self.assertEqual(len(inputs), 1)
+            self.assertEqual(inputs[0].video_path, str(link))
+            self.assertFalse(inputs[0].inference_ready)
+
     def test_project_video_statuses_combine_successful_layers_and_ignore_bad_manifests(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

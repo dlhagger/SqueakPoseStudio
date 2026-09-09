@@ -322,6 +322,10 @@ def plan_inference_run(
     root = os.path.abspath(project_root)
     if not str(video_path or ""):
         raise ValueError("video_path must not be empty")
+    # Project library entries are commonly symlinks. Snapshot their current
+    # target before planning so a later retarget cannot change the identity in
+    # the run manifest or make an already queued job process a different video.
+    source_video_path = os.path.realpath(os.path.abspath(os.fspath(video_path)))
     if int(batch_size) < 1:
         raise ValueError("batch_size must be at least 1")
     video_tracking = resolve_tracking_config(
@@ -390,7 +394,7 @@ def plan_inference_run(
                 layer_id=layer_id,
                 workflow=layer.worker_mode,
                 model_path=normalized_models[layer_id],
-                video_path=str(video_path),
+                video_path=source_video_path,
                 csv_path=csv_path,
                 preview_path=preview_path,
                 classes=classes,
@@ -415,7 +419,7 @@ def plan_inference_run(
         project_root=root,
         run_id=resolved_run_id,
         created_at=timestamp.isoformat(),
-        video_path=str(video_path),
+        video_path=source_video_path,
         manifest_path=manifest_path,
         jobs=tuple(jobs),
     )

@@ -1802,7 +1802,16 @@ class AnalysisDialog(QDialog):
             config = self._build_analysis_config()
         self._validated_analysis_config = None
         payload = config.as_dict()
-        os.makedirs(payload["output_dir"], exist_ok=True)
+        try:
+            os.makedirs(payload["output_dir"], exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Analysis failed",
+                "Could not create or access the analysis output directory. "
+                f"Check the path and its permissions.\n\n{exc}",
+            )
+            return
         try:
             self.analysis_config_path = create_worker_config(
                 self.project_root,

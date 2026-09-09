@@ -38,7 +38,9 @@ class VideoLibraryDialog(QDialog):
         super().__init__(parent)
         self.videos_dir = os.path.abspath(videos_dir)
         self.setWindowTitle("Project Videos")
-        self.setMinimumSize(720, 420)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(620, 360)
+        self.resize(900, 560)
 
         layout = QVBoxLayout(self)
         intro = QLabel(

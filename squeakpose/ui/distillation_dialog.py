@@ -113,6 +113,7 @@ class DistillationDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("DINO Distillation")
+        self.setSizeGripEnabled(True)
         self.resize(1050, 760)
         self.setMinimumSize(780, 560)
 

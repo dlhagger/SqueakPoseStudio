@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -22,6 +22,27 @@ from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION, norma
 from squeakpose.services.analysis import DEFAULT_ONE_EURO_BETA, DEFAULT_ONE_EURO_MIN_CUTOFF
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
+
+ANALYSIS_GENERATED_FILES = (
+    "analysis.csv",
+    "analysis_features.csv",
+    "segmentation_detections.csv",
+    "analysis_summary.json",
+    "summary.json",
+    "analysis_manifest.json",
+    "annotated_output.mp4",
+    "annotated_video.mp4",
+    "roi_summary.csv",
+    "roi_transition_matrix.csv",
+    "roi_time_seconds.png",
+    "roi_transition_matrix.png",
+)
+ANALYSIS_GENERATED_DIRECTORIES = (
+    "plots",
+    "tables",
+    "clustering",
+    "cluster_clips",
+)
 
 
 def prepare_analysis_output_dir(
@@ -40,6 +61,125 @@ def prepare_analysis_output_dir(
 
 class AnalysisError(RuntimeError):
     """Raised when an analysis workflow cannot be completed."""
+
+
+class AnalysisOutputTransaction:
+    """Build an analysis in a sibling directory and publish it on success.
+
+    Existing entries that are not owned by the application are copied into the
+    staged directory. Publishing can therefore replace the complete output
+    directory atomically without discarding user-created files.
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        generated_files: tuple[str, ...] = ANALYSIS_GENERATED_FILES,
+        generated_directories: tuple[str, ...] = ANALYSIS_GENERATED_DIRECTORIES,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        if self.output_dir.is_symlink():
+            if not self.output_dir.exists() or not self.output_dir.is_dir():
+                raise AnalysisError(
+                    f"Analysis output symlink does not target a directory: {self.output_dir}"
+                )
+            self._publish_dir = self.output_dir.resolve()
+        else:
+            self._publish_dir = self.output_dir
+        self._owned_names = frozenset((*generated_files, *generated_directories))
+        self.staging_dir: Optional[Path] = None
+        for name in self._owned_names:
+            if not name or Path(name).name != name:
+                raise AnalysisError(f"Unsafe generated analysis artifact name: {name!r}")
+
+    def __enter__(self) -> Path:
+        parent = self._publish_dir.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{self._publish_dir.name}.analysis-",
+                suffix=".tmp",
+                dir=parent,
+            )
+        )
+        self.staging_dir = staging_dir
+        try:
+            if self._publish_dir.exists():
+                if not self._publish_dir.is_dir():
+                    raise AnalysisError(
+                        f"Analysis output path is not a directory: {self.output_dir}"
+                    )
+                for source in self._publish_dir.iterdir():
+                    if source.name in self._owned_names:
+                        continue
+                    destination = staging_dir / source.name
+                    if source.is_symlink():
+                        destination.symlink_to(
+                            os.readlink(source), target_is_directory=source.is_dir()
+                        )
+                    elif source.is_dir():
+                        shutil.copytree(source, destination, symlinks=True)
+                    else:
+                        shutil.copy2(source, destination)
+            return staging_dir
+        except BaseException:
+            remove_path(str(staging_dir))
+            self.staging_dir = None
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        staging_dir = self.staging_dir
+        if staging_dir is None:
+            return False
+        if exc_type is not None:
+            remove_path(str(staging_dir))
+            self.staging_dir = None
+            return False
+        try:
+            commit_staged_paths([(str(staging_dir), str(self._publish_dir))])
+        finally:
+            if staging_dir.exists():
+                remove_path(str(staging_dir))
+            self.staging_dir = None
+        return False
+
+
+def _published_analysis_result(
+    value: Any,
+    *,
+    staging_dir: Path,
+    output_dir: Path,
+) -> Any:
+    """Rewrite staged result paths to their stable, published locations."""
+    if isinstance(value, dict):
+        return {
+            key: _published_analysis_result(
+                item,
+                staging_dir=staging_dir,
+                output_dir=output_dir,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _published_analysis_result(item, staging_dir=staging_dir, output_dir=output_dir)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _published_analysis_result(item, staging_dir=staging_dir, output_dir=output_dir)
+            for item in value
+        )
+    if not isinstance(value, str):
+        return value
+    staging_text = str(staging_dir)
+    if value == staging_text:
+        return str(output_dir)
+    prefix = f"{staging_text}{os.sep}"
+    if value.startswith(prefix):
+        return str(output_dir / value[len(prefix) :])
+    return value
 
 
 @dataclass
@@ -1880,7 +2020,7 @@ def export_cluster_clips(
     return paths
 
 
-def run_analysis_workflow(
+def _run_analysis_workflow_unpublished(
     config: AnalysisConfig, progress_callback: ProgressCallback = None
 ) -> dict[str, Any]:
     if not config.detections_csv or not os.path.isfile(config.detections_csv):
@@ -1890,25 +2030,12 @@ def run_analysis_workflow(
 
     total_steps = 8
     output_dir = Path(config.output_dir)
-    prepare_analysis_output_dir(
-        output_dir,
-        generated_files=(
-            "analysis_features.csv",
-            "analysis_summary.json",
-            "annotated_output.mp4",
-            "roi_summary.csv",
-            "roi_transition_matrix.csv",
-            "roi_time_seconds.png",
-            "roi_transition_matrix.png",
-        ),
-        generated_directories=("plots", "cluster_clips"),
-    )
 
     _progress(progress_callback, 1, total_steps, "Loading detections CSV")
     raw = pd.read_csv(config.detections_csv).dropna(axis=1, how="all")
     from segmentation_analysis_ops import (
+        _run_segmentation_analysis_workflow_unpublished,
         is_segmentation_inference_csv,
-        run_segmentation_analysis_workflow,
     )
 
     detected_layer = LAYER_SEGMENTATION if is_segmentation_inference_csv(raw) else LAYER_KEYPOINTS
@@ -1918,7 +2045,7 @@ def run_analysis_workflow(
             f"but this analysis was opened for the {config.layer_id} layer."
         )
     if detected_layer == LAYER_SEGMENTATION:
-        result = run_segmentation_analysis_workflow(
+        result = _run_segmentation_analysis_workflow_unpublished(
             config, progress_callback=progress_callback, raw=raw
         )
         result["layer_id"] = detected_layer
@@ -2016,3 +2143,23 @@ def run_analysis_workflow(
         "roi_transition_csv": roi_outputs.get("roi_transition_csv", ""),
         "roi_summary": roi_outputs.get("roi_summary", []),
     }
+
+
+def run_analysis_workflow(
+    config: AnalysisConfig, progress_callback: ProgressCallback = None
+) -> dict[str, Any]:
+    """Run pose or segmentation analysis and publish its outputs on success."""
+    if not config.output_dir:
+        raise AnalysisError("Select an output directory.")
+    output_dir = Path(config.output_dir)
+    with AnalysisOutputTransaction(output_dir) as staging_dir:
+        staged_config = replace(config, output_dir=str(staging_dir))
+        result = _run_analysis_workflow_unpublished(
+            staged_config,
+            progress_callback=progress_callback,
+        )
+    return _published_analysis_result(
+        result,
+        staging_dir=staging_dir,
+        output_dir=output_dir,
+    )

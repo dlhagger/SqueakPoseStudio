@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -18,6 +19,22 @@ from squeakpose.project.paths import (
 )
 from squeakpose.project.safety import ProjectPathError
 from squeakpose.ui.style import app_stylesheet
+
+logger = logging.getLogger(__name__)
+
+
+def _save_last_project_best_effort(project_root: str) -> bool:
+    """Remember *project_root* without making optional state block startup."""
+    try:
+        save_last_project(project_root)
+    except OSError:
+        logger.warning(
+            "Could not save the last-opened project; continuing to open %s",
+            project_root,
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -71,7 +88,7 @@ def run(argv: list[str] | None = None) -> int:
             f"The selected project contains an unsafe or unavailable managed path.\n\n{exc}",
         )
         return 1
-    save_last_project(project_root)
+    _save_last_project_best_effort(project_root)
     force_initial_setup = launcher.selection_mode == "create"
 
     splash_pix = QPixmap(os.path.join(app_base, "squeakpose_studio_logo.png"))

@@ -40,6 +40,7 @@ class ProjectVideoPickerDialog(QDialog):
         self._selected_names = {str(name) for name in selected_names}
 
         self.setWindowTitle(title)
+        self.setSizeGripEnabled(True)
         self.setMinimumSize(760, 440)
         self.resize(920, 540)
 

@@ -95,6 +95,8 @@ class ProjectAnalysisInput:
     video_path: str
     csv_path: str = ""
     created_at: str = ""
+    model_path: str = ""
+    run_id: str = ""
 
     @property
     def inference_ready(self) -> bool:
@@ -161,8 +163,58 @@ def _relocated_inference_csv(inference_root: str, recorded_path: str, layer_id: 
     return relocated if os.path.isfile(relocated) else ""
 
 
-def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAnalysisInput, ...]:
-    """Pair project-library videos with their newest successful layer inference output."""
+@dataclass(frozen=True, slots=True)
+class _ManifestAnalysisInput:
+    video_path: str
+    csv_path: str
+    created_at: str
+    modified: float
+    model_path: str
+    run_id: str
+    source_exists: bool
+
+    @property
+    def sort_key(self) -> tuple[str, float, str]:
+        return (self.created_at, self.modified, self.csv_path)
+
+
+def _manifest_video_path(project_root: str, recorded_path: str) -> str:
+    raw = str(recorded_path or "").strip()
+    if not raw:
+        return ""
+    if os.path.isabs(raw):
+        return os.path.abspath(raw)
+    return os.path.abspath(os.path.join(project_root, raw))
+
+
+def _analysis_csv_model_path(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            row = next(csv.DictReader(handle), {})
+    except (OSError, csv.Error):
+        return ""
+    return str(row.get("model_path") or "").strip()
+
+
+def _model_identity(path: str) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    return os.path.normcase(os.path.realpath(os.path.abspath(raw)))
+
+
+def project_analysis_inputs(
+    project_root: str,
+    layer_id: str,
+    *,
+    newest_per_model: bool = False,
+) -> tuple[ProjectAnalysisInput, ...]:
+    """Pair project videos with successful layer inference outputs.
+
+    By default this retains the historical analysis behavior of returning only the
+    newest output for each video. ``newest_per_model`` returns the newest output in
+    every distinct model group, which is used by inference quality review.
+    """
     root = os.path.abspath(project_root)
     normalized_layer = normalize_layer_id(layer_id)
     inference_root = os.path.join(root, "inference outputs")
@@ -170,8 +222,7 @@ def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAn
         entry for entry in list_project_videos(os.path.join(root, "videos")) if entry.target_exists
     ]
     runs_dir = os.path.join(root, "inference outputs", "runs")
-    newest_by_identity: dict[str, tuple[str, float, str]] = {}
-    newest_by_name: dict[str, tuple[str, float, str]] = {}
+    manifest_inputs: list[_ManifestAnalysisInput] = []
     try:
         manifest_names = os.listdir(runs_dir)
     except OSError:
@@ -185,11 +236,11 @@ def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAn
             modified = os.path.getmtime(manifest_path)
         except (JsonFileError, OSError):
             continue
-        video_path = str(manifest.get("video_path") or "").strip()
+        video_path = _manifest_video_path(root, str(manifest.get("video_path") or ""))
         passes = manifest.get("passes")
         if not video_path or not isinstance(passes, list):
             continue
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
         for item in passes:
             if not isinstance(item, Mapping):
                 continue
@@ -202,30 +253,63 @@ def project_analysis_inputs(project_root: str, layer_id: str) -> tuple[ProjectAn
                 inference_root, str(item.get("csv_path") or ""), normalized_layer
             )
             if csv_path and analysis_csv_matches_layer(csv_path, normalized_layer):
-                candidates.append(csv_path)
+                model_path = str(item.get("model_path") or "").strip()
+                candidates.append((csv_path, model_path or _analysis_csv_model_path(csv_path)))
         if not candidates:
             continue
         created_at = str(manifest.get("created_at") or "")
-        manifest_record = (created_at, modified, candidates[-1])
-        identity = _video_identity(video_path)
-        if manifest_record[:2] >= newest_by_identity.get(identity, ("", -1.0, ""))[:2]:
-            newest_by_identity[identity] = manifest_record
-        video_name = os.path.basename(video_path).casefold()
-        if manifest_record[:2] >= newest_by_name.get(video_name, ("", -1.0, ""))[:2]:
-            newest_by_name[video_name] = manifest_record
+        run_id = str(manifest.get("run_id") or Path(name).stem).strip()
+        for csv_path, model_path in candidates:
+            manifest_inputs.append(
+                _ManifestAnalysisInput(
+                    video_path=video_path,
+                    csv_path=csv_path,
+                    created_at=created_at,
+                    modified=modified,
+                    model_path=model_path,
+                    run_id=run_id,
+                    source_exists=os.path.exists(video_path),
+                )
+            )
 
     options: list[ProjectAnalysisInput] = []
     for entry in videos:
-        selected_record = newest_by_identity.get(_video_identity(entry.path))
-        if selected_record is None:
-            selected_record = newest_by_name.get(entry.name.casefold())
-        options.append(
+        video_identity = _video_identity(entry.path)
+        matching = [
+            item for item in manifest_inputs if _video_identity(item.video_path) == video_identity
+        ]
+        if not matching:
+            # Legacy manifests used absolute paths, so a moved project needs a
+            # filename fallback. If the recorded source still exists, however,
+            # this is a retargeted or unrelated same-name video and must not match.
+            matching = [
+                item
+                for item in manifest_inputs
+                if not item.source_exists
+                and os.path.basename(item.video_path).casefold() == entry.name.casefold()
+            ]
+        if newest_per_model:
+            newest: dict[str, _ManifestAnalysisInput] = {}
+            for item in matching:
+                key = _model_identity(item.model_path)
+                if item.sort_key >= newest.get(key, item).sort_key:
+                    newest[key] = item
+            selected = sorted(newest.values(), key=lambda item: item.model_path.casefold())
+        else:
+            selected = [max(matching, key=lambda item: item.sort_key)] if matching else []
+        if not selected:
+            options.append(ProjectAnalysisInput(video_name=entry.name, video_path=entry.path))
+            continue
+        options.extend(
             ProjectAnalysisInput(
                 video_name=entry.name,
                 video_path=entry.path,
-                csv_path=selected_record[2] if selected_record else "",
-                created_at=selected_record[0] if selected_record else "",
+                csv_path=item.csv_path,
+                created_at=item.created_at,
+                model_path=item.model_path,
+                run_id=item.run_id,
             )
+            for item in selected
         )
     return tuple(options)
 

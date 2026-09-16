@@ -370,6 +370,39 @@ class InferenceReviewServiceTests(unittest.TestCase):
             )
             self.assertEqual(lowest_detection[0].detection_confidence, 0.0)
 
+    def test_non_utf8_source_is_reported_without_aborting_other_videos(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            videos = project / "videos"
+            videos.mkdir()
+            good_video = videos / "good.mp4"
+            bad_video = videos / "bad.mp4"
+            good_video.write_bytes(b"video")
+            bad_video.write_bytes(b"video")
+            _write_output(
+                project,
+                good_video.name,
+                LAYER_KEYPOINTS,
+                [_pose_row(0)],
+                run_id="good-run",
+                recorded_video_path=str(good_video),
+            )
+            bad_csv = _write_output(
+                project,
+                bad_video.name,
+                LAYER_KEYPOINTS,
+                [_pose_row(0)],
+                run_id="bad-run",
+                recorded_video_path=str(bad_video),
+            )
+            bad_csv.write_bytes(b"frame_index,confidence\n0,\xff\n")
+
+            result = scan_project_inference_quality(str(project), layer_id=LAYER_KEYPOINTS)
+
+            self.assertEqual(result.videos_with_inference, 1)
+            self.assertEqual(result.frames_scanned, 1)
+            self.assertTrue(any("bad.mp4" in issue for issue in result.issues))
+
 
 if __name__ == "__main__":
     unittest.main()

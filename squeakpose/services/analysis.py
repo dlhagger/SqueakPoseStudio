@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import json
 import math
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from squeakpose.core import atomic_write_text
 from squeakpose.json_io import JsonFileError, read_json_file
 from squeakpose.project.layers import (
     LAYER_DEFINITIONS,
@@ -134,6 +137,39 @@ class ProjectAnalysisBundle:
     def csv_for_layer(self, layer_id: str) -> str:
         normalized = normalize_layer_id(layer_id)
         return self.keypoints_csv if normalized == LAYER_KEYPOINTS else self.segmentation_csv
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectVideoAnalysisStatus:
+    """Completed project-managed analysis outputs for one video."""
+
+    video_name: str
+    keypoints_analyzed: bool = False
+    segmentation_analyzed: bool = False
+    combined_analyzed: bool = False
+
+    @property
+    def any_analyzed(self) -> bool:
+        return self.keypoints_analyzed or self.segmentation_analyzed
+
+    @property
+    def analyzed_layers(self) -> tuple[str, ...]:
+        layers: list[str] = []
+        if self.keypoints_analyzed:
+            layers.append(LAYER_KEYPOINTS)
+        if self.segmentation_analyzed:
+            layers.append(LAYER_SEGMENTATION)
+        return tuple(layers)
+
+    @property
+    def label(self) -> str:
+        if self.keypoints_analyzed and self.segmentation_analyzed:
+            return "Both"
+        if self.keypoints_analyzed:
+            return "Pose"
+        if self.segmentation_analyzed:
+            return "Segmentation"
+        return "Not analyzed"
 
 
 def _video_identity(path: str) -> str:
@@ -403,6 +439,13 @@ def safe_analysis_stem(path: str) -> str:
     return cleaned or "analysis"
 
 
+def analysis_video_output_key(path: str) -> str:
+    """Return a portable, collision-resistant output directory name."""
+    name = Path(path).name if path else "analysis"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{safe_analysis_stem(path)}--{digest}"
+
+
 def default_analysis_output_dir(
     project_root: str,
     layer_id: str,
@@ -411,7 +454,7 @@ def default_analysis_output_dir(
     video_name: str = "",
 ) -> str:
     source_video = video_name or _existing_manifest_video_path(csv_path)
-    video_stem = safe_analysis_stem(source_video or csv_path)
+    video_stem = analysis_video_output_key(source_video or csv_path)
     return os.path.join(
         os.path.abspath(project_root),
         "analysis outputs",
@@ -428,19 +471,216 @@ def default_combined_analysis_output_dir(
     return os.path.join(
         os.path.abspath(project_root),
         "analysis outputs",
-        safe_analysis_stem(video_name),
+        analysis_video_output_key(video_name),
         "combined",
     )
+
+
+def _recorded_video_matches(
+    recorded_video: object,
+    *,
+    expected_video_path: str,
+    video_name: str,
+) -> bool:
+    recorded = str(recorded_video or "").strip()
+    if not recorded:
+        return False
+    if _video_identity(recorded) == _video_identity(expected_video_path):
+        return True
+    return not os.path.exists(recorded) and Path(recorded).name.casefold() == video_name.casefold()
+
+
+def _completed_layer_analysis(
+    output_dir: Path,
+    layer_id: str,
+    *,
+    expected_video_path: str,
+    video_name: str,
+) -> bool:
+    feature_path = output_dir / "analysis_features.csv"
+    summary_path = output_dir / "analysis_summary.json"
+    if not feature_path.is_file() or not summary_path.is_file():
+        return False
+    try:
+        summary = read_json_file(str(summary_path), max_bytes=1024 * 1024, require_object=True)
+    except JsonFileError:
+        return False
+    return normalize_layer_id(summary.get("layer_id"), default="") == layer_id and (
+        _recorded_video_matches(
+            summary.get("video_path"),
+            expected_video_path=expected_video_path,
+            video_name=video_name,
+        )
+    )
+
+
+def _completed_combined_analysis(
+    output_dir: Path,
+    *,
+    expected_video_path: str,
+    video_name: str,
+) -> bool:
+    manifest_path = output_dir / "analysis_manifest.json"
+    summary_path = output_dir / "summary.json"
+    if not all(
+        path.is_file() for path in (output_dir / "analysis.csv", summary_path, manifest_path)
+    ):
+        return False
+    try:
+        manifest = read_json_file(str(manifest_path), max_bytes=1024 * 1024, require_object=True)
+        summary = read_json_file(str(summary_path), max_bytes=1024 * 1024, require_object=True)
+    except JsonFileError:
+        return False
+    recorded_video = manifest.get("video_path") or summary.get("video_path")
+    return manifest.get("analysis_kind") == "pose_and_segmentation" and _recorded_video_matches(
+        recorded_video,
+        expected_video_path=expected_video_path,
+        video_name=video_name,
+    )
+
+
+def _analysis_status_for_output_dir(
+    output_dir: Path,
+    *,
+    video_name: str,
+    expected_video_path: str,
+) -> ProjectVideoAnalysisStatus:
+    combined = _completed_combined_analysis(
+        output_dir,
+        expected_video_path=expected_video_path,
+        video_name=video_name,
+    )
+    return ProjectVideoAnalysisStatus(
+        video_name=video_name,
+        keypoints_analyzed=combined
+        or _completed_layer_analysis(
+            output_dir,
+            LAYER_KEYPOINTS,
+            expected_video_path=expected_video_path,
+            video_name=video_name,
+        ),
+        segmentation_analyzed=combined
+        or _completed_layer_analysis(
+            output_dir,
+            LAYER_SEGMENTATION,
+            expected_video_path=expected_video_path,
+            video_name=video_name,
+        ),
+        combined_analyzed=combined,
+    )
+
+
+def _merge_analysis_status(
+    first: ProjectVideoAnalysisStatus,
+    second: ProjectVideoAnalysisStatus,
+) -> ProjectVideoAnalysisStatus:
+    return ProjectVideoAnalysisStatus(
+        video_name=first.video_name,
+        keypoints_analyzed=first.keypoints_analyzed or second.keypoints_analyzed,
+        segmentation_analyzed=first.segmentation_analyzed or second.segmentation_analyzed,
+        combined_analyzed=first.combined_analyzed or second.combined_analyzed,
+    )
+
+
+def _analysis_output_locations_path(project_root: str) -> Path:
+    return Path(project_root).absolute() / "analysis settings" / "output_locations.json"
+
+
+def _registered_analysis_output_dirs(project_root: str, video_name: str) -> tuple[Path, ...]:
+    path = _analysis_output_locations_path(project_root)
+    try:
+        payload = read_json_file(str(path), max_bytes=1024 * 1024, require_object=True)
+    except JsonFileError:
+        return ()
+    videos = payload.get("videos")
+    raw_locations = videos.get(video_name, []) if isinstance(videos, Mapping) else []
+    if not isinstance(raw_locations, list):
+        return ()
+    return tuple(Path(str(value)).absolute() for value in raw_locations if str(value).strip())
+
+
+def record_project_video_analysis_output(
+    project_root: str,
+    video_name: str,
+    output_dir: str,
+) -> None:
+    """Persist a successful custom output location for completion discovery."""
+    path = _analysis_output_locations_path(project_root)
+    try:
+        payload = read_json_file(str(path), max_bytes=1024 * 1024, require_object=True)
+    except JsonFileError:
+        payload = {}
+    videos = payload.get("videos")
+    if not isinstance(videos, dict):
+        videos = {}
+    locations = videos.get(video_name)
+    if not isinstance(locations, list):
+        locations = []
+    normalized = os.path.abspath(output_dir)
+    clean_locations = [str(value) for value in locations if str(value).strip()]
+    if normalized not in clean_locations:
+        clean_locations.append(normalized)
+    videos[video_name] = clean_locations[-20:]
+    payload.update({"schema_version": 1, "videos": videos})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(str(path), json.dumps(payload, indent=2, sort_keys=True))
+
+
+def project_video_analysis_status(
+    project_root: str,
+    video_name: str,
+) -> ProjectVideoAnalysisStatus:
+    """Inspect stable per-video outputs without trusting directory presence alone."""
+    root = Path(project_root).absolute()
+    expected_video_path = str(root / "videos" / video_name)
+    status = ProjectVideoAnalysisStatus(video_name=video_name)
+    video_roots = (
+        root / "analysis outputs" / analysis_video_output_key(video_name),
+        root / "analysis outputs" / safe_analysis_stem(video_name),
+    )
+    for video_root in dict.fromkeys(video_roots):
+        for output_dir in (
+            video_root / "combined",
+            video_root / LAYER_KEYPOINTS,
+            video_root / LAYER_SEGMENTATION,
+        ):
+            status = _merge_analysis_status(
+                status,
+                _analysis_status_for_output_dir(
+                    output_dir,
+                    video_name=video_name,
+                    expected_video_path=expected_video_path,
+                ),
+            )
+    for output_dir in _registered_analysis_output_dirs(project_root, video_name):
+        status = _merge_analysis_status(
+            status,
+            _analysis_status_for_output_dir(
+                output_dir,
+                video_name=video_name,
+                expected_video_path=expected_video_path,
+            ),
+        )
+    return status
 
 
 def analysis_csv_matches_layer(path: str, layer_id: str) -> bool:
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
             fieldnames = set(next(csv.reader(handle), []))
-    except (OSError, csv.Error):
+    except (OSError, UnicodeError, csv.Error):
         return False
-    is_segmentation = {"frame", "det", "mask_polygon"}.issubset(fieldnames)
-    return is_segmentation == (layer_id == "segmentation")
+    has_frame = bool({"frame", "frame_index"} & fieldnames)
+    is_segmentation = has_frame and {"det", "mask_polygon"}.issubset(fieldnames)
+    if normalize_layer_id(layer_id) == LAYER_SEGMENTATION:
+        return is_segmentation
+    has_bbox = {"bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"}.issubset(fieldnames)
+    has_legacy_point = {"x", "y"}.issubset(fieldnames)
+    has_keypoints = any(
+        field.startswith("kp_") and field.endswith("_x") and f"{field[:-2]}_y" in fieldnames
+        for field in fieldnames
+    )
+    return has_frame and not is_segmentation and (has_bbox or has_legacy_point or has_keypoints)
 
 
 def inspect_analysis_csv(path: str, *, row_limit: int = 1000) -> AnalysisCsvContext:
@@ -656,8 +896,41 @@ def latest_analysis_csv(directories: Iterable[str], layer_id: str) -> str:
         return ""
 
 
+def validate_analysis_output_dir(output_dir: str, *, project_root: str = "") -> str:
+    raw = str(output_dir or "").strip()
+    if not raw:
+        raise AnalysisConfigError(
+            "output_required",
+            "Output folder required",
+            "Select a dedicated analysis output folder.",
+        )
+    candidate = os.path.normcase(os.path.realpath(os.path.abspath(raw)))
+    protected = {
+        os.path.normcase(os.path.realpath(os.path.abspath(os.sep))),
+        os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser("~")))),
+        os.path.normcase(os.path.realpath(os.path.abspath(os.getcwd()))),
+        os.path.normcase(os.path.realpath(os.path.abspath(tempfile.gettempdir()))),
+    }
+    if project_root:
+        protected.add(os.path.normcase(os.path.realpath(os.path.abspath(project_root))))
+    for protected_path in protected:
+        try:
+            contains_protected = os.path.commonpath((candidate, protected_path)) == candidate
+        except ValueError:
+            contains_protected = False
+        if contains_protected:
+            raise AnalysisConfigError(
+                "unsafe_output",
+                "Unsafe output folder",
+                "Choose a dedicated analysis folder, not the project, working, home, temporary, "
+                "or filesystem root directory.",
+            )
+    return os.path.abspath(raw)
+
+
 def build_analysis_run_config(
     *,
+    project_root: str = "",
     layer_id: str,
     detections_csv: str,
     video_path: str,
@@ -707,11 +980,13 @@ def build_analysis_run_config(
             "Enable UMAP/HDBSCAN before exporting cluster clips.",
         )
 
+    clean_output_dir = validate_analysis_output_dir(output_dir, project_root=project_root)
     payload = {
+        "project_root": os.path.abspath(project_root) if project_root else "",
         "layer_id": layer_id,
         "detections_csv": csv_path,
         "video_path": clean_video_path,
-        "output_dir": str(output_dir).strip(),
+        "output_dir": clean_output_dir,
         "fps": 0.0,
         "pixel_distance": float(pixel_distance),
         "real_world_distance_mm": float(real_world_distance_mm),
@@ -738,6 +1013,7 @@ def build_analysis_run_config(
 
 def build_analysis_job_config(
     *,
+    project_root: str = "",
     analysis_mode: str,
     analysis_inputs: Mapping[str, str],
     video_path: str,
@@ -792,6 +1068,7 @@ def build_analysis_job_config(
 
     first_layer = selected_layers[0]
     base = build_analysis_run_config(
+        project_root=project_root,
         layer_id=first_layer,
         detections_csv=normalized_inputs[first_layer],
         video_path=video_path,

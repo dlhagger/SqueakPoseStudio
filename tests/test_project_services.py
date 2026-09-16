@@ -42,8 +42,8 @@ class ProjectPathTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(paths.analysis_outputs))
             self.assertTrue(os.path.isdir(paths.analysis_settings))
             self.assertTrue(os.path.isdir(paths.analysis_video_settings))
-            self.assertTrue(os.path.isdir(paths.analysis_keypoints))
-            self.assertTrue(os.path.isdir(paths.analysis_segmentation))
+            self.assertFalse(os.path.exists(paths.analysis_keypoints))
+            self.assertFalse(os.path.exists(paths.analysis_segmentation))
             self.assertTrue(os.path.isdir(paths.inference_keypoints))
             self.assertTrue(os.path.isdir(paths.inference_segmentation))
             self.assertTrue(os.path.isdir(paths.annotations_keypoints))
@@ -51,7 +51,7 @@ class ProjectPathTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(paths.depth_images))
             self.assertTrue(os.path.isdir(paths.depth_previews))
             self.assertTrue(os.path.isdir(paths.inference_depth))
-            self.assertTrue(os.path.isdir(paths.analysis_depth))
+            self.assertFalse(os.path.exists(paths.analysis_depth))
             self.assertTrue(os.path.isdir(paths.cache))
             self.assertTrue(os.path.isdir(paths.video_prediction_cache))
             with open(paths.classes_seg_file, "r", encoding="utf-8") as fh:
@@ -60,6 +60,25 @@ class ProjectPathTests(unittest.TestCase):
                 metadata = json.load(fh)
             self.assertIn("schema_version", metadata)
             self.assertIn("created_at", metadata)
+
+    def test_project_structure_prunes_only_empty_legacy_analysis_folders(self):
+        with TemporaryDirectory() as tmp:
+            paths = ProjectPaths.from_root(tmp)
+            for directory in (
+                paths.analysis_keypoints,
+                paths.analysis_segmentation,
+                paths.analysis_depth,
+            ):
+                os.makedirs(directory, exist_ok=True)
+            preserved = os.path.join(paths.analysis_segmentation, "previous-result.csv")
+            with open(preserved, "w", encoding="utf-8") as fh:
+                fh.write("frame,value\n0,1\n")
+
+            ensure_project_structure(tmp)
+
+            self.assertFalse(os.path.exists(paths.analysis_keypoints))
+            self.assertTrue(os.path.isfile(preserved))
+            self.assertFalse(os.path.exists(paths.analysis_depth))
 
     def test_last_project_state_ignores_missing_project(self):
         with TemporaryDirectory() as tmp:

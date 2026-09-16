@@ -16,6 +16,7 @@ from analysis_ops import (
     run_analysis_workflow,
 )
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION
+from squeakpose.services.analysis import AnalysisConfigError, validate_analysis_output_dir
 from squeakpose.workers.protocol import read_config, write_event
 from unified_analysis_ops import run_unified_analysis_workflow
 
@@ -112,11 +113,15 @@ def _run_analysis_job(
         )
         return 1
 
-    output_root = os.path.abspath(str(config.get("output_dir") or ""))
-    if not output_root:
+    try:
+        output_root = validate_analysis_output_dir(
+            str(config.get("output_dir") or ""),
+            project_root=str(config.get("project_root") or ""),
+        )
+    except AnalysisConfigError as exc:
         _emit_event(
             event_writer,
-            {"event": "error", "error_message": "No analysis output directory was selected."},
+            {"event": "error", "error_message": exc.message},
         )
         return 1
     os.makedirs(output_root, exist_ok=True)

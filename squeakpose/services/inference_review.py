@@ -323,7 +323,7 @@ def scan_project_inference_quality(
                 pool_per_mode=pool_per_mode_per_video,
                 cancel_requested=cancel_requested,
             )
-        except (OSError, csv.Error, ValueError) as exc:
+        except (OSError, UnicodeError, csv.Error, ValueError) as exc:
             issues.append(f"{source.video_name}: {exc}")
             continue
         successful_video_keys.add(os.path.normcase(os.path.abspath(source.video_path)))

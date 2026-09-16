@@ -87,6 +87,25 @@ class AnalysisOutputTransaction:
             self._publish_dir = self.output_dir.resolve()
         else:
             self._publish_dir = self.output_dir
+        publish_path = os.path.normcase(os.path.realpath(os.path.abspath(self._publish_dir)))
+        protected_paths = {
+            os.path.normcase(os.path.realpath(os.path.abspath(os.sep))),
+            os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser("~")))),
+            os.path.normcase(os.path.realpath(os.path.abspath(os.getcwd()))),
+            os.path.normcase(os.path.realpath(os.path.abspath(tempfile.gettempdir()))),
+        }
+        for protected_path in protected_paths:
+            try:
+                contains_protected = (
+                    os.path.commonpath((publish_path, protected_path)) == publish_path
+                )
+            except ValueError:
+                contains_protected = False
+            if contains_protected:
+                raise AnalysisError(
+                    "Choose a dedicated analysis output folder; refusing to replace a filesystem, "
+                    "home, temporary, or working directory."
+                )
         self._owned_names = frozenset((*generated_files, *generated_directories))
         self.staging_dir: Optional[Path] = None
         for name in self._owned_names:

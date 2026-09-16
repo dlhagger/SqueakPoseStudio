@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from squeakpose.services.analysis import (
     AnalysisConfigError,
     analysis_csv_matches_layer,
+    analysis_video_output_key,
     build_analysis_job_config,
     build_analysis_run_config,
     default_analysis_output_dir,
@@ -17,10 +18,100 @@ from squeakpose.services.analysis import (
     load_segmentation_preview,
     project_analysis_bundles,
     project_analysis_inputs,
+    project_video_analysis_status,
+    record_project_video_analysis_output,
 )
 
 
 class AnalysisServiceTests(unittest.TestCase):
+    def test_project_video_analysis_status_requires_completed_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "videos" / "session.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            video_root = root / "analysis outputs" / "session"
+            pose = video_root / "keypoints"
+            pose.mkdir(parents=True)
+            (pose / "analysis_features.csv").write_text("frame\n0\n", encoding="utf-8")
+            (pose / "analysis_summary.json").write_text(
+                json.dumps({"layer_id": "keypoints", "video_path": str(video)}),
+                encoding="utf-8",
+            )
+            incomplete_segmentation = video_root / "segmentation"
+            incomplete_segmentation.mkdir()
+            (incomplete_segmentation / "analysis_summary.json").write_text(
+                json.dumps({"layer_id": "segmentation"}), encoding="utf-8"
+            )
+
+            status = project_video_analysis_status(tmp, "session.mp4")
+
+            self.assertTrue(status.keypoints_analyzed)
+            self.assertFalse(status.segmentation_analyzed)
+            self.assertFalse(status.combined_analyzed)
+            self.assertEqual(status.label, "Pose")
+
+    def test_project_video_analysis_status_recognizes_combined_output(self):
+        with TemporaryDirectory() as tmp:
+            video = Path(tmp, "videos", "session.mp4")
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            combined = Path(tmp, "analysis outputs", "session", "combined")
+            combined.mkdir(parents=True)
+            (combined / "analysis.csv").write_text("frame\n0\n", encoding="utf-8")
+            (combined / "summary.json").write_text(
+                json.dumps({"video_path": str(video)}), encoding="utf-8"
+            )
+            (combined / "analysis_manifest.json").write_text(
+                json.dumps({"analysis_kind": "pose_and_segmentation", "video_path": str(video)}),
+                encoding="utf-8",
+            )
+
+            status = project_video_analysis_status(tmp, "session.mp4")
+
+            self.assertTrue(status.keypoints_analyzed)
+            self.assertTrue(status.segmentation_analyzed)
+            self.assertTrue(status.combined_analyzed)
+            self.assertEqual(status.label, "Both")
+
+    def test_analysis_status_does_not_alias_colliding_video_stems(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            videos = root / "videos"
+            videos.mkdir()
+            mp4 = videos / "session.mp4"
+            avi = videos / "session.avi"
+            mp4.write_bytes(b"mp4")
+            avi.write_bytes(b"avi")
+            output = root / "analysis outputs" / analysis_video_output_key(mp4.name) / "keypoints"
+            output.mkdir(parents=True)
+            (output / "analysis_features.csv").write_text("frame\n0\n", encoding="utf-8")
+            (output / "analysis_summary.json").write_text(
+                json.dumps({"layer_id": "keypoints", "video_path": str(mp4)}),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(project_video_analysis_status(tmp, mp4.name).keypoints_analyzed)
+            self.assertFalse(project_video_analysis_status(tmp, avi.name).any_analyzed)
+
+    def test_registered_custom_analysis_output_is_discovered_after_reopen(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "videos" / "session.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            output = root / "custom results"
+            output.mkdir()
+            (output / "analysis_features.csv").write_text("frame\n0\n", encoding="utf-8")
+            (output / "analysis_summary.json").write_text(
+                json.dumps({"layer_id": "keypoints", "video_path": str(video)}),
+                encoding="utf-8",
+            )
+
+            record_project_video_analysis_output(tmp, video.name, str(output))
+
+            self.assertTrue(project_video_analysis_status(tmp, video.name).keypoints_analyzed)
+
     def test_project_analysis_bundles_detect_both_layers_per_video(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -66,7 +157,12 @@ class AnalysisServiceTests(unittest.TestCase):
             output_dir = default_combined_analysis_output_dir(tmp, "session.mp4")
             self.assertEqual(
                 output_dir,
-                os.path.join(tmp, "analysis outputs", "session", "combined"),
+                os.path.join(
+                    tmp,
+                    "analysis outputs",
+                    analysis_video_output_key("session.mp4"),
+                    "combined",
+                ),
             )
 
             config = build_analysis_job_config(
@@ -305,10 +401,23 @@ class AnalysisServiceTests(unittest.TestCase):
                 os.path.join(
                     tmp,
                     "analysis outputs",
-                    "session",
+                    analysis_video_output_key("session.mp4"),
                     "keypoints",
                 ),
             )
+
+    def test_csv_layer_detection_rejects_empty_unrelated_and_non_utf8_files(self):
+        with TemporaryDirectory() as tmp:
+            empty = Path(tmp, "empty.csv")
+            empty.write_text("", encoding="utf-8")
+            unrelated = Path(tmp, "unrelated.csv")
+            unrelated.write_text("name,value\nmouse,1\n", encoding="utf-8")
+            invalid = Path(tmp, "invalid.csv")
+            invalid.write_bytes(b"frame,x,y\n0,\xff,1\n")
+
+            for path in (empty, unrelated, invalid):
+                self.assertFalse(analysis_csv_matches_layer(str(path), "keypoints"))
+                self.assertFalse(analysis_csv_matches_layer(str(path), "segmentation"))
 
     def test_worker_payload_is_exact_and_detached(self):
         with TemporaryDirectory() as tmp:
@@ -346,6 +455,37 @@ class AnalysisServiceTests(unittest.TestCase):
             self.assertEqual(config.as_dict()["fps"], 0.0)
             self.assertEqual(config.as_dict()["d_cutoff"], 1.0)
             self.assertEqual(config.as_dict()["pixel_distance"], 50.0)
+
+    def test_analysis_output_rejects_project_and_broad_roots(self):
+        with TemporaryDirectory() as tmp:
+            detections = Path(tmp, "detections.csv")
+            detections.write_text("frame,det,x,y\n", encoding="utf-8")
+            common = dict(
+                project_root=tmp,
+                layer_id="keypoints",
+                detections_csv=str(detections),
+                video_path="",
+                pixel_distance=1,
+                real_world_distance_mm=1,
+                smooth=False,
+                min_cutoff=1,
+                beta=0,
+                make_plots=False,
+                make_annotated_video=False,
+                run_clustering=False,
+                export_cluster_clips=False,
+                umap_neighbors=5,
+                umap_min_dist=0.1,
+                hdbscan_min_cluster_size=2,
+                cluster_clip_length_sec=1,
+                samples_per_cluster=1,
+                rois=[],
+            )
+            for output_dir in ("", tmp, str(Path(tmp).parent), os.path.expanduser("~")):
+                with self.subTest(output_dir=output_dir):
+                    with self.assertRaises(AnalysisConfigError) as error:
+                        build_analysis_run_config(output_dir=output_dir, **common)
+                    self.assertIn(error.exception.code, {"output_required", "unsafe_output"})
 
     def test_validation_errors_have_stable_codes(self):
         common = dict(

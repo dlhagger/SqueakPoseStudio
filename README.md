@@ -107,9 +107,10 @@ project/
 │   ├── depth/             # depth CSV summaries and preview videos
 │   └── runs/              # manifests linking multi-layer inference passes
 ├── analysis outputs/
-│   ├── keypoints/         # keypoint-layer analysis runs
-│   ├── segmentation/      # segmentation-layer analysis runs
-│   └── depth/             # reserved for future depth analysis
+│   └── <video-stem>--<id>/ # collision-resistant per-video analysis results
+│       ├── keypoints/      # keypoint-layer analysis
+│       ├── segmentation/   # segmentation-layer analysis
+│       └── combined/       # joint pose and segmentation analysis
 ├── cache/
 │   └── video_predictions/ # project-contained Video Reviewer caches
 ├── logs/

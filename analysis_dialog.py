@@ -54,6 +54,7 @@ from squeakpose.services.analysis import (
     AnalysisConfigError,
     AnalysisRunConfig,
     ProjectAnalysisBundle,
+    ProjectVideoAnalysisStatus,
     analysis_csv_matches_layer,
     build_analysis_job_config,
     default_analysis_output_dir,
@@ -62,6 +63,8 @@ from squeakpose.services.analysis import (
     load_pose_preview,
     load_segmentation_preview,
     project_analysis_bundles,
+    project_video_analysis_status,
+    record_project_video_analysis_output,
     safe_analysis_stem,
 )
 from squeakpose.services.analysis_state import AnalysisAnnotationState
@@ -629,6 +632,7 @@ class AnalysisDialog(QDialog):
         self.annotation_state = AnalysisAnnotationState()
         self.analysis_inputs = {LAYER_KEYPOINTS: "", LAYER_SEGMENTATION: ""}
         self._selected_bundle: Optional[ProjectAnalysisBundle] = None
+        self._analysis_statuses: dict[str, ProjectVideoAnalysisStatus] = {}
         self._active_setup_video_name = ""
         self._suspend_setup_persistence = False
 
@@ -689,6 +693,26 @@ class AnalysisDialog(QDialog):
         project_video_row.addWidget(self.project_video_combo, 1)
         project_video_row.addWidget(self.other_inputs_btn)
         input_form.addRow("Project video:", project_video_row)
+
+        analysis_status_row = QHBoxLayout()
+        analysis_status_row.setSpacing(6)
+        self.analysis_status_badges: dict[str, QLabel] = {}
+        for key, text in (
+            (LAYER_KEYPOINTS, "Pose"),
+            (LAYER_SEGMENTATION, "Segmentation"),
+            ("combined", "Combined"),
+        ):
+            badge = QLabel(text, self)
+            badge.setObjectName("AnalysisCoverageBadge")
+            badge.setProperty("state", "missing")
+            badge.setToolTip(f"{text} analysis has not been run for this video.")
+            analysis_status_row.addWidget(badge)
+            self.analysis_status_badges[key] = badge
+        analysis_status_row.addStretch(1)
+        self.analysis_coverage_label = QLabel("0 of 0 analyzed", self)
+        self.analysis_coverage_label.setObjectName("AnalysisCoverageSummary")
+        analysis_status_row.addWidget(self.analysis_coverage_label)
+        input_form.addRow("Analysis:", analysis_status_row)
 
         self.analysis_mode_combo = ThemedComboBox(self)
         self.analysis_mode_combo.setObjectName("AnalysisModeCombo")
@@ -1113,6 +1137,10 @@ class AnalysisDialog(QDialog):
     def _populate_project_video_selector(self) -> None:
         current_video = self.video_edit.text().strip()
         options = project_analysis_bundles(self.project_root)
+        self._analysis_statuses = {
+            option.video_name: project_video_analysis_status(self.project_root, option.video_name)
+            for option in options
+        }
         self.project_video_combo.blockSignals(True)
         self.project_video_combo.clear()
         self.project_video_combo.addItem("Choose a project video…", None)
@@ -1132,11 +1160,15 @@ class AnalysisDialog(QDialog):
                 ready_count += 1
             else:
                 suffix = "No inference"
-            self.project_video_combo.addItem(f"{option.video_name}  ·  {suffix}", option)
+            analysis_status = self._analysis_statuses[option.video_name]
+            self.project_video_combo.addItem(
+                f"{option.video_name}  ·  {suffix}  ·  Analysis: {analysis_status.label}",
+                option,
+            )
             index = self.project_video_combo.count() - 1
             self.project_video_combo.setItemData(
                 index,
-                f"{option.video_name} — {suffix}",
+                f"{option.video_name} — Inference: {suffix} — Analysis: {analysis_status.label}",
                 Qt.ItemDataRole.ToolTipRole,
             )
             if current_video and os.path.realpath(option.video_path) == os.path.realpath(
@@ -1151,6 +1183,7 @@ class AnalysisDialog(QDialog):
             selected_index = newest_index
         self.project_video_combo.setCurrentIndex(selected_index)
         self.project_video_combo.blockSignals(False)
+        self._refresh_analysis_coverage()
         self._project_video_changed(selected_index)
         if not options:
             self.input_detail_label.setText(
@@ -1175,8 +1208,10 @@ class AnalysisDialog(QDialog):
             self.setup_persistence_label.setText(
                 "Select a project video to restore its saved scale and ROIs."
             )
+            self._show_analysis_status(None)
             return
         self._selected_bundle = option
+        self._show_analysis_status(self._analysis_statuses.get(option.video_name))
         self.analysis_inputs = {
             LAYER_KEYPOINTS: option.keypoints_csv,
             LAYER_SEGMENTATION: option.segmentation_csv,
@@ -1194,6 +1229,59 @@ class AnalysisDialog(QDialog):
         self._load_preview_frame(silent=True)
         self._active_setup_video_name = option.video_name
         self._restore_analysis_setup()
+
+    def _refresh_analysis_coverage(self) -> None:
+        for name in tuple(self._analysis_statuses):
+            self._analysis_statuses[name] = project_video_analysis_status(self.project_root, name)
+        analyzed = sum(status.any_analyzed for status in self._analysis_statuses.values())
+        total = len(self._analysis_statuses)
+        self.analysis_coverage_label.setText(f"{analyzed} of {total} analyzed")
+
+        for index in range(1, self.project_video_combo.count()):
+            option = self.project_video_combo.itemData(index)
+            if not isinstance(option, ProjectAnalysisBundle):
+                continue
+            if option.both_ready:
+                inference = "Pose + Segmentation"
+            elif option.keypoints_csv:
+                inference = "Pose only"
+            elif option.segmentation_csv:
+                inference = "Segmentation only"
+            else:
+                inference = "No inference"
+            status = self._analysis_statuses[option.video_name]
+            self.project_video_combo.setItemText(
+                index,
+                f"{option.video_name}  ·  {inference}  ·  Analysis: {status.label}",
+            )
+            self.project_video_combo.setItemData(
+                index,
+                f"{option.video_name} — Inference: {inference} — Analysis: {status.label}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+
+    def _show_analysis_status(self, status: ProjectVideoAnalysisStatus | None) -> None:
+        states = {
+            LAYER_KEYPOINTS: bool(status and status.keypoints_analyzed),
+            LAYER_SEGMENTATION: bool(status and status.segmentation_analyzed),
+            "combined": bool(status and status.combined_analyzed),
+        }
+        labels = {
+            LAYER_KEYPOINTS: "Pose",
+            LAYER_SEGMENTATION: "Segmentation",
+            "combined": "Combined",
+        }
+        for key, complete in states.items():
+            badge = self.analysis_status_badges[key]
+            label = labels[key]
+            badge.setText(f"✓ {label}" if complete else f"— {label}")
+            badge.setProperty("state", "complete" if complete else "missing")
+            badge.setToolTip(
+                f"{label} analysis {'is complete' if complete else 'has not been run'} "
+                "for this video."
+            )
+            badge.style().unpolish(badge)
+            badge.style().polish(badge)
 
     def _populate_analysis_modes(self, available_layers: tuple[str, ...]) -> None:
         self.analysis_mode_combo.blockSignals(True)
@@ -1747,6 +1835,7 @@ class AnalysisDialog(QDialog):
             else 0.0
         )
         return build_analysis_job_config(
+            project_root=self.project_root,
             analysis_mode=self._analysis_mode(),
             analysis_inputs=self.analysis_inputs,
             video_path=self.video_edit.text(),
@@ -1965,6 +2054,20 @@ class AnalysisDialog(QDialog):
                 self._append_log(f"Prediction QC: {event.get('prediction_qc_csv')}")
             self._show_result_summary(event)
             self.open_output_btn.setEnabled(bool(self.last_output_dir))
+            if self._selected_bundle is not None and self.last_output_dir:
+                try:
+                    record_project_video_analysis_output(
+                        self.project_root,
+                        self._selected_bundle.video_name,
+                        self.last_output_dir,
+                    )
+                except OSError as exc:
+                    self._append_log(f"Could not save analysis output location: {exc}")
+            self._refresh_analysis_coverage()
+            if self._selected_bundle is not None:
+                self._show_analysis_status(
+                    self._analysis_statuses.get(self._selected_bundle.video_name)
+                )
         elif kind == "error":
             self.status_label.setText("Failed")
             self._append_log(f"Error: {event.get('error_message', '')}")

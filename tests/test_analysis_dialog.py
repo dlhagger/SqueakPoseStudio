@@ -12,6 +12,7 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from analysis_dialog import AnalysisDialog, FrameAnnotationView
+from squeakpose.services.analysis import analysis_video_output_key
 
 
 class FrameAnnotationViewTests(unittest.TestCase):
@@ -199,6 +200,55 @@ class AnalysisDialogInputTests(unittest.TestCase):
             self.assertEqual(dialog.video_edit.text(), str(video))
             self.assertEqual(dialog.csv_edit.text(), str(csv_path))
             self.assertIn("run_segmentation.csv", dialog.input_detail_label.text())
+            self.assertEqual(dialog.analysis_coverage_label.text(), "0 of 1 analyzed")
+            self.assertEqual(
+                dialog.analysis_status_badges["segmentation"].property("state"), "missing"
+            )
+            dialog.close()
+
+    def test_project_video_selector_shows_completed_analysis(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "videos" / "session.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"video")
+            inference_csv = root / "inference outputs" / "keypoints" / "run_pose.csv"
+            inference_csv.parent.mkdir(parents=True)
+            inference_csv.write_text("frame,det,kp_nose_x,kp_nose_y\n", encoding="utf-8")
+            runs = root / "inference outputs" / "runs"
+            runs.mkdir()
+            (runs / "run.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": str(video),
+                        "created_at": "2026-09-09T12:00:00",
+                        "passes": [{"layer_id": "keypoints", "csv_path": str(inference_csv)}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "analysis outputs" / "session" / "keypoints"
+            output.mkdir(parents=True)
+            (output / "analysis_features.csv").write_text("frame\n0\n", encoding="utf-8")
+            (output / "analysis_summary.json").write_text(
+                json.dumps({"layer_id": "keypoints", "video_path": str(video)}),
+                encoding="utf-8",
+            )
+
+            dialog = AnalysisDialog(None, project_root=tmp, app_base_dir=tmp)
+
+            self.assertIn("Analysis: Pose", dialog.project_video_combo.itemText(1))
+            self.assertEqual(dialog.analysis_coverage_label.text(), "1 of 1 analyzed")
+            self.assertEqual(
+                dialog.analysis_status_badges["keypoints"].property("state"), "complete"
+            )
+            self.assertEqual(
+                dialog.analysis_status_badges["segmentation"].property("state"), "missing"
+            )
             dialog.close()
 
     def test_project_video_with_both_layers_defaults_to_combined_analysis(self):
@@ -250,7 +300,12 @@ class AnalysisDialogInputTests(unittest.TestCase):
             self.assertEqual(dialog.analysis_inputs["segmentation"], str(segment_csv))
             self.assertEqual(
                 dialog.output_edit.text(),
-                os.path.join(tmp, "analysis outputs", "session", "combined"),
+                os.path.join(
+                    tmp,
+                    "analysis outputs",
+                    analysis_video_output_key("session.mp4"),
+                    "combined",
+                ),
             )
             self.assertIn("Pose:", dialog.input_detail_label.text())
             self.assertIn("Segmentation:", dialog.input_detail_label.text())
@@ -261,7 +316,12 @@ class AnalysisDialogInputTests(unittest.TestCase):
             )
             self.assertEqual(
                 dialog.output_edit.text(),
-                os.path.join(tmp, "analysis outputs", "session", "keypoints"),
+                os.path.join(
+                    tmp,
+                    "analysis outputs",
+                    analysis_video_output_key("session.mp4"),
+                    "keypoints",
+                ),
             )
             self.assertEqual(dialog.frame_view._tracking_bbox, (50.0, 51.0, 80.0, 81.0))
             dialog.close()

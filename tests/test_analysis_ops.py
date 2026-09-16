@@ -290,6 +290,26 @@ class AnalysisOpsTests(unittest.TestCase):
             )
             self.assertEqual((target / "research_notes.txt").read_text(encoding="utf-8"), "keep")
 
+    def test_analysis_output_transaction_rejects_working_directory(self):
+        with self.assertRaisesRegex(AnalysisError, "dedicated analysis output folder"):
+            AnalysisOutputTransaction(Path.cwd())
+
+    def test_analysis_worker_rejects_missing_output_directory(self):
+        events = []
+
+        code = run_analysis_worker(
+            {
+                "selected_layers": ["keypoints"],
+                "analysis_inputs": {"keypoints": "unused.csv"},
+                "output_dir": "",
+            },
+            event_writer=events.append,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertIn("dedicated analysis output folder", events[-1]["error_message"])
+
     def test_failed_pose_rerun_keeps_previous_successful_outputs(self):
         with TemporaryDirectory() as tmp:
             detections_csv = Path(tmp, "detections.csv")

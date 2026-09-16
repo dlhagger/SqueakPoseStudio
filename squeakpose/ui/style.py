@@ -697,6 +697,23 @@ def analysis_dialog_stylesheet() -> str:
         font-size: 9pt;
         padding: 2px 1px;
     }}
+    QLabel#AnalysisCoverageBadge {{
+        background-color: {COLORS["input_bg"]};
+        border: 1px solid {COLORS["input_border"]};
+        border-radius: 9px;
+        color: {COLORS["text_subtle"]};
+        font-size: 9pt;
+        padding: 2px 8px;
+    }}
+    QLabel#AnalysisCoverageBadge[state="complete"] {{
+        background-color: {COLORS["success"]};
+        border-color: #58a77a;
+        color: #ffffff;
+    }}
+    QLabel#AnalysisCoverageSummary {{
+        color: {COLORS["text_muted"]};
+        font-size: 9pt;
+    }}
     QLabel#AnalysisValuePill {{
         background-color: {COLORS["input_bg"]};
         border: 1px solid {COLORS["input_border"]};

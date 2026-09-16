@@ -146,13 +146,30 @@ PROJECT_DIRECTORY_FIELDS = (
     "analysis_outputs",
     "analysis_settings",
     "analysis_video_settings",
-    "analysis_keypoints",
-    "analysis_segmentation",
-    "analysis_depth",
     "logs",
     "cache",
     "video_prediction_cache",
 )
+
+LEGACY_ANALYSIS_DIRECTORY_FIELDS = (
+    "analysis_keypoints",
+    "analysis_segmentation",
+    "analysis_depth",
+)
+
+
+def _prune_empty_legacy_analysis_directories(paths: ProjectPaths) -> None:
+    """Remove obsolete root-level layer folders without touching stored results."""
+    for field_name in LEGACY_ANALYSIS_DIRECTORY_FIELDS:
+        directory = paths[field_name]
+        if os.path.islink(directory):
+            continue
+        try:
+            os.rmdir(directory)
+        except OSError:
+            # Missing, non-empty, and unavailable directories are all safe to
+            # leave alone. New analyses use per-video output directories.
+            continue
 
 
 def ensure_project_structure(
@@ -170,6 +187,8 @@ def ensure_project_structure(
             allow_root=False,
         )
         os.makedirs(directory, exist_ok=True)
+
+    _prune_empty_legacy_analysis_directories(paths)
 
     for field_name in (
         "classes_file",

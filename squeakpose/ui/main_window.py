@@ -18,11 +18,22 @@ from dataclasses import replace
 from typing import List, Optional
 
 import yaml
-from PyQt6.QtCore import QLibraryInfo, QPoint, QPointF, QProcess, QRectF, QSettings, Qt, QTimer
+from PyQt6.QtCore import (
+    QLibraryInfo,
+    QPoint,
+    QPointF,
+    QProcess,
+    QRectF,
+    QSettings,
+    Qt,
+    QTimer,
+    QUrl,
+)
 from PyQt6.QtGui import (
     QBrush,
     QColor,
     QCursor,
+    QDesktopServices,
     QFont,
     QFontDatabase,
     QFontInfo,
@@ -210,6 +221,7 @@ from squeakpose.services.model_download import (
     SAM3_MODEL_URL,
     sam3_download_error_message,
 )
+from squeakpose.services.openai_labeling import PoseProposal
 from squeakpose.services.prediction import (
     DepthPredictionTargets,
     plan_prediction_application,
@@ -219,6 +231,8 @@ from squeakpose.services.prediction_serialization import rank_prediction_frames
 from squeakpose.ui.annotation_panel import (
     AnnotationPanel,
     AnnotationPanelCallbacks,
+    OpenAIPoseCallbacks,
+    OpenAIPosePanel,
     SegmentationToolsCallbacks,
     SegmentationToolsPanel,
 )
@@ -252,6 +266,7 @@ from squeakpose.ui.inference_controller import InferenceController
 from squeakpose.ui.inference_review_dialog import InferenceReviewDialog
 from squeakpose.ui.inference_video_dialog import InferenceVideoDialog
 from squeakpose.ui.navigation_panel import NavigationPanel, NavigationPanelCallbacks
+from squeakpose.ui.openai_controller import OpenAIController
 from squeakpose.ui.operation_panel import (
     AnalysisOperationsPanel,
     DatasetOperationsPanel,
@@ -1641,6 +1656,8 @@ class LabelingApp(QMainWindow):
             self.seg_edit_btn.setVisible(is_segmentation)
         if hasattr(self, "seg_tools_frame"):
             self.seg_tools_frame.setVisible(is_segmentation)
+        if hasattr(self, "openai_pose_frame"):
+            self.openai_pose_frame.setVisible(is_pose)
         if hasattr(self, "depth_display_frame"):
             self.depth_display_frame.setVisible(is_depth)
         if hasattr(self, "depth_range_frame"):
@@ -3369,6 +3386,18 @@ class LabelingApp(QMainWindow):
         self._inference_coordinator.progress.connect(self._inference_controller_progress)
         self._inference_coordinator.pass_finished.connect(self._inference_controller_pass_finished)
         self._inference_coordinator.completed.connect(self._inference_controller_completed)
+        self._openai_models = ()
+        self._openai_status_text = ""
+        self._openai_last_usage = (0, 0, 0)
+        self._openai_session_tokens = 0
+        self._openai_controller = OpenAIController(self)
+        self._openai_controller.authorization_url.connect(self._open_chatgpt_authorization)
+        self._openai_controller.profile_changed.connect(self._openai_profile_changed)
+        self._openai_controller.models_ready.connect(self._openai_models_ready)
+        self._openai_controller.proposal_ready.connect(self._apply_openai_pose_proposal)
+        self._openai_controller.error.connect(self._openai_error)
+        self._openai_controller.status_changed.connect(self._openai_status_changed)
+        self._openai_controller.busy_changed.connect(self._openai_busy_changed)
         print(f"🧠 Inference device: {self._device}")
         # Build UI and load first image
         self._setup_ui()
@@ -3380,6 +3409,9 @@ class LabelingApp(QMainWindow):
         self._update_layer_ui_state()
         self.load_image()
         self._update_progress_label()
+        openai_profile = self._openai_controller.profile
+        if openai_profile is not None and openai_profile.access_token:
+            QTimer.singleShot(0, self._openai_controller.refresh_models)
         if self._queue_stem_collisions:
             QTimer.singleShot(0, self._warn_image_stem_collisions)
         if self._project_meta_recovery:
@@ -3417,6 +3449,9 @@ class LabelingApp(QMainWindow):
         sam_download_job = self.__dict__.get("_sam_download_job")
         if sam_download_job is not None:
             sam_download_job.shutdown(terminate_timeout_ms=1000, kill_timeout_ms=1000)
+        openai_controller = self.__dict__.get("_openai_controller")
+        if openai_controller is not None:
+            openai_controller.shutdown()
         self._restore_sam_wait_cursor()
         self._cleanup_prediction_depth_staging()
         self._project_lock.release()
@@ -3451,6 +3486,254 @@ class LabelingApp(QMainWindow):
         videos_menu.addSeparator()
         self.inference_review_action = videos_menu.addAction("Review Inference Quality…")
         self.inference_review_action.triggered.connect(self.open_inference_quality_review)
+
+        ai_menu = menu_bar.addMenu("&AI")
+        self.chatgpt_connect_action = ai_menu.addAction("Continue with ChatGPT…")
+        self.chatgpt_connect_action.triggered.connect(self.connect_chatgpt)
+        self.openai_autolabel_action = ai_menu.addAction("Auto-label Current Image…")
+        self.openai_autolabel_action.triggered.connect(self.run_openai_autolabel)
+        self.openai_refresh_models_action = ai_menu.addAction("Refresh OpenAI Models")
+        self.openai_refresh_models_action.triggered.connect(self._openai_controller.refresh_models)
+        ai_menu.addSeparator()
+        self.chatgpt_signout_action = ai_menu.addAction("Sign Out of ChatGPT")
+        self.chatgpt_signout_action.triggered.connect(self.sign_out_chatgpt)
+        self._refresh_openai_actions()
+
+    def _refresh_openai_actions(self) -> None:
+        controller = self.__dict__.get("_openai_controller")
+        if controller is None:
+            return
+        profile = controller.profile
+        connected = bool(profile and profile.access_token and profile.plan_usage_enabled)
+        busy = controller.is_busy
+        label = profile.email if profile and profile.email else "ChatGPT"
+        if hasattr(self, "chatgpt_connect_action"):
+            self.chatgpt_connect_action.setText(
+                f"Reconnect {label}…" if connected else "Continue with ChatGPT…"
+            )
+            self.chatgpt_connect_action.setEnabled(not busy)
+            self.openai_autolabel_action.setEnabled(connected and not busy)
+            self.openai_refresh_models_action.setEnabled(connected and not busy)
+            self.chatgpt_signout_action.setEnabled(connected and not busy)
+        panel = self.__dict__.get("openai_pose_frame")
+        if isinstance(panel, OpenAIPosePanel):
+            panel.set_state(
+                connected=connected,
+                account=profile.email if profile else "",
+                busy=busy,
+                status=self._openai_status_text,
+            )
+
+    def connect_chatgpt(self, _checked: bool = False) -> None:
+        self._openai_controller.sign_in()
+
+    def sign_out_chatgpt(self, _checked: bool = False) -> None:
+        self._openai_controller.sign_out()
+
+    def _open_chatgpt_authorization(self, authorization_url: str) -> None:
+        if not QDesktopServices.openUrl(QUrl(authorization_url)):
+            self._openai_error(
+                "Could not open the system browser. Copy the authorization URL from the log is "
+                "intentionally disabled because it contains sensitive sign-in state."
+            )
+
+    def _openai_profile_changed(self, _profile) -> None:
+        if _profile is None:
+            self._openai_models = ()
+            self._openai_status_text = "Signed out of ChatGPT."
+            panel = self.__dict__.get("openai_pose_frame")
+            if isinstance(panel, OpenAIPosePanel):
+                panel.set_models(())
+        elif _profile.plan_usage_enabled:
+            settings = QSettings()
+            if not settings.value("openai/plan_welcome_seen", False, type=bool):
+                QMessageBox.information(
+                    self,
+                    "You’re using your ChatGPT plan",
+                    "Eligible OpenAI requests in SqueakPose Studio use your ChatGPT plan. "
+                    "You can review usage at any time with Manage Usage.",
+                )
+                settings.setValue("openai/plan_welcome_seen", True)
+        self._refresh_openai_actions()
+
+    def _openai_models_ready(self, models) -> None:
+        self._openai_models = tuple(models or ())
+        panel = self.__dict__.get("openai_pose_frame")
+        if isinstance(panel, OpenAIPosePanel):
+            selected = self._preferred_openai_model()
+            panel.set_models(
+                tuple((choice.slug, choice.display_name) for choice in self._openai_models),
+                selected=selected,
+            )
+            if panel.selected_model:
+                self._openai_model_changed(panel.selected_model)
+        self._refresh_openai_actions()
+
+    def _openai_busy_changed(self, _busy: bool) -> None:
+        self._refresh_openai_actions()
+
+    def _openai_status_changed(self, message: str) -> None:
+        self._openai_status_text = str(message)
+        self.update_status_bar(self._openai_status_text)
+        self._refresh_openai_actions()
+
+    def _openai_model_changed(self, model: str) -> None:
+        if model:
+            QSettings().setValue("openai/pose_model", str(model))
+
+    def _preferred_openai_model(self) -> str:
+        saved = str(QSettings().value("openai/pose_model", "") or "")
+        available = {choice.slug for choice in self._openai_models}
+        if saved in available:
+            return saved
+        for slug in ("gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-sol"):
+            if slug in available:
+                return slug
+        return self._openai_models[0].slug if self._openai_models else ""
+
+    def _open_chatgpt_usage(self) -> None:
+        if not QDesktopServices.openUrl(QUrl("https://chatgpt.com/codex/settings/usage")):
+            self._openai_error("Could not open ChatGPT usage settings in the browser.")
+
+    def _openai_error(self, message: str) -> None:
+        self._openai_status_text = "OpenAI Assistant could not complete the operation."
+        self._refresh_openai_actions()
+        text = str(message)
+        normalized = text.casefold().replace("-", "_").replace(" ", "_")
+        if "usage_limit" in normalized or "rate_limit" in normalized:
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("OpenAI usage limit reached")
+            dialog.setText(text)
+            manage_button = dialog.addButton("Manage Usage", QMessageBox.ButtonRole.AcceptRole)
+            dialog.addButton(QMessageBox.StandardButton.Close)
+            dialog.exec()
+            if dialog.clickedButton() is manage_button:
+                self._open_chatgpt_usage()
+        else:
+            QMessageBox.warning(self, "OpenAI Assistant", text)
+        self.update_status_bar(self._openai_status_text)
+
+    def run_openai_autolabel(self, _checked: bool = False) -> None:
+        if not self._is_keypoints_layer():
+            QMessageBox.information(
+                self,
+                "OpenAI Auto-label",
+                "Switch to the Keypoints layer to create a pose proposal.",
+            )
+            return
+        image_path = self._displayed_image_path()
+        if not image_path:
+            QMessageBox.information(self, "OpenAI Auto-label", "Open an image first.")
+            return
+        class_id = self.class_selector.currentIndex()
+        if class_id < 0 or class_id >= len(self.classes):
+            QMessageBox.information(self, "OpenAI Auto-label", "Select a class first.")
+            return
+        keypoint_names = tuple(self._kp_names_for_index(class_id))
+        if not keypoint_names:
+            QMessageBox.information(
+                self,
+                "OpenAI Auto-label",
+                "The selected class has no keypoints configured.",
+            )
+            return
+        models = tuple(self._openai_models)
+        if not models:
+            self._openai_controller.refresh_models()
+            self._openai_status_changed(
+                "Loading OpenAI models; choose Auto-label again when ready."
+            )
+            return
+        panel = self.__dict__.get("openai_pose_frame")
+        model = panel.selected_model if isinstance(panel, OpenAIPosePanel) else ""
+        model = model or self._preferred_openai_model()
+        if not model:
+            self._openai_error("No OpenAI model is available for this ChatGPT account.")
+            return
+        self._openai_model_changed(model)
+        self._openai_controller.request_pose(
+            model=model,
+            image_path=image_path,
+            image_width=self.img_w,
+            image_height=self.img_h,
+            class_name=self.classes[class_id],
+            keypoint_names=keypoint_names,
+        )
+
+    def _apply_openai_pose_proposal(self, proposal: PoseProposal) -> None:
+        usage = proposal.usage
+        total = usage.total_tokens or usage.input_tokens + usage.output_tokens
+        self._openai_last_usage = (usage.input_tokens, usage.output_tokens, total)
+        self._openai_session_tokens += total
+        panel = self.__dict__.get("openai_pose_frame")
+        if isinstance(panel, OpenAIPosePanel):
+            panel.set_usage(
+                last_input=usage.input_tokens,
+                last_output=usage.output_tokens,
+                last_total=total,
+                session_total=self._openai_session_tokens,
+            )
+        if not self._is_keypoints_layer():
+            self._openai_status_changed(
+                "Discarded OpenAI proposal because the active layer changed."
+            )
+            return
+        displayed = self._displayed_image_path()
+        if os.path.normcase(os.path.abspath(displayed)) != os.path.normcase(
+            os.path.abspath(proposal.source_image)
+        ):
+            self._openai_status_changed(
+                "Discarded OpenAI proposal because the displayed image changed."
+            )
+            return
+        class_id = self.class_selector.currentIndex()
+        if class_id < 0 or self.classes[class_id] != proposal.class_name:
+            self._openai_status_changed(
+                "Discarded OpenAI proposal because the selected class changed."
+            )
+            return
+        confidence_lines = "\n".join(
+            f"• {point.name}: {point.confidence:.0%}" for point in proposal.keypoints
+        )
+        decision = QMessageBox.question(
+            self,
+            "Apply OpenAI pose proposal?",
+            f"{proposal.model} proposed {len(proposal.keypoints)} keypoints for "
+            f"'{proposal.class_name}'.\n\n{confidence_lines}\n\n"
+            "Applying replaces the current annotation for this class. The result remains "
+            "unsaved and can be moved, hidden, or undone before you save it.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            self._openai_status_changed("OpenAI pose proposal rejected.")
+            return
+        controller = self._bind_pose_annotation_controller()
+        if controller is None:
+            self._openai_error("The pose editor is unavailable.")
+            return
+        x, y, width, height = proposal.box
+        controller.select_class(class_id)
+        self.pose_edit_state = controller.state
+        controller.set_box(BoundingBox(x, y, width, height, class_id))
+        for point in proposal.keypoints:
+            controller.add_next_keypoint(
+                point.x,
+                point.y,
+                visibility=point.visibility,
+                display_name=point.name,
+            )
+        self._restore_annotation_for_class(class_id)
+        confidence_by_name = {point.name: point.confidence for point in proposal.keypoints}
+        for item in self._class_keypoint_items(class_id):
+            setattr(item, "pred_conf", confidence_by_name.get(item.kp.name, 0.0))
+            item.update_appearance()
+        self._update_item_editability()
+        self._update_status()
+        self._openai_status_changed(
+            f"Applied {proposal.model} proposal. Review and edit it, then Save when satisfied."
+        )
 
     def open_video_library(self, _checked: bool = False, *, add_immediately: bool = False):
         videos_dir = ProjectPaths.from_root(self.project_root).videos
@@ -3706,6 +3989,20 @@ class LabelingApp(QMainWindow):
         top_left_layout.addWidget(self.navigation_panel)
         top_left_layout.addWidget(self.annotation_panel)
         self.left_sidebar_layout.addWidget(self.top_left_frame)
+
+        self.openai_pose_frame = OpenAIPosePanel(
+            callbacks=OpenAIPoseCallbacks(
+                connect=self.connect_chatgpt,
+                auto_label=self.run_openai_autolabel,
+                refresh_models=self._openai_controller.refresh_models,
+                manage_usage=self._open_chatgpt_usage,
+                sign_out=self.sign_out_chatgpt,
+                model_changed=self._openai_model_changed,
+            ),
+            parent=self.left_sidebar_content,
+        )
+        self.left_sidebar_layout.addWidget(self.openai_pose_frame)
+        self._refresh_openai_actions()
 
         initial_depth_mode = (
             str(

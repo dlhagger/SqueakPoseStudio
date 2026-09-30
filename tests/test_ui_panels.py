@@ -102,6 +102,54 @@ class UiPanelTests(unittest.TestCase):
         self.assertEqual(events, ["load", "download", "run", "accept", "reset"])
         panel.close()
 
+    def test_openai_pose_panel_routes_actions_and_exposes_plan_usage(self):
+        events = []
+        panel = annotation_panel.OpenAIPosePanel(
+            callbacks=annotation_panel.OpenAIPoseCallbacks(
+                connect=lambda: events.append("connect"),
+                auto_label=lambda: events.append("auto"),
+                refresh_models=lambda: events.append("refresh"),
+                manage_usage=lambda: events.append("usage"),
+                sign_out=lambda: events.append("signout"),
+                model_changed=lambda model: events.append(("model", model)),
+            )
+        )
+        panel.show()
+        self.app.processEvents()
+
+        self.assertEqual(panel.connect_btn.text(), "Continue with ChatGPT")
+        self.assertFalse(panel.auto_label_btn.isEnabled())
+        self.assertTrue(panel.plan_label.isHidden())
+        panel.connect_btn.click()
+
+        panel.set_models(
+            (("gpt-6-astra", "Astra"), ("gpt-6.1-sol", "Sol")),
+            selected="gpt-6-astra",
+        )
+        panel.set_state(connected=True, account="scientist@example.com")
+        self.assertEqual(panel.selected_model, "gpt-6-astra")
+        self.assertTrue(panel.auto_label_btn.isEnabled())
+        self.assertFalse(panel.plan_label.isHidden())
+        panel.model_combo.setCurrentIndex(1)
+        panel.auto_label_btn.click()
+        panel.refresh_btn.click()
+        panel.manage_usage_btn.click()
+        panel.sign_out_btn.click()
+        panel.set_usage(
+            last_input=1200,
+            last_output=300,
+            last_total=1500,
+            session_total=4100,
+        )
+
+        self.assertEqual(
+            events,
+            ["connect", ("model", "gpt-6.1-sol"), "auto", "refresh", "usage", "signout"],
+        )
+        self.assertIn("1,500 total", panel.usage_label.text())
+        self.assertIn("4,100 tokens", panel.usage_label.text())
+        panel.close()
+
     def test_operation_panels_preserve_layer_aware_controls_and_callbacks(self):
         events = []
         callbacks = operation_panel.OperationCallbacks(

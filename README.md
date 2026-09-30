@@ -18,6 +18,8 @@ block the main interface.
 - Project launcher with **Create Project** and **Open Project** workflows.
 - Pose annotation with per-class bounding boxes, ordered keypoints, templates,
   visibility states, and model-assisted predictions.
+- Optional **Continue with ChatGPT** pose proposals from vision-capable OpenAI
+  models, with explicit human review and normal point editing before save.
 - Segmentation annotation with positive and negative SAM prompts, mask previews,
   and add/erase brush editing.
 - Inference-only depth maps for images, with raw NumPy data, color previews,
@@ -41,6 +43,7 @@ block the main interface.
 - A desktop environment supported by PyQt6
 - Optional CUDA or Apple Silicon acceleration
 - Optional SAM-compatible weights for the Segmentation layer
+- Optional eligible ChatGPT Plus or Pro account for OpenAI pose proposals
 
 PyTorch package sources are configured in `pyproject.toml`: macOS uses the
 PyTorch CPU index, while Linux and Windows use the configured CUDA index. The
@@ -177,6 +180,40 @@ The image browser can show all, labeled, or unlabeled images. Saving an image
 writes its active-layer labels, copies the image into `images_all/`, and
 renders an overlay into `annotations/`. These outputs are staged and committed
 together, so a failed save does not replace an existing annotation.
+
+### OpenAI pose assistant (experimental preview)
+
+The Keypoints workflow includes an **OpenAI Pose Assistant** panel in the left
+sidebar. Select **Continue with ChatGPT** to authorize SqueakPose Studio in the
+system browser. After sign-in, choose one of the vision-capable models available
+to your account and select **Auto-label Current Image**. Each installation uses
+the tester's own eligible ChatGPT Plus or Pro account and plan allowance; no API
+key is required.
+
+The assistant proposes a bounding box and the exact ordered keypoints configured
+for the currently selected class. SqueakPose asks for confirmation before
+applying the proposal. An accepted proposal replaces only that class's current
+annotation and remains unsaved: move or hide inaccurate points, undo the
+proposal, or reject it before using the normal **Save** action. Treat every
+proposal as a starting point requiring human review, not as ground truth.
+
+The panel shows the selected model, connection status, exact token counts for
+the last completed request and the current application session, and a **Manage
+Usage** link to ChatGPT settings. These counts describe completed requests; the
+app does not attempt to calculate or impose a remaining-plan cap.
+
+Auto-label sends the current image, class name, and keypoint names to OpenAI for
+that request. Only use images that you are authorized to share with OpenAI.
+Requests are stateless (`store: false`, `stream: true`) and do not grant the app
+access to ChatGPT conversations or the user's API key. OAuth credentials are
+stored outside SqueakPose projects in an owner-only application configuration
+file and are never written into a project or this repository. **Sign Out**
+revokes the refresh token when supported and always disables local token use.
+
+This feature follows OpenAI's open-source, locally hosted
+[ChatGPT plan usage flow](https://developers.openai.com/siwc/token-sharing-open-source).
+Paid or remotely hosted distribution has a separate eligibility path; see the
+current OpenAI documentation before changing how the application is distributed.
 
 ### Keypoints Layer
 

@@ -36,6 +36,10 @@ def _ignore_class(_class_id: int) -> None:
     pass
 
 
+def _ignore_text(_value: str) -> None:
+    pass
+
+
 def _ignore_action() -> None:
     pass
 
@@ -422,9 +426,171 @@ class SegmentationToolsPanel(QFrame):
         self.helper_label.setText(text)
 
 
+@dataclass(frozen=True, slots=True)
+class OpenAIPoseCallbacks:
+    connect: Callable[[], None] = _ignore_action
+    auto_label: Callable[[], None] = _ignore_action
+    refresh_models: Callable[[], None] = _ignore_action
+    manage_usage: Callable[[], None] = _ignore_action
+    sign_out: Callable[[], None] = _ignore_action
+    model_changed: Callable[[str], None] = _ignore_text
+
+
+class OpenAIPosePanel(QFrame):
+    """ChatGPT-backed keypoint proposal controls for the pose workflow."""
+
+    def __init__(
+        self,
+        *,
+        callbacks: OpenAIPoseCallbacks | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.callbacks = callbacks or OpenAIPoseCallbacks()
+        self.setObjectName("ToolPanel")
+        self.setStyleSheet(sidebar_stylesheet())
+        apply_panel_shadow(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setSpacing(6)
+        title = QLabel("OpenAI Pose Assistant")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+
+        self.account_label = QLabel("Not connected")
+        self.account_label.setObjectName("fieldLabel")
+        self.account_label.setWordWrap(True)
+        layout.addWidget(self.account_label)
+
+        self.connect_btn = _panel_button("Continue with ChatGPT")
+        self.connect_btn.clicked.connect(lambda _checked=False: self.callbacks.connect())
+        layout.addWidget(self.connect_btn)
+
+        model_label = QLabel("Model")
+        model_label.setObjectName("fieldLabel")
+        layout.addWidget(model_label)
+        self.model_combo = ThemedComboBox()
+        self.model_combo.setMinimumHeight(32)
+        self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.model_combo.setToolTip("Models available through the connected ChatGPT plan")
+        self.model_combo.currentIndexChanged.connect(self._model_changed)
+        layout.addWidget(self.model_combo)
+
+        self.plan_label = QLabel("Using ChatGPT plan")
+        self.plan_label.setObjectName("progressBadge")
+        layout.addWidget(self.plan_label)
+
+        self.auto_label_btn = _panel_button(
+            "Auto-label Current Image",
+            tooltip="Generate an editable keypoint proposal for the selected class",
+        )
+        self.auto_label_btn.setMinimumHeight(32)
+        self.auto_label_btn.clicked.connect(lambda _checked=False: self.callbacks.auto_label())
+        layout.addWidget(self.auto_label_btn)
+
+        action_row = QHBoxLayout()
+        self.refresh_btn = _panel_button("Refresh Models")
+        self.manage_usage_btn = _panel_button("Manage Usage")
+        self.refresh_btn.clicked.connect(lambda _checked=False: self.callbacks.refresh_models())
+        self.manage_usage_btn.clicked.connect(lambda _checked=False: self.callbacks.manage_usage())
+        action_row.addWidget(self.refresh_btn)
+        action_row.addWidget(self.manage_usage_btn)
+        layout.addLayout(action_row)
+
+        self.usage_label = QLabel("No OpenAI usage in this session.")
+        self.usage_label.setWordWrap(True)
+        self.usage_label.setObjectName("samHelper")
+        layout.addWidget(self.usage_label)
+
+        self.status_label = QLabel("Connect ChatGPT to generate editable pose proposals.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("samHelper")
+        layout.addWidget(self.status_label)
+
+        self.sign_out_btn = _panel_button("Sign Out")
+        self.sign_out_btn.clicked.connect(lambda _checked=False: self.callbacks.sign_out())
+        layout.addWidget(self.sign_out_btn)
+        self.set_state(connected=False)
+
+    @property
+    def selected_model(self) -> str:
+        return str(self.model_combo.currentData() or "")
+
+    def set_models(self, models: Sequence[tuple[str, str]], *, selected: str = "") -> None:
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for slug, display_name in models:
+            self.model_combo.addItem(str(display_name), str(slug))
+        selected_index = self.model_combo.findData(str(selected))
+        if selected_index >= 0:
+            self.model_combo.setCurrentIndex(selected_index)
+        self.model_combo.blockSignals(False)
+
+    def set_state(
+        self,
+        *,
+        connected: bool,
+        account: str = "",
+        busy: bool = False,
+        status: str = "",
+    ) -> None:
+        has_models = self.model_combo.count() > 0
+        self.account_label.setText(
+            f"Connected as {account}"
+            if connected and account
+            else "Connected to ChatGPT"
+            if connected
+            else "Not connected"
+        )
+        self.connect_btn.setText("Reconnect ChatGPT" if connected else "Continue with ChatGPT")
+        self.connect_btn.setEnabled(not busy)
+        self.model_combo.setEnabled(connected and has_models and not busy)
+        self.plan_label.setVisible(connected)
+        self.auto_label_btn.setEnabled(connected and has_models and not busy)
+        self.refresh_btn.setEnabled(connected and not busy)
+        self.manage_usage_btn.setEnabled(connected)
+        self.sign_out_btn.setVisible(connected)
+        self.sign_out_btn.setEnabled(not busy)
+        if status:
+            helper = status
+        elif busy:
+            helper = "OpenAI is working…"
+        elif connected and not has_models:
+            helper = "Refresh the model list before auto-labeling."
+        elif connected:
+            helper = "Generate a proposal, then review and edit every point before saving."
+        else:
+            helper = "Connect ChatGPT to generate editable pose proposals."
+        self.status_label.setText(helper)
+
+    def set_usage(
+        self,
+        *,
+        last_input: int,
+        last_output: int,
+        last_total: int,
+        session_total: int,
+    ) -> None:
+        if last_total <= 0 and session_total <= 0:
+            self.usage_label.setText("No OpenAI usage in this session.")
+            return
+        self.usage_label.setText(
+            f"Last: {last_input:,} in · {last_output:,} out · {last_total:,} total\n"
+            f"Session: {session_total:,} tokens"
+        )
+
+    def _model_changed(self, _index: int) -> None:
+        model = self.selected_model
+        if model:
+            self.callbacks.model_changed(model)
+
+
 __all__ = [
     "AnnotationPanel",
     "AnnotationPanelCallbacks",
+    "OpenAIPoseCallbacks",
+    "OpenAIPosePanel",
     "SegmentationToolsCallbacks",
     "SegmentationToolsPanel",
 ]

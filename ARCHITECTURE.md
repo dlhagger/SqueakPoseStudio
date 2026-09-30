@@ -13,7 +13,8 @@ project layouts, annotation formats, worker entry points, and the
   that state into scene items but do not write project files.
 - `squeakpose.services` owns workflow decisions: saving, dataset export, image queues,
   frame-annotation file coordination, prediction, inference, SAM requests, analysis,
-  training, distillation, and video-review planning. Services return values or
+  training, distillation, OpenAI authorization/request contracts, and video-review
+  planning. Services return values or
   structured errors and never display dialogs.
 - `squeakpose.workers` owns newline-delimited JSON parsing and process lifecycle.
 - `squeakpose.ui` gathers user input, presents results, and coordinates the boundaries
@@ -76,6 +77,13 @@ shutdown, followed by terminate/kill escalation when it does not complete.
 `SamAssistantController` is the Qt-side lifecycle owner; the main window selects weight
 paths, submits prompt values, and renders decisions without importing or constructing a
 model.
+
+The optional OpenAI pose assistant is remote I/O rather than local model execution.
+`OpenAIController` performs browser OAuth, model discovery, and streaming Responses
+requests on a daemon thread so Qt remains responsive. Its Qt-free services validate
+OIDC tokens and structured model output. Credentials are installation-global,
+owner-readable only, and never stored in a project; accepted proposals enter the
+ordinary pose edit state and remain unsaved until the user invokes Save.
 
 The accepted event families are:
 
@@ -171,8 +179,9 @@ consistently publish typing metadata; no local package is covered by a blanket
 The 2026-08 Phase 6 audit retained all runtime requirements. Static import evidence from
 the application and workers accounts for PyQt6, PyYAML, NumPy, OpenCV, pandas,
 matplotlib, seaborn, scikit-learn, hdbscan, UMAP, one-euro-filter, PyAV (`av`), PyTorch,
-Ultralytics, and Lightly Train. The notebook-facing IPython packages and transitive or
-lower-level model-stack packages such as CLIP, timm, torchvision, tqdm, and numba are
+Ultralytics, Lightly Train, HTTPX, and PyJWT. The notebook-facing IPython packages and
+transitive or lower-level model-stack packages such as CLIP, timm, torchvision, tqdm,
+and numba are
 candidates for future optional feature groups, but moving them now could change
 clean-install behavior for the bundled analysis notebook or distillation/model
 workflows. They must be validated from clean feature-specific environments before any

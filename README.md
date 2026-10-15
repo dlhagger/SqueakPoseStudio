@@ -45,9 +45,12 @@ block the main interface.
 - Optional SAM-compatible weights for the Segmentation layer
 - Optional eligible ChatGPT Plus or Pro account for OpenAI pose proposals
 
-PyTorch package sources are configured in `pyproject.toml`: macOS uses the
-PyTorch CPU index, while Linux and Windows use the configured CUDA index. The
-application selects CUDA, MPS, or CPU at runtime according to availability.
+PyTorch package sources are configured in `pyproject.toml`: Windows installs
+CUDA 13.2 builds of Torch and Torchvision from the official PyTorch index.
+Linux and macOS use PyPI builds. Windows GPU acceleration requires a supported
+NVIDIA GPU and a compatible driver; installing the CUDA build does not detect
+or upgrade drivers. Machines without a compatible GPU can use CPU execution.
+The application selects CUDA, MPS, or CPU at runtime according to availability.
 
 ## Install and Run
 
@@ -55,7 +58,7 @@ From the repository root, create the environment and install the locked
 dependencies:
 
 ```bash
-uv sync
+uv sync --locked
 ```
 
 Launch the application:

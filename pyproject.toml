@@ -97,8 +97,12 @@ select = [
 "squeakpose_studio.py" = ["F401", "F403"]
 "tests/render_ui_screenshots.py" = ["E402"]
 
-[tool.uv]
-torch-backend = "auto"
-
 [tool.uv.sources]
+torch = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
 clip = { git = "https://github.com/ultralytics/CLIP/", rev = "488e81a6711eea7346872b46ea928b367da8889d" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true

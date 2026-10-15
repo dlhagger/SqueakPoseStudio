@@ -10,7 +10,7 @@ TRACKER_BOTSORT = "botsort"
 TRACKER_NONE = "none"
 TRACKER_CHOICES = (TRACKER_AUTO, TRACKER_BYTETRACK, TRACKER_BOTSORT)
 DEFAULT_TRACKER_PROFILE = "fixed_camera_v1"
-MIN_EXPECTED_ANIMALS = 1
+MIN_EXPECTED_ANIMALS = 0
 MAX_EXPECTED_ANIMALS = 32
 
 
@@ -23,9 +23,11 @@ class TrackingConfig:
     resolved_tracker: str
     tracker_profile: str = DEFAULT_TRACKER_PROFILE
     enabled: bool = True
+    subject_class: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "subject_class": self.subject_class,
             "enabled": self.enabled,
             "expected_animal_count": self.expected_animal_count,
             "requested_tracker": self.requested_tracker,
@@ -50,6 +52,7 @@ def resolve_tracking_config(
     expected_animal_count: int = 1,
     requested_tracker: str = TRACKER_AUTO,
     *,
+    subject_class: str = "",
     enabled: bool = True,
     tracker_profile: str = DEFAULT_TRACKER_PROFILE,
 ) -> TrackingConfig:
@@ -70,13 +73,14 @@ def resolve_tracking_config(
     if not enabled:
         resolved = TRACKER_NONE
     elif requested == TRACKER_AUTO:
-        resolved = TRACKER_BYTETRACK if count == 1 else TRACKER_BOTSORT
+        resolved = TRACKER_BYTETRACK if count <= 1 else TRACKER_BOTSORT
     return TrackingConfig(
         expected_animal_count=count,
         requested_tracker=requested,
         resolved_tracker=resolved,
         tracker_profile=profile,
         enabled=bool(enabled),
+        subject_class=str(subject_class).strip(),
     )
 
 
@@ -93,3 +97,15 @@ __all__ = [
     "normalize_tracker_choice",
     "resolve_tracking_config",
 ]
+
+
+def resolve_subject_class(classes: list[str], requested: str = "") -> str:
+    """Validate an optional legacy subject selection; mixed-class inference needs none."""
+    names = list(dict.fromkeys(str(name).strip() for name in classes if str(name).strip()))
+    if requested:
+        if names and requested not in names:
+            raise ValueError(f"Subject class {requested!r} is absent from model classes {names!r}.")
+        return requested
+    if len(names) == 1:
+        return names[0]
+    return ""

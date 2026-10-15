@@ -186,7 +186,9 @@ class _FrameAccumulator:
         time_value = _finite(row.get("time_seconds"))
         if self.time_seconds is None and time_value is not None:
             self.time_seconds = time_value
-        _append_int(self.reported_detection_counts, row.get("detections_in_frame"))
+        subject_class = str(row.get("subject_class") or "").strip()
+        if not subject_class:
+            _append_int(self.reported_detection_counts, row.get("detections_in_frame"))
         _append_int(self.reported_track_counts, row.get("tracks_in_frame"))
         _append_int(self.expected_counts, row.get("expected_animal_count"))
         detection_index = _finite(row.get("detection_index"))
@@ -199,6 +201,9 @@ class _FrameAccumulator:
         )
         if not valid:
             return
+        self.overlays.append(_overlay_from_inference_row(row, self.source.layer_id))
+        if subject_class and row.get("class_name") != subject_class:
+            return
         self.valid_detection_rows += 1
         if confidence is not None:
             self.confidences.append(confidence)
@@ -209,7 +214,6 @@ class _FrameAccumulator:
             for column, raw_value in row.items():
                 if column.startswith("kp_") and column.endswith("_conf"):
                     _append_finite(self.keypoint_confidences, raw_value)
-        self.overlays.append(_overlay_from_inference_row(row, self.source.layer_id))
 
     def finish(self) -> InferenceReviewCandidate:
         detection_count = max(
@@ -228,9 +232,9 @@ class _FrameAccumulator:
             status = "good"
             if detection_count < expected:
                 reasons.append("missing_some_detections")
-            if detection_count > expected:
+            if expected > 0 and detection_count > expected:
                 reasons.append("extra_detection")
-            if track_count is not None and track_count != expected:
+            if expected > 0 and track_count is not None and track_count != expected:
                 reasons.append("track_count_mismatch")
             if confidence is not None and confidence < LOW_DETECTION_CONFIDENCE:
                 reasons.append("low_detection_confidence")

@@ -14,8 +14,9 @@ class TrackingServiceTests(unittest.TestCase):
         self.assertEqual(config.resolved_tracker, "bytetrack")
 
     def test_count_and_tracker_are_validated(self):
+        self.assertEqual(resolve_tracking_config(0).expected_animal_count, 0)
         with self.assertRaises(ValueError):
-            resolve_tracking_config(0)
+            resolve_tracking_config(-1)
         with self.assertRaises(ValueError):
             resolve_tracking_config(33)
         with self.assertRaises(ValueError):

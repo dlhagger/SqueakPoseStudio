@@ -57,7 +57,9 @@ from PyQt6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
+    QGraphicsRectItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QGridLayout,
     QHBoxLayout,
@@ -197,6 +199,7 @@ from squeakpose.services.frame_annotations import (
     load_pose_document,
     load_segmentation_document,
     plan_segmentation_box_transfer,
+    plan_segmentation_box_transfers,
 )
 from squeakpose.services.image_queue import (
     ImageDeletionPlan,
@@ -228,6 +231,12 @@ from squeakpose.services.prediction import (
     validate_prediction_identity,
 )
 from squeakpose.services.prediction_serialization import rank_prediction_frames
+from squeakpose.services.segmentation_transfer import (
+    create_pose_instances,
+    incomplete_pose_instances,
+    plan_box_assignments,
+    replace_pose_boxes,
+)
 from squeakpose.ui.annotation_panel import (
     AnnotationPanel,
     AnnotationPanelCallbacks,
@@ -284,6 +293,7 @@ from squeakpose.ui.project_launcher import (
 from squeakpose.ui.project_models_dialog import ProjectModelsDialog
 from squeakpose.ui.sam_assistant_controller import SamAssistantController
 from squeakpose.ui.segmentation_controller import SegmentationAnnotationController
+from squeakpose.ui.segmentation_transfer_dialog import SegmentationBoxReviewDialog
 from squeakpose.ui.style import (
     apply_panel_shadow,
     sidebar_stylesheet,
@@ -2127,7 +2137,8 @@ class LabelingApp(QMainWindow):
             image_width=self.img_w,
             image_height=self.img_h,
         )
-        for cid, entry in document.snapshot().items():
+        for entry in document.all_entries():
+            cid = int(entry["class_id"])
             points = []
             for pair in entry.get("segments", []):
                 try:
@@ -2161,7 +2172,8 @@ class LabelingApp(QMainWindow):
             image_width=self.img_w,
             image_height=self.img_h,
         )
-        for cid, entry in load_result.document.snapshot().items():
+        for entry in load_result.document.all_entries():
+            cid = int(entry["class_id"])
             bbox_data = entry.get("bbox", {})
             bbox = BoundingBox(
                 bbox_data.get("x", 0.0),
@@ -3076,7 +3088,231 @@ class LabelingApp(QMainWindow):
             required_keypoints=self._kp_names_for_index(class_id),
         )
 
+    def _multi_animal_enabled(self) -> bool:
+        panel = self.__dict__.get("annotation_panel")
+        return bool(panel is not None and panel.multi_animal_check.isChecked())
+
+    def _canvas_class_label(self, class_id: int) -> str:
+        return self.classes[class_id] if 0 <= class_id < len(self.classes) else str(class_id)
+
+    def _instance_label(self, class_id: int, instance_id: str | None = None) -> str:
+        name = self.classes[class_id] if 0 <= class_id < len(self.classes) else str(class_id)
+        if not self._multi_animal_enabled():
+            return name
+        document = self.annotation_cache
+        identifier = instance_id or document.selected_instance_id(class_id)
+        identifiers = document.instance_ids(class_id)
+        return f"{name} {identifiers.index(identifier) + 1}" if identifier in identifiers else name
+
+    def _refresh_instance_controls(self) -> None:
+        panel = self.__dict__.get("annotation_panel")
+        document = self.__dict__.get("annotation_cache")
+        if panel is None or document is None or self._is_depth_layer():
+            return
+        cid = self.class_selector.currentIndex()
+        if cid < 0:
+            return
+        entries = document.all_entries()
+        if len(entries) > len(document):
+            panel.multi_animal_check.setChecked(True)
+        selector = panel.instance_selector
+        selector.blockSignals(True)
+        selector.clear()
+        selected_id = document.selected_instance_id(cid)
+        for index, identifier in enumerate(document.instance_ids(cid)):
+            selector.addItem(self._instance_label(cid, identifier), identifier)
+            if identifier == selected_id:
+                selector.setCurrentIndex(index)
+        selector.blockSignals(False)
+        panel.add_instance_btn.setEnabled(bool(self.images))
+        panel.delete_instance_btn.setEnabled(bool(self.images))
+        for item in self.scene.items():
+            if self._is_reference_layer_item(item):
+                continue
+            if isinstance(item, BoxItem):
+                item.set_label_text(self._canvas_class_label(item.bbox.class_id))
+            elif self._is_seg_mask_item(item):
+                text = self._canvas_class_label(item.seg_class_id)
+                if getattr(item, "seg_preview", False):
+                    text += " (preview)"
+                self._scene_presenter.set_segmentation_label(item, text)
+        self._render_other_instances()
+
+    def _render_other_instances(self) -> None:
+        for item in list(self.scene.items()):
+            if getattr(item, "annotation_instance_reference", False):
+                self.scene.removeItem(item)
+        document = self.annotation_cache
+        selected = {document.entry_id(entry) for entry in document.values()}
+        for entry in document.all_entries():
+            if document.entry_id(entry) in selected:
+                continue
+            path = QPainterPath()
+            if self._is_seg_workflow():
+                polygon = self._polygon_path(entry.get("segments", []))
+                if polygon is None:
+                    continue
+                path = polygon
+            else:
+                box = entry.get("bbox", {})
+                path.addRect(
+                    QRectF(box.get("x", 0), box.get("y", 0), box.get("w", 0), box.get("h", 0))
+                )
+            item = QGraphicsPathItem(path)
+            item.reference_layer_id = "annotation_instance"
+            item.annotation_instance_reference = True
+            item.setPen(QPen(QColor("#e6bd69"), 2))
+            item.setOpacity(0.65)
+            item.setZValue(3)
+            self.scene.addItem(item)
+            if not self._is_seg_workflow():
+                for point in entry.get("keypoints", []):
+                    if not point.get("vis", 2):
+                        continue
+                    keypoint = KeypointItem(
+                        Keypoint(
+                            float(point["x"]),
+                            float(point["y"]),
+                            int(entry["class_id"]),
+                            str(point["name"]),
+                        ),
+                        self.kp_pixel_radius,
+                        self.kp_font_px,
+                    )
+                    keypoint.visibility = int(point.get("vis", 2))
+                    keypoint.set_reference_style(
+                        QColor("#e6bd69"),
+                        show_label=getattr(self, "_keypoint_labels_visible", True),
+                    )
+                    keypoint.reference_layer_id = "annotation_instance"
+                    keypoint.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+                    keypoint.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+                    keypoint.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    keypoint.setParentItem(item)
+            label = QGraphicsSimpleTextItem(self._canvas_class_label(int(entry["class_id"])), item)
+            label.setFont(_ui_font(12))
+            label.setBrush(QBrush(QColor("#201c14")))
+            label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            bounds = path.boundingRect()
+            badge_height = label.boundingRect().height() + 2
+            y = bounds.top() - badge_height - 2
+            if y < self.scene.sceneRect().top():
+                y = bounds.bottom() + 2
+            label.setPos(bounds.left() + 6, y + 1)
+            label.setZValue(0.2)
+            background = QGraphicsRectItem(item)
+            background.setRect(bounds.left() + 2, y, label.boundingRect().width() + 8, badge_height)
+            background.setBrush(QBrush(QColor("#e6bd69")))
+            background.setPen(QPen(Qt.PenStyle.NoPen))
+            background.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            background.setZValue(0.1)
+
+    def _instance_operation_busy(self) -> bool:
+        controllers = (
+            self.__dict__.get("_sam_assistant_controller"),
+            self.__dict__.get("_openai_controller"),
+        )
+        return bool(
+            getattr(self, "_predict_busy", False)
+            or getattr(self, "_analysis_read_only", False)
+            or any(controller is not None and controller.is_busy for controller in controllers)
+            or self.__dict__.get("_pending_sam_prompt_request") is not None
+        )
+
+    def _instance_edit_can_switch(self) -> bool:
+        if self._instance_operation_busy():
+            self.update_status_bar("Wait for the current operation before changing instances.")
+            return False
+        if self._is_seg_workflow():
+            if self.seg_preview_points:
+                self.update_status_bar(
+                    "Accept or cancel the SAM preview before switching instances."
+                )
+                return False
+            self._cache_active_annotation()
+            return True
+        cid = self.class_selector.currentIndex()
+        state = self._sync_pose_state_from_scene(cid)
+        if state.box is not None and not state.is_complete and not self._multi_animal_enabled():
+            self.update_status_bar("Finish this instance's keypoints before switching instances.")
+            return False
+        self._cache_active_annotation()
+        return True
+
+    def _restore_selected_instance(self, cid: int) -> None:
+        self._clear_class_items(cid, drop_cache=False)
+        if self._is_seg_workflow():
+            self._sync_segmentation_state_from_cache()
+        else:
+            self._pose_state_for_class(cid)
+        self._restore_annotation_for_class(cid)
+        self._sync_active_class_state()
+        self._update_item_editability()
+        self._update_status()
+
+    def _add_animal_instance(self) -> None:
+        # Keep this compatibility entry point; instances can belong to any class.
+        if not self.images or self._is_depth_layer():
+            return
+        cid = self.class_selector.currentIndex()
+        if cid < 0 or not self._instance_edit_can_switch():
+            return
+        if cid not in self.annotation_cache:
+            self.update_status_bar("Label the current instance before adding another.")
+            return
+        self.annotation_panel.multi_animal_check.setChecked(True)
+        self.annotation_cache.start_instance(cid)
+        self._restore_selected_instance(cid)
+        self.set_mode("segment" if self._is_seg_workflow() else "bbox")
+        self.update_status_bar("New instance selected. Add its mask or bounding box.")
+
+    def _cycle_instance(self) -> None:
+        panel = self.__dict__.get("annotation_panel")
+        if (
+            panel is None
+            or not self.images
+            or self._is_depth_layer()
+            or not self._multi_animal_enabled()
+        ):
+            return
+        selector = panel.instance_selector
+        if selector.count() > 1:
+            selector.setCurrentIndex((selector.currentIndex() + 1) % selector.count())
+
+    def _on_instance_changed(self, index: int) -> None:
+        panel = self.__dict__.get("annotation_panel")
+        if panel is None or index < 0:
+            return
+        cid = self.class_selector.currentIndex()
+        identifier = panel.instance_selector.itemData(index)
+        if identifier == self.annotation_cache.selected_instance_id(cid):
+            return
+        if not self._instance_edit_can_switch():
+            self._refresh_instance_controls()
+            return
+        self.annotation_cache.select_instance(cid, identifier)
+        self._restore_selected_instance(cid)
+
+    def _delete_animal_instance(self) -> None:
+        if not self.images or self._instance_operation_busy():
+            return
+        cid = self.class_selector.currentIndex()
+        if (
+            QMessageBox.question(
+                self, "Delete instance", "Delete the selected instance's annotation?"
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self._clear_class_items(cid, drop_cache=True)
+        remaining = [e for e in self.annotation_cache.all_entries() if e["class_id"] == cid]
+        if remaining:
+            self.annotation_cache.select_instance(cid, self.annotation_cache.entry_id(remaining[0]))
+        self._restore_selected_instance(cid)
+
     def _jump_to_next_pending_class(self):
+        if self._multi_animal_enabled():
+            return
         total = len(self.classes)
         if total <= 1:
             return
@@ -3631,13 +3867,6 @@ class LabelingApp(QMainWindow):
             QMessageBox.information(self, "OpenAI Auto-label", "Select a class first.")
             return
         keypoint_names = tuple(self._kp_names_for_index(class_id))
-        if not keypoint_names:
-            QMessageBox.information(
-                self,
-                "OpenAI Auto-label",
-                "The selected class has no keypoints configured.",
-            )
-            return
         models = tuple(self._openai_models)
         if not models:
             self._openai_controller.refresh_models()
@@ -3688,51 +3917,88 @@ class LabelingApp(QMainWindow):
             )
             return
         class_id = self.class_selector.currentIndex()
-        if class_id < 0 or self.classes[class_id] != proposal.class_name:
+        if (
+            class_id < 0
+            or class_id >= len(self.classes)
+            or self.classes[class_id] != proposal.class_name
+        ):
             self._openai_status_changed(
                 "Discarded OpenAI proposal because the selected class changed."
             )
             return
+        if tuple(self._kp_names_for_index(class_id)) != proposal.keypoint_names:
+            self._openai_status_changed(
+                "Discarded OpenAI proposals because the keypoint schema changed."
+            )
+            return
+        if not proposal.instances:
+            self._openai_status_changed(
+                f"OpenAI found no instances of '{proposal.class_name}'. Existing annotations were kept."
+            )
+            return
         confidence_lines = "\n".join(
-            f"• {point.name}: {point.confidence:.0%}" for point in proposal.keypoints
+            f"Instance {index}: "
+            + (
+                ", ".join(f"{point.name} {point.confidence:.0%}" for point in instance.keypoints)
+                or "bounding box only"
+            )
+            for index, instance in enumerate(proposal.instances[:10], start=1)
         )
+        count = len(proposal.instances)
+        instance_word = "instance" if count == 1 else "instances"
+        if count > 10:
+            confidence_lines += f"\n… and {count - 10} additional instances."
         decision = QMessageBox.question(
             self,
-            "Apply OpenAI pose proposal?",
-            f"{proposal.model} proposed {len(proposal.keypoints)} keypoints for "
-            f"'{proposal.class_name}'.\n\n{confidence_lines}\n\n"
-            "Applying replaces the current annotation for this class. The result remains "
-            "unsaved and can be moved, hidden, or undone before you save it.",
+            "Apply OpenAI instance proposals?",
+            f"{proposal.model} found {count} {instance_word} of '{proposal.class_name}'.\n\n"
+            f"{confidence_lines}\n\n"
+            "Applying replaces all current instances of this class on this image. "
+            "Other classes are preserved. Each proposal becomes a separately editable "
+            "instance and remains unsaved until you Save.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if decision != QMessageBox.StandardButton.Yes:
-            self._openai_status_changed("OpenAI pose proposal rejected.")
+            self._openai_status_changed("OpenAI instance proposals rejected.")
             return
-        controller = self._bind_pose_annotation_controller()
-        if controller is None:
-            self._openai_error("The pose editor is unavailable.")
-            return
-        x, y, width, height = proposal.box
-        controller.select_class(class_id)
-        self.pose_edit_state = controller.state
-        controller.set_box(BoundingBox(x, y, width, height, class_id))
-        for point in proposal.keypoints:
-            controller.add_next_keypoint(
-                point.x,
-                point.y,
-                visibility=point.visibility,
-                display_name=point.name,
+        entries = [
+            entry for entry in self.annotation_cache.all_entries() if entry["class_id"] != class_id
+        ]
+        for instance in proposal.instances:
+            x, y, width, height = instance.box
+            entries.append(
+                {
+                    "class_id": class_id,
+                    "bbox": {"x": x, "y": y, "w": width, "h": height},
+                    "keypoints": [
+                        {
+                            "name": point.name,
+                            "x": point.x,
+                            "y": point.y,
+                            "vis": point.visibility,
+                            "idx": index,
+                            "canon_idx": self.kp_names.index(point.name),
+                        }
+                        for index, point in enumerate(instance.keypoints)
+                    ],
+                }
             )
-        self._restore_annotation_for_class(class_id)
-        confidence_by_name = {point.name: point.confidence for point in proposal.keypoints}
-        for item in self._class_keypoint_items(class_id):
-            setattr(item, "pred_conf", confidence_by_name.get(item.kp.name, 0.0))
-            item.update_appearance()
+        document = PoseAnnotationDocument()
+        document.replace_instance_entries(entries)
+        self._clear_all_annotation_items()
+        self.annotation_cache = document
+        self._bind_pose_annotation_controller()
+        if count > 1:
+            self.annotation_panel.multi_animal_check.setChecked(True)
+        for cid in list(document):
+            self._restore_annotation_for_class(cid)
+        self._sync_active_class_state()
         self._update_item_editability()
         self._update_status()
+        self._update_progress_label()
         self._openai_status_changed(
-            f"Applied {proposal.model} proposal. Review and edit it, then Save when satisfied."
+            f"Applied {count} editable '{proposal.class_name}' {instance_word}. Review, edit, then Save."
         )
 
     def open_video_library(self, _checked: bool = False, *, add_immediately: bool = False):
@@ -3924,6 +4190,10 @@ class LabelingApp(QMainWindow):
                 class_changed=self._on_class_changed,
                 manage_classes=self.open_class_manager,
                 use_segmentation_box=self._use_segmentation_box_for_pose,
+                create_from_segmentation=self._create_pose_instances_from_segmentation,
+                add_instance=self._add_animal_instance,
+                instance_changed=self._on_instance_changed,
+                delete_instance=self._delete_animal_instance,
             ),
             embedded=True,
             parent=self.left_sidebar_content,
@@ -3939,6 +4209,9 @@ class LabelingApp(QMainWindow):
         self.class_controls_frame = self.annotation_panel.class_controls_frame
         self.class_label_widget = self.annotation_panel.class_label
         self.class_selector = self.annotation_panel.class_selector
+        self.annotation_panel.multi_animal_check.toggled.connect(
+            lambda _checked: self._refresh_instance_controls()
+        )
         self.manage_classes_btn = self.annotation_panel.manage_classes_btn
         self.progress_label = self.annotation_panel.progress_label
         self._fit_class_selector_to_items()
@@ -4191,6 +4464,7 @@ class LabelingApp(QMainWindow):
         if controller is None or not isinstance(self.annotation_cache, PoseAnnotationDocument):
             return None
         controller.bind_document(self.annotation_cache)
+        controller.retain_partial = self._multi_animal_enabled()
         controller.configure_schema(
             keypoint_order_for=self._kp_names_for_index,
             canonical_names=self.kp_names,
@@ -4210,7 +4484,7 @@ class LabelingApp(QMainWindow):
         controller.state = self.seg_edit_state
         return controller
 
-    def _segmentation_box_transfer_plan(self):
+    def _segmentation_box_transfer_plans(self):
         if not self._is_keypoints_layer():
             raise SegmentationBoxUnavailableError(
                 "Switch to the Keypoints layer to use a segmentation box."
@@ -4226,7 +4500,7 @@ class LabelingApp(QMainWindow):
             image_width=self.img_w,
             image_height=self.img_h,
         )
-        return plan_segmentation_box_transfer(
+        return plan_segmentation_box_transfers(
             pose_class_id=class_id,
             pose_classes=self.pose_classes,
             segmentation_classes=self.seg_classes,
@@ -4238,23 +4512,58 @@ class LabelingApp(QMainWindow):
         if panel is None:
             return
         try:
-            plan = self._segmentation_box_transfer_plan()
+            plans = self._segmentation_box_transfer_plans()
         except SegmentationBoxUnavailableError as error:
             panel.set_segmentation_box_available(False, reason=str(error))
             return
         panel.set_segmentation_box_available(
             True,
-            reason=f"Use saved segmentation bounds for '{plan.class_name}'.",
+            reason=f"Use {len(plans)} saved segmentation box(es) for '{plans[0].class_name}'.",
         )
 
     def _use_segmentation_box_for_pose(self) -> None:
         try:
-            plan = self._segmentation_box_transfer_plan()
+            plans = self._segmentation_box_transfer_plans()
         except SegmentationBoxUnavailableError as error:
             QMessageBox.information(self, "Segmentation box unavailable", str(error))
             self._refresh_segmentation_box_action()
             return
 
+        if self._instance_operation_busy():
+            return
+        cid = plans[0].pose_class_id
+        state = self._sync_pose_state_from_scene(cid)
+        if state.box is not None:
+            self.annotation_cache.apply_edit_state(state, require_complete=False)
+            if not state.is_complete:
+                self.annotation_panel.multi_animal_check.setChecked(True)
+        targets = [
+            entry for entry in self.annotation_cache.all_entries() if entry["class_id"] == cid
+        ]
+        if not targets:
+            self._create_pose_instances_from_segmentation()
+            return
+        if len(plans) > 1 or len(targets) > 1:
+            try:
+                assignment_plan = plan_box_assignments(targets, plans)
+            except SegmentationBoxUnavailableError as error:
+                QMessageBox.information(self, "Cannot replace boxes", str(error))
+                return
+            assignments = assignment_plan.assignments
+            if assignment_plan.requires_review:
+                dialog = SegmentationBoxReviewDialog(
+                    targets, plans, assignments, self.current_image_path, self
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                assignments = dialog.assignments
+            document = replace_pose_boxes(self.annotation_cache, plans, assignments)
+            self._install_transferred_pose_document(document)
+            self.update_status_bar(
+                f"Replaced {len(targets)} boxes. Keypoints preserved; Save when ready."
+            )
+            return
+        plan = plans[0]
         class_id = plan.pose_class_id
         state = self._sync_pose_state_from_scene(class_id)
         controller = self._bind_pose_annotation_controller()
@@ -4270,6 +4579,51 @@ class LabelingApp(QMainWindow):
         self.update_status_bar(
             f"Updated the {plan.class_name} keypoint box from segmentation; "
             "existing keypoints were preserved."
+        )
+
+    def _install_transferred_pose_document(self, document: PoseAnnotationDocument) -> None:
+        self._clear_all_annotation_items()
+        self.annotation_cache = document
+        self.annotation_panel.multi_animal_check.setChecked(True)
+        self._bind_pose_annotation_controller()
+        for cid in list(document):
+            self._restore_annotation_for_class(cid)
+        self._sync_active_class_state()
+        self._update_item_editability()
+        self._update_status()
+
+    def _create_pose_instances_from_segmentation(self) -> None:
+        if self._instance_operation_busy():
+            return
+        try:
+            plans = self._segmentation_box_transfer_plans()
+        except SegmentationBoxUnavailableError as error:
+            QMessageBox.information(self, "Segmentation unavailable", str(error))
+            return
+        cid = plans[0].pose_class_id
+        current_state = self._sync_pose_state_from_scene(cid)
+        existing = [
+            entry for entry in self.annotation_cache.all_entries() if entry["class_id"] == cid
+        ]
+        if (existing or current_state.box is not None) and QMessageBox.question(
+            self,
+            "Create instances from segmentation",
+            f"Create {len(plans)} '{plans[0].class_name}' instances from saved masks? "
+            "This replaces existing boxes AND keypoints of this class. Other classes are preserved. "
+            "Use Replace Boxes from Segmentation to keep existing keypoints.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        document = create_pose_instances(self.annotation_cache, plans)
+        self._install_transferred_pose_document(document)
+        self.set_mode("keypoint")
+        self.update_status_bar(
+            f"Created {len(plans)} instances. Place keypoints for each; I switches instances."
+        )
+
+    def _incomplete_pose_instance_ids(self) -> list[str]:
+        return incomplete_pose_instances(
+            self.annotation_cache,
+            [self._kp_names_for_index(cid) for cid in range(len(self.classes))],
         )
 
     def _pose_state_for_class(self, class_id: int) -> PoseEditState:
@@ -4388,12 +4742,12 @@ class LabelingApp(QMainWindow):
         self.annotation_cache.pop(int(class_id), None)
 
     def _sync_segmentation_state_from_cache(self) -> None:
-        entries = {int(class_id): dict(entry) for class_id, entry in self.annotation_cache.items()}
+        entries = self.annotation_cache.snapshot()
         selected = self.class_selector.currentIndex() if hasattr(self, "class_selector") else -1
         controller = self._bind_segmentation_annotation_controller()
         if controller is not None:
-            controller.replace_document(
-                entries,
+            controller.state.reset(
+                accepted_masks=entries,
                 selected_target=selected if selected >= 0 else None,
             )
             self.seg_edit_state = controller.state
@@ -4474,10 +4828,12 @@ class LabelingApp(QMainWindow):
             if state is self.pose_edit_state:
                 self._sync_pose_legacy_mirrors()
             return False
-        annotation = self.annotation_cache.apply_edit_state(state, require_complete=True)
+        annotation = self.annotation_cache.apply_edit_state(
+            state, require_complete=not self._multi_animal_enabled()
+        )
         if state is self.pose_edit_state:
             self._sync_pose_legacy_mirrors()
-        return annotation is not None
+        return annotation is not None and state.is_complete
 
     def _restore_annotation_for_class(self, cid: int):
         self._clear_class_items(cid)
@@ -4645,7 +5001,8 @@ class LabelingApp(QMainWindow):
             Qt.GlobalColor.red,
         ]
         try:
-            for idx, (cid, entry) in enumerate(sorted(self.annotation_cache.items())):
+            for idx, entry in enumerate(self.annotation_cache.all_entries()):
+                cid = int(entry["class_id"])
                 color = colors[idx % len(colors)]
                 pen = QPen(color)
                 pen.setWidth(2)
@@ -5527,12 +5884,17 @@ class LabelingApp(QMainWindow):
                 canonical_keypoints=self.kp_names,
                 class_keypoints=self.class_keypoints,
                 active_class_id=active_cid,
+                multiple_instances=self._multi_animal_enabled(),
             )
             if application.outcome == "no_detections":
                 self.update_status_bar("Prediction returned no detections.")
                 return
             if application.outcome == "no_usable_detections":
                 self.update_status_bar("Prediction returned no usable detections.")
+                return
+
+            if self._multi_animal_enabled():
+                self._apply_multi_animal_prediction(application)
                 return
 
             if active_layer == LAYER_SEGMENTATION:
@@ -5630,6 +5992,58 @@ class LabelingApp(QMainWindow):
             )
             self._on_predict_error(str(e) or "Could not apply the prediction payload")
 
+    def _apply_multi_animal_prediction(self, application) -> None:
+        entries = []
+        for mask in application.segmentation:
+            entries.append(
+                {"class_id": mask.class_id, "segments": list(mask.points), "score": mask.confidence}
+            )
+        for pose in application.pose:
+            predicted = {point.name: point for point in pose.keypoints}
+            points = []
+            for index, name in enumerate(self._kp_names_for_index(pose.class_id)):
+                point = predicted.get(name)
+                points.append(
+                    {
+                        "name": name,
+                        "x": point.x if point else 0.0,
+                        "y": point.y if point else 0.0,
+                        "vis": 2 if point else 0,
+                        "idx": index,
+                        "canon_idx": self.kp_names.index(name),
+                    }
+                )
+            entries.append(
+                {
+                    "class_id": pose.class_id,
+                    "bbox": {"x": pose.x, "y": pose.y, "w": pose.width, "h": pose.height},
+                    "keypoints": points,
+                }
+            )
+        if not entries:
+            self.update_status_bar("Prediction returned no usable instance annotations.")
+            return
+        if (
+            self.annotation_cache.all_entries()
+            and QMessageBox.question(
+                self,
+                "Replace instance annotations",
+                f"Replace this layer's current annotations with {len(entries)} model proposals?",
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self._clear_all_annotation_items()
+        self.annotation_cache.replace_instance_entries(entries)
+        if self._is_seg_workflow():
+            self._sync_segmentation_state_from_cache()
+        for cid in list(self.annotation_cache):
+            self._restore_annotation_for_class(cid)
+        self._sync_active_class_state()
+        self._update_item_editability()
+        self._update_status()
+        self.update_status_bar(f"Applied {len(entries)} instance proposals. Review before saving.")
+
     def _on_predict_error(self, error_text: str):
         # Reset busy state and re-enable button
         self._predict_busy = False
@@ -5723,6 +6137,8 @@ class LabelingApp(QMainWindow):
             "X": self._clear_seg_prompt_state,
             "A": self.apply_template_for_current_class,
             "C": lambda: self._cycle_class(+1),
+            "I": self._cycle_instance,
+            "Shift+I": self._add_animal_instance,
             Qt.Key.Key_Delete: self.delete_selected,
             Qt.Key.Key_Backspace: self.delete_selected,  # optional: Mac-friendly
             Qt.Key.Key_P: self.prev_index,
@@ -5832,6 +6248,7 @@ class LabelingApp(QMainWindow):
             isinstance(it, KeypointItem) and it.text_item.isVisible() for it in self.scene.items()
         )
         new_vis = not any_visible
+        self._keypoint_labels_visible = new_vis
         for it in self.scene.items():
             if isinstance(it, KeypointItem):
                 it.text_item.setVisible(new_vis)
@@ -6445,6 +6862,13 @@ class LabelingApp(QMainWindow):
             return any(
                 len(entry.get("segments", [])) >= 3 for entry in self.annotation_cache.values()
             )
+        if self._multi_animal_enabled():
+            state = self._sync_pose_state_from_scene(self.class_selector.currentIndex())
+            return (
+                bool(self.annotation_cache.all_entries())
+                and not self._incomplete_pose_instance_ids()
+                and (state.box is None or state.is_complete)
+            )
         for cid in range(len(self.classes)):
             if not self.annotation_cache.is_complete(
                 cid,
@@ -6457,6 +6881,7 @@ class LabelingApp(QMainWindow):
         panel = getattr(self, "__dict__", {}).get("annotation_panel")
         if panel is not None:
             panel.set_active_mode(self.mode)
+            self._refresh_instance_controls()
         buttons = {
             "panzoom": self.panzoom_btn,
             "bbox": self.bbox_btn,
@@ -6643,6 +7068,17 @@ class LabelingApp(QMainWindow):
                 self,
                 "Save Error",
                 "Place one bounding box and all keypoints for the selected class before saving.",
+            )
+            return False
+        if (
+            self._is_pose_workflow()
+            and LabelingApp._multi_animal_enabled(self)
+            and self._incomplete_pose_instance_ids()
+        ):
+            QMessageBox.warning(
+                self,
+                "Incomplete instances",
+                "Finish every instance's keypoints, or explicitly mark unavailable points invisible, before saving.",
             )
             return False
         if self._is_seg_workflow():

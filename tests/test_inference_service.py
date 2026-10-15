@@ -172,7 +172,8 @@ class InferenceServiceTests(unittest.TestCase):
                     LAYER_DEPTH: "depth.pt",
                 },
                 pose_classes=["mouse"],
-                segmentation_classes=["animal", "object"],
+                segmentation_classes=["mouse", "object"],
+                subject_class="mouse",
                 keypoint_names=["nose", "tail"],
                 device="mps",
                 batch_size=8,
@@ -192,13 +193,15 @@ class InferenceServiceTests(unittest.TestCase):
                 self.assertEqual(os.path.commonpath((tmp, job.csv_path)), os.path.abspath(tmp))
                 self.assertEqual(job.worker_config()["kp_names"], list(job.keypoint_names))
                 self.assertEqual(job.worker_config()["mode"], job.workflow)
-            self.assertEqual(plan.jobs[0].classes, ("animal", "object"))
+            self.assertEqual(plan.jobs[0].classes, ("mouse", "object"))
             self.assertEqual(plan.jobs[1].classes, ("mouse",))
             self.assertEqual(plan.jobs[1].keypoint_names, ("nose", "tail"))
             self.assertEqual(plan.jobs[2].classes, ())
             self.assertTrue(plan.jobs[2].preview_path.endswith("_depth_preview.mp4"))
             self.assertEqual(plan.jobs[0].worker_config()["resolved_tracker"], "bytetrack")
             self.assertTrue(plan.jobs[0].worker_config()["tracking_enabled"])
+            self.assertEqual(plan.jobs[0].worker_config()["subject_class"], "mouse")
+            self.assertEqual(plan.tracking.as_dict()["subject_class"], "mouse")
             self.assertFalse(plan.jobs[2].worker_config()["tracking_enabled"])
             self.assertEqual(plan.jobs[2].worker_config()["resolved_tracker"], "none")
             self.assertFalse(os.path.exists(os.path.join(tmp, "inference outputs")))

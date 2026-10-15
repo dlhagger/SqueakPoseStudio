@@ -404,6 +404,49 @@ def sidebar_stylesheet() -> str:
         padding: 7px 8px;
         line-height: 1.15;
     }}
+    QPushButton#OpenAIAutoLabel {{
+        background-color: #416e96;
+        border-color: #7398b9;
+        color: #ffffff;
+        font-weight: 750;
+    }}
+    QPushButton#OpenAIAutoLabel:hover {{
+        background-color: #4d80ae;
+    }}
+    QPushButton#OpenAIAutoLabel:pressed {{
+        background-color: #345a7b;
+    }}
+    QPushButton#OpenAIAutoLabel:disabled {{
+        background-color: {COLORS["button_bg"]};
+        border-color: {COLORS["panel_border"]};
+        color: {COLORS["text_subtle"]};
+    }}
+    QLabel#OpenAIConnection {{
+        color: {COLORS["text_muted"]};
+        font-size: 8pt;
+    }}
+    QLabel#OpenAIStatus {{
+        color: {COLORS["text_muted"]};
+        font-size: 9pt;
+        padding: 3px 0;
+    }}
+    QToolButton#OpenAIDetailsToggle {{
+        color: {COLORS["text_muted"]};
+        background: transparent;
+        border: none;
+        border-radius: 4px;
+        padding: 5px 2px;
+        text-align: left;
+    }}
+    QToolButton#OpenAIDetailsToggle:hover {{
+        color: {COLORS["text"]};
+        background-color: {COLORS["panel_bg_alt"]};
+    }}
+    QFrame#OpenAIAccountDetails {{
+        background: transparent;
+        border: none;
+        border-top: 1px solid {COLORS["panel_border"]};
+    }}
     QPushButton[layerVisibilityPill="true"] {{
         min-height: 24px;
         padding: 3px 8px;

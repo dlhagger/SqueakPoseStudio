@@ -14,6 +14,8 @@ from typing import Any, Callable, Optional
 
 from squeakpose.core import InferenceCsvWriter, build_segmentation_inference_rows
 from squeakpose.depth_ops import colorize_depth_map, depth_array_from_result, depth_map_summary
+from squeakpose.services.class_tracking import install_class_isolated_tracking
+from squeakpose.services.tracking import resolve_subject_class
 
 ProgressCallback = Callable[[int, int, str], None]
 CancelCallback = Callable[[], bool]
@@ -50,6 +52,8 @@ POSE_BASE_FIELDNAMES = [
     "detection_index",
     "track_id",
     "tracks_in_frame",
+    "total_tracks_in_frame",
+    "subject_class",
     "expected_animal_count",
     "tracker_type",
     "tracker_profile",
@@ -90,6 +94,8 @@ SEGMENTATION_FIELDNAMES = [
     "det",
     "track_id",
     "tracks_in_frame",
+    "total_tracks_in_frame",
+    "subject_class",
     "expected_animal_count",
     "tracker_type",
     "tracker_profile",
@@ -213,6 +219,8 @@ def _track_metadata(
     expected_animal_count: int,
     tracker_type: str,
     tracker_profile: str,
+    subject_class: str = "",
+    classes: list[str] | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     detections = int(len(boxes) if boxes is not None else 0)
     raw_ids = _to_list(getattr(boxes, "id", None)) if boxes is not None else []
@@ -221,8 +229,25 @@ def _track_metadata(
         for idx in range(detections)
     ]
     unique_ids = {track_id for track_id in ids if track_id != ""}
+    class_ids = _to_list(getattr(boxes, "cls", None)) if boxes is not None else []
+    subject_ids = {
+        track_id
+        for index, track_id in enumerate(ids)
+        if track_id != ""
+        and (
+            not subject_class
+            or (
+                index < len(class_ids)
+                and classes
+                and 0 <= int(class_ids[index]) < len(classes)
+                and classes[int(class_ids[index])] == subject_class
+            )
+        )
+    }
     return ids, {
-        "tracks_in_frame": len(unique_ids) if tracking_enabled else "",
+        "tracks_in_frame": len(subject_ids) if tracking_enabled else "",
+        "total_tracks_in_frame": len(unique_ids) if tracking_enabled else "",
+        "subject_class": subject_class,
         "expected_animal_count": int(expected_animal_count) if tracking_enabled else "",
         "tracker_type": tracker_type if tracking_enabled else "",
         "tracker_profile": tracker_profile if tracking_enabled else "",
@@ -234,6 +259,7 @@ def _record_tracking_qc(
     rows: list[dict[str, Any]],
     *,
     expected_animal_count: int,
+    subject_class: str = "",
 ) -> None:
     if not result.tracking_enabled:
         return
@@ -245,11 +271,12 @@ def _record_tracking_qc(
             if track_id != "":
                 normalized = int(float(track_id))
                 ids.add(normalized)
-                frame_ids.add(normalized)
+                if not subject_class or row.get("class_name") == subject_class:
+                    frame_ids.add(normalized)
         except (TypeError, ValueError):
             continue
     result.unique_track_ids = tuple(sorted(ids))
-    if len(frame_ids) != max(1, int(expected_animal_count)):
+    if expected_animal_count > 0 and len(frame_ids) != int(expected_animal_count):
         result.frames_with_track_count_mismatch += 1
     if rows and not frame_ids:
         result.frames_without_track_ids += 1
@@ -390,6 +417,7 @@ def pose_inference_rows_from_result(
     kp_names: list[str],
     classes: list[str],
     tracking_enabled: bool = False,
+    subject_class: str = "",
     expected_animal_count: int = 1,
     tracker_type: str = "",
     tracker_profile: str = "",
@@ -406,6 +434,8 @@ def pose_inference_rows_from_result(
         expected_animal_count=expected_animal_count,
         tracker_type=tracker_type,
         tracker_profile=tracker_profile,
+        subject_class=subject_class,
+        classes=classes,
     )
 
     if detections == 0:
@@ -534,6 +564,7 @@ def segmentation_rows_from_result(
     include_binary_mask: bool = True,
     numpy_module: Any = None,
     tracking_enabled: bool = False,
+    subject_class: str = "",
     expected_animal_count: int = 1,
     tracker_type: str = "",
     tracker_profile: str = "",
@@ -545,6 +576,8 @@ def segmentation_rows_from_result(
         expected_animal_count=expected_animal_count,
         tracker_type=tracker_type,
         tracker_profile=tracker_profile,
+        subject_class=subject_class,
+        classes=classes,
     )
     if result.boxes is None or len(result.boxes) == 0:
         rows = build_segmentation_inference_rows(
@@ -636,12 +669,20 @@ def run_pose_video_inference(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_requested: Optional[CancelCallback] = None,
     tracking_enabled: bool = False,
+    subject_class: str = "",
     expected_animal_count: int = 1,
     tracker_type: str = "bytetrack",
     tracker_profile: str = "fixed_camera_v1",
     tracker_path: str = "",
 ) -> InferenceRunResult:
     """Run pose inference, optionally associating detections sequentially."""
+    model_names = getattr(model, "names", None)
+    if isinstance(model_names, dict):
+        classes = [str(model_names[index]) for index in sorted(model_names)]
+    elif isinstance(model_names, (list, tuple)):
+        classes = list(model_names)
+    if subject_class:
+        resolve_subject_class(classes, subject_class)
     result = InferenceRunResult(csv_path=csv_path, tracking_enabled=tracking_enabled)
     csv_handle = None
     cap = None
@@ -662,6 +703,7 @@ def run_pose_video_inference(
                 kp_names=kp_names,
                 classes=classes,
                 tracking_enabled=tracking_enabled,
+                subject_class=subject_class,
                 expected_animal_count=expected_animal_count,
                 tracker_type=tracker_type,
                 tracker_profile=tracker_profile,
@@ -672,6 +714,7 @@ def run_pose_video_inference(
                 result,
                 rows,
                 expected_animal_count=expected_animal_count,
+                subject_class=subject_class,
             )
             result.rows_written = stream.rows_written
             result.processed_frames += 1
@@ -685,6 +728,7 @@ def run_pose_video_inference(
                 csv_handle.flush()
 
         if tracking_enabled:
+            install_class_isolated_tracking(model)
             resolved_path = tracker_path or tracker_resource_path(tracker_type)
             try:
                 results_iter = model.track(
@@ -825,12 +869,20 @@ def run_segmentation_video_inference(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_requested: Optional[CancelCallback] = None,
     tracking_enabled: bool = False,
+    subject_class: str = "",
     expected_animal_count: int = 1,
     tracker_type: str = "bytetrack",
     tracker_profile: str = "fixed_camera_v1",
     tracker_path: str = "",
 ) -> InferenceRunResult:
     """Run streaming segmentation inference, optionally with track association."""
+    model_names = getattr(model, "names", None)
+    if isinstance(model_names, dict):
+        classes = [str(model_names[index]) for index in sorted(model_names)]
+    elif isinstance(model_names, (list, tuple)):
+        classes = list(model_names)
+    if subject_class:
+        resolve_subject_class(classes, subject_class)
     result = InferenceRunResult(csv_path=csv_path, tracking_enabled=tracking_enabled)
     csv_handle = None
     try:
@@ -852,6 +904,7 @@ def run_segmentation_video_inference(
             "verbose": False,
         }
         if tracking_enabled:
+            install_class_isolated_tracking(model)
             inference_args.update(
                 {
                     "persist": True,
@@ -872,6 +925,7 @@ def run_segmentation_video_inference(
                 classes=classes,
                 include_binary_mask=False,
                 tracking_enabled=tracking_enabled,
+                subject_class=subject_class,
                 expected_animal_count=expected_animal_count,
                 tracker_type=tracker_type,
                 tracker_profile=tracker_profile,
@@ -907,6 +961,7 @@ def run_segmentation_video_inference(
                 result,
                 rows,
                 expected_animal_count=expected_animal_count,
+                subject_class=subject_class,
             )
 
             result.processed_frames = frame_idx + 1

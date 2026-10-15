@@ -16,6 +16,22 @@ class InferenceVideoDialogTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(["inference-picker-test"])
 
+    def test_mixed_class_inference_needs_no_subject_selection(self):
+        with TemporaryDirectory() as tmp:
+            videos = Path(tmp, "videos")
+            videos.mkdir()
+            Path(videos, "test.mp4").write_bytes(b"video")
+            dialog = InferenceVideoDialog(
+                tmp, configured_layers=("segmentation",), subject_classes=("mouse", "object")
+            )
+            self.assertFalse(hasattr(dialog, "subject_class_combo"))
+            dialog.select_all()
+            self.assertEqual(dialog.selected_video_settings[0].expected_animal_count, 0)
+            self.assertEqual(dialog.selected_video_settings[0].subject_class, "")
+            dialog.accept()
+            self.assertEqual(dialog.result(), 1)
+            dialog.close()
+
     def test_lists_project_videos_marks_history_and_supports_all_or_clear(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -69,7 +85,7 @@ class InferenceVideoDialogTests(unittest.TestCase):
             settings = dialog.selected_video_settings
             self.assertEqual(settings[0].expected_animal_count, 2)
             self.assertEqual(settings[0].requested_tracker, "botsort")
-            self.assertEqual(settings[1].expected_animal_count, 1)
+            self.assertEqual(settings[1].expected_animal_count, 0)
             self.assertEqual(settings[1].requested_tracker, "auto")
 
             dialog.clear_selection()
@@ -99,7 +115,7 @@ class InferenceVideoDialogTests(unittest.TestCase):
             second_tracker = dialog.video_table.cellWidget(1, 4)
             self.assertEqual(first_animals.value(), 3)
             self.assertEqual(first_tracker.currentData(), "botsort")
-            self.assertEqual(second_animals.value(), 1)
+            self.assertEqual(second_animals.value(), 0)
             self.assertEqual(second_tracker.currentData(), "auto")
 
     def test_auto_label_updates_with_expected_animal_count(self):

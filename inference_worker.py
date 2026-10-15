@@ -61,8 +61,9 @@ def run_inference_worker(
     batch_size = int(config.get("batch_size") or 1)
     total_frames = int(config.get("total_frames") or 0)
     fps = float(config.get("fps") or 0.0)
+    subject_class = str(config.get("subject_class") or "")
     requested_tracker = str(config.get("requested_tracker") or "auto")
-    expected_animal_count = int(config.get("expected_animal_count") or 1)
+    expected_animal_count = int(config.get("expected_animal_count", 1))
     tracker_profile = str(config.get("tracker_profile") or "fixed_camera_v1")
     tracking_enabled = bool(config.get("tracking_enabled", False)) and mode != "depth"
     tracking_config = resolve_tracking_config(
@@ -190,6 +191,7 @@ def run_inference_worker(
             progress_callback=progress,
             cancel_requested=_cancel_requested,
             tracking_enabled=tracking_enabled,
+            subject_class=subject_class,
             expected_animal_count=expected_animal_count,
             tracker_type=resolved_tracker,
             tracker_profile=tracker_profile,
@@ -210,6 +212,7 @@ def run_inference_worker(
             progress_callback=progress,
             cancel_requested=_cancel_requested,
             tracking_enabled=tracking_enabled,
+            subject_class=subject_class,
             expected_animal_count=expected_animal_count,
             tracker_type=resolved_tracker,
             tracker_profile=tracker_profile,

@@ -608,6 +608,49 @@ class PredictionOpsTests(unittest.TestCase):
         self.assertAlmostEqual(predictions["2"]["conf"], 0.85)
         self.assertEqual(predictions["2"]["detections"][0]["cls"], 1)
 
+    def test_video_review_worker_preserves_same_class_instances_and_geometry(self):
+        boxes = [[1, 2, 11, 12], [20, 2, 30, 12], [40, 2, 50, 12]]
+        polygons = [[[x1, y1], [x2, y1], [x2, y2]] for x1, y1, x2, y2 in boxes]
+        keypoints = [[[x1, y1, 0.9]] for x1, y1, _x2, _y2 in boxes]
+        for workflow in ("segmentation", "pose"):
+            with self.subTest(workflow=workflow):
+                model = _VideoReviewModel(
+                    [
+                        _Result(
+                            boxes=_Boxes(xyxy=boxes, conf=[0.86, 0.83, 0.75], cls=[0, 1, 1]),
+                            masks=_Masks(xy=polygons),
+                            keypoints=_Keypoints(keypoints),
+                        )
+                    ]
+                )
+                events = []
+                exit_code = run_video_review_worker(
+                    {
+                        "model_path": "model.pt",
+                        "video_path": "video.mp4",
+                        "workflow": workflow,
+                        "device": "cpu",
+                        "start": 0,
+                        "end": 0,
+                        "stride": 1,
+                        "batch": 1,
+                        "effective_batch": 1,
+                    },
+                    model_factory=lambda _path: model,
+                    cv2_module=_FakeCv2(["frame0"]),
+                    event_writer=events.append,
+                )
+                self.assertEqual(exit_code, 0)
+                prediction = _streamed_predictions(events)["0"]
+                detections = prediction["detections"]
+                self.assertEqual([d["cls"] for d in detections], [0, 1, 1])
+                self.assertEqual([d["xyxy"] for d in detections], boxes)
+                self.assertEqual([d["conf"] for d in detections], [0.86, 0.83, 0.75])
+                geometry = "segments" if workflow == "segmentation" else "kps"
+                expected = polygons if workflow == "segmentation" else keypoints
+                self.assertEqual([d[geometry] for d in detections], expected)
+                self.assertEqual(prediction["cls"], 0)
+
     def test_video_review_worker_batches_frames_and_preserves_result_order(self):
         model = _VideoReviewModel(
             [

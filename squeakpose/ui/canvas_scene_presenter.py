@@ -390,6 +390,12 @@ class CanvasScenePresenter:
         item.seg_label_item = label_item
         self._position_segmentation_frame(item, path)
 
+    def set_segmentation_label(self, item: QGraphicsPathItem, text: str) -> None:
+        label = getattr(item, "seg_label_item", None)
+        if label is not None:
+            label.setText(text)
+            self._position_segmentation_frame(item, item.path())
+
     def _position_segmentation_frame(
         self,
         item: QGraphicsPathItem,

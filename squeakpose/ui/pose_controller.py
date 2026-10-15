@@ -47,6 +47,7 @@ class PoseAnnotationController:
     ) -> None:
         self.document = document
         self.state = PoseEditState()
+        self.retain_partial = False
         self._keypoint_order_for = keypoint_order_for
         self._canonical_names = tuple(str(name) for name in canonical_names)
         self._callbacks = callbacks or PoseControllerCallbacks()
@@ -213,7 +214,7 @@ class PoseAnnotationController:
             return False
         annotation = self.document.apply_edit_state(
             self.state,
-            require_complete=require_complete,
+            require_complete=require_complete and not self.retain_partial,
         )
         if annotation is None:
             self.document.delete_annotation(class_id)

@@ -201,6 +201,20 @@ def top_prediction_from_payload(payload: dict[str, Any], *, workflow: str) -> di
     return out
 
 
+def instance_predictions_from_payload(
+    payload: dict[str, Any], *, workflow: str
+) -> list[dict[str, Any]]:
+    """Convert every detection to a review overlay, preserving instance geometry."""
+    detections = payload.get("detections") or []
+    if not isinstance(detections, list):
+        return []
+    return [
+        top_prediction_from_payload({"detections": [det]}, workflow=workflow)
+        for det in detections
+        if isinstance(det, dict)
+    ]
+
+
 def best_predictions_by_class_from_payload(
     payload: dict[str, Any], *, workflow: str
 ) -> list[dict[str, Any]]:

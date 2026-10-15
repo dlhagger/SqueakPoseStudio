@@ -91,6 +91,11 @@ class BoxItem(QGraphicsRectItem):
 
         self.update_model()  # ✅ now exists
 
+    def set_label_text(self, text: str) -> None:
+        """Update the display badge without changing the annotation's class."""
+        self._label.setText(text)
+        self._reposition_label()
+
     def _reposition_label(self):
         """Keep class label outside the bbox to avoid keypoint overlap.
 

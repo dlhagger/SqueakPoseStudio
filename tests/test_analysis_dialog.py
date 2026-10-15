@@ -95,6 +95,30 @@ class FrameAnnotationViewTests(unittest.TestCase):
 
 
 class AnalysisDialogInputTests(unittest.TestCase):
+    def test_class_selection_belongs_to_analysis(self):
+        from tempfile import TemporaryDirectory
+
+        from tests.test_mixed_class_inference import mixed_rows
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "input.csv")
+            mixed_rows().drop(columns="subject_class").to_csv(path, index=False)
+            dialog = AnalysisDialog(
+                None, project_root=tmp, app_base_dir=tmp, layer_id="segmentation"
+            )
+            dialog.analysis_inputs["segmentation"] = str(path)
+            dialog.csv_edit.setText(str(path))
+            dialog._refresh_analysis_classes()
+            self.assertEqual(dialog.analysis_class_combo.count(), 3)
+            self.assertEqual(dialog.analysis_class_combo.currentData(), "*")
+            dialog.analysis_class_combo.setCurrentIndex(
+                dialog.analysis_class_combo.findData("mouse")
+            )
+            dialog._set_scale_points([(0, 0), (10, 0)])
+            dialog.output_edit.setText(str(Path(tmp, "analysis")))
+            self.assertEqual(dialog._config_payload()["subject_class"], "mouse")
+            dialog.close()
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(["analysis-input-test"])

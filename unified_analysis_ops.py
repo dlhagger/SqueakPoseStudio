@@ -25,6 +25,7 @@ from analysis_ops import (
     _read_video_metadata,
     _setup_plotting,
     _smooth_centers,
+    _write_center_distances,
     assign_roi_labels,
     create_plots,
     draw_antialiased_polyline,
@@ -34,6 +35,7 @@ from analysis_ops import (
     run_behavior_clustering,
 )
 from segmentation_analysis_ops import _parse_polygon, compute_segmentation_detection_features
+from squeakpose.services.analysis_subjects import select_subject_rows
 
 POSE_SKELETON = (
     ("nose", "head"),
@@ -113,8 +115,10 @@ def _pose_candidates(raw: pd.DataFrame) -> pd.DataFrame:
     missing = sorted(required.difference(raw.columns))
     if missing:
         raise AnalysisError(f"Pose CSV is missing required columns: {', '.join(missing)}")
-    pose = raw.copy()
+    pose = select_subject_rows(raw)
     pose["pose_track_id"] = _normalized_track_ids(pose)
+    if "subject_class" in pose and "tracks_in_frame" in pose:
+        pose["tracks_in_frame"] = pose.groupby("frame_index")["pose_track_id"].transform("nunique")
     pose["frame_index"] = _numeric(pose["frame_index"])
     pose = pose.dropna(subset=["frame_index"])
     if "detection_index" in pose.columns:
@@ -154,6 +158,8 @@ def _pose_candidates(raw: pd.DataFrame) -> pd.DataFrame:
         if column.startswith("kp_") and column.endswith(("_x", "_y", "_conf")):
             if column not in keep:
                 keep.append(column)
+    if "detections_in_frame" in pose:
+        pose["detections_in_frame"] = pose.groupby("frame_index")["frame_index"].transform("size")
     return pose[keep].rename(columns=rename).reset_index(drop=True)
 
 
@@ -172,6 +178,12 @@ def _pose_primary(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def _segmentation_candidates(raw: pd.DataFrame, scale: float) -> pd.DataFrame:
+    raw = select_subject_rows(raw)
+    if "subject_class" in raw and "tracks_in_frame" in raw and "track_id" in raw:
+        frame_column = "frame_index" if "frame_index" in raw else "frame"
+        raw["tracks_in_frame"] = (
+            _normalized_track_ids(raw).groupby(raw[frame_column]).transform("nunique")
+        )
     detections = compute_segmentation_detection_features(raw, scale)
     detections["frame_index"] = _numeric(detections["frame_index"]).astype(int)
     # Geometry extraction deliberately has a compact schema. Reattach tracker
@@ -590,9 +602,20 @@ def build_unified_frame_table(
     scale: float,
 ) -> pd.DataFrame:
     """Construct an identity-aware frame table from pose and mask detections."""
+    count = _frame_count(pose_raw, segmentation_raw, video_path)
+    if config.subject_class:
+        pose_raw = select_subject_rows(pose_raw, config.subject_class)
+        segmentation_raw = select_subject_rows(segmentation_raw, config.subject_class)
+        pose_raw["subject_class"] = config.subject_class
+        segmentation_raw["subject_class"] = config.subject_class
+        for selected in (pose_raw, segmentation_raw):
+            if not selected.empty and "track_id" in selected:
+                frame_column = "frame_index" if "frame_index" in selected else "frame"
+                selected["expected_animal_count"] = max(
+                    1, int(selected.groupby(frame_column)["track_id"].nunique().max())
+                )
     pose_candidates = _pose_candidates(pose_raw)
     segmentation_candidates = _segmentation_candidates(segmentation_raw, scale)
-    count = _frame_count(pose_raw, segmentation_raw, video_path)
     if count <= 0:
         raise AnalysisError("Neither inference CSV contains a usable video frame index.")
     expected_animals = _expected_animal_count(pose_raw, segmentation_raw)
@@ -640,7 +663,11 @@ def build_unified_frame_table(
             # A one-animal recording can safely recover tracker fragments and
             # blank IDs on frames where the selected track is absent. This is
             # intentionally disabled for multi-animal recordings.
-            if expected_animals == 1:
+            if (
+                expected_animals == 1
+                and "subject_class" not in segmentation_raw
+                and "subject_class" not in pose_raw
+            ):
                 pose_primary = _pose_primary(pose_raw)
                 missing = ~pose_primary["frame_index"].isin(pose_layer["frame_index"])
                 pose_layer = pd.concat([pose_layer, pose_primary.loc[missing]], ignore_index=True)
@@ -1635,6 +1662,20 @@ def run_unified_analysis_workflow(
     """Run combined analysis and publish its outputs on success."""
     if not config.output_dir:
         raise AnalysisError("Select an output directory.")
+    if config.subject_class == "*":
+        from analysis_ops import run_all_class_analysis
+
+        return run_all_class_analysis(
+            config,
+            input_paths=[pose_csv, segmentation_csv],
+            runner=lambda selected, progress: run_unified_analysis_workflow(
+                selected,
+                pose_csv=pose_csv,
+                segmentation_csv=segmentation_csv,
+                progress_callback=progress,
+            ),
+            progress_callback=progress_callback,
+        )
     output_dir = Path(config.output_dir)
     with AnalysisOutputTransaction(output_dir) as staging_dir:
         staged_config = replace(config, output_dir=str(staging_dir))
@@ -1645,6 +1686,7 @@ def run_unified_analysis_workflow(
             published_output_dir=output_dir,
             progress_callback=progress_callback,
         )
+        _write_center_distances(result)
     return _published_analysis_result(
         result,
         staging_dir=staging_dir,

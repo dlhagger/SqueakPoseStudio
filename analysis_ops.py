@@ -20,6 +20,7 @@ import pandas as pd
 from squeakpose.core import commit_staged_paths, remove_path, staging_path_for
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
 from squeakpose.services.analysis import DEFAULT_ONE_EURO_BETA, DEFAULT_ONE_EURO_MIN_CUTOFF
+from squeakpose.services.analysis_errors import AnalysisError
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
@@ -42,6 +43,7 @@ ANALYSIS_GENERATED_DIRECTORIES = (
     "tables",
     "clustering",
     "cluster_clips",
+    "classes",
 )
 
 
@@ -57,10 +59,6 @@ def prepare_analysis_output_dir(
         if not name or Path(name).name != name:
             raise AnalysisError(f"Unsafe generated analysis artifact name: {name!r}")
         remove_path(str(output_dir / name))
-
-
-class AnalysisError(RuntimeError):
-    """Raised when an analysis workflow cannot be completed."""
 
 
 class AnalysisOutputTransaction:
@@ -206,6 +204,7 @@ class AnalysisConfig:
     detections_csv: str
     output_dir: str
     layer_id: str = ""
+    subject_class: str = ""
     video_path: str = ""
     fps: float = 0.0
     pixel_distance: float = 1.0
@@ -228,6 +227,7 @@ class AnalysisConfig:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "AnalysisConfig":
         return cls(
+            subject_class=str(raw.get("subject_class") or ""),
             detections_csv=str(raw.get("detections_csv") or ""),
             output_dir=str(raw.get("output_dir") or ""),
             layer_id=(normalize_layer_id(raw.get("layer_id")) if raw.get("layer_id") else ""),
@@ -488,7 +488,67 @@ def _prepare_single_detection_per_frame(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def compute_features(df: pd.DataFrame, fps: float, mm_per_pixel: float) -> pd.DataFrame:
+def compute_features(
+    df: pd.DataFrame, fps: float, mm_per_pixel: float, config: AnalysisConfig | None = None
+) -> pd.DataFrame:
+    """Preserve pose instances and isolate smoothing and motion by class and track."""
+    _require_columns(df, ["frame_index", "bbox_center_x", "bbox_center_y"])
+    data = df.copy().reset_index(drop=True)
+    data["frame_index"] = pd.to_numeric(data["frame_index"], errors="coerce")
+    if "detection_index" in data:
+        data = data.loc[
+            pd.to_numeric(data["detection_index"], errors="coerce").fillna(-1).ge(0)
+        ].copy()
+    data = data.dropna(subset=["frame_index"])
+    if data.empty:
+        raise AnalysisError("No pose detections are available for analysis.")
+    names = (
+        data.get("class_name", data.get("class_id", pd.Series("instance", index=data.index)))
+        .fillna("instance")
+        .astype(str)
+    )
+    tracks = data.get("track_id", pd.Series("", index=data.index)).fillna("").astype(str)
+    valid_track = ~tracks.isin(["", "nan", "None", "<NA>", "-1", "-1.0"])
+    tracks = tracks.map(
+        lambda value: (
+            str(int(float(value)))
+            if value.replace(".", "", 1).isdigit() and float(value).is_integer()
+            else value
+        )
+    )
+    legacy_single = not valid_track.any() and data.groupby("frame_index").size().max() <= 1
+    identities = [
+        f"{name}:{track}"
+        if tracked
+        else f"{name}:legacy"
+        if legacy_single
+        else f"{name}:untracked:{index}"
+        for index, (name, track, tracked) in enumerate(zip(names, tracks, valid_track))
+    ]
+    data["trajectory_id"] = identities
+    outputs = []
+    for trajectory_id, group in data.groupby("trajectory_id", sort=False):
+        group = _prepare_single_detection_per_frame(group)
+        gaps = group["frame_index"].diff().fillna(1).clip(lower=1) - 1
+        segments = group["frame_index"].diff().ne(1).cumsum()
+        for segment_id, segment in group.groupby(segments, sort=False):
+            prepared = _smooth_centers(segment, fps, config) if config is not None else segment
+            features = _compute_pose_segment_features(prepared, fps, mm_per_pixel)
+            features["trajectory_id"] = trajectory_id
+            features["trajectory_segment"] = int(segment_id)
+            features["missing_frame_gap_before"] = 0
+            features.loc[0, "missing_frame_gap_before"] = int(gaps.loc[segment.index[0]])
+            outputs.append(features)
+    result = pd.concat(outputs, ignore_index=True).sort_values(["frame_index", "trajectory_id"])
+    result["cumulative_distance_mm"] = (
+        result["distance_mm"].fillna(0).groupby(result["trajectory_id"]).cumsum()
+    )
+    return result.reset_index(drop=True)
+
+
+def _compute_pose_segment_features(
+    df: pd.DataFrame, fps: float, mm_per_pixel: float
+) -> pd.DataFrame:
     """Compute the notebook's core per-frame kinematic features."""
     _require_columns(df, ["frame_index", "bbox_center_x", "bbox_center_y"])
     detections = _prepare_single_detection_per_frame(df)
@@ -571,7 +631,9 @@ def summarize_features(df: pd.DataFrame, fps: float, mm_per_pixel: float) -> dic
         else math.nan
     )
     return {
-        "frames": int(len(df)),
+        "frames": int(df["frame_index"].nunique()),
+        "analysis_rows": int(len(df)),
+        "trajectory_count": int(df["trajectory_id"].nunique()) if "trajectory_id" in df else 1,
         "fps": float(fps),
         "duration_s": duration_s,
         "mm_per_pixel": float(mm_per_pixel),
@@ -1292,7 +1354,11 @@ def _plot_if_column(
         return None
     plt, sns = _setup_plotting()
     fig, ax = plt.subplots(figsize=(12, 4))
-    sns.lineplot(data=df, x=x_col, y=y_col, ax=ax)
+    if "trajectory_id" in df:
+        for _, segment in df.groupby(["trajectory_id", "trajectory_segment"], sort=False):
+            ax.plot(segment[x_col], segment[y_col], linewidth=1)
+    else:
+        sns.lineplot(data=df, x=x_col, y=y_col, ax=ax)
     ax.set_xlabel("Frame")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -1405,12 +1471,20 @@ def create_roi_outputs(df: pd.DataFrame, output_dir: Path, fps: float) -> dict[s
     transition_csv = ""
     transition = pd.DataFrame()
     if len(labels) > 1:
-        transition = pd.crosstab(
-            labels.iloc[:-1].to_numpy(),
-            labels.iloc[1:].to_numpy(),
-            rownames=["from_roi"],
-            colnames=["to_roi"],
-        )
+        ordered = roi_df.reset_index(drop=True)
+        if "trajectory_id" in ordered:
+            previous_labels = ordered.groupby("trajectory_id", sort=False)["roi_label"].shift()
+            previous_frames = ordered.groupby("trajectory_id", sort=False)["frame_index"].shift()
+            valid = (pd.to_numeric(ordered["frame_index"], errors="coerce") - previous_frames).eq(1)
+        else:
+            previous_labels = labels.shift()
+            valid = pd.Series(True, index=ordered.index)
+        pairs = pd.DataFrame({"from_roi": previous_labels, "to_roi": labels})
+        pairs = pairs.loc[valid].dropna()
+        transition = pd.crosstab(pairs["from_roi"], pairs["to_roi"])
+        if "trajectory_id" in ordered:
+            roi_names = sorted(labels.unique())
+            transition = transition.reindex(index=roi_names, columns=roi_names, fill_value=0)
         transition_path = output_dir / "roi_transition_matrix.csv"
         transition.to_csv(transition_path)
         transition_csv = str(transition_path)
@@ -1529,26 +1603,32 @@ def create_plots(
                 paths.append(plot_path)
 
         if "acceleration_mm_per_sec2" in plot_df.columns:
-            acceleration = pd.to_numeric(plot_df["acceleration_mm_per_sec2"], errors="coerce").abs()
             dt = pd.to_numeric(
                 plot_df.get("dt_seconds", pd.Series(np.nan, index=plot_df.index)),
                 errors="coerce",
             ).median()
             window = max(1, int(round(1.0 / dt))) if pd.notna(dt) and dt > 0 else 1
             fig, ax = plt.subplots(figsize=(12, 4))
-            ax.plot(
-                plot_df[time_column],
-                acceleration,
-                alpha=0.25,
-                linewidth=0.5,
-                label="Instantaneous magnitude",
+            groups = (
+                plot_df.groupby(["trajectory_id", "trajectory_segment"], sort=False)
+                if "trajectory_id" in plot_df
+                else [(None, plot_df)]
             )
-            ax.plot(
-                plot_df[time_column],
-                acceleration.rolling(window, min_periods=1).mean(),
-                linewidth=1.0,
-                label="1 s mean magnitude",
-            )
+            for _, group in groups:
+                values = pd.to_numeric(group["acceleration_mm_per_sec2"], errors="coerce").abs()
+                ax.plot(
+                    group[time_column],
+                    values,
+                    alpha=0.25,
+                    linewidth=0.5,
+                    label="Instantaneous magnitude",
+                )
+                ax.plot(
+                    group[time_column],
+                    values.rolling(window, min_periods=1).mean(),
+                    linewidth=1,
+                    label="1 s mean magnitude",
+                )
             ax.set(
                 title="Acceleration Magnitude",
                 xlabel=time_label,
@@ -1749,9 +1829,8 @@ def render_annotated_video(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
     rows_by_frame = {
-        int(row["frame_index"]): row
-        for _, row in df.iterrows()
-        if not pd.isna(row.get("frame_index"))
+        int(frame_index): [row for _, row in group.iterrows()]
+        for frame_index, group in df.dropna(subset=["frame_index"]).groupby("frame_index")
     }
     normalized_rois = normalize_rois(rois or [])
 
@@ -1799,8 +1878,10 @@ def render_annotated_video(
                         2,
                         lineType=cv2.LINE_AA,
                     )
-                row = rows_by_frame.get(frame_idx)
-                if row is not None:
+                frame_rows = rows_by_frame.get(frame_idx, [])
+                line_height = max(12, min(25, (height - 20) // max(3 * len(frame_rows), 1)))
+                for instance_index, row in enumerate(frame_rows):
+                    text_y = 20 + instance_index * 3 * line_height
                     bbox_vals = [
                         row.get("bbox_x1"),
                         row.get("bbox_y1"),
@@ -1828,15 +1909,17 @@ def render_annotated_video(
                             -1,
                             lineType=cv2.LINE_AA,
                         )
-                    text = f"Frame: {frame_idx}"
+                    class_name = row.get("analysis_class") or row.get("class_name") or "instance"
+                    track = row.get("track_id", "")
+                    text = f"Frame: {frame_idx} | {class_name} track {track}"
                     if not pd.isna(row.get("cumulative_distance_mm")):
                         text += f" | Distance: {float(row['cumulative_distance_mm']):.1f} mm"
                     cv2.putText(
                         frame,
                         text,
-                        (10, 30),
+                        (10, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
+                        0.45,
                         (255, 255, 255),
                         2,
                         lineType=cv2.LINE_AA,
@@ -1846,9 +1929,9 @@ def render_annotated_video(
                         cv2.putText(
                             frame,
                             f"Speed: {float(speed_val):.1f} mm/s",
-                            (10, 60),
+                            (10, text_y + line_height),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
+                            0.45,
                             (255, 255, 255),
                             2,
                             lineType=cv2.LINE_AA,
@@ -1858,9 +1941,9 @@ def render_annotated_video(
                         cv2.putText(
                             frame,
                             f"ROI: {roi_label}",
-                            (10, 90),
+                            (10, text_y + 2 * line_height),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
+                            0.45,
                             (255, 255, 255),
                             2,
                             lineType=cv2.LINE_AA,
@@ -1870,6 +1953,34 @@ def render_annotated_video(
     finally:
         cap.release()
     return str(output_path)
+
+
+def _rolling_behavior_features(df: pd.DataFrame, columns: list[str], window: int) -> pd.DataFrame:
+    """Build temporal windows within one track and contiguous segment at a time."""
+    parts = []
+    if "trajectory_id" in df:
+        keys = ["trajectory_id"]
+        if "trajectory_segment" in df:
+            keys.append("trajectory_segment")
+        groups = df.groupby(keys, sort=False)
+    else:
+        groups = [(None, df)]
+    for _, group in groups:
+        group = group.sort_values("frame_index") if "frame_index" in group else group
+        clean = group[columns].replace([np.inf, -np.inf], np.nan)
+        if "trajectory_id" in group and "frame_index" in group:
+            segments = pd.to_numeric(group["frame_index"], errors="coerce").diff().ne(1).cumsum()
+            segments = [segment for _, segment in clean.groupby(segments, sort=False)]
+        else:
+            segments = [clean]
+        for segment in segments:
+            parts.append(
+                segment.rolling(window=window, min_periods=window, center=True).agg(["mean", "std"])
+            )
+    rolled = pd.concat(parts).sort_index() if parts else pd.DataFrame()
+    if not rolled.empty:
+        rolled.columns = [f"{column}_{stat}_1s" for column, stat in rolled.columns]
+    return rolled
 
 
 def run_behavior_clustering(
@@ -1907,11 +2018,7 @@ def run_behavior_clustering(
         raise AnalysisError(f"Cannot cluster; missing feature columns: {', '.join(missing)}")
 
     window_frames = max(int(round(float(fps))), 1)
-    clean_features = df[feature_cols].replace([np.inf, -np.inf], np.nan)
-    rolled = clean_features.rolling(
-        window=window_frames, min_periods=window_frames, center=True
-    ).agg(["mean", "std"])
-    rolled.columns = [f"{col}_{stat}_1s" for col, stat in rolled.columns]
+    rolled = _rolling_behavior_features(df, feature_cols, window_frames)
     behavior_df = rolled.dropna()
     if behavior_df.empty:
         raise AnalysisError(
@@ -2072,6 +2179,9 @@ def _run_analysis_workflow_unpublished(
             result["summary"]["layer_id"] = detected_layer
         return result
 
+    from squeakpose.services.analysis_subjects import select_subject_rows
+
+    raw = select_subject_rows(raw, config.subject_class)
     _require_columns(raw, ["frame_index", "bbox_center_x", "bbox_center_y"])
 
     video_path = config.video_path.strip() or _first_existing_video_path(raw)
@@ -2079,11 +2189,8 @@ def _run_analysis_workflow_unpublished(
     scale = _mm_per_pixel(config)
 
     _progress(progress_callback, 2, total_steps, "Smoothing detection centers")
-    ordered = raw.sort_values("frame_index").reset_index(drop=True)
-    smoothed = _smooth_centers(ordered, fps, config)
-
-    _progress(progress_callback, 3, total_steps, "Computing analysis features")
-    features = compute_features(smoothed, fps, scale)
+    _progress(progress_callback, 3, total_steps, "Computing per-track analysis features")
+    features = compute_features(raw, fps, scale, config)
     rois = normalize_rois(config.rois)
     if rois:
         _progress(progress_callback, 4, total_steps, "Applying ROI annotations")
@@ -2092,6 +2199,15 @@ def _run_analysis_workflow_unpublished(
         _progress(progress_callback, 4, total_steps, "No ROI annotations selected")
     summary = summarize_features(features, fps, scale)
     summary["layer_id"] = LAYER_KEYPOINTS
+    summary["motion_gap_policy"] = "No motion across missing frames or track changes."
+    summary["tracks"] = [
+        {
+            "trajectory_id": str(identity),
+            "observed_frames": int(group["frame_index"].nunique()),
+            "total_distance_mm": float(group["distance_mm"].sum()),
+        }
+        for identity, group in features.groupby("trajectory_id", sort=False)
+    ]
     summary["detections_csv"] = os.path.abspath(config.detections_csv)
     summary["video_path"] = os.path.abspath(video_path) if video_path else ""
     summary["roi_count"] = len(rois)
@@ -2164,10 +2280,224 @@ def _run_analysis_workflow_unpublished(
     }
 
 
+def _write_center_distances(result: dict[str, Any]) -> None:
+    """Enrich the published feature table without changing its instance rows."""
+    from squeakpose.services.center_distances import add_center_distances
+
+    path = Path(result["feature_csv"])
+    features = pd.read_csv(path)
+    scale = result.get("summary", {}).get("mm_per_pixel")
+    features = add_center_distances(features, float(scale) if scale is not None else None)
+    features.to_csv(path, index=False)
+    alias = path.parent / "analysis.csv"
+    if alias.is_file() and alias != path:
+        features.to_csv(alias, index=False)
+
+
+def run_all_class_analysis(
+    config: AnalysisConfig,
+    *,
+    input_paths: list[str],
+    runner: Callable[[AnalysisConfig, ProgressCallback], dict[str, Any]],
+    progress_callback: ProgressCallback = None,
+) -> dict[str, Any]:
+    """Publish one instance table, with class-grouped summaries and visual artifacts."""
+    import hashlib
+    import re
+
+    from squeakpose.services.analysis_subjects import analysis_class_names
+
+    classes = analysis_class_names(input_paths)
+    if not classes:
+        raise AnalysisError("No classes were found in the selected inference results.")
+    output_dir = Path(config.output_dir)
+    with (
+        AnalysisOutputTransaction(output_dir) as staging_dir,
+        tempfile.TemporaryDirectory(
+            prefix="squeakpose-class-work-", dir=staging_dir.parent
+        ) as workspace,
+    ):
+        features = []
+        summaries = {}
+        plot_paths = []
+        clip_paths = []
+        roi_rows = []
+        transition_tables = []
+        detections = None
+
+        def copy_artifact(source: str, folder: str, prefix: str, index: int) -> str:
+            source_path = Path(source)
+            destination = staging_dir / folder / f"{prefix}_{index}_{source_path.name}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination)
+            return str(destination)
+
+        for index, name in enumerate(classes):
+            slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_")[:50] or "class"
+            digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+            prefix = f"{slug}-{digest}"
+            class_config = replace(
+                config,
+                subject_class=name,
+                make_annotated_video=False,
+                output_dir=str(Path(workspace) / prefix),
+            )
+
+            def progress(
+                step: int, total: int, message: str, *, offset: int = index, label: str = name
+            ) -> None:
+                _progress(
+                    progress_callback,
+                    offset * 100 + int(step / max(total, 1) * 100),
+                    len(classes) * 100 + 1,
+                    f"{label}: {message}",
+                )
+
+            # Existing computations remain isolated by class; intermediate CSVs
+            # are temporary and are never exposed as analysis outputs.
+            result = runner(class_config, progress)
+            summaries[name] = result["summary"]
+            frame = pd.read_csv(result["feature_csv"]).copy()
+            frame["analysis_class"] = name
+            for column in ("trajectory_id", "animal_id"):
+                if column in frame:
+                    values = frame[column].astype(str)
+                    frame[column] = values.where(
+                        values.str.startswith(name + ":"), name + ":" + values
+                    )
+            features.append(frame)
+            plot_paths.extend(
+                copy_artifact(path, "plots", prefix, n)
+                for n, path in enumerate(result.get("plot_paths", []))
+            )
+            clip_paths.extend(
+                copy_artifact(path, "cluster_clips", prefix, n)
+                for n, path in enumerate(result.get("cluster_clip_paths", []))
+            )
+            roi_rows.extend(
+                {**row, "analysis_class": name} for row in result.get("roi_summary", [])
+            )
+            if result.get("roi_transition_csv"):
+                transitions = pd.read_csv(result["roi_transition_csv"])
+                transitions["analysis_class"] = name
+                transition_tables.append(transitions)
+            if detections is None and result.get("segmentation_detections_csv"):
+                detections = pd.read_csv(result["segmentation_detections_csv"])
+
+        combined = pd.concat(features, ignore_index=True).sort_values(
+            ["frame_index", "analysis_class"]
+        )
+        feature_path = staging_dir / "analysis_features.csv"
+        combined.to_csv(feature_path, index=False)
+        first = next(iter(summaries.values()))
+        video_path = config.video_path or first.get("video_path", "")
+        summary = {
+            "analysis_kind": "all_classes",
+            "layer_id": first.get("layer_id") or config.layer_id,
+            "video_path": video_path,
+            "classes": classes,
+            "frames": int(combined["frame_index"].nunique()),
+            "analysis_rows": int(len(combined)),
+            "duration_s": first.get("duration_s"),
+            "mm_per_pixel": first.get("mm_per_pixel"),
+            "roi_count": len(config.rois),
+            "rois": config.rois,
+            "summaries_by_class": summaries,
+        }
+        summary_path = staging_dir / "analysis_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        detection_path = ""
+        if detections is not None:
+            if {"frame_index", "detection_index"}.issubset(combined):
+                used = set(zip(combined["frame_index"], combined["detection_index"]))
+                detections["is_primary_detection"] = [
+                    (frame, det) in used
+                    for frame, det in zip(detections["frame_index"], detections["detection_index"])
+                ]
+            detection_path = str(staging_dir / "segmentation_detections.csv")
+            detections.to_csv(detection_path, index=False)
+        roi_summary_path = ""
+        roi_transition_path = ""
+        if roi_rows:
+            roi_summary_path = str(staging_dir / "roi_summary.csv")
+            pd.DataFrame(roi_rows).to_csv(roi_summary_path, index=False)
+        if transition_tables:
+            roi_transition_path = str(staging_dir / "roi_transition_matrix.csv")
+            pd.concat(transition_tables, ignore_index=True).to_csv(roi_transition_path, index=False)
+        annotated_video = ""
+        if config.make_annotated_video:
+            fps = float(first.get("fps") or config.fps or 30)
+            annotated_path = staging_dir / "annotated_output.mp4"
+            if len(input_paths) > 1:
+                from unified_analysis_ops import render_unified_annotated_video
+
+                annotated_video = render_unified_annotated_video(
+                    combined, video_path, annotated_path, fps, normalize_rois(config.rois)
+                )
+            elif summary["layer_id"] == LAYER_SEGMENTATION:
+                from segmentation_analysis_ops import render_segmentation_annotated_video
+
+                annotated_video = (
+                    render_segmentation_annotated_video(
+                        combined, video_path, annotated_path, fps, rois=config.rois
+                    )
+                    or ""
+                )
+            else:
+                annotated_video = (
+                    render_annotated_video(
+                        combined, video_path, annotated_path, fps, rois=config.rois
+                    )
+                    or ""
+                )
+        aggregate = {
+            "output_dir": str(staging_dir),
+            "layer_id": summary["layer_id"],
+            "feature_csv": str(feature_path),
+            "summary_json": str(summary_path),
+            "summary": summary,
+            "segmentation_detections_csv": detection_path,
+            "plot_paths": plot_paths,
+            "annotated_video": annotated_video,
+            "cluster_clip_paths": clip_paths,
+            "roi_summary": roi_rows,
+            "roi_summary_csv": roi_summary_path,
+            "roi_transition_csv": roi_transition_path,
+        }
+        if len(input_paths) > 1:
+            # Compatibility aliases for the existing combined-analysis readers.
+            combined.to_csv(staging_dir / "analysis.csv", index=False)
+            (staging_dir / "summary.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            manifest = {
+                "analysis_kind": "pose_and_segmentation",
+                "analysis_scope": "all_classes",
+                "video_path": video_path,
+                "classes": classes,
+                "summaries_by_class": summaries,
+            }
+            (staging_dir / "analysis_manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        _write_center_distances(aggregate)
+        _progress(
+            progress_callback, len(classes) * 100 + 1, len(classes) * 100 + 1, "Analysis complete"
+        )
+    return _published_analysis_result(aggregate, staging_dir=staging_dir, output_dir=output_dir)
+
+
 def run_analysis_workflow(
     config: AnalysisConfig, progress_callback: ProgressCallback = None
 ) -> dict[str, Any]:
     """Run pose or segmentation analysis and publish its outputs on success."""
+    if config.subject_class == "*":
+        return run_all_class_analysis(
+            config,
+            input_paths=[config.detections_csv],
+            runner=lambda selected, progress: run_analysis_workflow(selected, progress),
+            progress_callback=progress_callback,
+        )
     if not config.output_dir:
         raise AnalysisError("Select an output directory.")
     output_dir = Path(config.output_dir)
@@ -2177,6 +2507,7 @@ def run_analysis_workflow(
             staged_config,
             progress_callback=progress_callback,
         )
+        _write_center_distances(result)
     return _published_analysis_result(
         result,
         staging_dir=staging_dir,

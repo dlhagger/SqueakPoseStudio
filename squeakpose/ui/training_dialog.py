@@ -297,8 +297,8 @@ class TrainDialog(QDialog):
 
         # Hyperparameters
         self.epoch_spin = QSpinBox()
-        self.epoch_spin.setRange(1, 1000)
-        self.epoch_spin.setValue(50)
+        self.epoch_spin.setRange(1, 42069)
+        self.epoch_spin.setValue(999)
         form.addRow("Epochs:", self.epoch_spin)
 
         self.batch_spin = QSpinBox()

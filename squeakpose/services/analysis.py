@@ -1033,6 +1033,7 @@ def build_analysis_job_config(
     cluster_clip_length_sec: float,
     samples_per_cluster: int,
     rois: Iterable[Mapping[str, Any]],
+    subject_class: str = "",
 ) -> AnalysisRunConfig:
     """Validate a single- or dual-layer analysis job using the existing worker contract."""
     clean_mode = str(analysis_mode or "").strip().lower()
@@ -1066,6 +1067,21 @@ def build_analysis_job_config(
                 f"{os.path.basename(csv_path)} is not a valid {layer} inference CSV.",
             )
 
+    from squeakpose.services.analysis_subjects import analysis_class_names
+
+    classes = analysis_class_names([normalized_inputs[layer] for layer in selected_layers])
+    if len(classes) > 1 and not subject_class:
+        raise AnalysisConfigError(
+            "class_required",
+            "Choose Class",
+            "Choose which class to analyze. Inference includes every class.",
+        )
+    if subject_class and subject_class != "*" and classes and subject_class not in classes:
+        raise AnalysisConfigError(
+            "invalid_class",
+            "Choose Class",
+            "The selected class is absent from these inference results.",
+        )
     first_layer = selected_layers[0]
     base = build_analysis_run_config(
         project_root=project_root,
@@ -1092,6 +1108,7 @@ def build_analysis_job_config(
     payload = base.as_dict()
     payload.update(
         {
+            "subject_class": subject_class or (classes[0] if len(classes) == 1 else ""),
             "analysis_mode": "both" if len(selected_layers) == 2 else first_layer,
             "analysis_inputs": {layer: normalized_inputs[layer] for layer in selected_layers},
             "selected_layers": list(selected_layers),

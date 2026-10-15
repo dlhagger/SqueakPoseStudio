@@ -14,8 +14,8 @@ from squeakpose.annotation.documents import (
 from squeakpose.annotation.models import BoundingBox
 from squeakpose.annotation.segmentation import polygon_bounds
 from squeakpose.annotation.serialization import (
-    load_pose_annotations_from_file,
-    load_segmentation_annotations_from_file,
+    parse_pose_label_line,
+    parse_segmentation_label_line,
     pose_annotation_to_line,
     segmentation_annotation_to_line,
 )
@@ -38,20 +38,21 @@ class SegmentationBoxTransferPlan:
     segmentation_class_id: int
     class_name: str
     box: BoundingBox
+    polygon: tuple[tuple[float, float], ...] = ()
 
 
 class SegmentationBoxUnavailableError(ValueError):
     """Raised when no unambiguous saved segmentation can supply a pose box."""
 
 
-def plan_segmentation_box_transfer(
+def plan_segmentation_box_transfers(
     *,
     pose_class_id: int,
     pose_classes: Sequence[str],
     segmentation_classes: Sequence[str],
     segmentation_document: SegmentationAnnotationDocument,
-) -> SegmentationBoxTransferPlan:
-    """Match a pose class by name and derive tight bounds from its segmentation."""
+) -> tuple[SegmentationBoxTransferPlan, ...]:
+    """Return every saved mask box for the selected class in shared image pixels."""
     target_id = int(pose_class_id)
     if target_id < 0 or target_id >= len(pose_classes):
         raise SegmentationBoxUnavailableError("Select a valid keypoint class first.")
@@ -75,22 +76,49 @@ def plan_segmentation_box_transfer(
     else:
         source_id = exact_matches[0]
 
-    annotation = segmentation_document.annotation(source_id)
-    if annotation is None:
+    candidates = [e for e in segmentation_document.all_entries() if e["class_id"] == source_id]
+    if not candidates:
         raise SegmentationBoxUnavailableError(
             f"No saved segmentation exists for '{class_name}' on this image."
         )
-    bounds = polygon_bounds(annotation.segments)
-    if bounds is None:
-        raise SegmentationBoxUnavailableError(
-            f"The saved segmentation for '{class_name}' has no usable bounds."
+    plans = []
+    for entry in candidates:
+        bounds = polygon_bounds(entry.get("segments", []))
+        if bounds is None:
+            raise SegmentationBoxUnavailableError(
+                f"A saved segmentation for '{class_name}' has no usable bounds."
+            )
+        plans.append(
+            SegmentationBoxTransferPlan(
+                target_id,
+                source_id,
+                class_name,
+                BoundingBox(*bounds, class_id=target_id),
+                tuple((float(x), float(y)) for x, y in entry.get("segments", [])),
+            )
         )
-    return SegmentationBoxTransferPlan(
-        pose_class_id=target_id,
-        segmentation_class_id=source_id,
-        class_name=class_name,
-        box=BoundingBox(*bounds, class_id=target_id),
+    return tuple(plans)
+
+
+def plan_segmentation_box_transfer(
+    *,
+    pose_class_id: int,
+    pose_classes: Sequence[str],
+    segmentation_classes: Sequence[str],
+    segmentation_document: SegmentationAnnotationDocument,
+) -> SegmentationBoxTransferPlan:
+    """Compatibility shortcut for a single unambiguous segmentation mask."""
+    plans = plan_segmentation_box_transfers(
+        pose_class_id=pose_class_id,
+        pose_classes=pose_classes,
+        segmentation_classes=segmentation_classes,
+        segmentation_document=segmentation_document,
     )
+    if len(plans) != 1:
+        raise SegmentationBoxUnavailableError(
+            "Multiple masks are available. Use the instance box transfer controls."
+        )
+    return plans[0]
 
 
 def load_pose_document(
@@ -103,18 +131,27 @@ def load_pose_document(
     image_height: float,
 ) -> PoseFrameLoadResult:
     """Load one pose label file without changing its tolerant row semantics."""
-    entries, extra_rows = load_pose_annotations_from_file(
-        label_file,
-        classes_count=classes_count,
-        canonical_names=list(canonical_names),
-        class_keypoint_lookup=[list(names) for names in class_keypoint_lookup],
-        img_w=image_width,
-        img_h=image_height,
-    )
-    return PoseFrameLoadResult(
-        document=PoseAnnotationDocument(entries),
-        extra_keypoint_rows=extra_rows,
-    )
+    document = PoseAnnotationDocument()
+    annotations = []
+    extra_rows = 0
+    try:
+        with open(label_file, encoding="utf-8") as source:
+            for line in source:
+                entry, had_extra = parse_pose_label_line(
+                    line.strip(),
+                    classes_count=classes_count,
+                    canonical_names=list(canonical_names),
+                    class_keypoint_lookup=[list(names) for names in class_keypoint_lookup],
+                    img_w=image_width,
+                    img_h=image_height,
+                )
+                extra_rows += int(had_extra)
+                if entry:
+                    annotations.append(entry)
+    except (OSError, UnicodeError):
+        return PoseFrameLoadResult(document=document)
+    document.replace_instance_entries(annotations)
+    return PoseFrameLoadResult(document=document, extra_keypoint_rows=extra_rows)
 
 
 def load_segmentation_document(
@@ -125,13 +162,23 @@ def load_segmentation_document(
     image_height: float,
 ) -> SegmentationAnnotationDocument:
     """Load one segmentation label file into its typed document owner."""
-    entries = load_segmentation_annotations_from_file(
-        label_file,
-        classes_count=classes_count,
-        img_w=image_width,
-        img_h=image_height,
-    )
-    return SegmentationAnnotationDocument(entries)
+    document = SegmentationAnnotationDocument()
+    annotations = []
+    try:
+        with open(label_file, encoding="utf-8") as source:
+            for line in source:
+                entry = parse_segmentation_label_line(
+                    line.strip(),
+                    classes_count=classes_count,
+                    img_w=image_width,
+                    img_h=image_height,
+                )
+                if entry:
+                    annotations.append(entry)
+    except (OSError, UnicodeError):
+        return document
+    document.replace_instance_entries(annotations)
+    return document
 
 
 def serialize_pose_snapshot(
@@ -259,6 +306,7 @@ __all__ = [
     "load_pose_document",
     "load_segmentation_document",
     "plan_segmentation_box_transfer",
+    "plan_segmentation_box_transfers",
     "serialize_pose_snapshot",
     "serialize_segmentation_snapshot",
 ]

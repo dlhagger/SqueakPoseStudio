@@ -51,7 +51,7 @@ class FrameAnnotationServiceTests(unittest.TestCase):
                 segmentation_document=document,
             )
 
-    def test_pose_load_preserves_duplicate_malformed_and_extra_row_semantics(self):
+    def test_pose_load_preserves_instances_and_malformed_extra_row_recovery(self):
         with TemporaryDirectory() as tmp:
             label_file = Path(tmp, "frame.txt")
             label_file.write_text(
@@ -72,7 +72,7 @@ class FrameAnnotationServiceTests(unittest.TestCase):
 
         self.assertIsInstance(result.document, PoseAnnotationDocument)
         self.assertEqual(result.extra_keypoint_rows, 1)
-        self.assertEqual(len(result.document.typed_snapshot().annotations), 1)
+        self.assertEqual(len(result.document.typed_snapshot().annotations), 2)
         annotation = result.document.annotation(0)
         self.assertIsNotNone(annotation)
         self.assertEqual(annotation.keypoints[0].visibility, 1)

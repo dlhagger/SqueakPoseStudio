@@ -411,6 +411,7 @@ class StudioVideoReviewTests(unittest.TestCase):
             sig = dummy._video_signature()
             payload = {
                 "meta": {
+                    "instance_format": 2,
                     "video": sig,
                     "model_path": "model.pt",
                     "workflow": WORKFLOW_SEG,
@@ -450,6 +451,7 @@ class StudioVideoReviewTests(unittest.TestCase):
             }
             payload = {
                 "meta": {
+                    "instance_format": 2,
                     "video": dummy._video_signature(),
                     "model_paths": dict(dummy.model_paths),
                 },

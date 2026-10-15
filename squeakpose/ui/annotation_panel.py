@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListView,
     QPushButton,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +52,10 @@ class AnnotationPanelCallbacks:
     class_changed: Callable[[int], None] = _ignore_class
     manage_classes: Callable[[], None] = _ignore_action
     use_segmentation_box: Callable[[], None] = _ignore_action
+    create_from_segmentation: Callable[[], None] = _ignore_action
+    add_instance: Callable[[], None] = _ignore_action
+    instance_changed: Callable[[int], None] = _ignore_class
+    delete_instance: Callable[[], None] = _ignore_action
 
 
 def _panel_button(text: str, *, tooltip: str = "") -> QPushButton:
@@ -129,11 +135,19 @@ class AnnotationPanel(QFrame):
                 lambda _checked=False, selected_mode=mode: self._choose_mode(selected_mode)
             )
 
+        self.create_from_segmentation_btn = _panel_button(
+            "Create Instances from Segmentation",
+            tooltip="Create pose boxes from every saved mask of the selected class, then place keypoints.",
+        )
+        self.create_from_segmentation_btn.clicked.connect(
+            lambda: self.callbacks.create_from_segmentation()
+        )
+        layout.addWidget(self.create_from_segmentation_btn)
         self.use_segmentation_box_btn = _panel_button(
-            "Use Segmentation Box",
+            "Replace Boxes from Segmentation",
             tooltip=(
-                "Replace this class's keypoint box with the tight bounds of its saved "
-                "segmentation mask. Existing keypoints are preserved."
+                "Replace this class's keypoint boxes with the tight bounds of its saved "
+                "segmentation masks. Boxes are associated spatially; keypoints stay fixed."
             ),
         )
         self.use_segmentation_box_btn.clicked.connect(
@@ -179,6 +193,34 @@ class AnnotationPanel(QFrame):
             lambda _checked=False: self.callbacks.manage_classes()
         )
         class_layout.addWidget(self.manage_classes_btn)
+        self.multi_animal_check = QCheckBox("Multiple instances")
+        self.multi_animal_check.setStyleSheet("QCheckBox { color: #dce4ec; }")
+        self.multi_animal_check.setToolTip(
+            "Label multiple instances of the same class. Predictions retain all instances."
+        )
+        class_layout.addWidget(self.multi_animal_check)
+        self.instance_controls = QFrame()
+        instance_layout = QVBoxLayout(self.instance_controls)
+        instance_layout.setContentsMargins(0, 0, 0, 0)
+        self.instance_selector = ThemedComboBox()
+        self.instance_selector.setToolTip(
+            "Choose an instance of the selected class (I: next instance)"
+        )
+        instance_layout.addWidget(self.instance_selector)
+        instance_buttons = QHBoxLayout()
+        self.add_instance_btn = QPushButton("Add instance")
+        self.add_instance_btn.setToolTip("Add another instance of the selected class (Shift+I)")
+        self.delete_instance_btn = QPushButton("Delete instance")
+        instance_buttons.addWidget(self.add_instance_btn)
+        instance_buttons.addWidget(self.delete_instance_btn)
+        instance_layout.addLayout(instance_buttons)
+        class_layout.addWidget(self.instance_controls)
+        self.instance_controls.hide()
+        self.multi_animal_check.toggled.connect(self.instance_controls.setVisible)
+        self.add_instance_btn.clicked.connect(lambda: self.callbacks.add_instance())
+        self.delete_instance_btn.clicked.connect(lambda: self.callbacks.delete_instance())
+        self.instance_selector.currentIndexChanged.connect(self.callbacks.instance_changed)
+
         layout.addWidget(self.class_controls_frame)
 
         progress_row = QHBoxLayout()
@@ -220,6 +262,8 @@ class AnnotationPanel(QFrame):
         self.bbox_btn.setEnabled(is_pose)
         self.keypoint_btn.setVisible(is_pose)
         self.keypoint_btn.setEnabled(is_pose)
+        self.create_from_segmentation_btn.setVisible(is_pose)
+        self.create_from_segmentation_btn.setEnabled(is_pose and self._segmentation_box_available)
         self.use_segmentation_box_btn.setVisible(is_pose)
         self.use_segmentation_box_btn.setEnabled(is_pose and self._segmentation_box_available)
         self.segment_btn.setVisible(is_segmentation)
@@ -255,13 +299,21 @@ class AnnotationPanel(QFrame):
         """Present whether the current pose class has transferable saved bounds."""
         self._segmentation_box_available = bool(available)
         self._segmentation_box_reason = str(reason).strip()
+        self.create_from_segmentation_btn.setEnabled(
+            self.active_layer == LAYER_KEYPOINTS and self._segmentation_box_available
+        )
+        self.create_from_segmentation_btn.setToolTip(
+            "Create pose boxes from every saved mask of the selected class, then place keypoints."
+            if available
+            else self._segmentation_box_reason
+        )
         self.use_segmentation_box_btn.setEnabled(
             self.active_layer == LAYER_KEYPOINTS and self._segmentation_box_available
         )
         if self._segmentation_box_available:
             self.use_segmentation_box_btn.setToolTip(
-                "Replace this class's keypoint box with the tight bounds of its saved "
-                "segmentation mask. Existing keypoints are preserved."
+                "Replace this class's keypoint boxes with the tight bounds of its saved "
+                "segmentation masks. Boxes are associated spatially; keypoints stay fixed."
             )
         else:
             self.use_segmentation_box_btn.setToolTip(
@@ -458,10 +510,9 @@ class OpenAIPosePanel(QFrame):
         title.setObjectName("panelTitle")
         layout.addWidget(title)
 
-        self.account_label = QLabel("Not connected")
-        self.account_label.setObjectName("fieldLabel")
-        self.account_label.setWordWrap(True)
-        layout.addWidget(self.account_label)
+        self.plan_label = QLabel("Connected · ChatGPT plan")
+        self.plan_label.setObjectName("OpenAIConnection")
+        layout.addWidget(self.plan_label)
 
         self.connect_btn = _panel_button("Continue with ChatGPT")
         self.connect_btn.clicked.connect(lambda _checked=False: self.callbacks.connect())
@@ -470,48 +521,89 @@ class OpenAIPosePanel(QFrame):
         model_label = QLabel("Model")
         model_label.setObjectName("fieldLabel")
         layout.addWidget(model_label)
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
         self.model_combo = ThemedComboBox()
         self.model_combo.setMinimumHeight(32)
+        self.model_combo.setMinimumWidth(0)
+        self.model_combo.setMinimumContentsLength(10)
+        self.model_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
         self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.model_combo.setToolTip("Models available through the connected ChatGPT plan")
         self.model_combo.currentIndexChanged.connect(self._model_changed)
-        layout.addWidget(self.model_combo)
-
-        self.plan_label = QLabel("Using ChatGPT plan")
-        self.plan_label.setObjectName("progressBadge")
-        layout.addWidget(self.plan_label)
+        model_row.addWidget(self.model_combo, 1)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setMinimumHeight(32)
+        self.refresh_btn.setToolTip("Refresh models available through your ChatGPT account")
+        self.refresh_btn.clicked.connect(lambda _checked=False: self.callbacks.refresh_models())
+        model_row.addWidget(self.refresh_btn)
+        layout.addLayout(model_row)
 
         self.auto_label_btn = _panel_button(
             "Auto-label Current Image",
-            tooltip="Generate an editable keypoint proposal for the selected class",
+            tooltip="Find all instances of the selected class and propose editable boxes and keypoints",
         )
-        self.auto_label_btn.setMinimumHeight(32)
+        self.auto_label_btn.setObjectName("OpenAIAutoLabel")
+        self.auto_label_btn.setMinimumHeight(38)
         self.auto_label_btn.clicked.connect(lambda _checked=False: self.callbacks.auto_label())
         layout.addWidget(self.auto_label_btn)
 
-        action_row = QHBoxLayout()
-        self.refresh_btn = _panel_button("Refresh Models")
-        self.manage_usage_btn = _panel_button("Manage Usage")
-        self.refresh_btn.clicked.connect(lambda _checked=False: self.callbacks.refresh_models())
-        self.manage_usage_btn.clicked.connect(lambda _checked=False: self.callbacks.manage_usage())
-        action_row.addWidget(self.refresh_btn)
-        action_row.addWidget(self.manage_usage_btn)
-        layout.addLayout(action_row)
+        self.status_label = QLabel("Connect ChatGPT to generate editable pose proposals.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("OpenAIStatus")
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.status_label)
+
+        self.details_toggle = QToolButton()
+        self.details_toggle.setObjectName("OpenAIDetailsToggle")
+        self.details_toggle.setText("Account && usage")
+        self.details_toggle.setAccessibleName("Account and usage")
+        self.details_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.details_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.details_toggle.setCheckable(True)
+        self.details_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self.details_toggle)
+
+        self.details_frame = QFrame()
+        self.details_frame.setObjectName("OpenAIAccountDetails")
+        details_layout = QVBoxLayout(self.details_frame)
+        details_layout.setContentsMargins(0, 8, 0, 0)
+        details_layout.setSpacing(6)
+        self.account_label = QLabel("Not connected")
+        self.account_label.setObjectName("fieldLabel")
+        self.account_label.setWordWrap(True)
+        self.account_label.setTextFormat(Qt.TextFormat.PlainText)
+        details_layout.addWidget(self.account_label)
 
         self.usage_label = QLabel("No OpenAI usage in this session.")
         self.usage_label.setWordWrap(True)
         self.usage_label.setObjectName("samHelper")
-        layout.addWidget(self.usage_label)
+        details_layout.addWidget(self.usage_label)
 
-        self.status_label = QLabel("Connect ChatGPT to generate editable pose proposals.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setObjectName("samHelper")
-        layout.addWidget(self.status_label)
+        self.manage_usage_btn = _panel_button("Manage Usage")
+        self.manage_usage_btn.clicked.connect(lambda _checked=False: self.callbacks.manage_usage())
+        details_layout.addWidget(self.manage_usage_btn)
 
+        account_actions = QHBoxLayout()
+        self.reconnect_btn = _panel_button("Reconnect")
+        self.reconnect_btn.clicked.connect(lambda _checked=False: self.callbacks.connect())
         self.sign_out_btn = _panel_button("Sign Out")
         self.sign_out_btn.clicked.connect(lambda _checked=False: self.callbacks.sign_out())
-        layout.addWidget(self.sign_out_btn)
+        account_actions.addWidget(self.reconnect_btn)
+        account_actions.addWidget(self.sign_out_btn)
+        details_layout.addLayout(account_actions)
+        layout.addWidget(self.details_frame)
+        self.details_frame.hide()
+        self.details_toggle.toggled.connect(self._set_details_expanded)
         self.set_state(connected=False)
+
+    def _set_details_expanded(self, expanded: bool) -> None:
+        self.details_frame.setVisible(expanded)
+        self.details_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
 
     @property
     def selected_model(self) -> str:
@@ -543,8 +635,10 @@ class OpenAIPosePanel(QFrame):
             if connected
             else "Not connected"
         )
-        self.connect_btn.setText("Reconnect ChatGPT" if connected else "Continue with ChatGPT")
+        self.connect_btn.setVisible(not connected)
         self.connect_btn.setEnabled(not busy)
+        self.reconnect_btn.setVisible(connected)
+        self.reconnect_btn.setEnabled(not busy)
         self.model_combo.setEnabled(connected and has_models and not busy)
         self.plan_label.setVisible(connected)
         self.auto_label_btn.setEnabled(connected and has_models and not busy)
@@ -559,7 +653,9 @@ class OpenAIPosePanel(QFrame):
         elif connected and not has_models:
             helper = "Refresh the model list before auto-labeling."
         elif connected:
-            helper = "Generate a proposal, then review and edit every point before saving."
+            helper = (
+                "Find all instances, then review and edit their boxes and keypoints before saving."
+            )
         else:
             helper = "Connect ChatGPT to generate editable pose proposals."
         self.status_label.setText(helper)

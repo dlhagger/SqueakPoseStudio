@@ -718,6 +718,14 @@ class AnalysisDialog(QDialog):
         self.analysis_mode_combo.setObjectName("AnalysisModeCombo")
         self.analysis_mode_combo.currentIndexChanged.connect(self._analysis_mode_changed)
         input_form.addRow("Analyze:", self.analysis_mode_combo)
+        self.analysis_class_combo = ThemedComboBox(self)
+        self.analysis_class_combo.setObjectName("AnalysisClassCombo")
+        self.analysis_class_combo.addItem("All classes", "*")
+        self.analysis_class_combo.setToolTip(
+            "Choose whose movement to analyze. Inference tracks and exports all classes."
+        )
+        input_form.addRow("Class to analyze:", self.analysis_class_combo)
+        self.csv_edit.textChanged.connect(self._refresh_analysis_classes)
 
         self.input_detail_label = QLabel(self)
         self.input_detail_label.setObjectName("AnalysisInputDetail")
@@ -1300,6 +1308,29 @@ class AnalysisDialog(QDialog):
         self.analysis_mode_combo.blockSignals(False)
         self._analysis_mode_changed(self.analysis_mode_combo.currentIndex())
 
+    def _refresh_analysis_classes(self, _path: str = "") -> None:
+        from squeakpose.services.analysis_subjects import analysis_class_names
+
+        if not hasattr(self, "analysis_class_combo"):
+            return
+        previous = self.analysis_class_combo.currentData()
+        mode = self._analysis_mode()
+        paths = (
+            [path for path in self.analysis_inputs.values() if path]
+            if mode == "both"
+            else [self.analysis_inputs.get(mode) or self.csv_edit.text().strip()]
+        )
+        classes = analysis_class_names(paths)
+        self.analysis_class_combo.clear()
+        self.analysis_class_combo.addItem("All classes", "*")
+        for name in classes:
+            self.analysis_class_combo.addItem(name, name)
+        selected = self.analysis_class_combo.findData(previous)
+        if selected > 0:
+            self.analysis_class_combo.setCurrentIndex(selected)
+        elif len(classes) == 1:
+            self.analysis_class_combo.setCurrentIndex(1)
+
     def _analysis_mode(self) -> str:
         return str(self.analysis_mode_combo.currentData() or self.layer_id)
 
@@ -1310,6 +1341,7 @@ class AnalysisDialog(QDialog):
             (path for path in self.analysis_inputs.values() if path), ""
         )
         self.csv_edit.setText(csv_path)
+        self._refresh_analysis_classes()
         bundle = self._selected_bundle
         if mode == "both" and bundle is not None:
             output = default_combined_analysis_output_dir(self.project_root, bundle.video_name)
@@ -1837,6 +1869,7 @@ class AnalysisDialog(QDialog):
         return build_analysis_job_config(
             project_root=self.project_root,
             analysis_mode=self._analysis_mode(),
+            subject_class=str(self.analysis_class_combo.currentData() or ""),
             analysis_inputs=self.analysis_inputs,
             video_path=self.video_edit.text(),
             output_dir=self.output_edit.text(),
@@ -1948,6 +1981,19 @@ class AnalysisDialog(QDialog):
 
     def _show_result_summary(self, event: dict[str, Any]) -> None:
         summary = event.get("summary") or {}
+        if summary.get("analysis_kind") == "all_classes":
+            lines = ["All classes · one analysis table", ""]
+            for name, details in (summary.get("summaries_by_class") or {}).items():
+                lines.extend(
+                    [
+                        str(name),
+                        f"  Tracks: {int(details.get('trajectory_count') or details.get('expected_animal_count') or 0)}",
+                        f"  Distance: {_fmt_number(details.get('total_distance_m'))} m",
+                        f"  Average speed: {_fmt_number(details.get('average_speed_mm_per_sec'))} mm/s",
+                    ]
+                )
+            self.summary_view.setPlainText("\n".join(lines))
+            return
         lines = [
             f"Frames: {int(summary.get('frames') or 0)}",
             f"Duration: {_fmt_number(summary.get('duration_s'))} s",

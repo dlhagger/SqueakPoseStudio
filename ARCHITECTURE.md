@@ -54,6 +54,39 @@ Package initializers resolve convenience exports lazily. In particular, importin
 `squeakpose.annotation.pose` or `squeakpose.annotation.segmentation` must not initialize
 PyQt graphics; UI-only modules are loaded only when their exports are requested.
 
+## Annotation instances
+
+Pose and segmentation documents retain multiple instances per class. The existing
+mapping API remains a view of the selected instance for each class, preserving
+legacy controllers and single-animal callers. Whole-frame saves, dataset-facing
+serialization, and reference rendering use `all_entries()` or typed snapshots.
+`AnnotationEntries` snapshots carry the complete instance collection and selected
+slots through existing frame-loading interfaces; casting one to a plain `dict`
+loses that extra collection and must not be used for whole-frame replacement.
+
+Explicit add/select operations park the previous instance rather than overwriting
+it. Inactive instances are read-only scene references, excluded from existing
+class-based scene queries. Editor instance IDs are not tracking identities and are
+not written into YOLO rows. Loading assigns new local IDs while preserving row
+order. Multi-animal prediction is opt-in; the default best-per-class planner remains
+available to existing callers. Training/export formats and inference identity
+contracts remain unchanged.
+
+Segmentation-to-pose transfer uses shared image pixels. The frame service resolves
+matching class schemas and exposes every saved mask's polygon bounds. The
+`segmentation_transfer` service builds detached pose documents for creation or
+box-only replacement. Replacement scores actual mask-polygon containment of
+located keypoints (visible points weighted above inferred points), then box
+geometry. A maximum-weight one-to-one assignment avoids mask reuse and greedy
+pairing errors. The score gap to the next-best assignment and positive spatial
+evidence determine whether the UI needs a chooser; ordinary separated objects
+and overlapping boxes with distinct polygon/keypoint evidence apply automatically.
+This is same-image spatial association, independent of instance numbers or labeling
+order, not persistent identity mapping. Creating new boxes needs no association.
+Replacing boxes preserves instance IDs and all
+keypoint fields. Imported boxes with unplaced keypoints remain editable drafts;
+completion and save checks evaluate every instance before writing training labels.
+
 ## Worker contracts
 
 Protocol-aware workers write one JSON object per stdout line. Every protocol object has
@@ -83,7 +116,12 @@ The optional OpenAI pose assistant is remote I/O rather than local model executi
 requests on a daemon thread so Qt remains responsive. Its Qt-free services validate
 OIDC tokens and structured model output. Credentials are installation-global,
 owner-readable only, and never stored in a project; accepted proposals enter the
-ordinary pose edit state and remain unsaved until the user invokes Save.
+ordinary annotation document as separate editable instances and remain unsaved
+until the user invokes Save. The structured response is an `instances` array with
+one box and configured keypoint set per object, including an empty array when no
+object is found. Parsing validates the entire response before application. After
+confirmation, proposals replace only the requested class; other classes remain
+intact. Responses for a changed image, layer, class, or keypoint schema are discarded.
 
 The accepted event families are:
 
@@ -197,3 +235,38 @@ pinned repository tooling
 test-only sync, the complete unit suite, lifecycle smoke, and all screenshot renders.
 A locked full dependency sync and the same lifecycle/render path also completed. No
 runtime package was removed or reclassified during this audit.
+
+## Mixed-class inference and segmentation analysis
+
+Inference tracks every class without requiring a subject selection. Optional
+count checks compare all confirmed tracks with an expected total; zero disables
+them. Legacy subject metadata is still readable. Analysis worker configs carry
+the class selected in the analysis dialog, independently of inference.
+
+`services/class_tracking.py` wraps per-model tracker initialization with independent
+ByteTrack/BoT-SORT instances per class. It remaps per-class detection indices back
+to the original result indices so masks and keypoints remain paired correctly,
+and emits a shared track-ID namespace within each model pass. No Ultralytics global
+tracker registry is patched.
+
+`services/analysis_subjects.py` applies the analysis class selection, with recorded
+subject metadata as a legacy fallback. Segmentation
+geometry exports preserve all detections; movement analysis splits subject data
+by track and contiguous frame segments before smoothing and derivatives. Legacy
+single-class inputs remain usable. Mixed-class inputs require an analysis class
+choice rather than selecting an object implicitly.
+
+All-class analysis uses temporary per-class computations inside one outer output
+transaction. Only one class-labelled instance table is published; original track
+IDs remain available and trajectory IDs are namespaced for unambiguous grouping.
+One summary holds grouped class statistics, plots share the output `plots/`
+directory, and one annotated video renders all instances. Intermediate class
+CSVs and folders are removed with the temporary workspace. Failure in any class
+leaves the previous published analysis intact.
+
+Pose-only analysis splits detections by class, track, and contiguous frame
+segments before smoothing and derivatives. Repeated same-class instances are
+retained; untracked multi-instance rows receive no inferred temporal association.
+Motion plots and ROI transitions respect trajectory boundaries. Reviewer cache
+metadata includes an instance-format version so caches that may have collapsed
+same-class detections cannot silently reappear as complete predictions.

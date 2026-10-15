@@ -15,6 +15,10 @@ from squeakpose.services.openai_labeling import (
 )
 
 
+def _parse_single_proposal(value, **kwargs):
+    return parse_pose_proposal({"instances": [value]}, **kwargs)
+
+
 class OpenAILabelingTests(unittest.TestCase):
     def test_plan_model_catalog_keeps_only_listed_models_in_server_order(self):
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -57,14 +61,16 @@ class OpenAILabelingTests(unittest.TestCase):
             schema = payload["text"]["format"]
             self.assertEqual(schema["type"], "json_schema")
             self.assertTrue(schema["strict"])
-            self.assertEqual(schema["schema"]["properties"]["keypoints"]["minItems"], 3)
+            self.assertEqual(
+                schema["schema"]["properties"]["instances"]["items"]["properties"]["keypoints"][
+                    "minItems"
+                ],
+                3,
+            )
 
     def test_normalized_proposal_maps_to_pixels_and_canonical_names(self):
-        proposal = parse_pose_proposal(
+        proposal = _parse_single_proposal(
             {
-                "mouse_id": 1,
-                "coordinate_range": [0, 1000],
-                "left_right_convention": "mouse_anatomical",
                 "keypoints": [
                     {
                         "name": "tailbase",
@@ -104,12 +110,13 @@ class OpenAILabelingTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [point.name for point in proposal.keypoints], ["nose", "left_ear", "tail_base"]
+            [point.name for point in proposal.instances[0].keypoints],
+            ["nose", "left_ear", "tail_base"],
         )
-        self.assertAlmostEqual(proposal.keypoints[0].x, 743.04)
-        self.assertAlmostEqual(proposal.keypoints[0].y, 710.64)
-        self.assertEqual(proposal.keypoints[1].visibility, 1)
-        for actual, expected in zip(proposal.box, (681.12, 491.4, 348.48, 238.68)):
+        self.assertAlmostEqual(proposal.instances[0].keypoints[0].x, 743.04)
+        self.assertAlmostEqual(proposal.instances[0].keypoints[0].y, 710.64)
+        self.assertEqual(proposal.instances[0].keypoints[1].visibility, 1)
+        for actual, expected in zip(proposal.instances[0].box, (681.12, 491.4, 348.48, 238.68)):
             self.assertAlmostEqual(actual, expected)
 
     def test_completed_response_usage_is_returned_with_proposal(self):
@@ -117,6 +124,7 @@ class OpenAILabelingTests(unittest.TestCase):
             "keypoints": [{"name": "nose", "x": 500, "y": 600, "visibility": 2, "confidence": 0.9}],
             "bounding_box": {"x_min": 100, "y_min": 200, "x_max": 900, "y_max": 800},
         }
+        result = {"instances": [result]}
         events = "\n".join(
             (
                 f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': json.dumps(result)})}",
@@ -150,7 +158,7 @@ class OpenAILabelingTests(unittest.TestCase):
 
     def test_missing_requested_keypoint_is_rejected(self):
         with self.assertRaisesRegex(OpenAILabelingError, "tail_base"):
-            parse_pose_proposal(
+            _parse_single_proposal(
                 {
                     "keypoints": [
                         {
@@ -175,6 +183,77 @@ class OpenAILabelingTests(unittest.TestCase):
                 image_width=100,
                 image_height=100,
             )
+
+    def _parse_batch(self, value, keypoints=("nose",)):
+        return parse_pose_proposal(
+            value,
+            source_image="frame.png",
+            model="test-model",
+            class_name="mouse",
+            keypoint_names=keypoints,
+            image_width=100,
+            image_height=200,
+        )
+
+    def _instance(self, x=100):
+        return {
+            "bounding_box": {"x_min": x, "y_min": 100, "x_max": x + 100, "y_max": 400},
+            "keypoints": [
+                {"name": "nose", "x": x + 50, "y": 200, "visibility": 2, "confidence": 0.9}
+            ],
+        }
+
+    def test_one_five_and_zero_instances_and_stable_spatial_order(self):
+        for count in (0, 1, 5):
+            proposal = self._parse_batch(
+                {"instances": [self._instance(100 + i * 150) for i in reversed(range(count))]}
+            )
+            self.assertEqual(len(proposal.instances), count)
+            positions = [instance.box[0] for instance in proposal.instances]
+            self.assertEqual(positions, sorted(positions))
+            self.assertTrue(all(len(instance.keypoints) == 1 for instance in proposal.instances))
+
+    def test_missing_instance_list_and_malformed_member_reject_entire_response(self):
+        for value in (
+            {},
+            {"instances": None},
+            {"instances": {}},
+            {"instances": [self._instance(), None]},
+            {"instances": [self._instance(), {"keypoints": []}]},
+        ):
+            with self.subTest(value=value), self.assertRaises(OpenAILabelingError):
+                self._parse_batch(value)
+
+    def test_duplicate_extra_keypoints_invalid_boxes_and_nonfinite_coordinates_rejected(self):
+        for mutation in ("duplicate", "extra", "box", "nan"):
+            instance = self._instance()
+            if mutation == "duplicate":
+                instance["keypoints"].append(dict(instance["keypoints"][0]))
+            elif mutation == "extra":
+                instance["keypoints"].append(dict(instance["keypoints"][0], name="tail"))
+            elif mutation == "box":
+                instance["bounding_box"]["x_max"] = 50
+            else:
+                instance["keypoints"][0]["x"] = float("nan")
+            with self.subTest(mutation=mutation), self.assertRaises(OpenAILabelingError):
+                self._parse_batch({"instances": [instance]})
+
+    def test_generic_box_only_class_has_empty_keypoints(self):
+        with TemporaryDirectory() as tmp:
+            image = Path(tmp, "frame.png")
+            image.write_bytes(b"image")
+            payload = build_pose_request(
+                model="test", image_path=str(image), class_name="marble", keypoint_names=()
+            )
+            prompt = payload["input"][0]["content"][0]["text"]
+            self.assertIn('"marble"', prompt)
+            self.assertIn("every distinct instance", prompt)
+            self.assertNotIn("exactly one", prompt)
+            self.assertNotIn("mouse_id", json.dumps(payload["text"]["format"]["schema"]))
+        instance = self._instance()
+        instance["keypoints"] = []
+        proposal = self._parse_batch({"instances": [instance]}, keypoints=())
+        self.assertEqual(proposal.instances[0].keypoints, ())
 
 
 if __name__ == "__main__":

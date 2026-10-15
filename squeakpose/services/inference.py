@@ -27,6 +27,7 @@ from squeakpose.services.tracking import (
     TRACKER_AUTO,
     TrackingConfig,
     normalize_tracker_choice,
+    resolve_subject_class,
     resolve_tracking_config,
 )
 
@@ -72,6 +73,7 @@ class InferenceJobPlan:
             "batch_size": self.batch_size,
             "total_frames": self.total_frames,
             "fps": self.fps,
+            "subject_class": self.tracking.subject_class,
             "tracking_enabled": self.tracking.enabled,
             "expected_animal_count": self.tracking.expected_animal_count,
             "requested_tracker": self.tracking.requested_tracker,
@@ -190,6 +192,7 @@ class VideoInferenceStatus:
     requested_tracker: str = TRACKER_AUTO
     resolved_tracker: str = "bytetrack"
     tracker_profile: str = DEFAULT_TRACKER_PROFILE
+    subject_class: str = ""
 
 
 def video_identity(video_path: str) -> str:
@@ -264,6 +267,7 @@ def project_video_inference_statuses(project_root: str) -> dict[str, VideoInfere
             requested_tracker=record["tracking"].requested_tracker,
             resolved_tracker=record["tracking"].resolved_tracker,
             tracker_profile=record["tracking"].tracker_profile,
+            subject_class=record["tracking"].subject_class,
         )
         for key, record in history.items()
     }
@@ -314,6 +318,7 @@ def plan_inference_run(
     fps: float = 0.0,
     created_at: datetime.datetime | None = None,
     run_id: str | None = None,
+    subject_class: str = "",
     expected_animal_count: int = 1,
     requested_tracker: str = TRACKER_AUTO,
     tracker_profile: str = DEFAULT_TRACKER_PROFILE,
@@ -332,6 +337,7 @@ def plan_inference_run(
         expected_animal_count,
         requested_tracker,
         tracker_profile=tracker_profile,
+        subject_class=subject_class,
     )
 
     timestamp = created_at or datetime.datetime.now()
@@ -386,6 +392,8 @@ def plan_inference_run(
         else:
             classes = ()
             keypoints = ()
+        if layer_id in {LAYER_KEYPOINTS, LAYER_SEGMENTATION}:
+            resolve_subject_class(list(classes), subject_class)
         jobs.append(
             InferenceJobPlan(
                 run_id=resolved_run_id,
@@ -563,6 +571,7 @@ def _tracking_from_manifest(payload: Mapping[str, Any]) -> TrackingConfig:
             normalize_tracker_choice(requested),
             enabled=enabled,
             tracker_profile=str(profile or DEFAULT_TRACKER_PROFILE),
+            subject_class=str(tracking.get("subject_class") or ""),
         )
     except (TypeError, ValueError):
         return resolve_tracking_config()

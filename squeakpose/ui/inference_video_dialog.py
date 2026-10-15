@@ -50,6 +50,7 @@ class InferenceVideoSelection:
     video_path: str
     expected_animal_count: int
     requested_tracker: str
+    subject_class: str = ""
 
 
 class AnimalCountControl(QWidget):
@@ -59,7 +60,7 @@ class AnimalCountControl(QWidget):
 
     def __init__(self, parent=None, *, maximum: int = MAX_EXPECTED_ANIMALS) -> None:
         super().__init__(parent)
-        self._minimum = 1
+        self._minimum = 0
         self._maximum = max(self._minimum, int(maximum))
         self._value = self._minimum
         counter_layout = QHBoxLayout(self)
@@ -109,6 +110,7 @@ class InferenceVideoDialog(QDialog):
         *,
         configured_layers: tuple[str, ...] = (),
         default_batch_size: int = 4,
+        subject_classes: tuple[str, ...] = (),
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -134,7 +136,7 @@ class InferenceVideoDialog(QDialog):
         title.setObjectName("InferencePickerTitle")
         layout.addWidget(title)
         subtitle = QLabel(
-            "Select the videos to process, then confirm the animal count and tracker for "
+            "Select the videos to process, then confirm the tracker for "
             "each one. Previous inference is shown for reference.",
             self,
         )
@@ -166,17 +168,17 @@ class InferenceVideoDialog(QDialog):
         tracking_title = QLabel("Tracking defaults", self.tracking_defaults_panel)
         tracking_title.setObjectName("InferenceTrackingTitle")
         tracking_hint = QLabel(
-            "Auto uses ByteTrack for one animal and BoT-SORT for multiple animals.",
+            "All classes are tracked. Expected tracks: 0 disables count checks.",
             self.tracking_defaults_panel,
         )
         tracking_hint.setObjectName("InferenceTrackingHint")
         tracking_copy.addWidget(tracking_title)
         tracking_copy.addWidget(tracking_hint)
         tracking_defaults.addLayout(tracking_copy, 1)
-        tracking_defaults.addWidget(QLabel("Animals", self.tracking_defaults_panel))
+        tracking_defaults.addWidget(QLabel("Expected tracks", self.tracking_defaults_panel))
         self.default_animals_spin = AnimalCountControl(self.tracking_defaults_panel)
         self.default_animals_spin.setObjectName("InferenceDefaultAnimals")
-        self.default_animals_spin.setValue(1)
+        self.default_animals_spin.setValue(0)
         self.default_animals_spin.setMinimumWidth(112)
         tracking_defaults.addWidget(self.default_animals_spin)
         tracking_defaults.addWidget(QLabel("Tracker", self.tracking_defaults_panel))
@@ -198,11 +200,10 @@ class InferenceVideoDialog(QDialog):
         )
         self.tracking_defaults_panel.setVisible(self.tracking_available)
         layout.addWidget(self.tracking_defaults_panel)
-
         self.video_table = QTableWidget(0, 5, self)
         self.video_table.setObjectName("InferenceVideoTable")
         self.video_table.setHorizontalHeaderLabels(
-            ("Video", "Source", "Previous inference", "Animals", "Tracker")
+            ("Video", "Source", "Previous inference", "Expected tracks", "Tracker")
         )
         self.video_table.verticalHeader().setVisible(False)
         self.video_table.setAlternatingRowColors(True)
@@ -338,8 +339,12 @@ class InferenceVideoDialog(QDialog):
         status = self._statuses.get(key)
         animal_spin = AnimalCountControl(self.video_table)
         animal_spin.setObjectName("InferenceRowAnimals")
-        animal_spin.setValue(status.expected_animal_count if status is not None else 1)
-        animal_spin.setToolTip("Expected number of animals visible in this video.")
+        animal_spin.setValue(
+            status.expected_animal_count if status is not None and not status.subject_class else 0
+        )
+        animal_spin.setToolTip(
+            "Optional total track count across every class. Set 0 to disable count checks."
+        )
         animal_spin.setMinimumWidth(110)
         tracker_combo = ThemedComboBox(self.video_table)
         tracker_combo.setObjectName("InferenceRowTracker")
@@ -349,7 +354,7 @@ class InferenceVideoDialog(QDialog):
         selected_index = tracker_combo.findData(requested)
         tracker_combo.setCurrentIndex(max(0, selected_index))
         tracker_combo.setToolTip(
-            "Auto uses ByteTrack for one animal and BoT-SORT for multiple animals."
+            "All classes are tracked. Expected tracks: 0 disables count checks."
         )
         self._tracking_widgets_by_key[key] = (animal_spin, tracker_combo)
         animal_spin.valueChanged.connect(
@@ -370,7 +375,7 @@ class InferenceVideoDialog(QDialog):
         combo.addItem("Auto", TRACKER_AUTO)
         combo.addItem("ByteTrack", TRACKER_BYTETRACK)
         combo.addItem("BoT-SORT", TRACKER_BOTSORT)
-        combo.setToolTip("Auto uses ByteTrack for one animal and BoT-SORT for multiple animals.")
+        combo.setToolTip("All classes are tracked. Expected tracks: 0 disables count checks.")
 
     @staticmethod
     def _update_auto_tracker_label(combo: QComboBox, expected_animals: int) -> None:

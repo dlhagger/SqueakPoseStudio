@@ -20,6 +20,7 @@ from squeakpose.project.paths import ProjectPaths
 from squeakpose.project.safety import require_path_within_project
 from squeakpose.services.prediction_serialization import rank_prediction_frames
 
+INSTANCE_CACHE_FORMAT = 2
 MAX_VIDEO_CACHE_BYTES = 128 * 1024 * 1024
 
 
@@ -125,6 +126,7 @@ def plan_video_review_run(
         "effective_batch": int(effective_batch),
     }
     meta = {
+        "instance_format": INSTANCE_CACHE_FORMAT,
         "video": dict(video_signature),
         # Cache identity covers every configured model, including a preserved
         # layer that was not selected for this particular prediction pass.
@@ -181,7 +183,7 @@ def decide_video_review_cache(
     workflow: str,
 ) -> VideoReviewCacheDecision | None:
     meta = data.get("meta", {})
-    if not isinstance(meta, Mapping):
+    if not isinstance(meta, Mapping) or meta.get("instance_format") != INSTANCE_CACHE_FORMAT:
         return None
     saved_video = meta.get("video", {})
     if not isinstance(saved_video, Mapping):
@@ -244,7 +246,7 @@ def build_video_review_cache_payload(
     predictions_by_layer: Mapping[str, Mapping[int, dict]],
 ) -> dict[str, Any]:
     return {
-        "meta": dict(meta),
+        "meta": {**dict(meta), "instance_format": INSTANCE_CACHE_FORMAT},
         "preds_by_layer": {
             layer: {str(frame_index): prediction for frame_index, prediction in predictions.items()}
             for layer, predictions in predictions_by_layer.items()

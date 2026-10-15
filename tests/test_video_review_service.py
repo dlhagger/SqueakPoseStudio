@@ -128,6 +128,7 @@ class VideoReviewServiceTests(unittest.TestCase):
         decision = decide_video_review_cache(
             {
                 "meta": {
+                    "instance_format": 2,
                     "video": {**video, "mtime": 101.5},
                     "model_paths": {LAYER_KEYPOINTS: "pose.pt", LAYER_SEGMENTATION: "seg.pt"},
                 },
@@ -151,7 +152,11 @@ class VideoReviewServiceTests(unittest.TestCase):
     def test_cache_rejects_identity_model_and_index_mismatches(self):
         video = {"path": "/video.mp4", "size": 10, "mtime": 100.0}
         base = {
-            "meta": {"video": video, "model_paths": {LAYER_KEYPOINTS: "pose.pt"}},
+            "meta": {
+                "instance_format": 2,
+                "video": video,
+                "model_paths": {LAYER_KEYPOINTS: "pose.pt"},
+            },
             "preds_by_layer": {LAYER_KEYPOINTS: {"2": {"ok": True}}},
         }
         arguments = {
@@ -172,7 +177,7 @@ class VideoReviewServiceTests(unittest.TestCase):
         bad_index = {**base, "preds_by_layer": {LAYER_KEYPOINTS: {"bad": {"ok": True}}}}
         self.assertIsNone(decide_video_review_cache(bad_index, **arguments))
 
-    def test_legacy_cache_preserves_single_layer_contract(self):
+    def test_legacy_cache_requires_reprediction_for_multi_instance_support(self):
         video = {"path": "/video.mp4", "size": 10, "mtime": 100.0}
         decision = decide_video_review_cache(
             {
@@ -187,8 +192,7 @@ class VideoReviewServiceTests(unittest.TestCase):
             workflow="segmentation",
         )
 
-        self.assertTrue(decision.has_predictions)
-        self.assertEqual(decision.predictions_by_layer[LAYER_SEGMENTATION], {4: {"ok": True}})
+        self.assertIsNone(decision)
 
     def test_cache_payload_stringifies_frame_indices_and_omits_empty_layers(self):
         payload = build_video_review_cache_payload(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from typing import Optional
@@ -1829,6 +1830,12 @@ class VideoReviewDialog(QDialog):
             if name not in class_kp_names:
                 continue
             x, y, conf = kp
+            if (
+                not all(math.isfinite(value) for value in (x, y, conf))
+                or conf <= 0
+                or (x == 0 and y == 0)
+            ):
+                continue
             vis = 2 if conf >= thr else 1  # 2=visible(red), 1=occluded(yellow)
 
             if vis == 2:

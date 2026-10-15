@@ -181,6 +181,59 @@ writes its active-layer labels, copies the image into `images_all/`, and
 renders an overlay into `annotations/`. These outputs are staged and committed
 together, so a failed save does not replace an existing annotation.
 
+### Labeling multiple instances
+
+The same workflow supports mice, marbles, or any other project class.
+The default class-based workflow is unchanged. To label two or more mice of the
+same class, enable **Multiple instances** in the Annotation panel. Label the first
+mouse normally, select **Add instance** (or **Shift+I**), then draw the next mouse's box and
+keypoints, or prompt and accept its segmentation mask. Choose an instance in the
+instance selector to edit it; other same-class animals remain visible as dimmed
+references. Canvas badges show the class name; the instance selector retains numbered
+entries such as `mouse 1` and `mouse 2`. **Delete instance** removes only the selected instance after confirmation.
+Unfinished keypoint instances can be switched without losing their placed points.
+Accept or cancel a SAM preview before switching segmentation instances.
+Undo applies to edits of the selected animal; switching animals starts a fresh
+edit history, as switching classes does in the original workflow.
+
+In this mode, prediction retains all usable same-class detections. Applying them
+asks before replacing existing annotations in the active layer. Complete each
+animal's keypoints (mark unavailable points invisible), review that every animal
+has been included, then save. Completion checks the annotated animals rather than
+requiring every configured class to appear. Automatic class advancement is disabled.
+Two actions use saved segmentation masks in the same image coordinates:
+
+- **Create Instances from Segmentation** creates one pose box per mask of the
+  selected class. Place keypoints afterward. If that class already has poses,
+  confirmation is required because creating new instances replaces its existing
+  boxes and keypoints. Other classes are preserved.
+- **Replace Boxes from Segmentation** keeps the existing instances and every
+  keypoint coordinate and visibility value. It automatically associates existing
+  keypoint groups with saved masks using keypoint locations inside the mask
+  polygons, with box overlap and proximity as fallback evidence. Instance numbers
+  and labeling order do not matter. Overlapping boxes alone do not require review.
+  A chooser appears only when the available geometry does not clearly separate
+  the objects: blue is the current box, gold is the proposed mask box. Different
+  pose/mask counts are reported without replacing boxes.
+
+Both actions leave edits unsaved. Every pose instance must have all configured
+keypoints placed or explicitly marked invisible before saving; imported empty
+keypoint sets are drafts, not invisible ground truth.
+
+Saving and exporting keep standard YOLO labels: one row per animal, with the same
+class ID for all mice. The keypoint schema is per animal and does not change when
+more animals are added. Pose and segmentation remain separate datasets and
+training tasks. Internal instance IDs distinguish annotations only during editing;
+they are regenerated when YOLO files are loaded and do not establish identity
+across images or link animals between layers. Video identity mapping is separate
+future work.
+
+Existing single-animal projects need no migration. This version preserves repeated
+same-class rows when opening multi-animal files, and enables the instance controls
+automatically. Earlier SqueakPose versions only retain one annotation per class
+when editing, so keep a separate copy before editing multi-animal labels with an
+older version. The YOLO file format remains compatible with normal training tools.
+
 ### OpenAI pose assistant (experimental preview)
 
 The Keypoints workflow includes an **OpenAI Pose Assistant** panel in the left
@@ -190,16 +243,25 @@ to your account and select **Auto-label Current Image**. Each installation uses
 the tester's own eligible ChatGPT Plus or Pro account and plan allowance; no API
 key is required.
 
-The assistant proposes a bounding box and the exact ordered keypoints configured
-for the currently selected class. SqueakPose asks for confirmation before
-applying the proposal. An accepted proposal replaces only that class's current
-annotation and remains unsaved: move or hide inaccurate points, undo the
-proposal, or reject it before using the normal **Save** action. Treat every
-proposal as a starting point requiring human review, not as ground truth.
+The assistant searches the full image for **all instances of the selected class**,
+returning a separate bounding box and the configured ordered keypoints for each.
+One object produces one editable instance; five objects produce up to five model
+proposals for review. Classes with no keypoints receive box-only proposals. A
+no-instance response leaves existing annotations unchanged.
 
-The panel shows the selected model, connection status, exact token counts for
-the last completed request and the current application session, and a **Manage
-Usage** link to ChatGPT settings. These counts describe completed requests; the
+SqueakPose shows the number of proposed instances and asks before applying them.
+Acceptance replaces all existing instances of the selected class on this image,
+while preserving other classes. Multiple proposals automatically enable
+**Multiple instances**. Use the instance selector or **I** to review and edit each
+object independently, then **Save**. Proposals remain unsaved until then. Rejecting
+a response leaves the annotations unchanged. Instance numbering follows bounding-box
+centers from left to right, then top to bottom; these numbers are not persistent
+animal identities. Treat every proposal as a starting point requiring human review,
+including checking for missed or duplicate objects and misplaced keypoints.
+
+The panel keeps the model selector, Auto-label action, and result status visible.
+Expand **Account & usage** for account details, reconnect/sign-out controls, exact
+token counts for the last request and current session, and **Manage Usage**. These counts describe completed requests; the
 app does not attempt to calculate or impose a remaining-plan cap.
 
 Auto-label sends the current image, class name, and keypoint names to OpenAI for
@@ -321,6 +383,8 @@ This is a display-only spot check and does not modify the keypoint annotations.
 | `0` | Mark the next keypoint invisible |
 | `A` | Apply the active pose template |
 | `C` | Select the next class |
+| `I` | Select the next instance of the current class (Multiple instances mode) |
+| `Shift+I` | Add another instance of the current class |
 | `G` | Run SAM |
 | `Shift+Enter` | Accept the SAM preview |
 | `E` | Edit the accepted segmentation mask |
@@ -420,8 +484,10 @@ to the Keypoints and Segmentation layers. The selections are remembered with
 the project. SAM and Depth use their dedicated model-assistant panels on the
 left side of the labeling window.
 
-Single-image prediction applies the best prediction for each class to the
-current image. Pose predictions populate boxes and keypoints; segmentation
+Single-image prediction applies the best prediction for each class by default.
+With **Multiple instances** enabled, it preserves every usable instance. Video
+Reviewer also preserves every instance, including repeated classes.
+Pose predictions populate boxes and keypoints; segmentation
 predictions populate boxes and masks; depth prediction saves and displays a
 dense map.
 
@@ -444,6 +510,10 @@ selection within that layer.
 Exported frame names include a short identifier derived from the source video
 path, preventing same-named videos from being mistaken for one another.
 
+Video Reviewer displays every pose instance with its own box and keypoints.
+Prediction caches created before multi-instance support are ignored and require
+**Predict Range** again; saved labels and inference CSVs are unaffected.
+
 Video Reviewer shortcuts include:
 
 | Shortcut | Action |
@@ -462,6 +532,46 @@ Video inference runs every configured project prediction model sequentially.
 Each layer writes its own compatible CSV, and a run manifest links the passes.
 Depth inference writes one summary row per frame and a colorized preview MP4.
 If one pass fails, completed output from the other layers is retained.
+
+Inference tracks and exports **every class and instance**. No subject selection
+is required. ByteTrack and BoT-SORT run independently for each class, so overlap
+cannot associate a mouse detection with an object track. Track IDs are local to
+a model pass; they are not permanent experimental identities.
+
+**Expected tracks** is an optional total count across all classes. Its default,
+`0`, disables count checks. For one mouse and two objects, enter `3` if you want
+a total-count check. Class-specific expectations are not currently configured.
+CSV `tracks_in_frame` and `total_tracks_in_frame` count all confirmed tracks.
+Older CSVs that record `subject_class` retain their original subject-count meaning.
+
+In **Analysis**, **All classes** analyzes every class in one run and writes one
+`analysis_features.csv` table with an `analysis_class` column and original track
+IDs. One summary contains grouped class statistics, and plots share the `plots/`
+folder. No per-class data folders are published. You can also choose one class
+(for example, `mouse` or `object`). This choice does not
+change or rerun inference. Segmentation analysis retains all classes in
+`segmentation_detections.csv`, with track IDs and flags identifying detections
+used for movement. Both pose and segmentation movement features use the selected
+class, independently per track. Pose keypoint coordinates and confidences remain
+attached to their original instance. Untracked multi-instance pose rows are kept
+without assuming that detection order establishes identity; their movement
+remains undefined until tracks are available. Gaps and track changes reset smoothing and derivatives; they receive no
+inferred movement. Summary output includes per-track distances and coverage.
+The `center_distances` column in `analysis_features.csv` is a JSON list of all
+other observed instances in the same frame, with their class, original track ID,
+detection index, and distances in pixels and millimeters. It uses unsmoothed mask
+centroids, falling back to geometric box centers. The companion column
+`center_distances_smoothed` uses the existing filtered centers with the same target
+identifiers and distance units. It remains blank when filtered centers are
+unavailable; raw coordinates are never substituted for filtered coordinates.
+With smoothing disabled, both columns agree. `[]` means no other valid center
+was observed; a blank cell means the row has no measurable center. Missing
+instances are not imputed. **All classes** includes cross-class and same-class
+pairs; a single-class analysis includes only that class's instances.
+
+Mixed-class CSVs can be analyzed by choosing a class, including older exports
+without subject metadata. Mouse–object interaction measurements and manual
+identity corrections remain separate work.
 
 Pose output includes frame/time metadata, class and confidence, bounding boxes,
 tracking IDs when available, speed values, and absolute/normalized keypoint

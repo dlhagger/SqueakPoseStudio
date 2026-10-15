@@ -26,6 +26,7 @@ from analysis_ops import (
     _published_analysis_result,
     _setup_plotting,
     _smooth_centers,
+    _write_center_distances,
     assign_roi_labels,
     create_roi_outputs,
     draw_antialiased_polyline,
@@ -34,6 +35,7 @@ from analysis_ops import (
     normalize_rois,
     run_behavior_clustering,
 )
+from squeakpose.services.analysis_subjects import select_subject_rows
 
 SEGMENTATION_REQUIRED_COLUMNS = ["frame", "det", "x1", "y1", "x2", "y2", "mask_polygon"]
 
@@ -227,6 +229,9 @@ def compute_segmentation_detection_features(raw: pd.DataFrame, mm_per_pixel: flo
         "detections_in_frame",
         "class_id",
         "class_name",
+        "track_id",
+        "subject_class",
+        "total_tracks_in_frame",
         "confidence",
         "inference_bbox_x1",
         "inference_bbox_y1",
@@ -278,6 +283,50 @@ def _smooth_segmentation_centers(
 
 
 def compute_segmentation_track_features(
+    detection_features: pd.DataFrame,
+    raw: pd.DataFrame,
+    fps: float,
+    mm_per_pixel: float,
+    config: AnalysisConfig,
+) -> pd.DataFrame:
+    """Compute subject motion independently per track and contiguous frame segment."""
+    subjects = select_subject_rows(detection_features, config.subject_class)
+    if subjects.empty:
+        raise AnalysisError("No subject detections are available for movement analysis.")
+    subjects = subjects.copy()
+    if config.subject_class:
+        subjects["subject_class"] = config.subject_class
+    if "track_id" in subjects and subjects["track_id"].notna().any():
+        subjects["track_id"] = pd.to_numeric(subjects["track_id"], errors="coerce")
+        subjects = subjects.loc[subjects["track_id"].ge(0)].copy()
+        groups = subjects.groupby("track_id", sort=False)
+    else:
+        groups = [(None, subjects)]
+    outputs = []
+    for track_id, group in groups:
+        group = group.sort_values(["frame_index", "confidence"], ascending=[True, False])
+        group = group.drop_duplicates("frame_index", keep="first")
+        # Reset smoothing and derivatives after every missing frame. No inferred
+        # movement is credited to gaps or changes of tracker identity.
+        frame_gaps = group["frame_index"].diff().fillna(1).clip(lower=1) - 1
+        segments = group["frame_index"].diff().ne(1).cumsum()
+        for segment_id, segment in group.groupby(segments, sort=False):
+            result = _compute_segmentation_segment_features(segment, raw, fps, mm_per_pixel, config)
+            result["trajectory_id"] = "legacy" if track_id is None else str(int(track_id))
+            result["trajectory_segment"] = int(segment_id)
+            result.loc[0, "missing_frame_gap_before"] = int(frame_gaps.loc[segment.index[0]])
+            outputs.append(result)
+    if not outputs:
+        raise AnalysisError("No confirmed subject tracks are available for movement analysis.")
+    result = pd.concat(outputs, ignore_index=True).sort_values(["frame_index", "trajectory_id"])
+    result["cumulative_distance_mm"] = (
+        result["distance_mm"].fillna(0).groupby(result["trajectory_id"]).cumsum()
+    )
+    result["segmentation_valid_frames"] = result["frame_index"].nunique()
+    return result.reset_index(drop=True)
+
+
+def _compute_segmentation_segment_features(
     detection_features: pd.DataFrame,
     raw: pd.DataFrame,
     fps: float,
@@ -389,6 +438,9 @@ def _line_plot(
     columns = [x_col, y_col]
     if "time_seconds" in df.columns:
         columns.append("time_seconds")
+    for column in ("trajectory_id", "trajectory_segment"):
+        if column in df:
+            columns.append(column)
     clean = df[columns].copy()
     clean[x_col] = pd.to_numeric(clean[x_col], errors="coerce")
     clean[y_col] = pd.to_numeric(clean[y_col], errors="coerce")
@@ -410,7 +462,11 @@ def _line_plot(
     max_plot_points = 4000
     step = max(1, int(math.ceil(len(clean) / max_plot_points)))
     sampled = slice(None, None, step)
-    if len(clean) > 2000:
+    if "trajectory_id" in clean:
+        for _, segment in clean.groupby(["trajectory_id", "trajectory_segment"], sort=False):
+            segment_x = segment["time_seconds"] / 60.0 if use_time else segment[x_col]
+            ax.plot(segment_x, segment[y_col], linewidth=1.2)
+    elif len(clean) > 2000:
         ax.plot(
             x_values.iloc[sampled],
             clean[y_col].iloc[sampled],
@@ -663,9 +719,8 @@ def render_segmentation_annotated_video(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
     rows_by_frame = {
-        int(row["frame_index"]): row
-        for _, row in primary.iterrows()
-        if not pd.isna(row.get("frame_index"))
+        int(frame_index): [row for _, row in group.iterrows()]
+        for frame_index, group in primary.dropna(subset=["frame_index"]).groupby("frame_index")
     }
     normalized_rois = normalize_rois(rois or [])
 
@@ -748,8 +803,10 @@ def render_segmentation_annotated_video(
                         lineType=cv2.LINE_AA,
                     )
 
-                row = rows_by_frame.get(frame_idx)
-                if row is not None:
+                frame_rows = rows_by_frame.get(frame_idx, [])
+                line_height = max(12, min(25, (height - 20) // max(3 * len(frame_rows), 1)))
+                for instance_index, row in enumerate(frame_rows):
+                    text_y = 20 + instance_index * 3 * line_height
                     bbox_vals = [
                         row.get("bbox_x1"),
                         row.get("bbox_y1"),
@@ -791,16 +848,18 @@ def render_segmentation_annotated_video(
                             lineType=cv2.LINE_AA,
                         )
 
-                    text = f"Frame: {frame_idx}"
+                    class_name = row.get("analysis_class") or row.get("class_name") or "instance"
+                    track = row.get("track_id", "")
+                    text = f"Frame: {frame_idx} | {class_name} track {track}"
                     speed_val = row.get("speed_mm_per_sec")
                     if not pd.isna(speed_val):
                         text += f" | Speed: {float(speed_val):.1f} mm/s"
                     cv2.putText(
                         frame,
                         text,
-                        (10, 30),
+                        (10, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
+                        0.45,
                         (255, 255, 255),
                         2,
                         lineType=cv2.LINE_AA,
@@ -811,9 +870,9 @@ def render_segmentation_annotated_video(
                         cv2.putText(
                             frame,
                             area_text,
-                            (10, 60),
+                            (10, text_y + line_height),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
+                            0.45,
                             (255, 255, 255),
                             2,
                             lineType=cv2.LINE_AA,
@@ -824,9 +883,9 @@ def render_segmentation_annotated_video(
                         cv2.putText(
                             frame,
                             f"ROI: {roi_label}",
-                            (10, 90),
+                            (10, text_y + 2 * line_height),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
+                            0.45,
                             (255, 255, 255),
                             2,
                             lineType=cv2.LINE_AA,
@@ -870,6 +929,11 @@ def _run_segmentation_analysis_workflow_unpublished(
 
     _progress(progress_callback, 3, total_steps, "Computing segmentation motion features")
     primary = compute_segmentation_track_features(detections, raw, fps, scale, config)
+    primary_keys = set(zip(primary["frame_index"], primary["detection_index"]))
+    detections["is_primary_detection"] = [
+        (frame, detection) in primary_keys
+        for frame, detection in zip(detections["frame_index"], detections["detection_index"])
+    ]
     if rois:
         _progress(progress_callback, 4, total_steps, "Applying ROI annotations")
         primary = assign_roi_labels(
@@ -878,8 +942,28 @@ def _run_segmentation_analysis_workflow_unpublished(
     else:
         _progress(progress_callback, 4, total_steps, "No ROI annotations selected")
 
-    summary = summarize_segmentation_features(primary, detections, raw, fps, scale)
+    subject_detections = select_subject_rows(detections, config.subject_class)
+    summary = summarize_segmentation_features(primary, subject_detections, raw, fps, scale)
+    summary["detections"] = int(len(detections))
+    summary["all_classes_multi_detection_frames"] = int(
+        (detections.groupby("frame_index").size() > 1).sum()
+    )
     summary["layer_id"] = "segmentation"
+    summary["subject_class"] = str(primary["class_name"].iloc[0]) if "class_name" in primary else ""
+    summary["trajectory_count"] = int(primary["trajectory_id"].nunique())
+    summary["motion_gap_policy"] = "No motion across missing frames or track changes."
+    summary["subject_detections"] = int(len(subject_detections))
+    summary["tracks"] = [
+        {
+            "trajectory_id": str(track_id),
+            "observed_frames": int(group["frame_index"].nunique()),
+            "total_distance_mm": float(group["distance_mm"].sum()),
+            "mean_speed_mm_per_sec": float(group["speed_mm_per_sec"].mean())
+            if group["speed_mm_per_sec"].notna().any()
+            else None,
+        }
+        for track_id, group in primary.groupby("trajectory_id", sort=False)
+    ]
     summary["detections_csv"] = os.path.abspath(config.detections_csv)
     summary["video_path"] = os.path.abspath(video_path) if video_path else ""
     summary["roi_count"] = len(rois)
@@ -963,6 +1047,17 @@ def run_segmentation_analysis_workflow(
     raw: Optional[pd.DataFrame] = None,
 ) -> dict[str, Any]:
     """Run segmentation analysis and publish its outputs on success."""
+    if config.subject_class == "*":
+        from analysis_ops import run_all_class_analysis
+
+        return run_all_class_analysis(
+            config,
+            input_paths=[config.detections_csv],
+            runner=lambda selected, progress: run_segmentation_analysis_workflow(
+                selected, progress, raw=raw
+            ),
+            progress_callback=progress_callback,
+        )
     if not config.output_dir:
         raise AnalysisError("Select an output directory.")
     output_dir = Path(config.output_dir)
@@ -973,6 +1068,7 @@ def run_segmentation_analysis_workflow(
             progress_callback=progress_callback,
             raw=raw,
         )
+        _write_center_distances(result)
     return _published_analysis_result(
         result,
         staging_dir=staging_dir,

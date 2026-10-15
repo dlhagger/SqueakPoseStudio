@@ -362,6 +362,7 @@ def plan_prediction_application(
     canonical_keypoints: Sequence[str] = (),
     class_keypoints: Mapping[str, Sequence[str]] | None = None,
     active_class_id: int = 0,
+    multiple_instances: bool = False,
     depth_targets: DepthPredictionTargets | None = None,
 ) -> PredictionApplicationPlan:
     """Convert a worker payload into immutable pose, mask, or depth actions."""
@@ -403,11 +404,21 @@ def plan_prediction_application(
         class_count=len(classes),
         active_class_id=active_class_id,
     )
-    selected_classes = tuple(selected)
+    selected_items = list(selected.items())
+    if multiple_instances:
+        selected_items = []
+        for index, detection in enumerate(detections):
+            try:
+                cid = int(detection.get("class_id", active_class_id))
+            except (ValueError, TypeError):
+                continue
+            if 0 <= cid < len(classes):
+                selected_items.append((cid, index))
+    selected_classes = tuple(dict.fromkeys(cid for cid, _ in selected_items))
     if layer_id == LAYER_SEGMENTATION:
         masks: list[SegmentationDetectionPlan] = []
         missing_masks = 0
-        for class_id, detection_index in selected.items():
+        for class_id, detection_index in selected_items:
             points = _segmentation_points(detections[detection_index].get("segments"))
             if len(points) < 3:
                 missing_masks += 1
@@ -433,7 +444,7 @@ def plan_prediction_application(
     keypoint_names = tuple(str(name) for name in canonical_keypoints)
     class_keypoint_map = class_keypoints or {}
     boxes: list[PoseDetectionPlan] = []
-    for class_id, detection_index in selected.items():
+    for class_id, detection_index in selected_items:
         detection = detections[detection_index]
         box = _pose_box(detection.get("xyxy"))
         if box is None:

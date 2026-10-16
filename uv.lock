@@ -3,16 +3,13 @@ revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
-    "python_full_version >= '3.15' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.15' and sys_platform == 'darwin'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
-    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.14.*' and sys_platform == 'darwin'",
     "python_full_version < '3.14' and sys_platform == 'win32'",
-    "python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform == 'darwin'",
+    "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'darwin'",
+    "python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version < '3.14' and sys_platform == 'darwin'",
 ]
 
@@ -2804,11 +2801,11 @@ wheels = [
 
 [[package]]
 name = "platformdirs"
-version = "4.13.0"
+version = "4.13.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/80/a8/66d45abadff219e36e2a824181b8f6a67e7ed4572934d6252c71c29d5731/platformdirs-4.13.0.tar.gz", hash = "sha256:1aa0b0d3f224c1f07c295121e312a5a24a180d6ae5a8425ea1784b3e3863e9c0", size = 61094, upload-time = "2026-10-11T02:05:24.109Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/91/4a03cfdb03314cfca262921797fff04ff4054bd86a160aed76eddf8aa12b/platformdirs-4.13.3.tar.gz", hash = "sha256:5e567f664eb087ab8521c0179cd8d1bd60857d271136567a39719e28e2d383ce", size = 61559, upload-time = "2026-10-16T01:16:16.573Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/15/1633010b26e88e872c93b67c0b6c5e174fb74cb6fb5c1472b4d51d4a8f22/platformdirs-4.13.0-py3-none-any.whl", hash = "sha256:3dbcf4cd708f21cf876c4eaa90e58412bc4f033d87143f41b1493ff77c25b7e1", size = 32724, upload-time = "2026-10-11T02:05:22.776Z" },
+    { url = "https://files.pythonhosted.org/packages/45/b8/fd1af06b079af236f5423f7c1821264419cc8f6b4803f79353acbb8bfa53/platformdirs-4.13.3-py3-none-any.whl", hash = "sha256:f6ad7f447f24f8a3b82cce5976387428bff894a0eca6c3488f4a17f153c130c4", size = 32762, upload-time = "2026-10-16T01:16:15.051Z" },
 ]
 
 [[package]]
@@ -4170,14 +4167,11 @@ name = "torch"
 version = "2.14.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.15' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'darwin'",
-    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version == '3.14.*' and sys_platform == 'darwin'",
-    "python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version < '3.14' and sys_platform == 'darwin'",
 ]
 dependencies = [
@@ -4266,14 +4260,11 @@ name = "torchvision"
 version = "0.29.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.15' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'darwin'",
-    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version == '3.14.*' and sys_platform == 'darwin'",
-    "python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version < '3.14' and sys_platform == 'darwin'",
 ]
 dependencies = [
@@ -4359,7 +4350,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.19.0"
+version = "5.20.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -4372,9 +4363,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/65/4c/70012ed0795235fb6bd7806fafd4a1842f03e49ebbfa3bb9580e451948ce/transformers-5.19.0.tar.gz", hash = "sha256:87f38dd25e4521151b97e94520ac457f44a0ae8a8358a5b112daff6c64a822d6", size = 10032022, upload-time = "2026-10-06T16:39:00.229Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/32/03/2e8d6da6a582a0fdbaa7af9c0dab72dac113e6e3ea3b98d6ed67248322cc/transformers-5.20.1.tar.gz", hash = "sha256:25b30879e4c243f00630c1079171ede6d4f6bf76e68f978acd47628a640bc8a0", size = 10224416, upload-time = "2026-10-16T13:02:04.181Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/59/1e7f1212c215c73690ae6cab4678efe1555ff985953e145d88cc212859b0/transformers-5.19.0-py3-none-any.whl", hash = "sha256:afcd2dd5f603ed28c1e1fcb00a338ccbb4ef5f878ed289635df8b58187afb518", size = 12599123, upload-time = "2026-10-06T16:38:56.794Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/ba/057af605774c3c7a9228ce61d88040749134ef320426403b31bb73755d43/transformers-5.20.1-py3-none-any.whl", hash = "sha256:5f51ce444193e5d0a751e3fa489ddbc2224ff12f6675a5cfefd4044b09757c19", size = 12844669, upload-time = "2026-10-16T13:02:00.488Z" },
 ]
 
 [[package]]
@@ -4448,7 +4439,7 @@ wheels = [
 
 [[package]]
 name = "ultralytics"
-version = "8.4.177"
+version = "8.4.178"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "matplotlib" },
@@ -4467,21 +4458,21 @@ dependencies = [
     { name = "ultralytics-platform" },
     { name = "ultralytics-thop" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b7/78/afc12fcafbf1753e4db41c9a56021dc16eb1e23e852e3625cdb678128e04/ultralytics-8.4.177.tar.gz", hash = "sha256:cee81b288d28dcefa725037bb8fd41674ffd1a5438162272012ac16758de93dc", size = 1272107, upload-time = "2026-10-13T15:37:51.225Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/42/f1/5fc3f30085aa54aad4c6cebec9caa183d5174b66144fb9a46608651b8f06/ultralytics-8.4.178.tar.gz", hash = "sha256:bc768f10c8dbe370ff00ac138ebef79277b491c419fb7edf273be7d161213e4d", size = 1273734, upload-time = "2026-10-16T00:10:28.739Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6b/a6/07320a8c3aa5bbe411a693fff6a2e4ee41a0847b8583d390869aa5a9506f/ultralytics-8.4.177-py3-none-any.whl", hash = "sha256:de8fd2fc5ea2c51c7c8f5b50dd503d88702767395e2bc12474ec0741b846aecd", size = 1423216, upload-time = "2026-10-13T15:37:46.045Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/e0/8d280753d06b6bf7598d6af0881b960aac10c6558d139496ae68b64d4a3c/ultralytics-8.4.178-py3-none-any.whl", hash = "sha256:58d5196acf903edc14119ee2700ea1e85d9d0c97662c16f648733d5f8177aa81", size = 1423772, upload-time = "2026-10-16T00:10:23.806Z" },
 ]
 
 [[package]]
 name = "ultralytics-platform"
-version = "0.1.88"
+version = "0.1.89"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c1/fc/755db40d681761a09f504e390389af1e9baf8aa7a24926c2636fdfd52f37/ultralytics_platform-0.1.88.tar.gz", hash = "sha256:368df454da13e5b8043912d32061dc0ed3371bc4fddcfc41880642b6cdd9033d", size = 88890, upload-time = "2026-10-15T00:37:11.143Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/35/5d/26087a4559093915bd3f204a27dbaf440edd1a9bd82f948d5c5bd203f62e/ultralytics_platform-0.1.89.tar.gz", hash = "sha256:420223e10f480511f3be930b9d061b0266338e015e52d1bd2a2f209b257b0fa1", size = 88914, upload-time = "2026-10-16T00:37:02.328Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/e2/358e3e72f7deb88b618abf9daf443ed182e33c3ffce8c4ac7d01beb49319/ultralytics_platform-0.1.88-py3-none-any.whl", hash = "sha256:0b6135d203e21400c7cfd92f0c2a9eda17dce1e68346ae8393ffdf5c177c85ec", size = 97143, upload-time = "2026-10-15T00:37:09.543Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/f5/b84b6999a457f51087186d808387a5dc33587edfa206c1a558dc411ebf8c/ultralytics_platform-0.1.89-py3-none-any.whl", hash = "sha256:3862b93d660d64116735c872d915977ca2587159901790f6c0998eee2655e2e6", size = 97164, upload-time = "2026-10-16T00:37:00.898Z" },
 ]
 
 [[package]]

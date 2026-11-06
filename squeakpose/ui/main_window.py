@@ -221,8 +221,7 @@ from squeakpose.services.inference import (
 )
 from squeakpose.services.inference_runtime import probe_video_metadata
 from squeakpose.services.model_download import (
-    SAM3_MODEL_URL,
-    sam3_download_error_message,
+    sam_download_error_message,
 )
 from squeakpose.services.openai_labeling import PoseProposal
 from squeakpose.services.prediction import (
@@ -231,6 +230,13 @@ from squeakpose.services.prediction import (
     validate_prediction_identity,
 )
 from squeakpose.services.prediction_serialization import rank_prediction_frames
+from squeakpose.services.sam_models import (
+    DEFAULT_SAM_VARIANT,
+    SAM_MODELS,
+    get_sam_model,
+    official_sam_variant,
+    sam_download_target,
+)
 from squeakpose.services.segmentation_transfer import (
     create_pose_instances,
     incomplete_pose_instances,
@@ -314,7 +320,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CLASS_NAMES = ["mouse"]
 DEFAULT_KEYPOINT_NAMES = ["nose", "head", "left_ear", "right_ear", "back", "tail_base"]
-DEFAULT_SAM3_WEIGHTS = "sam3.pt"
 # Worker-facing compatibility values. Project and UI state use layer ids.
 WORKFLOW_POSE = "pose"
 WORKFLOW_SEG = "segmentation"
@@ -1150,6 +1155,7 @@ class LabelingApp(QMainWindow):
             self.sam_model_path = session.assistant_model_path
         else:
             session.assistant_model_path = str(getattr(self, "sam_model_path", "") or "")
+        self.sam_model_variant = session.assistant_model_variant
         self._project_session = session
         self._sync_project_session_legacy_fields()
 
@@ -1169,6 +1175,7 @@ class LabelingApp(QMainWindow):
                 bool(getattr(self, "layer_visibility", {}).get(layer_id, True)),
             )
         session.assistant_model_path = str(getattr(self, "sam_model_path", "") or "")
+        session.assistant_model_variant = self.sam_model_variant
         payload = session.to_preferences()
         self.layer_settings = normalize_layer_settings(session.layer_settings)
         self.layer_visibility = dict(session.layer_visibility)
@@ -2501,25 +2508,33 @@ class LabelingApp(QMainWindow):
         )
         accept_enabled = has_preview and not model_busy
         clear_enabled = (has_preview or total_prompts > 0) and not model_busy
-        load_enabled = (
-            not model_loaded and not model_loading and not model_busy and not download_busy
-        )
+        load_enabled = not model_loading and not model_busy and not download_busy
         if hasattr(self, "sam_load_btn"):
             self.sam_load_btn.setEnabled(load_enabled)
-            self.sam_load_btn.setText(
-                "SAM Ready" if model_loaded else ("Loading SAM…" if model_loading else "Load SAM")
-            )
+            self.sam_load_btn.setText("Loading SAM…" if model_loading else "Load SAM")
             self.sam_load_btn.setProperty("tone", "load" if load_enabled else "")
             _refresh_qt_style(self.sam_load_btn)
         if hasattr(self, "sam_download_btn"):
-            downloaded = os.path.isfile(os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS))
+            model = get_sam_model(self.sam_model_variant)
+            target = sam_download_target(self.project_root, model.key)
+            downloaded = os.path.isfile(target)
             self.sam_download_btn.setEnabled(
-                not downloaded and not download_busy and not model_loading and not model_busy
+                not download_busy and not model_loading and not model_busy
+            )
+            self.sam_model_selector.setEnabled(
+                not download_busy and not model_loading and not model_busy
             )
             self.sam_download_btn.setText(
-                "Downloading SAM 3…"
+                f"Downloading {model.display_name}…"
                 if download_busy
-                else ("SAM 3 Downloaded" if downloaded else "Download SAM 3")
+                else (
+                    f"Load {model.display_name}" if downloaded else f"Download {model.display_name}"
+                )
+            )
+            self.sam_download_btn.setToolTip(
+                f"Load downloaded {model.filename}"
+                if downloaded
+                else f"Download {model.filename} from {model.access_url} into this project"
             )
         self.sam_run_btn.setEnabled(run_enabled)
         self.sam_accept_btn.setEnabled(accept_enabled)
@@ -2576,26 +2591,40 @@ class LabelingApp(QMainWindow):
     def _load_sam_model_interactive(self):
         if not self._is_seg_workflow():
             self._switch_workflow(WORKFLOW_SEG)
-        self._ensure_sam_model_loaded()
+        selected, _ = QFileDialog.getOpenFileName(
+            self, "Select SAM model file", self.project_root, "Model Files (*.pt *.pth)"
+        )
+        if selected:
+            self._warm_sam_model(selected)
+        self._refresh_sam_controls()
+
+    def _sam_model_variant_changed(self, key: str) -> None:
+        self.sam_model_variant = get_sam_model(key).key
+        self._save_project_preferences()
         self._refresh_sam_controls()
 
     def _download_sam3_from_hugging_face(self) -> None:
         """Download the gated official checkpoint without blocking the Qt thread."""
-        target = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
+        model = get_sam_model(self.sam_model_variant)
+        target = sam_download_target(self.project_root, model.key)
         if os.path.isfile(target):
             self._warm_sam_model(target)
             return
         current = self.__dict__.get("_sam_download_job")
         if current is not None and current.is_running:
-            self.update_status_bar("SAM 3 is already downloading from Hugging Face.")
+            self.update_status_bar(
+                f"{model.display_name} is already downloading from Hugging Face."
+            )
             return
 
+        size_text = f" ({model.approximate_size})" if model.approximate_size else ""
         answer = QMessageBox.question(
             self,
-            "Download SAM 3",
-            "Download the official SAM 3 checkpoint (about 3.45 GB) into this project?\n\n"
+            f"Download {model.display_name}",
+            f"Download the official {model.display_name} checkpoint"
+            f"{size_text} into this project?\n\n"
             "The model is gated. You must first accept its terms at\n"
-            f"{SAM3_MODEL_URL}\n"
+            f"{model.access_url}\n"
             "and sign in with `hf auth login` or HF_TOKEN.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
@@ -2604,6 +2633,7 @@ class LabelingApp(QMainWindow):
             return
 
         self._sam_download_result_path = ""
+        self._sam_download_variant = model.key
         job = WorkerJobController(self)
         self._sam_download_job = job
         job.event_received.connect(self._sam3_download_event)
@@ -2615,12 +2645,16 @@ class LabelingApp(QMainWindow):
                 "squeakpose.workers.sam3_download",
                 "--destination",
                 self.project_root,
+                "--model",
+                model.key,
             ],
             working_directory=APP_BASE_DIR,
             start_timeout_ms=3000,
         )
         if started:
-            self.update_status_bar("Downloading sam3.pt from Hugging Face (about 3.45 GB)…")
+            self.update_status_bar(
+                f"Downloading {model.display_name} ({model.filename}) from Hugging Face…"
+            )
         self._refresh_sam_controls()
 
     def _sam3_download_event(self, event: dict) -> None:
@@ -2629,21 +2663,21 @@ class LabelingApp(QMainWindow):
 
     def _sam3_download_finished(self, result: WorkerJobResult) -> None:
         self._sam_download_job = None
-        target = os.path.abspath(
-            self.__dict__.pop("_sam_download_result_path", "")
-            or os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
-        )
-        if result.succeeded and os.path.isfile(target):
-            self.update_status_bar("Downloaded sam3.pt. Loading SAM 3…")
+        model = get_sam_model(self.__dict__.pop("_sam_download_variant", self.sam_model_variant))
+        expected = sam_download_target(self.project_root, model.key)
+        reported = self.__dict__.pop("_sam_download_result_path", "")
+        target = os.path.abspath(reported) if reported else ""
+        if result.succeeded and target == expected and os.path.isfile(target):
+            self.update_status_bar(f"Downloaded {model.filename}. Loading {model.display_name}…")
             self._warm_sam_model(target)
         elif result.state != "cancelled":
             detail = result.stderr.strip() or result.error_message
             QMessageBox.warning(
                 self,
-                "SAM 3 download failed",
-                sam3_download_error_message(detail),
+                f"{model.display_name} download failed",
+                sam_download_error_message(detail, model.key),
             )
-            self.update_status_bar("SAM 3 download failed.")
+            self.update_status_bar(f"{model.display_name} download failed.")
         self._refresh_sam_controls()
 
     def _draw_seg_prompt_marker(self, x: float, y: float, positive: bool):
@@ -2681,7 +2715,7 @@ class LabelingApp(QMainWindow):
         return list(
             discover_sam_weight_candidates(
                 self.__dict__.get("project_root", ""),
-                default_filename=DEFAULT_SAM3_WEIGHTS,
+                default_filename=get_sam_model(self.sam_model_variant).filename,
             )
         )
 
@@ -2689,7 +2723,7 @@ class LabelingApp(QMainWindow):
         """Queue non-interactive SAM warm-up from a project-local weight file."""
         if self._sam_model_ready:
             return False, self._sam_worker_model_path
-        candidates = self._sam3_model_candidates_in_project_root()
+        candidates = [self.sam_model_path, *self._sam3_model_candidates_in_project_root()]
         model_path = select_existing_sam_weight(candidates)
         if model_path:
             self._warm_sam_model(model_path)
@@ -2707,10 +2741,8 @@ class LabelingApp(QMainWindow):
             candidate_paths.append(self.sam_model_path)
         candidate_paths.extend(self._sam3_model_candidates_in_project_root())
         candidate_paths.extend(
-            [
-                os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS),
-                os.path.join(os.getcwd(), DEFAULT_SAM3_WEIGHTS),
-            ]
+            os.path.join(os.getcwd(), get_sam_model(key).filename)
+            for key in dict.fromkeys((self.sam_model_variant, *SAM_MODELS))
         )
 
         model_path = select_existing_sam_weight(candidate_paths) or ""
@@ -2734,6 +2766,13 @@ class LabelingApp(QMainWindow):
         if self._sam_model_ready and normalized == self._sam_worker_model_path:
             return True
         self.sam_model_path = normalized
+        inferred = official_sam_variant(normalized)
+        if inferred:
+            self.sam_model_variant = inferred
+            if hasattr(self, "sam_model_selector"):
+                self.sam_model_selector.blockSignals(True)
+                self.sam_model_selector.setCurrentIndex(self.sam_model_selector.findData(inferred))
+                self.sam_model_selector.blockSignals(False)
         self._sam_worker_model_path = normalized
         self._sam_model_ready = False
         self._sam_model_loading = True
@@ -3528,7 +3567,8 @@ class LabelingApp(QMainWindow):
         self.layer_model_paths: dict[str, str] = {layer_id: "" for layer_id in LAYER_DEFINITIONS}
         self.layer_visibility: dict[str, bool] = {layer_id: True for layer_id in LAYER_DEFINITIONS}
         self.predict_model_path: Optional[str] = None
-        self.sam_model_path = os.path.join(self.project_root, DEFAULT_SAM3_WEIGHTS)
+        self.sam_model_path = ""
+        self.sam_model_variant = DEFAULT_SAM_VARIANT
         self._sam_download_job: WorkerJobController | None = None
         self._sam_download_result_path = ""
         self._sam_worker_model_path = ""
@@ -4396,6 +4436,7 @@ class LabelingApp(QMainWindow):
         # -----------------------------
         self.seg_tools_frame = SegmentationToolsPanel(
             callbacks=SegmentationToolsCallbacks(
+                model_changed=self._sam_model_variant_changed,
                 load_model=self._load_sam_model_interactive,
                 download_model=self._download_sam3_from_hugging_face,
                 run=self._run_sam_segmentation,
@@ -4408,6 +4449,12 @@ class LabelingApp(QMainWindow):
         self.seg_brush_size_label = self.seg_tools_frame.brush_size_label
         self.sam_load_btn = self.seg_tools_frame.load_btn
         self.sam_download_btn = self.seg_tools_frame.download_btn
+        self.sam_model_selector = self.seg_tools_frame.model_selector
+        self.sam_model_selector.blockSignals(True)
+        self.sam_model_selector.setCurrentIndex(
+            self.sam_model_selector.findData(self.sam_model_variant)
+        )
+        self.sam_model_selector.blockSignals(False)
         self.sam_run_btn = self.seg_tools_frame.run_btn
         self.sam_accept_btn = self.seg_tools_frame.accept_btn
         self.sam_clear_btn = self.seg_tools_frame.reset_btn

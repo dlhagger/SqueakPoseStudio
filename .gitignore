@@ -22,6 +22,24 @@ htmlcov/
 # Virtual environments
 .venv/
 
+# Local development notes, agent settings, and credentials
+/.local/
+/.agents/
+/.codex/
+/.aws/
+/AUDIT_FIX_PLAN.md
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Generated notebook artifacts; retain the portable demonstration CSV
+/analysis_toolset/inference outputs/*
+!/analysis_toolset/inference outputs/demo_video_20251201-153106.csv
+/analysis_toolset/analysis outputs/
+/analysis_toolset/numba_cache/
+/.cache/huggingface/
+
 # OS-generated files
 .DS_Store
 

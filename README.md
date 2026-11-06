@@ -20,8 +20,8 @@ block the main interface.
   visibility states, and model-assisted predictions.
 - Optional **Continue with ChatGPT** pose proposals from vision-capable OpenAI
   models, with explicit human review and normal point editing before save.
-- Segmentation annotation with positive and negative SAM prompts, mask previews,
-  and add/erase brush editing.
+- Segmentation annotation with SAM 3 or SAM 3.1, positive and negative point
+  prompts, mask previews, and add/erase brush editing.
 - Inference-only depth maps for images, with raw NumPy data, color previews,
   and compact metadata saved together.
 - YOLO keypoint/pose and segmentation dataset export with reproducible
@@ -31,18 +31,21 @@ block the main interface.
   optional DINO-distilled backbones.
 - Single-image prediction and a video reviewer for finding and exporting useful
   frames back into the labeling queue.
-- Video inference with per-frame CSV output; depth passes also save a colorized
-  MP4 preview.
+- Video inference across project videos with per-class tracking and per-frame
+  CSV output; depth passes also save a colorized MP4 preview.
+- Inference quality review that ranks suspicious frames for export back to labeling.
+- Pose, segmentation, and combined video analysis with saved scale/ROI setup,
+  per-track movement features, and distances between observed instances.
 - Qt-free helper modules with unit tests for label, dataset, prediction,
   inference, and training logic.
 
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/)
-- Python 3.12 or newer
+- Python 3.12 or newer (`.python-version` selects 3.12)
 - A desktop environment supported by PyQt6
 - Optional CUDA or Apple Silicon acceleration
-- Optional SAM-compatible weights for the Segmentation layer
+- Optional SAM 3 or SAM 3.1 weights for interactive segmentation prompts
 - Optional eligible ChatGPT Plus or Pro account for OpenAI pose proposals
 
 PyTorch package sources are configured in `pyproject.toml`: Windows installs
@@ -64,11 +67,14 @@ uv sync --locked
 Launch the application:
 
 ```bash
-uv run python squeakpose_studio.py
+uv run --locked python squeakpose_studio.py
 ```
 
 This is a dependency-only uv project; the repository itself is run directly and
-is not installed as a Python package.
+is not installed as a Python package. CI uses uv 0.12.2.
+
+Keep research projects outside the repository so image data, local models, and
+analysis results stay separate from the application source.
 
 ## Projects
 
@@ -81,8 +87,8 @@ launcher starts in:
 
 A project stores its own images, labels, datasets, training runs, templates,
 inference outputs, and UI state. The active editing layer, the YOLO model
-selected for each layer, and the most recent SAM weights path are restored from
-project metadata.
+selected for each layer, SAM variant and checkpoint path, and layer visibility
+choices are restored from project metadata.
 
 New projects receive a default `mouse` pose class with six keypoints. Classes
 and keypoints can be changed through the application before labeling begins.
@@ -104,8 +110,10 @@ project/
 ├── depth maps/
 │   ├── images/            # raw float32 .npy maps and JSON metadata
 │   └── previews/          # colorized depth-map PNG files
-├── datasets/              # exported YOLO datasets
-├── runs/                  # training output
+├── datasets/              # exported YOLO pose/segment datasets
+├── distillation/
+│   └── unlabeled_images/  # optional extracted corpus
+├── runs/                  # training and distillation output
 ├── templates/             # pose annotation templates
 ├── inference outputs/
 │   ├── keypoints/         # keypoint-layer video inference CSV files
@@ -117,6 +125,8 @@ project/
 │       ├── keypoints/      # keypoint-layer analysis
 │       ├── segmentation/   # segmentation-layer analysis
 │       └── combined/       # joint pose and segmentation analysis
+├── analysis settings/
+│   └── videos/            # per-video scale points and named ROIs
 ├── cache/
 │   └── video_predictions/ # project-contained Video Reviewer caches
 ├── logs/
@@ -172,12 +182,13 @@ case. For example, `frame.jpg`, `frame.png`, and `Frame.jpg` cannot coexist in
 one labeling queue because each would map to the same YOLO label name. The
 application excludes conflicting files until they are renamed.
 
-The main window is organized into four control areas:
+The main window has a central image canvas and two sidebars:
 
-- Top left: image navigation and labeling controls
-- Top right: video review
-- Bottom left: dataset validation, export, and training
-- Bottom right: model loading, prediction, and inference
+- Left: image navigation, layer/class/instance controls, annotation modes, and
+  the active layer's OpenAI, SAM, or Depth assistant/display panels.
+- Right: Video Reviewer, Project Models & Inference, Dataset & Training, and
+  the active layer's **Run Analysis** control. Depth shows Project Tools and
+  hides unsupported training and analysis controls.
 
 The image browser can show all, labeled, or unlabeled images. Saving an image
 writes its active-layer labels, copies the image into `images_all/`, and
@@ -228,8 +239,9 @@ class ID for all mice. The keypoint schema is per animal and does not change whe
 more animals are added. Pose and segmentation remain separate datasets and
 training tasks. Internal instance IDs distinguish annotations only during editing;
 they are regenerated when YOLO files are loaded and do not establish identity
-across images or link animals between layers. Video identity mapping is separate
-future work.
+across images or link animals between layers. Video track IDs are separate;
+combined analysis can associate pose and segmentation tracks using observed
+geometry, but does not establish permanent experimental identities.
 
 Existing single-animal projects need no migration. This version preserves repeated
 same-class rows when opening multi-animal files, and enables the instance controls
@@ -243,7 +255,7 @@ The Keypoints workflow includes an **OpenAI Pose Assistant** panel in the left
 sidebar. Select **Continue with ChatGPT** to authorize SqueakPose Studio in the
 system browser. After sign-in, choose one of the vision-capable models available
 to your account and select **Auto-label Current Image**. Each installation uses
-the tester's own eligible ChatGPT Plus or Pro account and plan allowance; no API
+the user's own eligible ChatGPT Plus or Pro account and plan allowance; no API
 key is required.
 
 The assistant searches the full image for **all instances of the selected class**,
@@ -263,9 +275,9 @@ animal identities. Treat every proposal as a starting point requiring human revi
 including checking for missed or duplicate objects and misplaced keypoints.
 
 The panel keeps the model selector, Auto-label action, and result status visible.
-Expand **Account & usage** for account details, reconnect/sign-out controls, exact
-token counts for the last request and current session, and **Manage Usage**. These counts describe completed requests; the
-app does not attempt to calculate or impose a remaining-plan cap.
+Expand **Account & usage** for account details, reconnect/sign-out controls,
+exact token counts for the last request and current session, and **Manage Usage**. These counts describe completed requests; the app does not attempt to
+calculate or impose a remaining-plan cap.
 
 Auto-label sends the current image, class name, and keypoint names to OpenAI for
 that request. Only use images that you are authorized to share with OpenAI.
@@ -308,21 +320,38 @@ included in this repository.
 
 To use segmentation:
 
-1. Click **Download SAM 3** to fetch the official `facebook/sam3/sam3.pt`
-   checkpoint from Hugging Face, put a compatible `sam3*.pt` or `sam3*.pth`
-   file in the project root, or select one from the segmentation controls.
-2. Use left-click prompts for foreground and right-click prompts for
-   background.
-3. Run SAM to generate a preview.
-4. Accept the preview, then optionally refine it with the mask brush.
+1. Choose **SAM 3** or **SAM 3.1** in the **SAM model** selector and click
+   **Download SAM 3** or **Download SAM 3.1** to fetch its official Hugging Face
+   checkpoint into the project.
+   New projects default to SAM 3.1. If the selected checkpoint already exists,
+   the button becomes **Load SAM 3** or **Load SAM 3.1** and warms it without
+   downloading again. Downloads also warm the model immediately.
+   You can also place compatible `sam3*.pt` or `sam3*.pth` weights in the
+   project root, or use **Load SAM** to select a checkpoint manually.
+2. Select **Segment Prompt (2)**. Use left-click prompts for foreground and
+   right-click prompts for background.
+3. Select **Run (G)** to generate a preview.
+4. Select **Accept** (Shift+Enter), then optionally refine the accepted mask in
+   **Edit Mask (E)** mode.
 5. Save the completed masks.
 
-The application automatically looks for SAM weights in the project root and
-prioritizes `sam3.pt`. Accepted polygons are written in YOLO segmentation
-format to `labels_seg_all/<image-stem>.txt`.
+Both official checkpoints are gated. Accept access at the appropriate page and
+sign in with `uv run --locked hf auth login` from the repository root (or set
+`HF_TOKEN`) before downloading:
 
-The official checkpoint is gated. Accept its terms on Hugging Face and sign in
-with `hf auth login` (or set `HF_TOKEN`) before downloading it in the app.
+| Model | Repository | Checkpoint | Access page |
+| --- | --- | --- | --- |
+| SAM 3 | `facebook/sam3` | `sam3.pt` | [SAM 3](https://huggingface.co/facebook/sam3) |
+| SAM 3.1 | `facebook/sam3.1` | `sam3.1_multiplex.pt` | [SAM 3.1](https://huggingface.co/facebook/sam3.1) |
+
+The saved checkpoint path takes priority during autoloading, including manual
+checkpoints. Otherwise the application prefers the selected variant in the
+project root, then other compatible weights. Existing projects with only
+`sam3.pt` keep using SAM 3. The selector is saved in project preferences.
+Both checkpoints load through Ultralytics SAM; the declared minimum is
+Ultralytics 8.4.148. SAM 3.1 uses image/point-prompt prediction; SqueakPoseStudio does
+not use SAM 3.1 Object Multiplex video tracking. Accepted polygons are written
+in YOLO segmentation format to `labels_seg_all/<image-stem>.txt`.
 
 SAM model loading and prompt inference run in a persistent child process rather
 than the Qt process. The worker keeps one model warm, correlates replies to the
@@ -384,14 +413,19 @@ This is a display-only spot check and does not modify the keypoint annotations.
 | `Space` | Temporarily pan |
 | `V` | Toggle selected keypoint visibility |
 | `0` | Mark the next keypoint invisible |
+| `Shift+0` | Mark the selected keypoint invisible |
 | `A` | Apply the active pose template |
 | `C` | Select the next class |
 | `I` | Select the next instance of the current class (Multiple instances mode) |
 | `Shift+I` | Add another instance of the current class |
 | `G` | Run SAM |
+| `X` | Reset SAM prompts and preview |
 | `Shift+Enter` | Accept the SAM preview |
 | `E` | Edit the accepted segmentation mask |
 | `,` / `.` | Decrease / increase segmentation brush size |
+| `L` | Toggle keypoint labels |
+| `=` / `-` | Increase / decrease keypoint marker size |
+| `]` / `[` | Increase / decrease keypoint label size |
 | `R` | Reset zoom |
 
 ## Dataset Validation and Export
@@ -470,8 +504,9 @@ training begins.
 Device selection prefers CUDA, then MPS, then CPU. CUDA uses automatic batch
 sizing in the UI; MPS requires a positive manual batch size.
 
-Use **Distillation** in the Dataset & Training panel to explicitly create an
-unlabeled image corpus from project videos and launch DINO distillation. Images
+From the **Keypoints** layer, use **Distillation** in the Dataset & Training
+panel to create an unlabeled image corpus from project videos and launch DINO
+distillation. Images
 default to `<project>/distillation/unlabeled_images/`, and outputs are stored
 under `<project>/runs/distillation/<run-name>/`. The GUI requires confirmation
 before extracting frames and supports sampling intervals and per-video limits.
@@ -485,7 +520,8 @@ project-aware command-line entry point is `distillation/distiller.py`.
 Use **Project Models…** to assign `.pt`, `.yaml`, or `.onnx` prediction models
 to the Keypoints and Segmentation layers. The selections are remembered with
 the project. SAM and Depth use their dedicated model-assistant panels on the
-left side of the labeling window.
+left side of the labeling window. The SAM checkpoint assists interactive mask
+labeling; video inference uses the configured YOLO prediction models.
 
 Single-image prediction applies the best prediction for each class by default.
 With **Multiple instances** enabled, it preserves every usable instance. Video
@@ -529,10 +565,27 @@ Video Reviewer shortcuts include:
 | `+` / `-` | Zoom in / out |
 | `R` | Reset zoom |
 
+### Review existing inference outputs
+
+Use **Videos > Review Inference Quality…** to inspect results already written by
+video inference. Choose the Keypoints/Pose or Segmentation layer and the model
+whose outputs you want to review. The scanner uses the newest successful output
+for each matching video/model/layer, rather than rerunning prediction.
+
+Rank by overall quality priority, detection confidence, or pose keypoint
+confidence. Filters narrow the list by video, severity, and reason, including
+missing/extra detections, track-count mismatches, and track changes. Preview a
+candidate, then use **Export Selected to Labeler** or **Export All Shown** to add
+original frames to the labeling queue for correction. This is separate from
+Video Reviewer's **Predict Range** workflow.
+
 ## Video Inference
 
-Video inference runs every configured project prediction model sequentially.
-Each layer writes its own compatible CSV, and a run manifest links the passes.
+Select **Inference** in the right sidebar, choose one or more project videos
+(or use **Browse for Video…**), and confirm the tracking settings for each.
+Video inference runs every configured project prediction model sequentially,
+starting with the active layer. Each layer writes its own compatible CSV, and a
+run manifest links the passes.
 Depth inference writes one summary row per frame and a colorized preview MP4.
 If one pass fails, completed output from the other layers is retained.
 
@@ -546,35 +599,9 @@ a model pass; they are not permanent experimental identities.
 a total-count check. Class-specific expectations are not currently configured.
 CSV `tracks_in_frame` and `total_tracks_in_frame` count all confirmed tracks.
 Older CSVs that record `subject_class` retain their original subject-count meaning.
-
-In **Analysis**, **All classes** analyzes every class in one run and writes one
-`analysis_features.csv` table with an `analysis_class` column and original track
-IDs. One summary contains grouped class statistics, and plots share the `plots/`
-folder. No per-class data folders are published. You can also choose one class
-(for example, `mouse` or `object`). This choice does not
-change or rerun inference. Segmentation analysis retains all classes in
-`segmentation_detections.csv`, with track IDs and flags identifying detections
-used for movement. Both pose and segmentation movement features use the selected
-class, independently per track. Pose keypoint coordinates and confidences remain
-attached to their original instance. Untracked multi-instance pose rows are kept
-without assuming that detection order establishes identity; their movement
-remains undefined until tracks are available. Gaps and track changes reset smoothing and derivatives; they receive no
-inferred movement. Summary output includes per-track distances and coverage.
-The `center_distances` column in `analysis_features.csv` is a JSON list of all
-other observed instances in the same frame, with their class, original track ID,
-detection index, and distances in pixels and millimeters. It uses unsmoothed mask
-centroids, falling back to geometric box centers. The companion column
-`center_distances_smoothed` uses the existing filtered centers with the same target
-identifiers and distance units. It remains blank when filtered centers are
-unavailable; raw coordinates are never substituted for filtered coordinates.
-With smoothing disabled, both columns agree. `[]` means no other valid center
-was observed; a blank cell means the row has no measurable center. Missing
-instances are not imputed. **All classes** includes cross-class and same-class
-pairs; a single-class analysis includes only that class's instances.
-
-Mixed-class CSVs can be analyzed by choosing a class, including older exports
-without subject metadata. Mouse–object interaction measurements and manual
-identity corrections remain separate work.
+**Auto** chooses ByteTrack for an expected count of 0 or 1 and BoT-SORT for
+larger counts; either tracker can also be selected explicitly. Tracked inference
+processes frames sequentially to preserve tracker state.
 
 Pose output includes frame/time metadata, class and confidence, bounding boxes,
 tracking IDs when available, speed values, and absolute/normalized keypoint
@@ -591,25 +618,89 @@ unexpectedly large.
 
 ## Analysis
 
-For the Keypoints and Segmentation layers, use **Analysis** in the right-hand
-panel to run the repeatable parts of
-`analysis_toolset/analysis_toolkit.ipynb` from a GUI. The dialog opens in the
-active layer's context, prefers that layer's inference directory, and rejects a
-CSV whose schema belongs to the other layer. It loads a source
-frame when a video is available, lets you click two scale points, draw named
-rectangular ROIs, and then runs the workflow on an inference CSV with the
-selected smoothing and output options.
+Open **Run Analysis** from the right sidebar while in Keypoints or Segmentation.
+Select a **Project video** to load its available inference outputs. The **Analyze**
+selector offers **Pose only**, **Segmentation only**, and, when both passes are
+available, **Both — Pose + Segmentation**. Both is selected by default when
+available. Status badges show completed pose, segmentation, and combined analyses.
+Use **Other…** to select an external inference CSV matching the layer from which
+Analysis was opened; the app detects its source video or asks you to select one.
+Depth analysis is not currently supported.
 
-The analysis worker writes `analysis_features.csv`, `analysis_summary.json`,
-ROI summaries, and optional plots into the active project's
-`analysis outputs/` directory. Optional video-dependent outputs include
-annotated videos and behavior-cluster clips when UMAP/HDBSCAN clustering is
-enabled.
+Click two scale points and enter their real-world separation in millimeters,
+then select **Polygon ROI** and click its vertices. Click the first vertex or
+press Enter to finish, Backspace to undo a vertex, and Escape to cancel. Name the
+completed ROIs in the list; their order determines precedence where they overlap.
+Scale points and ROIs are saved automatically per project video under
+`analysis settings/videos/` and restored when that video is reopened. Choose
+smoothing, plots, annotated-video, and optional UMAP/HDBSCAN clustering/clip
+settings before running. Analysis opens in
+its own window; project editing and project switching are paused until it closes.
 
-Segmentation inference CSVs are routed through a segmentation-specific workflow.
-It parses `mask_polygon`, computes mask geometry, tracks the primary mask
-centroid per frame, writes `segmentation_detections.csv`, and includes
-segmentation coverage, mask area, trajectory, and ROI occupancy outputs.
+Results are published under `analysis outputs/<video-stem>--<id>/keypoints/`,
+`segmentation/`, or `combined/`. A failed or canceled rerun preserves previously
+published results. Output files depend on the selected mode:
+
+| Mode | Main outputs |
+| --- | --- |
+| Pose only | `analysis_features.csv`, `analysis_summary.json` |
+| Segmentation only | `analysis_features.csv`, `analysis_summary.json`, `segmentation_detections.csv` |
+| Both | `analysis.csv`, `summary.json`, `analysis_manifest.json` |
+
+ROI summaries, plots, annotated videos, and behavior-cluster clips are optional
+additional outputs. **All classes** publishes a merged `analysis_features.csv`
+and `analysis_summary.json`; combined mode also provides the combined filenames
+above. Original track IDs and an `analysis_class` column keep classes distinct.
+
+### Classes, tracks, and movement
+
+**Class to analyze** lets you choose **All classes** or a single class such as
+`mouse` or `object`. This choice does not rerun inference. All-class results
+share one table, grouped summary, and `plots/` directory; no per-class data
+folders are published. Segmentation analysis retains all classes in
+`segmentation_detections.csv`, with track IDs and flags identifying detections
+used for movement. Both pose and segmentation movement features use the selected
+class, independently per track. Pose keypoint coordinates and confidences remain
+attached to their original instance. Untracked multi-instance pose rows are kept
+without assuming that detection order establishes identity; their movement
+remains undefined until tracks are available. Gaps and track changes reset
+smoothing and derivatives; they receive no inferred movement. Summary output
+includes per-track distances and coverage.
+The `center_distances` column in `analysis_features.csv` is a JSON list of all
+other observed instances in the same frame, with their class, original track ID,
+detection index, and distances in pixels and millimeters. It uses unsmoothed mask
+centroids, falling back to geometric box centers. The companion column
+`center_distances_smoothed` uses the existing filtered centers with the same target
+identifiers and distance units. It remains blank when filtered centers are
+unavailable; raw coordinates are never substituted for filtered coordinates.
+With smoothing disabled, both columns agree. `[]` means no other valid center
+was observed; a blank cell means the row has no measurable center. Missing
+instances are not imputed. **All classes** includes cross-class and same-class
+pairs; a single-class analysis includes only that class's instances.
+
+Mixed-class CSVs can be analyzed by choosing a class, including older exports
+without subject metadata. Mouse–object interaction measurements and manual
+identity corrections remain separate work.
+
+### Combined pose and segmentation
+
+Combined analysis associates independent layer tracks using temporal overlap and
+box geometry. The merged table retains original pose/segmentation track IDs and
+analysis-local `animal_id` values. Centroids prefer segmentation masks, then
+segmentation boxes, then pose boxes; mask bounds supply segmentation box geometry.
+Prediction quality flags are diagnostic and do not remove measured rows. These
+associations should be reviewed where tracks fragment or objects overlap; they
+are not persistent identities across videos.
+
+### Example notebook
+
+`analysis_toolset/analysis_toolkit.ipynb` contains the exploratory analysis
+notebook. Its saved outputs are cleared, and the demo CSV uses portable
+placeholder paths for the source video and model. The source video and checkpoint
+are not bundled. Open the notebook from `analysis_toolset/` so its example CSV
+path resolves, or update `csv_path` to your own inference CSV. Video-dependent
+cells require the matching source video. The desktop Analysis workflow uses the
+application's analysis services and workers rather than executing the notebook.
 
 ## Repository Layout
 
@@ -635,16 +726,18 @@ dataset_ops.py             Compatibility imports for service dataset operations
 depth_ops.py               Compatibility imports for squeakpose.depth_ops
 prediction_ops.py          Compatibility imports for prediction serialization
 inference_ops.py           Compatibility imports for inference runtime
-predict_worker.py          Single-image prediction process
+predict_worker.py          Persistent single-image prediction process
 sam_worker.py              Persistent interactive SAM assistant process
+squeakpose/workers/sam3_download.py  One-shot official SAM checkpoint downloader
 video_review_worker.py     Video review prediction process
 inference_worker.py        Video inference process
-analysis_ops.py            Inference CSV analysis workflow
+analysis_ops.py            Pose, all-class analysis, and output transactions
+segmentation_analysis_ops.py  Segmentation geometry and movement analysis
+unified_analysis_ops.py    Combined pose and segmentation analysis
 analysis_worker.py         Analysis child process
 analysis_dialog.py         PyQt6 analysis dialog
 train_worker.py            Ultralytics training process
 tests/                     Unit test suite
-example_datasets/          Example pose images, labels, and overlays
 analysis_toolset/          Example inference analysis notebook
 distillation/              Project-aware DINO distillation entry point
 ```
@@ -712,16 +805,23 @@ uv sync --locked
 QT_QPA_PLATFORM=offscreen uv run --locked python -m unittest -q tests.test_main_window_lifecycle
 ```
 
-The lifecycle test creates a temporary project, opens the complete main window without
-model weights, closes it, and verifies project-lock cleanup. The Phase 6 acceptance was
-also reproduced in a clean temporary workspace using the locked test-only group: the
-complete unit suite, lifecycle smoke, and all UI screenshot renders passed. The locked
-full dependency environment passed the same application smoke path.
+The lifecycle test creates a temporary project, opens the complete main window
+without model weights, closes it, and verifies project-lock cleanup. The UI smoke
+renderer constructs the launcher, workflow states, and feature dialogs without
+downloading real checkpoints.
+
+On macOS, if the symlink-source test fails only because `/var` and `/private/var`
+spell the same temporary directory differently, rerun with a canonical temp path:
+
+```bash
+TMPDIR=/private/tmp QT_QPA_PLATFORM=offscreen uv run --locked --only-group test \
+  python -m unittest discover -s tests -q
+```
 
 Run the PyTorch and Ultralytics environment check:
 
 ```bash
-uv run python torch_ultralytics_checks.py
+uv run --locked python torch_ultralytics_checks.py
 ```
 
 The environment check reports the selected PyTorch device and verifies that the

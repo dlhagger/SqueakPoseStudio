@@ -1,5 +1,7 @@
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sam_worker import run_sam_server
 from squeakpose.annotation.segmentation_assistant import SamPromptRequest
@@ -100,6 +102,61 @@ class SamAssistantServiceTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(factory_calls, ["sam3.pt"])
+        self.assertEqual(events[0], {"event": "ready"})
+        result = next(event for event in events if event["event"] == "result")
+        self.assertEqual(result["request_id"], 2)
+        selection = deserialize_sam_selection(result["prediction"])
+        self.assertEqual(selection.result.score, 0.93)
+        self.assertEqual(
+            selection.result.points,
+            ((4.0, 3.0), (10.0, 3.0), (7.0, 9.0)),
+        )
+        self.assertEqual(
+            model.calls,
+            [
+                {
+                    "source": "frame.png",
+                    "points": [[2.0, 3.0]],
+                    "labels": [1],
+                    "verbose": False,
+                    "device": "cpu",
+                }
+            ],
+        )
+
+    def test_worker_reuses_sam31_with_same_ultralytics_factory(self):
+        model = _Model()
+        factory_calls = []
+        events = []
+        requests = [
+            json.dumps(
+                {
+                    "command": "load",
+                    "request_id": 1,
+                    "model_path": "sam3.1_multiplex.pt",
+                    "device": "cpu",
+                }
+            ),
+            json.dumps(
+                {
+                    "command": "predict",
+                    "request_id": 2,
+                    "model_path": "sam3.1_multiplex.pt",
+                    "image_path": "frame.png",
+                    "points": [[2, 3]],
+                    "labels": [1],
+                    "device": "cpu",
+                }
+            ),
+            json.dumps({"command": "shutdown", "request_id": 3}),
+        ]
+
+        ultralytics = SimpleNamespace(SAM=lambda path: factory_calls.append(path) or model)
+        with patch.dict("sys.modules", {"ultralytics": ultralytics}):
+            exit_code = run_sam_server(requests, event_writer=events.append)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(factory_calls, ["sam3.1_multiplex.pt"])
         self.assertEqual(events[0], {"event": "ready"})
         result = next(event for event in events if event["event"] == "result")
         self.assertEqual(result["request_id"], 2)

@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from squeakpose.project.layers import LAYER_DEPTH, LAYER_KEYPOINTS, LAYER_SEGMENTATION
+from squeakpose.services.sam_models import DEFAULT_SAM_VARIANT, SAM_MODELS, get_sam_model
 from squeakpose.ui.style import (
     ThemedComboBox,
     apply_panel_shadow,
@@ -364,6 +365,7 @@ class AnnotationPanel(QFrame):
 
 @dataclass(frozen=True, slots=True)
 class SegmentationToolsCallbacks:
+    model_changed: Callable[[str], None] = _ignore_text
     load_model: Callable[[], None] = _ignore_action
     download_model: Callable[[], None] = _ignore_action
     run: Callable[[], None] = _ignore_action
@@ -402,6 +404,17 @@ class SegmentationToolsPanel(QFrame):
         brush_row.addStretch(1)
         layout.addLayout(brush_row)
 
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("SAM model:"))
+        self.model_selector = ThemedComboBox()
+        for model in SAM_MODELS.values():
+            self.model_selector.addItem(model.display_name, model.key)
+        self.model_selector.setCurrentIndex(self.model_selector.findData(DEFAULT_SAM_VARIANT))
+        self.model_selector.currentIndexChanged.connect(
+            lambda _index: self.callbacks.model_changed(self.model_selector.currentData())
+        )
+        model_row.addWidget(self.model_selector, 1)
+        layout.addLayout(model_row)
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(6)
@@ -410,8 +423,8 @@ class SegmentationToolsPanel(QFrame):
             tooltip="Load a SAM model file for segmentation prompts",
         )
         self.download_btn = _panel_button(
-            "Download SAM 3",
-            tooltip="Download the official sam3.pt from Hugging Face into this project",
+            f"Download {get_sam_model(DEFAULT_SAM_VARIANT).display_name}",
+            tooltip="Download the selected official checkpoint from Hugging Face into this project",
         )
         self.run_btn = _panel_button(
             "Run (G)",

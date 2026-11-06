@@ -45,6 +45,7 @@ class SegmentationAssistantServiceTests(unittest.TestCase):
             names = [
                 "project-sam3-last.pth",
                 "sam3-z.pt",
+                "sam3.1_multiplex.pt",
                 "sam3.pt",
                 "sam2.pt",
                 "sam3-not-a-weight.txt",
@@ -59,7 +60,7 @@ class SegmentationAssistantServiceTests(unittest.TestCase):
 
             self.assertEqual(
                 [os.path.basename(path) for path in candidates],
-                ["sam3.pt", "sam3-z.pt", "project-sam3-last.pth"],
+                ["sam3.pt", "sam3-z.pt", "sam3.1_multiplex.pt", "project-sam3-last.pth"],
             )
             self.assertEqual(
                 select_existing_sam_weight(["missing.pt", *candidates]),

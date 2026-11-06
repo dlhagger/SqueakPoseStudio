@@ -19,6 +19,7 @@ from squeakpose.project.layers import (
 from squeakpose.project.metadata import ProjectMetadataStore
 from squeakpose.project.paths import ProjectPaths
 from squeakpose.project.safety import ProjectPathError, require_path_within_project
+from squeakpose.services.sam_models import resolve_sam_variant
 
 PathExists = Callable[[str], bool]
 BUILTIN_DEPTH_MODEL_REFERENCES = frozenset(f"yolo26{size}-depth.pt" for size in "nslmx")
@@ -152,6 +153,7 @@ class ProjectSession:
         layer_visibility: Mapping[str, bool] | None = None,
         layer_settings: Mapping[str, Any] | None = None,
         assistant_model_path: str = "",
+        assistant_model_variant: str = "",
     ):
         self.project_root = os.path.abspath(project_root)
         self.paths = paths or ProjectPaths.from_root(self.project_root)
@@ -201,6 +203,9 @@ class ProjectSession:
         self.layer_visibility[self.active_layer] = True
         self.layer_settings = normalize_layer_settings(layer_settings or {})
         self.assistant_model_path = str(assistant_model_path or "")
+        self.assistant_model_variant = resolve_sam_variant(
+            self.project_root, assistant_model_variant, self.assistant_model_path
+        )
 
     @classmethod
     def from_preferences(
@@ -252,6 +257,7 @@ class ProjectSession:
             layer_visibility=visibility,
             layer_settings=settings,
             assistant_model_path=assistant_path,
+            assistant_model_variant=str(metadata.get("sam_model_variant") or ""),
         )
 
     @property
@@ -388,6 +394,7 @@ class ProjectSession:
                 settings[layer_id].pop("model_path", None)
 
         payload: dict[str, Any] = {
+            "sam_model_variant": self.assistant_model_variant,
             "active_layer": self.active_layer,
             "active_workflow": self.active_workflow,
             "layers": settings,

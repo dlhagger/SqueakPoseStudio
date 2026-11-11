@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
+import ntpath
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 VIDEO_EXTENSIONS = (
     ".mp4",
@@ -15,6 +18,19 @@ VIDEO_EXTENSIONS = (
     ".mpg",
     ".mpeg",
     ".wmv",
+)
+
+
+# Samba/macOS "minshall-french" symlink files: a fixed 1067-byte text file that records
+# the link target. SqueakPose writes them when the OS refuses real symlinks (Windows
+# without administrator rights or Developer Mode, FAT/exFAT drives); macOS also treats
+# them as symlinks on SMB shares.
+XSYM_MAGIC = b"XSym\n"
+XSYM_FILE_SIZE = 1067
+_POINTER_READ_LIMIT = 64 * 1024
+_WINDOWS_PRIVILEGE_NOT_HELD = 1314
+_SYMLINK_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.EPERM, errno.EACCES, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}
 )
 
 
@@ -38,21 +54,64 @@ def _require_library_child(videos_dir: str, name: str) -> str:
     return path
 
 
-def _legacy_macos_alias_target(videos_dir: str, path: str) -> str:
-    """Resolve a copied Finder alias when its original Mac path is stale."""
+def _xsym_recorded_target(path: str) -> str:
+    """Return the target recorded in an XSym pointer file, or "" for any other file."""
     try:
-        if os.path.getsize(path) > 64 * 1024:
+        if os.path.getsize(path) > _POINTER_READ_LIMIT:
             return ""
         with open(path, "rb") as handle:
-            payload = handle.read(64 * 1024)
+            payload = handle.read(_POINTER_READ_LIMIT)
     except OSError:
         return ""
-    if not payload.startswith(b"XSym\n"):
+    if not payload.startswith(XSYM_MAGIC):
         return ""
-    text = payload.decode("utf-8", errors="ignore")
-    recorded = next(
-        (line.strip() for line in text.splitlines() if line.strip().startswith("/")), ""
-    )
+    lines = [line.strip() for line in payload.decode("utf-8", errors="ignore").splitlines()]
+    # Layout: magic, 4-digit length, md5, target, padding. Older copies written by other
+    # tools are not always exact, so fall back to the first absolute-looking line.
+    if len(lines) >= 4 and lines[3]:
+        return lines[3]
+    return next((line for line in lines if line.startswith("/") or ntpath.isabs(line)), "")
+
+
+def _is_pointer_file(path: str) -> bool:
+    return os.path.isfile(path) and not os.path.islink(path) and bool(_xsym_recorded_target(path))
+
+
+def _write_pointer_file(destination: str, target: str) -> None:
+    encoded = target.encode("utf-8")
+    digest = hashlib.md5(encoded, usedforsecurity=False).hexdigest().encode("ascii")
+    body = XSYM_MAGIC + b"%04d\n%s\n%s\n" % (len(encoded), digest, encoded)
+    with open(destination, "xb") as handle:
+        handle.write(body.ljust(XSYM_FILE_SIZE, b" "))
+
+
+def _symlink_unsupported(exc: OSError) -> bool:
+    if isinstance(exc, FileExistsError):
+        return False
+    if getattr(exc, "winerror", None) == _WINDOWS_PRIVILEGE_NOT_HELD:
+        return True
+    return exc.errno in _SYMLINK_UNSUPPORTED_ERRNOS
+
+
+def _create_link(source: str, destination: str) -> bool:
+    """Link ``destination`` to ``source``; return False when a pointer file was written."""
+    try:
+        os.symlink(source, destination)
+        return True
+    except OSError as exc:
+        if not _symlink_unsupported(exc):
+            raise
+    _write_pointer_file(destination, source)
+    return False
+
+
+def _is_library_link(path: str) -> bool:
+    return os.path.islink(path) or _is_pointer_file(path)
+
+
+def _legacy_macos_alias_target(videos_dir: str, path: str) -> str:
+    """Resolve an XSym pointer file: SqueakPose's Windows fallback or a copied Mac alias."""
+    recorded = _xsym_recorded_target(path)
     if not recorded:
         return ""
     if os.path.isfile(recorded):
@@ -62,14 +121,15 @@ def _legacy_macos_alias_target(videos_dir: str, path: str) -> str:
     # this project layout the source video remains beside the project folder,
     # under its animal/session directory. Require the expected filename and a
     # unique nearby match rather than searching arbitrary filesystem roots.
-    filename = os.path.basename(recorded)
+    recorded_path = PureWindowsPath(recorded) if "\\" in recorded else Path(recorded)
+    filename = recorded_path.name
     if filename.casefold() != os.path.basename(path).casefold():
         return ""
     # Preserve the caller's absolute path spelling. On macOS, ``Path.resolve``
     # rewrites /var to /private/var, which made an otherwise valid relocated
     # alias differ from the rest of the library's abspath-based results.
     import_root = Path(os.path.abspath(videos_dir)).parent.parent
-    session_name = Path(recorded).parent.name
+    session_name = recorded_path.parent.name
     direct = import_root / session_name / filename
     if direct.is_file():
         return str(direct)
@@ -99,16 +159,24 @@ def list_project_videos(videos_dir: str) -> list[VideoLibraryEntry]:
                 target = os.path.abspath(os.path.join(directory, raw_target))
                 target_exists = os.path.isfile(path)
             elif item.is_file(follow_symlinks=False):
-                alias_target = _legacy_macos_alias_target(directory, path)
-                target = alias_target or path
-                target_exists = os.path.isfile(target)
+                recorded = _xsym_recorded_target(path)
+                if recorded:
+                    # A pointer file is a link; an unresolvable one is a broken link,
+                    # never a playable video.
+                    is_link = True
+                    alias_target = _legacy_macos_alias_target(directory, path)
+                    target = alias_target or recorded
+                    target_exists = bool(alias_target)
+                else:
+                    target = path
+                    target_exists = True
             else:
                 continue
             entries.append(
                 VideoLibraryEntry(
                     name=item.name,
                     path=target if alias_target else path,
-                    is_link=is_link or bool(alias_target),
+                    is_link=is_link,
                     target=target,
                     target_exists=target_exists,
                 )
@@ -147,7 +215,7 @@ def _available_link_name(videos_dir: str, preferred_name: str) -> str:
 
 
 def add_video_links(videos_dir: str, source_paths: list[str]) -> list[VideoLibraryEntry]:
-    """Create absolute symlinks and choose non-conflicting destination names."""
+    """Link source videos (symlink, or XSym pointer file when symlinks are refused)."""
     directory = os.path.abspath(videos_dir)
     os.makedirs(directory, exist_ok=True)
     created: list[VideoLibraryEntry] = []
@@ -170,23 +238,31 @@ def add_video_links(videos_dir: str, source_paths: list[str]) -> list[VideoLibra
             continue
         name = _available_link_name(directory, os.path.basename(source))
         destination = _require_library_child(directory, name)
-        os.symlink(source, destination)
-        created.append(VideoLibraryEntry(name, destination, True, source, target_exists=True))
+        is_symlink = _create_link(source, destination)
+        created.append(
+            VideoLibraryEntry(
+                name,
+                destination if is_symlink else source,
+                True,
+                source,
+                target_exists=True,
+            )
+        )
     return created
 
 
 def remove_video_link(videos_dir: str, name: str) -> None:
-    """Remove a library symlink without ever deleting a regular video file."""
+    """Remove a library link without ever deleting a regular video file."""
     path = _require_library_child(videos_dir, name)
-    if not os.path.islink(path):
+    if not _is_library_link(path):
         raise ValueError("Only video links can be removed here; the original file was not changed")
     os.unlink(path)
 
 
 def rename_video_link(videos_dir: str, old_name: str, new_name: str) -> str:
-    """Rename a symlink while preserving its target."""
+    """Rename a library link while preserving its target."""
     source = _require_library_child(videos_dir, old_name)
-    if not os.path.islink(source):
+    if not _is_library_link(source):
         raise ValueError("Only linked videos can be renamed here")
     clean_name = str(new_name).strip()
     if not os.path.splitext(clean_name)[1]:
@@ -201,9 +277,9 @@ def rename_video_link(videos_dir: str, old_name: str, new_name: str) -> str:
 
 
 def retarget_video_link(videos_dir: str, name: str, source_path: str) -> str:
-    """Atomically change a symlink target without modifying either video."""
+    """Atomically change a library link target without modifying either video."""
     link_path = _require_library_child(videos_dir, name)
-    if not os.path.islink(link_path):
+    if not _is_library_link(link_path):
         raise ValueError("Only linked videos can have their source changed")
     source = os.path.realpath(os.path.abspath(os.fspath(source_path)))
     if not os.path.isfile(source):
@@ -214,9 +290,9 @@ def retarget_video_link(videos_dir: str, name: str, source_path: str) -> str:
     if os.path.lexists(temporary):
         raise FileExistsError(f"Temporary link already exists: {temporary}")
     try:
-        os.symlink(source, temporary)
+        _create_link(source, temporary)
         os.replace(temporary, link_path)
     finally:
-        if os.path.islink(temporary):
+        if os.path.lexists(temporary):
             os.unlink(temporary)
     return source

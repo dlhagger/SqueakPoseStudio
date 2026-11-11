@@ -191,7 +191,8 @@ class ProjectMetadataStoreTests(unittest.TestCase):
 
             serialized = store.store_path(nested)
 
-            self.assertEqual(serialized, os.path.join("models", "sam.pt"))
+            # Stored with "/" on every OS so projects move between Windows and POSIX.
+            self.assertEqual(serialized, "models/sam.pt")
             self.assertEqual(store.resolve_path(serialized), nested)
 
 

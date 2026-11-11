@@ -12,6 +12,7 @@ from PyQt6.QtCore import QProcess
 from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION
+from squeakpose.services import video_library
 from squeakpose.ui.video_reviewer import APP_BASE_DIR, VideoReviewDialog
 from squeakpose.workers.process import WorkerJobResult
 
@@ -189,8 +190,11 @@ class VideoReviewerProcessTests(unittest.TestCase):
             source = Path(sources) / "session.mp4"
             source.write_bytes(b"video")
             link = videos_dir / source.name
-            link.symlink_to(source)
-            (videos_dir / "missing.mov").symlink_to(Path(sources) / "missing.mov")
+            # Real symlink where allowed, pointer file otherwise (Windows without admin).
+            video_library._create_link(str(source), str(link))
+            video_library._create_link(
+                str(Path(sources) / "missing.mov"), str(videos_dir / "missing.mov")
+            )
 
             with (
                 patch(

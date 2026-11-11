@@ -1,8 +1,11 @@
+import errno
 import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from squeakpose.services import video_library
 from squeakpose.services.video_library import (
     add_video_links,
     list_project_videos,
@@ -13,7 +16,22 @@ from squeakpose.services.video_library import (
 )
 
 
+def _symlinks_supported() -> bool:
+    with TemporaryDirectory() as tmp:
+        try:
+            os.symlink(os.path.join(tmp, "target"), os.path.join(tmp, "link"))
+        except OSError, NotImplementedError:
+            return False
+    return True
+
+
+def _refuse_symlinks(*_args, **_kwargs):
+    # What Windows reports without administrator rights or Developer Mode.
+    raise PermissionError(errno.EPERM, "A required privilege is not held by the client")
+
+
 class VideoLibraryServiceTests(unittest.TestCase):
+    @unittest.skipUnless(_symlinks_supported(), "symlinks need admin or Developer Mode")
     def test_add_list_rename_retarget_and_remove_link(self):
         with TemporaryDirectory() as project, TemporaryDirectory() as sources:
             videos_dir = Path(project) / "videos"
@@ -44,6 +62,74 @@ class VideoLibraryServiceTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(renamed))
             self.assertTrue(first.exists())
             self.assertTrue(second.exists())
+
+    def test_pointer_file_fallback_supports_the_full_link_lifecycle(self):
+        with (
+            TemporaryDirectory() as project,
+            TemporaryDirectory() as sources,
+            patch.object(video_library.os, "symlink", side_effect=_refuse_symlinks),
+        ):
+            videos_dir = Path(project) / "videos"
+            first = Path(sources) / "session.mp4"
+            second = Path(sources) / "replacement.mov"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            created = add_video_links(str(videos_dir), [str(first), str(first)])
+            self.assertEqual([entry.name for entry in created], ["session.mp4"])
+            pointer = videos_dir / "session.mp4"
+            self.assertFalse(pointer.is_symlink())
+            raw = pointer.read_bytes()
+            self.assertTrue(raw.startswith(b"XSym\n"))
+            self.assertEqual(len(raw), video_library.XSYM_FILE_SIZE)
+
+            entries = list_project_videos(str(videos_dir))
+            self.assertEqual(len(entries), 1)
+            self.assertTrue(entries[0].is_link)
+            self.assertTrue(entries[0].target_exists)
+            self.assertEqual(os.path.realpath(entries[0].path), os.path.realpath(first))
+            self.assertEqual(
+                resolve_project_video_paths(str(videos_dir), [str(pointer)]),
+                [entries[0].path],
+            )
+
+            renamed = rename_video_link(str(videos_dir), "session.mp4", "experiment")
+            self.assertEqual(Path(renamed).name, "experiment.mp4")
+            retarget_video_link(str(videos_dir), "experiment.mp4", str(second))
+            entry = list_project_videos(str(videos_dir))[0]
+            self.assertEqual(os.path.realpath(entry.target), os.path.realpath(second))
+            self.assertEqual(sorted(os.listdir(videos_dir)), ["experiment.mp4"])
+
+            remove_video_link(str(videos_dir), "experiment.mp4")
+            self.assertFalse(os.path.lexists(renamed))
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
+
+    def test_pointer_to_missing_video_is_a_broken_link_not_a_playable_file(self):
+        with TemporaryDirectory() as project:
+            videos_dir = Path(project) / "videos"
+            videos_dir.mkdir()
+            with patch.object(video_library.os, "symlink", side_effect=_refuse_symlinks):
+                video_library._create_link(
+                    str(Path(project) / "gone.mp4"), str(videos_dir / "gone.mp4")
+                )
+
+            entry = list_project_videos(str(videos_dir))[0]
+            self.assertTrue(entry.is_link)
+            self.assertFalse(entry.target_exists)
+            remove_video_link(str(videos_dir), "gone.mp4")
+            self.assertEqual(os.listdir(videos_dir), [])
+
+    def test_other_link_errors_are_not_hidden_by_the_fallback(self):
+        with TemporaryDirectory() as project, TemporaryDirectory() as sources:
+            source = Path(sources) / "session.mp4"
+            source.write_bytes(b"video")
+            failure = OSError(errno.EIO, "disk error")
+            with (
+                patch.object(video_library.os, "symlink", side_effect=failure),
+                self.assertRaises(OSError),
+            ):
+                add_video_links(str(Path(project) / "videos"), [str(source)])
 
     def test_project_video_resolution_preserves_non_library_paths(self):
         with TemporaryDirectory() as project, TemporaryDirectory() as sources:
@@ -79,7 +165,7 @@ class VideoLibraryServiceTests(unittest.TestCase):
             regular = videos_dir / "local.mp4"
             regular.write_bytes(b"video")
             broken = videos_dir / "missing.mp4"
-            broken.symlink_to(Path(project) / "does-not-exist.mp4")
+            video_library._create_link(str(Path(project) / "does-not-exist.mp4"), str(broken))
 
             entries = {entry.name: entry for entry in list_project_videos(str(videos_dir))}
             self.assertFalse(entries["local.mp4"].is_link)

@@ -739,6 +739,7 @@ analysis_worker.py         Analysis child process
 analysis_dialog.py         PyQt6 analysis dialog
 train_worker.py            Ultralytics training process
 tests/                     Unit test suite
+tests.py                   One-command runner for all checks (`uv run tests.py`)
 analysis_toolset/          Example inference analysis notebook
 distillation/              Project-aware DINO distillation entry point
 fonts/                     Bundled Fira Sans interface font (SIL Open Font License)
@@ -753,6 +754,16 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership, worker protocol con
 project-data guardrails, and the contribution path for new workflows.
 
 ## Development Checks
+
+Run every check (Ruff lint, Ruff format, mypy, and the unit tests) with one command:
+
+```bash
+uv run tests.py          # run all checks and print a pass/fail summary
+uv run tests.py --fix    # apply Ruff's lint fixes and formatting first
+```
+
+`tests.py` uses the same locked dependency groups as CI and sets the offscreen Qt
+platform for the tests. The individual commands are listed below.
 
 Install the locked developer tools without the application dependencies:
 

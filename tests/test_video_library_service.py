@@ -139,6 +139,20 @@ class VideoLibraryServiceTests(unittest.TestCase):
                 {os.path.realpath(first), os.path.realpath(second)},
             )
 
+    def test_playable_video_path_only_rewrites_pointer_files(self):
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp, "session.mp4")
+            source.write_bytes(b"video")
+            pointer = Path(tmp, "pointer.mp4")
+            video_library._write_pointer_file(str(pointer), str(source))
+            unresolved = os.path.join(tmp, "session.mp4")
+
+            # Ordinary paths keep their spelling (no /var -> /private/var on macOS).
+            self.assertEqual(video_library.playable_video_path(unresolved), unresolved)
+            self.assertEqual(
+                video_library.playable_video_path(str(pointer)), os.path.realpath(source)
+            )
+
     def test_other_link_errors_are_not_hidden_by_the_fallback(self):
         with TemporaryDirectory() as project, TemporaryDirectory() as sources:
             source = Path(sources) / "session.mp4"

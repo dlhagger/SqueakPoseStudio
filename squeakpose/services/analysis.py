@@ -22,7 +22,11 @@ from squeakpose.project.layers import (
     LAYER_SEGMENTATION,
     normalize_layer_id,
 )
-from squeakpose.services.video_library import list_project_videos, resolve_video_path
+from squeakpose.services.video_library import (
+    list_project_videos,
+    playable_video_path,
+    resolve_video_path,
+)
 
 DEFAULT_ONE_EURO_MIN_CUTOFF = 1.0
 DEFAULT_ONE_EURO_BETA = 0.1
@@ -423,14 +427,14 @@ def _existing_manifest_video_path(csv_path: str) -> str:
         candidate = str(inference_root.parent / candidate)
     if candidate and os.path.isfile(candidate):
         # Pointer-file library links (Windows without symlink rights) are files too.
-        return resolve_video_path(candidate)
+        return playable_video_path(candidate)
 
     # A project video link may have been retargeted after inference. Prefer the
     # current link with the same filename when the manifest's original path is stale.
     if candidate:
         project_video = inference_root.parent / "videos" / os.path.basename(candidate)
         if project_video.is_file():
-            return resolve_video_path(str(project_video))
+            return playable_video_path(str(project_video))
     return ""
 
 

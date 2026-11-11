@@ -162,6 +162,15 @@ def resolve_video_path(path: str) -> str:
     return resolved
 
 
+def playable_video_path(path: str) -> str:
+    """Return ``path`` unchanged unless it is a pointer file, then the video it names.
+
+    Unlike :func:`resolve_video_path` this keeps the caller's spelling for ordinary
+    files and symlinks, which media readers open directly.
+    """
+    return resolve_video_path(path) if _is_pointer_file(path) else path
+
+
 def list_project_videos(videos_dir: str) -> list[VideoLibraryEntry]:
     """List video files and links, including broken video links."""
     directory = os.path.abspath(videos_dir)

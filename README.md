@@ -49,11 +49,12 @@ block the main interface.
 - Optional eligible ChatGPT Plus or Pro account for OpenAI pose proposals
 
 PyTorch package sources are configured in `pyproject.toml`: Windows installs
-CUDA 13.2 builds of Torch and Torchvision from the official PyTorch index.
-Linux and macOS use PyPI builds. Windows GPU acceleration requires a supported
-NVIDIA GPU and a compatible driver; installing the CUDA build does not detect
-or upgrade drivers. Machines without a compatible GPU can use CPU execution.
-The application selects CUDA, MPS, or CPU at runtime according to availability.
+CUDA 13.4 builds of Torch and Torchvision from the official PyTorch index.
+Linux and macOS use PyPI builds. Windows GPU acceleration requires an NVIDIA
+GPU from the Turing generation (RTX 20-series) or newer and NVIDIA driver 580
+or newer; installing the CUDA build does not detect or upgrade drivers.
+Machines without a compatible GPU can use CPU execution. The application
+selects CUDA, MPS, or CPU at runtime according to availability.
 
 ## Install and Run
 

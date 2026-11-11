@@ -31,8 +31,8 @@ dependencies = [
     "scikit-learn>=1.9.0",
     "seaborn>=0.13.2",
     "timm>=1.0.28",
-    "torch>=2.13.0",
-    "torchvision>=0.28.0",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
     "ultralytics>=8.4.148",
     "umap-learn>=0.5.12",
 ]
@@ -98,10 +98,10 @@ select = [
 "tests/render_ui_screenshots.py" = ["E402"]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
-torchvision = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
+torch = [{ index = "pytorch-cu134", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu134", marker = "sys_platform == 'win32'" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
 explicit = true

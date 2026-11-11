@@ -37,8 +37,26 @@ def _save_last_project_best_effort(project_root: str) -> bool:
     return True
 
 
+def make_console_output_lossless() -> None:
+    """Never crash on text the console encoding cannot represent.
+
+    When output is redirected on Windows (shortcuts, IDEs, log files), Python encodes
+    with the ANSI code page (e.g. cp1252), which cannot represent many characters in
+    file paths or third-party messages. Escape those characters instead of raising.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="backslashreplace")
+            except OSError, ValueError:
+                pass
+
+
 def run(argv: list[str] | None = None) -> int:
     """Launch the desktop application and return its Qt exit code."""
+    make_console_output_lossless()
     # Imported lazily so ``squeakpose_studio.py`` remains a compatible module
     # for integrations and tests while this module owns application startup.
     from squeakpose.ui.main_window import (

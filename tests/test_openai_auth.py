@@ -48,10 +48,11 @@ class OpenAIAuthTests(unittest.TestCase):
             self.assertEqual(query["redirect_uri"], [attempt.redirect_uri])
 
             host_path = Path(tmp) / "host.json"
-            self.assertEqual(
-                stat.S_IMODE(host_path.stat().st_mode),
-                0o600,
-            )
+            if os.name == "posix":  # Windows has no POSIX permission bits
+                self.assertEqual(
+                    stat.S_IMODE(host_path.stat().st_mode),
+                    0o600,
+                )
             self.assertEqual(store.host_id(), attempt.host_id)
 
     def test_returning_registration_reuses_client_and_identity_hints(self):

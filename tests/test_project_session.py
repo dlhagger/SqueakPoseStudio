@@ -15,6 +15,7 @@ from squeakpose.project import (
     resolve_model_reference,
     store_model_reference,
 )
+from squeakpose.project.metadata import ProjectMetadataStore
 
 
 class ProjectModelReferenceTests(unittest.TestCase):
@@ -32,6 +33,22 @@ class ProjectModelReferenceTests(unittest.TestCase):
             self.assertEqual(store_model_reference(tmp, "models/pose.pt"), "models/pose.pt")
             self.assertEqual(resolve_model_reference(tmp, str(external)), str(external))
             self.assertEqual(store_model_reference(tmp, str(external)), str(external))
+
+    def test_project_relative_paths_are_portable_between_windows_and_posix(self):
+        with TemporaryDirectory() as tmp:
+            model = Path(tmp) / "models" / "pose.pt"
+            model.parent.mkdir()
+            model.write_bytes(b"model")
+            store = ProjectMetadataStore(tmp)
+
+            # Always written with "/" so a project made on Windows opens on macOS/Linux.
+            self.assertEqual(store.store_path(str(model)), "models/pose.pt")
+            # Paths saved by older Windows builds (backslashes) resolve everywhere.
+            self.assertEqual(store.resolve_path("models\\pose.pt"), str(model))
+            self.assertEqual(resolve_model_reference(tmp, "models\\pose.pt"), str(model))
+            # A backslash escape is still rejected after normalisation.
+            with self.assertRaises(ProjectPathError):
+                resolve_model_reference(tmp, "..\\outside.pt")
 
     def test_builtin_depth_references_remain_symbolic(self):
         self.assertTrue(is_builtin_model_reference("YOLO26N-DEPTH.PT"))

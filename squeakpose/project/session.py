@@ -16,7 +16,7 @@ from squeakpose.project.layers import (
     normalize_layer_id,
     normalize_layer_settings,
 )
-from squeakpose.project.metadata import ProjectMetadataStore
+from squeakpose.project.metadata import ProjectMetadataStore, native_relative_path
 from squeakpose.project.paths import ProjectPaths
 from squeakpose.project.safety import ProjectPathError, require_path_within_project
 from squeakpose.sam_models import resolve_sam_variant
@@ -45,7 +45,7 @@ def resolve_model_reference(project_root: str, reference: Any) -> str:
         return os.path.abspath(raw)
     return require_path_within_project(
         project_root,
-        os.path.join(os.path.abspath(project_root), raw),
+        os.path.join(os.path.abspath(project_root), native_relative_path(raw)),
         purpose="project-relative model reference",
         allow_root=False,
     )

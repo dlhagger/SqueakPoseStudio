@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from squeakpose.ui.dialog_launch import (
@@ -11,12 +12,13 @@ from squeakpose.ui.dialog_launch import (
 
 class DialogLaunchPlanTests(unittest.TestCase):
     def test_training_selects_layer_task_and_existing_specific_dataset(self):
+        segment_dir = os.path.join("/project", "datasets", "segment")
         plan = plan_training_dialog(
             project_root="/project",
             layer_id="segmentation",
-            is_directory=lambda path: path == "/project/datasets/segment",
+            is_directory=lambda path: path == segment_dir,
         )
-        self.assertEqual(plan.default_dataset, "/project/datasets/segment")
+        self.assertEqual(plan.default_dataset, segment_dir)
         self.assertEqual(plan.default_task, "segment")
         self.assertEqual(plan.layer_id, "segmentation")
 
@@ -25,7 +27,7 @@ class DialogLaunchPlanTests(unittest.TestCase):
             layer_id="keypoints",
             is_directory=lambda _path: False,
         )
-        self.assertEqual(fallback.default_dataset, "/project/datasets")
+        self.assertEqual(fallback.default_dataset, os.path.join("/project", "datasets"))
         self.assertEqual(fallback.default_task, "pose")
 
     def test_depth_feature_notices_preserve_existing_text(self):

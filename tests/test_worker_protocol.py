@@ -97,7 +97,8 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertNotEqual(first, second)
             self.assertEqual(read_config(first), {"value": 1})
             self.assertEqual(read_config(second), {"value": 2})
-            self.assertEqual(os.stat(first).st_mode & 0o777, 0o600)
+            if os.name == "posix":  # Windows has no POSIX permission bits
+                self.assertEqual(os.stat(first).st_mode & 0o777, 0o600)
             self.assertEqual(os.path.commonpath((tmp, first)), os.path.abspath(tmp))
 
     def test_worker_config_creation_rejects_directory_outside_project(self):

@@ -133,7 +133,11 @@ from squeakpose.core import (
     staging_path_for,
 )
 from squeakpose.depth_ops import DepthMapError, keypoint_depth_label, sample_depth_map
-from squeakpose.diagnostics import configure_project_logging, project_log_path
+from squeakpose.diagnostics import (
+    configure_project_logging,
+    project_log_path,
+    release_project_logging,
+)
 from squeakpose.json_io import read_json_file
 from squeakpose.project.distillation import (
     discover_distillation_exports,
@@ -3832,7 +3836,7 @@ class LabelingApp(QMainWindow):
         self._openai_controller.error.connect(self._openai_error)
         self._openai_controller.status_changed.connect(self._openai_status_changed)
         self._openai_controller.busy_changed.connect(self._openai_busy_changed)
-        print(f"🧠 Inference device: {self._device}")
+        print(f"Inference device: {self._device}")
         # Build UI and load first image
         self._setup_ui()
         self._limit_button_focus_to_keyboard()
@@ -3890,6 +3894,9 @@ class LabelingApp(QMainWindow):
         self._restore_sam_wait_cursor()
         self._cleanup_prediction_depth_staging()
         self._project_lock.release()
+        # Close this project's log file (Windows keeps open files locked); a no-op when
+        # another window has already switched logging to a different project.
+        release_project_logging(self.project_root)
         super().closeEvent(event)
 
     def _setup_menu(self):
@@ -5279,10 +5286,10 @@ class LabelingApp(QMainWindow):
         try:
             if not pm.save(out_path):
                 raise OSError(f"Qt could not encode overlay image: {out_path}")
-            print(f"✅ Saved annotated image to {out_path}")
+            print(f"Saved annotated image to {out_path}")
             return True
         except Exception as e:
-            print(f"⚠️ Failed to save annotated image: {e}")
+            print(f"Failed to save annotated image: {e}")
             return False
 
     # ---------- Navigation helpers ----------
@@ -5837,7 +5844,7 @@ class LabelingApp(QMainWindow):
             self._save_project_preferences()
             # Re-detect device in case hardware/availability changed
             self._device = _auto_device()
-            print(f"🧠 Inference device: {self._device}")
+            print(f"Inference device: {self._device}")
             self._restart_prediction_worker(warm=bool(self.predict_model_path))
             self._update_layer_ui_state()
             configured = [

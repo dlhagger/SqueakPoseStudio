@@ -96,9 +96,10 @@ class InferenceControllerTests(unittest.TestCase):
 
             first = controllers[0]
             self.assertEqual(configs[0][3], plan.jobs[0].worker_config())
+            first_config = os.path.join(configs[0][1], "config-1.json")
             self.assertEqual(
                 first.starts[0][1],
-                ["-m", "inference_worker", "--config", configs[0][1] + "/config-1.json"],
+                ["-m", "inference_worker", "--config", first_config],
             )
             first.event_received.emit(
                 {"event": "progress", "processed_frames": 4, "total_frames": 10}

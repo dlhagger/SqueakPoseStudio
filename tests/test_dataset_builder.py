@@ -143,12 +143,14 @@ class DatasetBuilderTests(unittest.TestCase):
             here = Path(tmp, "here")
             here.mkdir()
             legacy = here / "dataset.yaml"
+            # Absolute on the current OS ("/elsewhere" is not absolute on Windows).
+            elsewhere = str(Path(tmp, "elsewhere", "datasets", "pose"))
             legacy.write_text(
-                yaml.safe_dump({"path": "/elsewhere/datasets/pose", "train": "images/train"}),
+                yaml.safe_dump({"path": elsewhere, "train": "images/train"}),
                 encoding="utf-8",
             )
-            self.assertEqual(resolve_dataset_root(str(legacy)), "/elsewhere/datasets/pose")
-            self.assertEqual(stale_dataset_root(str(legacy)), "/elsewhere/datasets/pose")
+            self.assertEqual(resolve_dataset_root(str(legacy)), elsewhere)
+            self.assertEqual(stale_dataset_root(str(legacy)), elsewhere)
 
             legacy.write_text(yaml.safe_dump({"path": str(here)}), encoding="utf-8")
             self.assertEqual(resolve_dataset_root(str(legacy)), str(here))

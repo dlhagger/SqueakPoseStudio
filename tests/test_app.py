@@ -1,7 +1,8 @@
+import io
 import unittest
 from unittest.mock import patch
 
-from squeakpose.app import _save_last_project_best_effort
+from squeakpose.app import _save_last_project_best_effort, make_console_output_lossless
 
 
 class AppStartupTests(unittest.TestCase):
@@ -26,6 +27,16 @@ class AppStartupTests(unittest.TestCase):
 
         self.assertTrue(saved)
         save.assert_called_once_with("/valid/project")
+
+    def test_console_output_escapes_characters_the_encoding_cannot_represent(self):
+        # Simulates a redirected Windows console using the cp1252 ANSI code page.
+        raw = io.BytesIO()
+        stdout = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        with patch("sys.stdout", stdout), patch("sys.stderr", stdout):
+            make_console_output_lossless()
+            print("\U0001f9e0 Inference device: cuda")
+            stdout.flush()
+        self.assertIn(b"\\U0001f9e0 Inference device: cuda", raw.getvalue())
 
 
 if __name__ == "__main__":

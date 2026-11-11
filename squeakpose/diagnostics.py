@@ -93,6 +93,24 @@ def reset_project_logging() -> None:
     logging.captureWarnings(False)
 
 
+def release_project_logging(project_root: str) -> bool:
+    """Close the project log handler if it belongs to ``project_root``.
+
+    Windows cannot delete or move a file that is still open, so a closed project must
+    not keep its ``logs/squeakpose.jsonl`` handle. Returns True when a handler was closed.
+    """
+
+    target = os.path.normcase(os.path.abspath(project_log_path(project_root)))
+    for handler in logging.getLogger().handlers:
+        if not getattr(handler, _HANDLER_MARKER, False):
+            continue
+        current = os.path.normcase(os.path.abspath(str(getattr(handler, "baseFilename", ""))))
+        if current == target:
+            reset_project_logging()
+            return True
+    return False
+
+
 def configure_project_logging(
     project_root: str,
     *,

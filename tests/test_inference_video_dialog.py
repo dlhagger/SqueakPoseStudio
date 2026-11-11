@@ -8,6 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
+from squeakpose.services.inference import video_identity
 from squeakpose.ui.inference_video_dialog import InferenceVideoDialog
 
 
@@ -102,7 +103,7 @@ class InferenceVideoDialogTests(unittest.TestCase):
             second.write_bytes(b"second")
             dialog = InferenceVideoDialog(tmp, configured_layers=("keypoints",))
 
-            dialog._set_checked_for_key(str(first.resolve()), True)
+            dialog._set_checked_for_key(video_identity(str(first)), True)
             dialog.default_animals_spin.setValue(3)
             dialog.default_tracker_combo.setCurrentIndex(
                 dialog.default_tracker_combo.findData("botsort")

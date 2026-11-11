@@ -23,6 +23,20 @@ from .safety import require_path_within_project
 logger = logging.getLogger(__name__)
 
 
+def portable_relative_path(relative: str) -> str:
+    """Store project-relative paths with "/" so projects move between Windows and POSIX."""
+    return relative.replace(os.sep, "/") if os.sep != "/" else relative
+
+
+def native_relative_path(stored: str) -> str:
+    """Read a stored project-relative path written with either separator.
+
+    Projects saved by older Windows builds contain backslashes, which would be part of
+    the file name on macOS/Linux; both separators are accepted on every platform.
+    """
+    return os.path.normpath(str(stored).replace("\\", "/"))
+
+
 @dataclass(frozen=True, slots=True)
 class MetadataReadResult:
     data: dict[str, Any]
@@ -136,7 +150,7 @@ class ProjectMetadataStore:
             return ""
         if os.path.isabs(raw):
             return os.path.abspath(raw)
-        return os.path.abspath(os.path.join(self.project_root, raw))
+        return os.path.abspath(os.path.join(self.project_root, native_relative_path(raw)))
 
     def store_path(self, path: str) -> str:
         raw = str(path or "").strip()
@@ -150,7 +164,7 @@ class ProjectMetadataStore:
         if relative == ".":
             return os.path.basename(abs_path)
         if relative != ".." and not relative.startswith(f"..{os.sep}"):
-            return relative
+            return portable_relative_path(relative)
         return abs_path
 
     def _corrupt_backup_path(self) -> str:

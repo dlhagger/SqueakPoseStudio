@@ -40,11 +40,10 @@ def _environment() -> dict[str, str]:
     env = dict(os.environ)
     # The tests construct Qt windows without a display.
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
-    if os.name == "nt":
-        # The offscreen platform does not use Windows' font system and PyQt6 no longer
-        # bundles fonts; point it at the system fonts to avoid a missing-font warning.
-        windows_dir = env.get("WINDIR", r"C:\Windows")
-        env.setdefault("QT_QPA_FONTDIR", os.path.join(windows_dir, "Fonts"))
+    # Offscreen Qt on Windows has no system font access and PyQt6 no longer bundles
+    # fonts; use the app's bundled Fira Sans so text renders identically on every
+    # machine. Platforms whose font database is fontconfig/CoreText ignore this.
+    env.setdefault("QT_QPA_FONTDIR", os.path.join(ROOT, "fonts"))
     return env
 
 

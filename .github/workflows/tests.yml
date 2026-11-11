@@ -120,8 +120,8 @@ jobs:
           MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
           QT_QPA_PLATFORM: offscreen
           # The offscreen platform does not use Windows' font system and PyQt6 no
-          # longer bundles fonts; point it at the system fonts.
-          QT_QPA_FONTDIR: C:\Windows\Fonts
+          # longer bundles fonts; use the app's bundled Fira Sans.
+          QT_QPA_FONTDIR: ${{ github.workspace }}\fonts
         run: uv run --locked --only-group test python -m unittest discover -s tests -q
 
       - name: Construct and render the application UI
@@ -129,6 +129,6 @@ jobs:
           MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
           QT_QPA_PLATFORM: offscreen
           # The offscreen platform does not use Windows' font system and PyQt6 no
-          # longer bundles fonts; point it at the system fonts.
-          QT_QPA_FONTDIR: C:\Windows\Fonts
+          # longer bundles fonts; use the app's bundled Fira Sans.
+          QT_QPA_FONTDIR: ${{ github.workspace }}\fonts
         run: uv run --locked --only-group test python tests/render_ui_screenshots.py --output-dir "${{ runner.temp }}/squeakpose-ui"

@@ -262,6 +262,25 @@ class PoseEditStateTests(unittest.TestCase):
         self.assertEqual(state.keypoints, {})
         self.assertFalse(state.can_undo)
 
+    def test_reselecting_same_class_resets_edit_but_keeps_undo(self):
+        state = self.make_state()
+        state.set_box(BoundingBox(0, 0, 10, 10, 2))
+        state.add_next_keypoint(1, 2)
+        state.push_undo_snapshot()
+
+        state.select_class(2, ["nose", "tail"], canonical_names=["tail", "nose", "ear"])
+
+        self.assertEqual(state.active_class_id, 2)
+        self.assertIsNone(state.box)
+        self.assertEqual(state.keypoints, {})
+        self.assertTrue(state.can_undo)
+        self.assertTrue(state.undo())
+        self.assertEqual(state.box, BoundingBox(0, 0, 10, 10, 2))
+        self.assertIn("nose", state.keypoints)
+
+        state.select_class(3, ["nose"], canonical_names=["tail", "nose", "ear"])
+        self.assertFalse(state.can_undo)
+
 
 if __name__ == "__main__":
     unittest.main()

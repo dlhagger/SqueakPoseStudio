@@ -71,6 +71,10 @@ files = [
 ]
 check_untyped_defs = true
 ignore_missing_imports = true
+# Match CI, where the dev group (mypy + ruff only) is installed alone. Without this,
+# a full local .venv exposes third-party stubs to mypy; PyQt6 6.12.0 ships a QtGui.pyi
+# with invalid syntax (`*args, /`) that aborts the whole check.
+no_site_packages = true
 no_implicit_optional = true
 show_error_codes = true
 warn_redundant_casts = true

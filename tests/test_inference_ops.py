@@ -1,5 +1,6 @@
 import csv
 import os
+import signal
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 
 import inference_ops
+import inference_worker
 from inference_ops import (
     probe_video_metadata,
     run_depth_video_inference,
@@ -588,6 +590,61 @@ class InferenceOpsTests(unittest.TestCase):
             self.assertEqual(result_event["rows_written"], 1)
             self.assertFalse(result_event["had_error"])
             self.assertTrue(Path(csv_path).exists())
+
+    def test_inference_worker_cancel_signal_keeps_rows_and_emits_canceled_result(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "worker_cancel.csv")
+            cv2 = _FakeCv2(["frame0", "frame1", "frame2"], fps=10.0)
+            fake_model = _PoseModel(
+                [
+                    _Result(boxes=_Boxes(), orig_shape=(20, 40)),
+                    _Result(boxes=_Boxes(), orig_shape=(20, 40)),
+                    _Result(boxes=_Boxes(), orig_shape=(20, 40)),
+                ]
+            )
+            original_predict = fake_model.predict
+            predict_calls = []
+
+            def predict_then_cancel(**kwargs):
+                out = original_predict(**kwargs)
+                predict_calls.append(kwargs)
+                if len(predict_calls) == 2:
+                    # Simulate SIGTERM from the Qt owner arriving while the
+                    # second batch is in flight; the handler must only set the
+                    # flag so the pass stops cooperatively and emits ``result``.
+                    inference_worker._handle_cancel_signal(signal.SIGTERM, None)
+                return out
+
+            fake_model.predict = predict_then_cancel
+            events = []
+
+            exit_code = run_inference_worker(
+                {
+                    "mode": "pose",
+                    "model_path": "model.pt",
+                    "video_path": "video.mp4",
+                    "csv_path": csv_path,
+                    "classes": ["mouse"],
+                    "kp_names": ["nose"],
+                    "device": "cpu",
+                    "batch_size": 1,
+                    "total_frames": 3,
+                    "fps": 10.0,
+                },
+                model_factory=lambda _path: fake_model,
+                cv2_module=cv2,
+                event_writer=events.append,
+            )
+
+            self.assertEqual(exit_code, 0)
+            result_event = events[-1]
+            self.assertEqual(result_event["event"], "result")
+            self.assertTrue(result_event["canceled"])
+            self.assertFalse(result_event["had_error"])
+            self.assertEqual(result_event["rows_written"], 1)
+            self.assertEqual(result_event["processed_frames"], 1)
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                self.assertEqual(len(list(csv.DictReader(fh))), 1)
 
     def test_inference_worker_writes_segmentation_source_metadata(self):
         with TemporaryDirectory() as tmp:

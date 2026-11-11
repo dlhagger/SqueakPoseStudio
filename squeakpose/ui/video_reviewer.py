@@ -709,6 +709,7 @@ class VideoReviewDialog(QDialog):
         self.video_source_id = stable_path_id(path)
         self.total = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT) or 0)
         self.fps = float(cap.get(_cv2.CAP_PROP_FPS) or 0.0)
+        self._reset_predictions_for_new_video()
 
         w = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -1123,6 +1124,10 @@ class VideoReviewDialog(QDialog):
         self._finish_project_review_prediction()
 
     def _finish_project_review_prediction(self) -> None:
+        if self._review_closing:
+            # reject() already tore the job down; do not save a partial cache or
+            # pop a "Prediction canceled" box while the dialog is closing.
+            return
         progress = self._review_progress
         self._review_progress = None
         if progress is not None:
@@ -1691,8 +1696,7 @@ class VideoReviewDialog(QDialog):
                 f"{saved} succeeded, {len(failed)} failed.\n\n{msg}{more}",
             )
 
-    def _draw_overlay_for(self, frame_idx: int):
-        # clear old
+    def _clear_overlay_items(self) -> None:
         for it in getattr(self, "_overlay_items", []):
             try:
                 owner_scene = it.scene()
@@ -1704,6 +1708,15 @@ class VideoReviewDialog(QDialog):
                 except Exception:
                     pass
         self._overlay_items = []
+
+    def _reset_predictions_for_new_video(self) -> None:
+        """Drop the previous video's predictions so they cannot leak into a new one."""
+        self.preds_by_layer = {layer: {} for layer in (LAYER_KEYPOINTS, LAYER_SEGMENTATION)}
+        self.preds = self.preds_by_layer.setdefault(self.layer_id, {})
+        self._clear_overlay_items()
+
+    def _draw_overlay_for(self, frame_idx: int):
+        self._clear_overlay_items()
 
         for layer_id in self.review_layers:
             if layer_id == LAYER_KEYPOINTS:
@@ -1904,7 +1917,15 @@ class VideoReviewDialog(QDialog):
                 _shutdown_qprocess(self._review_process)
                 _remove_file_quietly(self._review_config_path)
             if self._review_progress is not None:
-                self._review_progress.close()
+                progress = self._review_progress
+                self._review_progress = None
+                # QProgressDialog.close() emits canceled(); detach the user-cancel
+                # handler so closing the reviewer does not re-enter the finish path.
+                try:
+                    progress.canceled.disconnect(self._cancel_review_prediction_process)
+                except (TypeError, RuntimeError):
+                    pass
+                progress.close()
             self._review_job = None
             self._review_process = None
             self._review_progress = None

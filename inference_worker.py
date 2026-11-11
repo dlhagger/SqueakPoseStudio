@@ -16,15 +16,20 @@ from squeakpose.services.inference_runtime import (
     tracking_dependency_error,
 )
 from squeakpose.services.tracking import resolve_tracking_config
-from squeakpose.workers.protocol import read_config, write_event
+from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
 
 _CANCEL_REQUESTED = False
 
 
 def _handle_cancel_signal(_signum, _frame):
+    # Only set the flag. The per-frame ``cancel_requested()`` checks in the
+    # inference runtime stop the pass cooperatively and the worker then emits a
+    # ``result`` with ``canceled=True`` and the real ``rows_written``, so the
+    # Qt owner keeps the partial CSV. Raising ``SystemExit`` here would unwind
+    # out of the predict loop before that result is written; the owner's kill
+    # escalation still covers a worker that does not stop in time.
     global _CANCEL_REQUESTED
     _CANCEL_REQUESTED = True
-    raise SystemExit(130)
 
 
 def _cancel_requested() -> bool:
@@ -246,6 +251,9 @@ def run_inference_worker(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
+    # Portable cancel channel: QProcess.terminate() does not reach console
+    # children on Windows, so the owner also sends a stdin cancel line.
+    start_cancel_listener(lambda: _handle_cancel_signal(None, None))
 
     parser = argparse.ArgumentParser(
         description="Run SqueakPose video inference in a child process."

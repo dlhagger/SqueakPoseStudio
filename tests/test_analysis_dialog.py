@@ -11,7 +11,7 @@ from PyQt6.QtGui import QColor, QPixmap
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
-from analysis_dialog import AnalysisDialog, FrameAnnotationView
+from analysis_dialog import ANALYSIS_CANCEL_KILL_AFTER_MS, AnalysisDialog, FrameAnnotationView
 from squeakpose.services.analysis import analysis_video_output_key
 
 
@@ -150,6 +150,107 @@ class AnalysisDialogInputTests(unittest.TestCase):
             text = dialog.summary_view.toPlainText()
             self.assertIn("Prediction QC: good=8, warning=2, bad=0", text)
             self.assertIn("extra_pose_detection=2", text)
+            dialog.close()
+
+    def test_reject_shuts_down_running_analysis_controller(self):
+        from tempfile import TemporaryDirectory
+
+        class _FakeController:
+            def __init__(self):
+                self.shutdown_calls = 0
+
+            def shutdown(self):
+                self.shutdown_calls += 1
+
+        with TemporaryDirectory() as tmp:
+            dialog = AnalysisDialog(None, project_root=tmp, app_base_dir=tmp, layer_id="keypoints")
+            controller = _FakeController()
+            dialog.analysis_controller = controller
+            dialog.analysis_config_path = os.path.join(tmp, "analysis_config.json")
+
+            with patch.object(dialog, "_save_analysis_setup") as save_setup:
+                dialog.reject()
+
+            save_setup.assert_called_once()
+            self.assertEqual(controller.shutdown_calls, 1)
+            self.assertIsNone(dialog.analysis_controller)
+            self.assertIsNone(dialog.analysis_config_path)
+            self.assertFalse(dialog.isVisible())
+
+    def test_cancel_button_is_graceful_first_and_force_stop_second(self):
+        from tempfile import TemporaryDirectory
+
+        from squeakpose.workers.process import WorkerJobResult
+
+        class _FakeController:
+            is_running = True
+
+            def __init__(self):
+                self.cancel_calls = []
+                self.force_stop_calls = 0
+
+            def cancel(self, *, kill_after_ms=5000):
+                self.cancel_calls.append(kill_after_ms)
+                return True
+
+            def force_stop(self):
+                self.force_stop_calls += 1
+                return True
+
+            def shutdown(self):
+                return True
+
+            def deleteLater(self):
+                return None
+
+        with TemporaryDirectory() as tmp:
+            dialog = AnalysisDialog(None, project_root=tmp, app_base_dir=tmp, layer_id="keypoints")
+            self.assertFalse(dialog.cancel_analysis_btn.isEnabled())
+            controller = _FakeController()
+            dialog.analysis_controller = controller
+            dialog._set_running(True)
+            self.assertTrue(dialog.cancel_analysis_btn.isEnabled())
+
+            dialog._cancel_analysis()
+
+            self.assertEqual(controller.cancel_calls, [ANALYSIS_CANCEL_KILL_AFTER_MS])
+            self.assertEqual(dialog.status_label.text(), "Canceling")
+            self.assertEqual(dialog.cancel_analysis_btn.text(), "Force Stop")
+
+            dialog._cancel_analysis()
+            self.assertEqual(controller.force_stop_calls, 1)
+
+            # A force stop produces no canceled result; the terminal still lands as Canceled.
+            dialog._analysis_job_finished(WorkerJobResult(state="cancelled", exit_code=-1))
+            self.assertEqual(dialog.status_label.text(), "Canceled")
+            self.assertFalse(dialog.cancel_analysis_btn.isEnabled())
+            self.assertEqual(dialog.cancel_analysis_btn.text(), "Cancel Analysis")
+            dialog.analysis_controller = None
+            dialog.close()
+
+    def test_canceled_result_is_not_recorded_as_completed_analysis(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            dialog = AnalysisDialog(None, project_root=tmp, app_base_dir=tmp, layer_id="keypoints")
+            dialog.status_label.setText("Canceling")
+
+            record_patch = patch("analysis_dialog.record_project_video_analysis_output")
+            summary_patch = patch.object(dialog, "_show_result_summary")
+            with record_patch as record_output, summary_patch as show_summary:
+                dialog._handle_worker_event(
+                    {
+                        "event": "result",
+                        "canceled": True,
+                        "had_error": False,
+                        "output_dir": os.path.join(tmp, "analysis"),
+                    }
+                )
+
+            self.assertEqual(dialog.status_label.text(), "Canceled")
+            self.assertIn("Previous results were left unchanged", dialog.log_view.toPlainText())
+            record_output.assert_not_called()
+            show_summary.assert_not_called()
             dialog.close()
 
     def test_start_analysis_reports_invalid_output_directory(self):

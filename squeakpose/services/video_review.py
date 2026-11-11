@@ -317,7 +317,7 @@ def exported_frame_indices(
 ) -> set[int]:
     prefix = f"{_safe_export_component(video_base, fallback='video')}_{_safe_export_component(source_id, fallback='source')}_f"
     pattern = re.compile(
-        rf"^{re.escape(prefix)}(\d{{6}})(?:_.*)?\.(?:png|jpg|jpeg|bmp|webp)$",
+        rf"^{re.escape(prefix)}(\d{{6,}})(?:_.*)?\.(?:png|jpg|jpeg|bmp|webp)$",
         re.IGNORECASE,
     )
     indices: set[int] = set()

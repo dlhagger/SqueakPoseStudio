@@ -36,6 +36,7 @@ from analysis_ops import (
     run_behavior_clustering,
 )
 from squeakpose.services.analysis_subjects import select_subject_rows
+from squeakpose.services.cancellation import raise_if_canceled
 
 SEGMENTATION_REQUIRED_COLUMNS = ["frame", "det", "x1", "y1", "x2", "y2", "mask_polygon"]
 
@@ -728,6 +729,7 @@ def render_segmentation_annotated_video(
     try:
         with _open_h264_video_writer(output_path, video_fps, width, height) as writer:
             while True:
+                raise_if_canceled()
                 ok, frame = cap.read()
                 if not ok:
                     break

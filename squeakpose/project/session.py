@@ -25,6 +25,10 @@ PathExists = Callable[[str], bool]
 BUILTIN_DEPTH_MODEL_REFERENCES = frozenset(f"yolo26{size}-depth.pt" for size in "nslmx")
 
 
+class ProjectSchemaError(ValueError):
+    """Raised when a positional schema file lists the same name more than once."""
+
+
 def is_builtin_model_reference(reference: Any) -> bool:
     return str(reference or "").strip().lower() in BUILTIN_DEPTH_MODEL_REFERENCES
 
@@ -59,7 +63,12 @@ def store_model_reference(project_root: str, path: Any) -> str:
         raw = resolve_model_reference(project_root, raw)
     stored = ProjectMetadataStore(project_root).store_path(raw)
     if stored and not os.path.isabs(stored):
-        resolve_model_reference(project_root, stored)
+        try:
+            resolve_model_reference(project_root, stored)
+        except ProjectPathError:
+            # Lexically inside the project but resolving outside it (for example a
+            # symlinked ``models/`` directory): persist it as an external model.
+            return os.path.abspath(raw)
     return stored
 
 
@@ -164,7 +173,9 @@ class ProjectSession:
             pose_keypoints,
             pose_class_keypoints or {},
         )
-        segmentation_classes_clean = _clean_names(segmentation_classes)
+        segmentation_classes_clean = _clean_names(
+            segmentation_classes, source="classes_seg.txt", kind="class names"
+        )
         selected = selected_class_ids or {}
         models = layer_model_paths or {}
         self._layers: dict[str, _LayerSessionState] = {
@@ -347,7 +358,7 @@ class ProjectSession:
             )
             state.classes, state.keypoints, state.class_keypoints = normalized
         elif self.active_layer == LAYER_SEGMENTATION and classes is not None:
-            state.classes = _clean_names(classes)
+            state.classes = _clean_names(classes, source="classes_seg.txt", kind="class names")
         if self.active_layer != LAYER_DEPTH:
             requested_selection = (
                 state.selected_class_id if selected_class_id is None else selected_class_id
@@ -433,15 +444,42 @@ def _resolve_persisted_reference(project_root: str, reference: Any) -> str:
         return ""
 
 
-def _clean_names(values: Sequence[str]) -> list[str]:
+def require_unique_schema_names(
+    values: Sequence[str],
+    *,
+    source: str,
+    kind: str = "names",
+) -> list[str]:
+    """Strip and drop blank schema entries, rejecting duplicates instead of hiding them.
+
+    Positional schema files (``classes.txt``, ``keypoints.txt``, ``classes_seg.txt``)
+    define label indices, so silently de-duplicating them shifts every later index.
+    Positions are 1-based over ``values`` (blank entries included), so passing the raw
+    file lines reports real line numbers.
+    """
+
     names: list[str] = []
-    seen: set[str] = set()
-    for value in values:
+    positions: dict[str, list[int]] = {}
+    for line_number, value in enumerate(values, start=1):
         name = str(value).strip()
-        if name and name not in seen:
+        if not name:
+            continue
+        lines = positions.setdefault(name, [])
+        lines.append(line_number)
+        if len(lines) == 1:
             names.append(name)
-            seen.add(name)
+    duplicates = {name: lines for name, lines in positions.items() if len(lines) > 1}
+    if duplicates:
+        detail = ", ".join(
+            f"'{name}' (lines {', '.join(str(line) for line in lines)})"
+            for name, lines in duplicates.items()
+        )
+        raise ProjectSchemaError(f"{source} contains duplicate {kind}: {detail}")
     return names
+
+
+def _clean_names(values: Sequence[str], *, source: str, kind: str = "names") -> list[str]:
+    return require_unique_schema_names(values, source=source, kind=kind)
 
 
 def _normalize_pose_schema(
@@ -449,11 +487,15 @@ def _normalize_pose_schema(
     keypoints: Sequence[str],
     class_keypoints: Mapping[str, Sequence[str]],
 ) -> tuple[list[str], list[str], dict[str, list[str]]]:
-    class_names = _clean_names(classes)
-    canonical = _clean_names(keypoints)
+    class_names = _clean_names(classes, source="classes.txt", kind="class names")
+    canonical = _clean_names(keypoints, source="keypoints.txt", kind="keypoint names")
     mapping: dict[str, list[str]] = {}
     for class_name in class_names:
-        selected = _clean_names(class_keypoints.get(class_name, canonical))
+        selected = _clean_names(
+            class_keypoints.get(class_name, canonical),
+            source=f"class_keypoints.json entry '{class_name}'",
+            kind="keypoint names",
+        )
         mapping[class_name] = selected or canonical[:]
         for keypoint_name in mapping[class_name]:
             if keypoint_name not in canonical:

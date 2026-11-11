@@ -267,6 +267,26 @@ class VideoReviewServiceTests(unittest.TestCase):
 
         self.assertEqual(indices, {2, 5})
 
+    def test_export_index_scan_recognises_frames_beyond_six_digits(self):
+        exported = os.path.basename(
+            plan_export_frame_path(
+                "/exports",
+                video_base="session",
+                source_id="src",
+                frame_index=1_234_567,
+                avoid_collisions=False,
+            )
+        )
+        self.assertEqual(exported, "session_src_f1234567.png")
+
+        indices = exported_frame_indices(
+            [exported, "session_src_f1234567_1.png", "session_src_f000009.png"],
+            video_base="session",
+            source_id="src",
+        )
+
+        self.assertEqual(indices, {1_234_567, 9})
+
     def test_export_path_stays_inside_destination_and_adds_collision_suffix(self):
         with TemporaryDirectory() as tmp:
             existing = Path(tmp) / "my video_src_f000007.png"

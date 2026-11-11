@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, TextIO
 
@@ -14,6 +17,50 @@ class WorkerProtocolError(ValueError):
 
 
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
+CANCEL_COMMAND = "cancel"
+
+
+def cancel_command_bytes() -> bytes:
+    """Return the stdin request a Qt owner sends to ask a one-shot worker to stop.
+
+    ``QProcess.terminate()`` is a no-op for console children on Windows, so a
+    stdin line is the portable graceful-cancel channel; SIGTERM remains the
+    POSIX fallback.
+    """
+    return (json.dumps({"command": CANCEL_COMMAND}) + "\n").encode("utf-8")
+
+
+def start_cancel_listener(
+    on_cancel: Callable[[], None],
+    *,
+    stream: TextIO | None = None,
+) -> threading.Thread:
+    """Call ``on_cancel`` once when a ``{"command": "cancel"}`` line arrives on stdin.
+
+    Runs on a daemon thread so a worker that never receives the request still
+    exits normally. Other lines are ignored; EOF ends the listener.
+    """
+
+    source = stream if stream is not None else sys.stdin
+
+    def listen() -> None:
+        if source is None:
+            return
+        try:
+            for raw_line in source:
+                try:
+                    request = json.loads(raw_line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(request, dict) and request.get("command") == CANCEL_COMMAND:
+                    on_cancel()
+                    return
+        except (OSError, ValueError):
+            return
+
+    thread = threading.Thread(target=listen, name="squeakpose-cancel-listener", daemon=True)
+    thread.start()
+    return thread
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,17 +131,26 @@ class JsonLineBuffer:
         return self._buffer
 
     def feed(self, chunk: str) -> list[str]:
+        # Split only on "\n", "\r" and "\r\n". ``str.splitlines`` would also
+        # break on "\x0c", "\x1c"-"\x1e", "\x85", "\u2028" and "\u2029", which
+        # third-party stdout (progress bars, form feeds) can emit mid-line;
+        # treating those as terminators would truncate the pending text and
+        # corrupt the next protocol line.
         self._buffer += str(chunk or "")
-        lines = self._buffer.splitlines(keepends=True)
-        self._buffer = ""
+        text = self._buffer
+        holdback = ""
+        if text.endswith("\r"):
+            # A trailing "\r" may be the first half of "\r\n"; keep it pending
+            # so the following "\n" does not produce a spurious empty line.
+            text = text[:-1]
+            holdback = "\r"
+        parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        self._buffer = parts.pop() + holdback
         complete: list[str] = []
-        for line in lines:
-            if line.endswith(("\n", "\r")):
-                stripped = line.strip()
-                if stripped:
-                    complete.append(stripped)
-            else:
-                self._buffer = line
+        for part in parts:
+            stripped = part.strip()
+            if stripped:
+                complete.append(stripped)
         return complete
 
     def finish(self) -> str:

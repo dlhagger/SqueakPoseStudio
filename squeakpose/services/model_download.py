@@ -30,15 +30,18 @@ def download_sam_weights(
     downloaded = downloader(repo_id=model.repo_id, filename=model.filename, local_dir=root)
     expected = os.path.join(root, model.filename)
     target = os.path.abspath(str(downloaded)) if downloaded else ""
-    if (
-        target != expected
-        or not os.path.isfile(target)
-        or os.path.realpath(target) != os.path.join(os.path.realpath(root), model.filename)
-    ):
+    # ``hf_hub_download`` reports the file under ``Path(local_dir).resolve()``, so a
+    # symlinked component in the project path (``/tmp`` and ``/var`` on macOS, synced
+    # folders) makes a plain string comparison fail. Compare fully resolved paths:
+    # this accepts symlinked project folders but still rejects a checkpoint that is
+    # itself a symlink to some other file. Return the project-visible path, which is
+    # what the UI compares against ``sam_download_target``.
+    resolved_expected = os.path.join(os.path.realpath(root), model.filename)
+    if not target or os.path.realpath(target) != resolved_expected or not os.path.isfile(expected):
         raise RuntimeError(
             f"Hugging Face finished without creating {model.filename} in the project."
         )
-    return target
+    return expected
 
 
 def sam_download_error_message(error: BaseException | str, model_key: str) -> str:

@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from PyQt6.QtCore import QCoreApplication, QProcess
 
 from squeakpose.workers.process import WorkerJobController
+from squeakpose.workers.protocol import cancel_command_bytes
 
 
 class _FakeSignal:
@@ -36,6 +37,13 @@ class _FakeProcess:
         self.terminate_calls = 0
         self.kill_calls = 0
         self.signals_blocked = False
+        self.stdin = b""
+        self.call_order = []
+
+    def write(self, data):
+        self.stdin += bytes(data)
+        self.call_order.append("write")
+        return len(data)
 
     def setProgram(self, program):
         self.program = program
@@ -69,6 +77,7 @@ class _FakeProcess:
 
     def terminate(self):
         self.terminate_calls += 1
+        self.call_order.append("terminate")
 
     def blockSignals(self, blocked):
         self.signals_blocked = bool(blocked)
@@ -197,6 +206,119 @@ class WorkerJobControllerTests(unittest.TestCase):
         process.finished.emit(-1, QProcess.ExitStatus.CrashExit)
         self.assertEqual(len(terminal), 1)
         self.assertEqual(terminal[0].state, "cancelled")
+
+    def test_cancel_sends_stdin_cancel_request_before_terminate(self):
+        process = _FakeProcess(None)
+        controller = WorkerJobController(
+            process_factory=lambda _parent: process,
+            schedule=lambda _delay, _callback: None,
+        )
+        self.assertTrue(controller.start("/python", ["worker.py"]))
+
+        self.assertTrue(controller.cancel(kill_after_ms=60_000))
+
+        # The stdin line is the portable channel (Windows terminate() is a no-op
+        # for console children); SIGTERM follows for POSIX.
+        self.assertEqual(process.stdin, cancel_command_bytes())
+        self.assertEqual(process.call_order, ["write", "terminate"])
+        self.assertEqual(process.kill_calls, 0)
+
+    def test_force_stop_kills_immediately_and_reports_cancelled(self):
+        process = _FakeProcess(None)
+        controller = WorkerJobController(
+            process_factory=lambda _parent: process,
+            schedule=lambda _delay, _callback: None,
+        )
+        terminal = []
+        controller.terminal.connect(terminal.append)
+        self.assertTrue(controller.start("/python", ["worker.py"]))
+        controller.cancel(kill_after_ms=60_000)
+
+        self.assertTrue(controller.force_stop())
+        self.assertEqual(process.kill_calls, 1)
+        process.finished.emit(-1, QProcess.ExitStatus.CrashExit)
+
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].state, "cancelled")
+        self.assertFalse(controller.force_stop())
+
+    def test_shutdown_sends_cancel_request_first(self):
+        process = _FakeProcess(None)
+        controller = WorkerJobController(process_factory=lambda _parent: process)
+        self.assertTrue(controller.start("/python", ["worker.py"]))
+
+        controller.shutdown()
+
+        self.assertEqual(process.stdin, cancel_command_bytes())
+        self.assertEqual(process.call_order[:2], ["write", "terminate"])
+
+    def test_cancel_tolerates_process_without_write(self):
+        process = _FakeProcess(None)
+        process.write = None
+        controller = WorkerJobController(
+            process_factory=lambda _parent: process,
+            schedule=lambda _delay, _callback: None,
+        )
+        self.assertTrue(controller.start("/python", ["worker.py"]))
+
+        self.assertTrue(controller.cancel())
+        self.assertEqual(process.terminate_calls, 1)
+
+    def test_reentrant_finished_during_event_delivery_keeps_result_before_terminal(self):
+        process = _FakeProcess(None)
+        controller = WorkerJobController(process_factory=lambda _parent: process)
+        timeline = []
+
+        def on_event(event):
+            timeline.append(("event", event["event"]))
+            if event["event"] == "progress":
+                # Simulate a consumer slot that re-enters the event loop
+                # (``QApplication.processEvents()``) after the child already
+                # exited: Qt dispatches ``finished`` while the outer
+                # ``_read_stdout`` is still delivering the chunk.
+                process.process_state = QProcess.ProcessState.NotRunning
+                process.finished.emit(0, QProcess.ExitStatus.NormalExit)
+
+        controller.event_received.connect(on_event)
+        controller.terminal.connect(lambda result: timeline.append(("terminal", result)))
+        self.assertTrue(controller.start("/python", ["worker.py"]))
+
+        process.stdout = b'{"event":"started"}\n{"event":"progress"}\n{"event":"result","ok":1}\n'
+        process.readyReadStandardOutput.emit()
+
+        kinds = [kind for kind, _ in timeline]
+        self.assertEqual(kinds.count("terminal"), 1)
+        self.assertEqual(
+            [name for kind, name in timeline if kind == "event"],
+            ["started", "progress", "result"],
+        )
+        self.assertGreater(kinds.index("terminal"), timeline.index(("event", "result")))
+        self.assertEqual(timeline[-1][0], "terminal")
+        self.assertTrue(timeline[-1][1].succeeded)
+        self.assertIs(controller.terminal_result, timeline[-1][1])
+
+    def test_reentrant_finished_also_flushes_unterminated_trailing_result(self):
+        process = _FakeProcess(None)
+        controller = WorkerJobController(process_factory=lambda _parent: process)
+        events = []
+        terminal = []
+
+        def on_event(event):
+            events.append(event["event"])
+            if event["event"] == "progress":
+                process.process_state = QProcess.ProcessState.NotRunning
+                process.finished.emit(0, QProcess.ExitStatus.NormalExit)
+
+        controller.event_received.connect(on_event)
+        controller.terminal.connect(terminal.append)
+        self.assertTrue(controller.start("/python", ["worker.py"]))
+
+        process.stdout = b'{"event":"progress"}\n{"event":"result"}'
+        process.readyReadStandardOutput.emit()
+
+        self.assertEqual(events, ["progress", "result"])
+        self.assertEqual(len(terminal), 1)
+        self.assertTrue(terminal[0].succeeded)
 
     def test_shutdown_stops_process_cleans_config_and_notifies_once(self):
         with TemporaryDirectory() as tmp:

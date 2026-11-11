@@ -17,16 +17,39 @@ from analysis_ops import (
 )
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION
 from squeakpose.services.analysis import AnalysisConfigError, validate_analysis_output_dir
-from squeakpose.workers.protocol import read_config, write_event
+from squeakpose.services.cancellation import OperationCanceled, cancel_check_scope
+from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
 from unified_analysis_ops import run_unified_analysis_workflow
 
 _CANCEL_REQUESTED = False
 
 
-def _handle_cancel_signal(_signum, _frame):
+def _request_cancel() -> None:
     global _CANCEL_REQUESTED
     _CANCEL_REQUESTED = True
-    raise SystemExit(130)
+
+
+def _handle_cancel_signal(_signum, _frame):
+    # Only set the flag. Analysis checks it at every progress step and every
+    # rendered video frame, then unwinds through the output transaction so the
+    # previous published analysis is left untouched and a canceled ``result``
+    # is emitted. The owner's kill escalation still covers a stuck worker.
+    _request_cancel()
+
+
+def _cancel_requested() -> bool:
+    return _CANCEL_REQUESTED
+
+
+def _canceled_result(output_dir: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "event": "result",
+        "canceled": True,
+        "had_error": False,
+        "error_message": "",
+        "output_dir": output_dir,
+        **extra,
+    }
 
 
 def _stdout_event_writer(payload: dict[str, Any]) -> None:
@@ -41,11 +64,21 @@ def run_analysis_worker(
     config: dict[str, Any],
     *,
     event_writer: Callable[[dict[str, Any]], None] = _stdout_event_writer,
+    reset_cancel: bool = True,
 ) -> int:
     """Run one analysis job and emit JSON-compatible event payloads."""
     global _CANCEL_REQUESTED
-    _CANCEL_REQUESTED = False
+    if reset_cancel:
+        _CANCEL_REQUESTED = False
+    with cancel_check_scope(_cancel_requested):
+        return _run_analysis_worker(config, event_writer=event_writer)
 
+
+def _run_analysis_worker(
+    config: dict[str, Any],
+    *,
+    event_writer: Callable[[dict[str, Any]], None],
+) -> int:
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "squeakpose-mpl"))
     os.environ.setdefault(
         "NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "squeakpose-numba-cache")
@@ -81,6 +114,9 @@ def run_analysis_worker(
 
     try:
         result = run_analysis_workflow(analysis_config, progress_callback=progress)
+    except OperationCanceled:
+        _emit_event(event_writer, _canceled_result(analysis_config.output_dir))
+        return 0
     except AnalysisError as exc:
         _emit_event(event_writer, {"event": "error", "error_message": str(exc)})
         return 1
@@ -167,6 +203,9 @@ def _run_analysis_job(
                 segmentation_csv=inputs.get(LAYER_SEGMENTATION, ""),
                 progress_callback=unified_progress,
             )
+        except OperationCanceled:
+            _emit_event(event_writer, _canceled_result(output_root))
+            return 0
         except AnalysisError as exc:
             _emit_event(event_writer, {"event": "error", "error_message": str(exc)})
             return 1
@@ -217,6 +256,20 @@ def _run_analysis_job(
             results_by_layer[layer] = run_analysis_workflow(
                 layer_config, progress_callback=progress
             )
+        except OperationCanceled:
+            # Each layer publishes independently. Layers finished before the
+            # cancel keep their new output; the canceled layer keeps its
+            # previous output. Report which is which.
+            _emit_event(
+                event_writer,
+                _canceled_result(
+                    output_root,
+                    analysis_mode=config.get("analysis_mode"),
+                    completed_layers=list(results_by_layer),
+                    results_by_layer=results_by_layer,
+                ),
+            )
+            return 0
         except Exception as exc:
             errors_by_layer[layer] = str(exc)
             _emit_event(
@@ -273,6 +326,7 @@ def _run_analysis_job(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
+    start_cancel_listener(_request_cancel)
 
     parser = argparse.ArgumentParser(
         description="Run SqueakPose inference analysis in a child process."
@@ -285,7 +339,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:
         _stdout_event_writer({"event": "error", "error_message": f"Could not read config: {exc}"})
         return 1
-    return run_analysis_worker(config)
+    # Keep a cancel that arrived while the config was loading.
+    return run_analysis_worker(config, reset_cancel=False)
 
 
 if __name__ == "__main__":

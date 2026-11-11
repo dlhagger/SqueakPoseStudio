@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
+import analysis_worker
 from analysis_ops import (
     AnalysisConfig,
     AnalysisError,
@@ -1003,6 +1004,141 @@ class AnalysisOpsTests(unittest.TestCase):
             self.assertIn("Center", set(features["roi_label"]))
             self.assertEqual(len(features), 4)
             self.assertEqual(len(detections), 5)
+
+
+def _cancel_after_progress_step(events: list, step: int):
+    """Event writer that requests cancel once a progress event reaches ``step``."""
+
+    def writer(event):
+        events.append(event)
+        if event.get("event") == "progress" and int(event.get("step") or 0) >= step:
+            analysis_worker._request_cancel()
+
+    return writer
+
+
+def _directory_snapshot(root: str) -> dict[str, bytes]:
+    snapshot = {}
+    for path in sorted(Path(root).rglob("*")):
+        if path.is_file():
+            snapshot[str(path.relative_to(root))] = path.read_bytes()
+    return snapshot
+
+
+class AnalysisCancelTests(unittest.TestCase):
+    def tearDown(self):
+        analysis_worker._CANCEL_REQUESTED = False
+
+    def _pose_config(self, csv_path, out_dir):
+        return {
+            "detections_csv": csv_path,
+            "output_dir": out_dir,
+            "fps": 10.0,
+            "smooth": True,
+            "make_plots": False,
+            "make_annotated_video": False,
+            "run_clustering": False,
+            "export_cluster_clips": False,
+        }
+
+    def test_canceled_rerun_keeps_previous_analysis_and_reports_canceled(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "detections.csv")
+            out_dir = os.path.join(tmp, "analysis")
+            _write_demo_detections(csv_path)
+            first_events = []
+            self.assertEqual(
+                run_analysis_worker(
+                    self._pose_config(csv_path, out_dir), event_writer=first_events.append
+                ),
+                0,
+            )
+            Path(out_dir, "my_notes.txt").write_text("keep me", encoding="utf-8")
+            before = _directory_snapshot(out_dir)
+            siblings_before = sorted(os.listdir(tmp))
+
+            events = []
+            code = run_analysis_worker(
+                {**self._pose_config(csv_path, out_dir), "fps": 20.0},
+                event_writer=_cancel_after_progress_step(events, 3),
+            )
+
+            self.assertEqual(code, 0)
+            result = next(event for event in events if event["event"] == "result")
+            self.assertTrue(result["canceled"])
+            self.assertFalse(result["had_error"])
+            self.assertNotIn("feature_csv", result)
+            self.assertFalse(any(event["event"] == "error" for event in events))
+            # Stopped at the checkpoint after step 3, never reached later steps.
+            steps = [int(e["step"]) for e in events if e["event"] == "progress"]
+            self.assertEqual(max(steps), 3)
+            # Previous published output (and the user's own file) is byte-identical,
+            # and no staging directory was left behind.
+            self.assertEqual(_directory_snapshot(out_dir), before)
+            self.assertEqual(sorted(os.listdir(tmp)), siblings_before)
+
+    def test_cancel_before_first_step_reports_canceled_without_output(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "detections.csv")
+            out_dir = os.path.join(tmp, "analysis")
+            _write_demo_detections(csv_path)
+            analysis_worker._request_cancel()
+            events = []
+
+            code = run_analysis_worker(
+                self._pose_config(csv_path, out_dir),
+                event_writer=events.append,
+                reset_cancel=False,
+            )
+
+            self.assertEqual(code, 0)
+            result = next(event for event in events if event["event"] == "result")
+            self.assertTrue(result["canceled"])
+            self.assertFalse(Path(out_dir, "analysis.csv").exists())
+
+    def test_canceled_combined_rerun_keeps_previous_analysis(self):
+        with TemporaryDirectory() as tmp:
+            pose_csv = os.path.join(tmp, "pose.csv")
+            segment_csv = os.path.join(tmp, "segmentation.csv")
+            out_dir = os.path.join(tmp, "analysis")
+            _write_demo_detections(pose_csv)
+            pose = pd.read_csv(pose_csv)
+            pose["kp_nose_x"] = pose["bbox_center_x"]
+            pose["kp_nose_y"] = pose["bbox_center_y"]
+            pose.to_csv(pose_csv, index=False)
+            _write_demo_segmentation(segment_csv)
+            config = {
+                "analysis_mode": "both",
+                "analysis_inputs": {"keypoints": pose_csv, "segmentation": segment_csv},
+                "selected_layers": ["keypoints", "segmentation"],
+                "output_dir": out_dir,
+                "fps": 10.0,
+                "pixel_distance": 2.0,
+                "real_world_distance_mm": 4.0,
+                "smooth": False,
+                "make_plots": False,
+                "make_annotated_video": False,
+                "run_clustering": False,
+                "export_cluster_clips": False,
+            }
+            self.assertEqual(run_analysis_worker(config, event_writer=[].append), 0)
+            before = _directory_snapshot(out_dir)
+
+            events = []
+            code = run_analysis_worker(
+                {**config, "fps": 20.0},
+                event_writer=_cancel_after_progress_step(events, 4),
+            )
+
+            self.assertEqual(code, 0)
+            result = next(event for event in events if event["event"] == "result")
+            self.assertTrue(result["canceled"])
+            self.assertEqual(_directory_snapshot(out_dir), before)
+
+    def test_signal_handler_only_sets_flag(self):
+        analysis_worker._CANCEL_REQUESTED = False
+        analysis_worker._handle_cancel_signal(None, None)  # must not raise SystemExit
+        self.assertTrue(analysis_worker._CANCEL_REQUESTED)
 
 
 if __name__ == "__main__":

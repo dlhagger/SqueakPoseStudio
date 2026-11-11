@@ -21,6 +21,7 @@ from squeakpose.core import commit_staged_paths, remove_path, staging_path_for
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION, normalize_layer_id
 from squeakpose.services.analysis import DEFAULT_ONE_EURO_BETA, DEFAULT_ONE_EURO_MIN_CUTOFF
 from squeakpose.services.analysis_errors import AnalysisError
+from squeakpose.services.cancellation import OperationCanceled, raise_if_canceled
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
@@ -254,7 +255,13 @@ class AnalysisConfig:
         )
 
 
+AnalysisCanceled = OperationCanceled
+
+
 def _progress(callback: ProgressCallback, step: int, total: int, message: str) -> None:
+    # Every progress step is a cancellation checkpoint; raising here unwinds
+    # through AnalysisOutputTransaction, which discards the staged output.
+    raise_if_canceled()
     if callback is not None:
         callback(int(step), int(total), str(message))
 
@@ -456,18 +463,28 @@ def _smooth_centers(df: pd.DataFrame, fps: float, config: AnalysisConfig) -> pd.
         raise AnalysisError(f"Could not import OneEuroFilter: {exc}") from exc
 
     freq = max(float(fps), 1.0)
-    euro_cx = OneEuroFilter(freq, config.min_cutoff, config.beta, config.d_cutoff)
-    euro_cy = OneEuroFilter(freq, config.min_cutoff, config.beta, config.d_cutoff)
 
+    def _new_filter():
+        return OneEuroFilter(freq, config.min_cutoff, config.beta, config.d_cutoff)
+
+    # Fresh filter objects are created at the start of every contiguous run of valid
+    # centers. ``OneEuroFilter.reset()`` only clears the last raw input and keeps the last
+    # filtered value, so re-using one filter across a NaN gap would seed the derivative
+    # estimate with stale pre-gap state and leave the output unsmoothed after the gap.
+    euro_cx = None
+    euro_cy = None
     filtered_cx: list[float] = []
     filtered_cy: list[float] = []
     for cx, cy in zip(out["bbox_center_x"], out["bbox_center_y"]):
         if pd.isna(cx) or pd.isna(cy):
             filtered_cx.append(math.nan)
             filtered_cy.append(math.nan)
-            euro_cx.reset()
-            euro_cy.reset()
+            euro_cx = None
+            euro_cy = None
             continue
+        if euro_cx is None or euro_cy is None:
+            euro_cx = _new_filter()
+            euro_cy = _new_filter()
         filtered_cx.append(float(euro_cx(float(cx))))
         filtered_cy.append(float(euro_cy(float(cy))))
     out["bbox_center_x_euro"] = filtered_cx
@@ -1524,6 +1541,16 @@ def create_roi_outputs(df: pd.DataFrame, output_dir: Path, fps: float) -> dict[s
     }
 
 
+def _max_frame_dimension(df: pd.DataFrame, column: str) -> int:
+    """Return the largest finite value in ``column`` as an int, or 0 when none exists."""
+    if column not in df.columns:
+        return 0
+    sizes = pd.to_numeric(df[column], errors="coerce").dropna()
+    if sizes.empty:
+        return 0
+    return int(sizes.max())
+
+
 def create_plots(
     df: pd.DataFrame,
     output_dir: Path,
@@ -1667,8 +1694,8 @@ def create_plots(
         if frame is not None:
             ax.imshow(frame)
         else:
-            width = int(df.get("image_width", pd.Series([0])).dropna().max() or 0)
-            height = int(df.get("image_height", pd.Series([0])).dropna().max() or 0)
+            width = _max_frame_dimension(df, "image_width")
+            height = _max_frame_dimension(df, "image_height")
             if width > 0 and height > 0:
                 ax.set_xlim(0, width)
                 ax.set_ylim(height, 0)
@@ -1699,8 +1726,8 @@ def create_plots(
 
         clean = df.dropna(subset=["bbox_center_x_euro", "bbox_center_y_euro"])
         if not clean.empty:
-            frame_width = int(clean.get("image_width", pd.Series([0])).dropna().max() or 0)
-            frame_height = int(clean.get("image_height", pd.Series([0])).dropna().max() or 0)
+            frame_width = _max_frame_dimension(clean, "image_width")
+            frame_height = _max_frame_dimension(clean, "image_height")
             if frame is not None:
                 frame_height, frame_width = frame.shape[:2]
             if frame_width > 0 and frame_height > 0:
@@ -1838,6 +1865,7 @@ def render_annotated_video(
     try:
         with _open_h264_video_writer(output_path, video_fps, width, height) as writer:
             while True:
+                raise_if_canceled()
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -2136,6 +2164,7 @@ def export_cluster_clips(
                 clip_path = clip_dir / f"cluster_{cluster_id:02d}_sample_{clip_idx:02d}.mp4"
                 with _open_h264_video_writer(clip_path, video_fps, width, height) as writer:
                     while cap.get(cv2.CAP_PROP_POS_FRAMES) < end_frame:
+                        raise_if_canceled()
                         ok, frame = cap.read()
                         if not ok:
                             break

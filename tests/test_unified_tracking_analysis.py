@@ -246,6 +246,99 @@ class UnifiedTrackingAnalysisTests(unittest.TestCase):
                 {("31", "501"), ("32", "502")},
             )
 
+    def test_plots_survive_animal_without_pose_rows_when_image_size_columns_exist(self):
+        # Real pose CSVs carry image_width/image_height. In the unified table those
+        # columns only come from pose rows, so an animal that has a segmentation track
+        # but no matched pose track ends up with an all-NaN image size group; plotting
+        # used to crash on ``int(NaN)`` for that animal.
+        pose = pd.DataFrame([_pose_row(0, 0, 501, 0), _pose_row(1, 0, 501, 2)])
+        pose["image_width"] = 640
+        pose["image_height"] = 480
+        segmentation = pd.DataFrame(
+            [
+                _segmentation_row(0, 0, 31, 0),
+                _segmentation_row(0, 1, 32, 30),
+                _segmentation_row(1, 0, 31, 2),
+                _segmentation_row(1, 1, 32, 28),
+            ]
+        )
+        with TemporaryDirectory() as tmp:
+            pose_path = Path(tmp, "pose.csv")
+            segmentation_path = Path(tmp, "segmentation.csv")
+            pose.to_csv(pose_path, index=False)
+            segmentation.to_csv(segmentation_path, index=False)
+
+            result = run_unified_analysis_workflow(
+                AnalysisConfig(
+                    detections_csv="",
+                    output_dir=str(Path(tmp, "analysis")),
+                    fps=10.0,
+                    smooth=False,
+                    make_plots=True,
+                    make_annotated_video=False,
+                ),
+                pose_csv=str(pose_path),
+                segmentation_csv=str(segmentation_path),
+            )
+
+            analysis = pd.read_csv(result["feature_csv"])
+            self.assertEqual(analysis["animal_id"].nunique(), 2)
+            pose_free = analysis.groupby("animal_id")["image_width"].apply(
+                lambda values: values.isna().all()
+            )
+            self.assertTrue(pose_free.any(), "expected one animal with no pose rows")
+            trajectory_plots = {
+                Path(path).parent.name
+                for path in result["plot_paths"]
+                if Path(path).name == "trajectory.png"
+            }
+            self.assertEqual(trajectory_plots, set(analysis["animal_id"].unique()))
+            for path in result["plot_paths"]:
+                self.assertTrue(Path(path).is_file())
+
+    def test_single_mouse_fragment_recovery_applies_when_a_class_is_selected(self):
+        # One mouse recorded alongside static objects; the tracker re-labels the
+        # mouse from id 3 to id 9 halfway through. Selecting the mouse class must not
+        # disable the one-animal fragment recovery that an unscoped run receives.
+        rows = []
+        for frame in range(4):
+            mouse_track = 3 if frame < 2 else 9
+            for detection, track, x1, name, confidence in [
+                (0, 1, 100, "object", 0.99),
+                (1, 2, 200, "object", 0.98),
+                (2, mouse_track, frame * 2, "mouse", 0.8),
+            ]:
+                row = _segmentation_row(
+                    frame, detection, track, x1, confidence=confidence, expected=1
+                )
+                row.update(
+                    class_name=name,
+                    class_id=int(name == "object"),
+                    tracks_in_frame=1,
+                    total_tracks_in_frame=3,
+                )
+                rows.append(row)
+        segmentation = pd.DataFrame(rows)
+        pose = pd.DataFrame(columns=list(_pose_row(0, 0, 0, 0)))
+        config = AnalysisConfig(
+            detections_csv="",
+            output_dir="unused",
+            fps=10.0,
+            smooth=False,
+            make_plots=False,
+            subject_class="mouse",
+        )
+
+        table = build_unified_frame_table(
+            pose, segmentation, config, video_path="", fps=10, scale=1
+        )
+
+        self.assertEqual(table["animal_id"].unique().tolist(), ["animal_1"])
+        self.assertEqual(table["segmentation_valid"].tolist(), [True, True, True, True])
+        self.assertEqual(table["segmentation_track_id"].astype(int).tolist(), [3, 3, 9, 9])
+        self.assertEqual(set(table["segmentation_class_name"]), {"mouse"})
+        self.assertEqual(table["extra_segmentation_tracks"].max(), 0)
+
     def test_prediction_qc_flags_extra_detections_without_discarding_primary_track(self):
         pose = pd.DataFrame(
             [

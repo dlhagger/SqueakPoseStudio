@@ -23,9 +23,14 @@ class _Signal:
     def connect(self, callback):
         self.callbacks.append(callback)
 
-    def emit(self, value):
+    def disconnect(self, callback):
+        if callback not in self.callbacks:
+            raise TypeError("disconnect() failed: not connected")
+        self.callbacks.remove(callback)
+
+    def emit(self, *args):
         for callback in list(self.callbacks):
-            callback(value)
+            callback(*args)
 
 
 class _Process:
@@ -106,6 +111,8 @@ class _Progress:
 
     def close(self):
         self.closed = True
+        # Mirror QProgressDialog: closing the dialog emits canceled().
+        self.canceled.emit()
 
     def show(self):
         self.shown = True
@@ -117,6 +124,33 @@ class _Capture:
 
     def release(self):
         self.released = True
+
+
+class _FakeVideoCapture:
+    def __init__(self, _path):
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def get(self, prop):
+        return {
+            _FakeCv2.CAP_PROP_FRAME_COUNT: 10,
+            _FakeCv2.CAP_PROP_FPS: 25.0,
+            _FakeCv2.CAP_PROP_FRAME_WIDTH: 64,
+            _FakeCv2.CAP_PROP_FRAME_HEIGHT: 48,
+        }.get(prop, 0)
+
+    def release(self):
+        self.released = True
+
+
+class _FakeCv2:
+    CAP_PROP_FRAME_COUNT = 7
+    CAP_PROP_FPS = 5
+    CAP_PROP_FRAME_WIDTH = 3
+    CAP_PROP_FRAME_HEIGHT = 4
+    VideoCapture = _FakeVideoCapture
 
 
 class VideoReviewerProcessTests(unittest.TestCase):
@@ -341,6 +375,7 @@ class VideoReviewerProcessTests(unittest.TestCase):
             controller = _Controller()
             capture = _Capture()
             progress = dialog._review_progress
+            progress.canceled.connect(dialog._cancel_review_prediction_process)
             dialog._review_job = controller
             dialog._review_process = controller.process
             controller.terminal.connect(dialog._finish_review_prediction_job)
@@ -348,19 +383,67 @@ class VideoReviewerProcessTests(unittest.TestCase):
             finished = Mock()
             dialog._finish_project_review_prediction = finished
 
-            with patch.object(
-                QMessageBox,
-                "question",
-                return_value=QMessageBox.StandardButton.Yes,
+            with (
+                patch.object(
+                    QMessageBox,
+                    "question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch.object(QMessageBox, "information") as information,
             ):
                 dialog.reject()
 
             self.assertEqual(controller.shutdown_calls, 1)
             self.assertFalse(finished.called)
+            information.assert_not_called()
             self.assertTrue(progress.closed)
+            self.assertEqual(progress.canceled.callbacks, [])
             self.assertTrue(capture.released)
             self.assertIsNone(dialog._review_job)
             self.assertIsNone(dialog._review_process)
+            self.assertIsNone(dialog._review_progress)
+
+    def test_finish_is_a_no_op_while_reviewer_is_closing(self):
+        with TemporaryDirectory() as tmp:
+            dialog = self.make_dialog(tmp)
+            dialog._review_closing = True
+            dialog._review_run_canceled = True
+            dialog.preds_by_layer[LAYER_KEYPOINTS] = {0: {"ok": True, "confidence": 0.8}}
+
+            with (
+                patch.object(dialog, "_save_cache") as save_cache,
+                patch.object(QMessageBox, "information") as information,
+            ):
+                dialog._finish_project_review_prediction()
+
+            save_cache.assert_not_called()
+            information.assert_not_called()
+            dialog.close()
+
+    def test_open_video_discards_previous_video_predictions(self):
+        with TemporaryDirectory() as tmp:
+            dialog = self.make_dialog(tmp)
+            old_capture = _Capture()
+            dialog.cap = old_capture
+            dialog.preds_by_layer[LAYER_KEYPOINTS] = {0: {"ok": True, "confidence": 0.8}}
+            dialog.preds_by_layer[LAYER_SEGMENTATION] = {1: {"ok": True, "confidence": 0.4}}
+            dialog.preds = dialog.preds_by_layer[LAYER_KEYPOINTS]
+
+            with (
+                patch("squeakpose.ui.video_reviewer._cv2", _FakeCv2),
+                patch.object(dialog, "_load_cache_if_valid", return_value=False) as load_cache,
+                patch.object(dialog, "_seek"),
+            ):
+                dialog._open_video(os.path.join(tmp, "second.mp4"))
+
+            load_cache.assert_called_once_with()
+            self.assertTrue(old_capture.released)
+            self.assertEqual(dialog.preds_by_layer, {LAYER_KEYPOINTS: {}, LAYER_SEGMENTATION: {}})
+            self.assertIs(dialog.preds, dialog.preds_by_layer[LAYER_KEYPOINTS])
+            self.assertEqual(dialog._overlay_items, [])
+            self.assertEqual(dialog.base, "second")
+            dialog.cap = None
+            dialog.close()
 
     def test_legacy_event_line_helper_keeps_protocol_and_plain_output_behavior(self):
         with TemporaryDirectory() as tmp:

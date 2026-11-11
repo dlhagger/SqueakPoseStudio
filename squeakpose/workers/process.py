@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import tempfile
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -14,7 +15,12 @@ from typing import Any
 from PyQt6.QtCore import QObject, QProcess, QTimer, pyqtSignal
 
 from squeakpose.project.safety import require_path_within_project
-from squeakpose.workers.protocol import JsonLineBuffer, WorkerProtocolError, parse_event_line
+from squeakpose.workers.protocol import (
+    JsonLineBuffer,
+    WorkerProtocolError,
+    cancel_command_bytes,
+    parse_event_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +61,7 @@ class WorkerJobController(QObject):
         self._process: Any = None
         self._config_path: str | None = None
         self._stdout = JsonLineBuffer()
+        self._pending_lines: deque[str] = deque()
         self._stderr_pending = ""
         self._stderr_parts: list[str] = []
         self._started = False
@@ -123,17 +130,42 @@ class WorkerJobController(QObject):
         return False
 
     def cancel(self, *, kill_after_ms: int = 5000) -> bool:
-        """Request termination and force-kill this job if it remains active."""
+        """Request a graceful stop and force-kill this job if it remains active.
+
+        The worker receives a ``{"command": "cancel"}`` stdin line (portable,
+        including Windows where ``terminate()`` does not reach console
+        children) followed by ``terminate()`` (SIGTERM on POSIX).
+        """
         process = self._process
         if process is None or self._terminal_result is not None:
             return False
         self._cancel_requested = True
+        self._send_cancel_request(process)
         return request_qprocess_stop(
             process,
             schedule=self._schedule,
             force_kill=self._force_kill,
             kill_after_ms=kill_after_ms,
         )
+
+    def force_stop(self) -> bool:
+        """Kill the job immediately; the terminal result arrives via ``finished``."""
+        process = self._process
+        if process is None or self._terminal_result is not None:
+            return False
+        self._cancel_requested = True
+        self._force_kill()
+        return True
+
+    @staticmethod
+    def _send_cancel_request(process: Any) -> None:
+        writer = getattr(process, "write", None)
+        if not callable(writer):
+            return
+        try:
+            writer(cancel_command_bytes())
+        except (RuntimeError, OSError):
+            return
 
     def shutdown(
         self,
@@ -144,6 +176,8 @@ class WorkerJobController(QObject):
         """Synchronously stop an owned job, clean up, and emit its terminal result."""
         process = self._process
         self._cancel_requested = True
+        if process is not None and self._terminal_result is None:
+            self._send_cancel_request(process)
         stopped = shutdown_qprocess(
             process,
             terminate_timeout_ms=terminate_timeout_ms,
@@ -165,8 +199,16 @@ class WorkerJobController(QObject):
             data = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
         except RuntimeError:
             return
-        for line in self._stdout.feed(data):
-            self._deliver_stdout_line(line.strip())
+        self._pending_lines.extend(self._stdout.feed(data))
+        self._flush_pending_lines()
+
+    def _flush_pending_lines(self) -> None:
+        # Consumer slots may re-enter the event loop (``processEvents``) and
+        # dispatch ``finished`` while a line is still being delivered. Draining
+        # one shared queue from both paths keeps delivery ordered and lets
+        # ``_drain_output`` hand over every parsed line before ``terminal``.
+        while self._pending_lines and self._terminal_result is None:
+            self._deliver_stdout_line(self._pending_lines.popleft().strip())
 
     def _read_stderr(self) -> None:
         process = self._process
@@ -186,7 +228,7 @@ class WorkerJobController(QObject):
                 self.stderr_received.emit(line.strip())
 
     def _deliver_stdout_line(self, line: str) -> None:
-        if not line:
+        if not line or self._terminal_result is not None:
             return
         try:
             event = parse_event_line(line).as_dict()
@@ -224,7 +266,8 @@ class WorkerJobController(QObject):
         self._read_stderr()
         pending_stdout = self._stdout.finish()
         if pending_stdout:
-            self._deliver_stdout_line(pending_stdout.strip())
+            self._pending_lines.append(pending_stdout)
+        self._flush_pending_lines()
         if self._stderr_pending.strip():
             self.stderr_received.emit(self._stderr_pending.strip())
         self._stderr_pending = ""
@@ -317,6 +360,7 @@ class PersistentWorkerSession(QObject):
         self._schedule = schedule or QTimer.singleShot
         self._process: Any = None
         self._stdout = JsonLineBuffer()
+        self._pending_lines: deque[str] = deque()
         self._stderr_pending = ""
         self._stderr_parts: list[str] = []
         self._ready = False
@@ -487,6 +531,7 @@ class PersistentWorkerSession(QObject):
 
     def _reset_generation_state(self) -> None:
         self._stdout = JsonLineBuffer()
+        self._pending_lines = deque()
         self._stderr_pending = ""
         self._stderr_parts = []
         self._ready = False
@@ -504,8 +549,18 @@ class PersistentWorkerSession(QObject):
             data = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
         except RuntimeError:
             return
-        for line in self._stdout.feed(data):
-            self._deliver_stdout_line(line.strip())
+        self._pending_lines.extend(self._stdout.feed(data))
+        self._flush_pending_lines(process, generation)
+
+    def _flush_pending_lines(self, process: Any, generation: int) -> None:
+        # See WorkerJobController._flush_pending_lines: a consumer slot may
+        # re-enter the event loop and finish this generation mid-delivery.
+        while (
+            self._pending_lines
+            and self._terminal_result is None
+            and self._is_active_generation(process, generation)
+        ):
+            self._deliver_stdout_line(self._pending_lines.popleft().strip())
 
     def _read_stderr(self, process: Any, generation: int) -> None:
         if not self._is_active_generation(process, generation):
@@ -524,7 +579,7 @@ class PersistentWorkerSession(QObject):
                 self.stderr_received.emit(line.strip())
 
     def _deliver_stdout_line(self, line: str) -> None:
-        if not line:
+        if not line or self._terminal_result is not None:
             return
         try:
             event = parse_event_line(line).as_dict()
@@ -579,7 +634,8 @@ class PersistentWorkerSession(QObject):
         self._read_stderr(process, generation)
         pending_stdout = self._stdout.finish()
         if pending_stdout:
-            self._deliver_stdout_line(pending_stdout.strip())
+            self._pending_lines.append(pending_stdout)
+        self._flush_pending_lines(process, generation)
         if self._stderr_pending.strip():
             self.stderr_received.emit(self._stderr_pending.strip())
         self._stderr_pending = ""

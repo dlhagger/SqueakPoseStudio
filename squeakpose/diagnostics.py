@@ -47,6 +47,26 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+class OwnerOnlyRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotating handler that keeps every (re)opened log file owner-readable only.
+
+    ``RotatingFileHandler`` recreates the active log with the process umask after each
+    rollover, so the permission restriction has to happen on every ``_open``. Failures
+    are recorded rather than logged here because ``_open`` runs inside ``emit``.
+    """
+
+    permission_error: OSError | None = None
+
+    def _open(self):
+        stream = super()._open()
+        if os.name == "posix":
+            try:
+                os.fchmod(stream.fileno(), 0o600)
+            except OSError as exc:
+                self.permission_error = exc
+        return stream
+
+
 def project_log_path(project_root: str) -> str:
     """Return the canonical structured log path for a project."""
 
@@ -87,7 +107,7 @@ def configure_project_logging(
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
     reset_project_logging()
-    handler = logging.handlers.RotatingFileHandler(
+    handler = OwnerOnlyRotatingFileHandler(
         log_path,
         maxBytes=max(1, int(max_bytes)),
         backupCount=max(0, int(backup_count)),
@@ -104,12 +124,10 @@ def configure_project_logging(
         root_logger.setLevel(logging.INFO)
     logging.captureWarnings(True)
 
-    try:
-        os.chmod(log_path, 0o600)
-    except OSError:
+    if handler.permission_error is not None:
         logging.getLogger(__name__).warning(
-            "Could not restrict project log permissions",
-            exc_info=True,
+            "Could not restrict project log permissions: %s",
+            handler.permission_error,
             extra={"event": "log_permissions_failed", "target_path": log_path},
         )
 

@@ -342,6 +342,74 @@ class DatasetOpsTests(unittest.TestCase):
             self.assertIsNone(result.backup_dir)
             self.assertEqual(result.warnings, [])
 
+    def test_normalize_finds_upper_case_image_extension_for_label(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            labels = root / "labels_all"
+            images_all = root / "images_all"
+            images_to_label = root / "images_to_label"
+            labels.mkdir()
+            images_all.mkdir()
+            images_to_label.mkdir()
+            label_line = "0 0.500000 0.500000 0.200000 0.200000 0.100000 0.100000 2\n"
+            (labels / "frame1.txt").write_text(label_line, encoding="utf-8")
+            (labels / "frame2.txt").write_text(label_line, encoding="utf-8")
+            (images_all / "frame1.JPG").write_bytes(b"fake-image")
+            (images_to_label / "frame2.JPG").write_bytes(b"fake-image")
+
+            result = normalize_label_directory(
+                labels_dir=str(labels),
+                images_all_dir=str(images_all),
+                images_to_label_dir=str(images_to_label),
+                mode=DATASET_POSE,
+                class_count=1,
+                keypoint_count=1,
+            )
+
+            self.assertEqual(result.warnings, [])
+            self.assertEqual(result.copied_images, 1)
+            self.assertTrue((images_all / "frame2.JPG").exists())
+
+    def test_normalize_with_zero_class_count_keeps_valid_rows(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            labels = root / "labels_all"
+            images_all = root / "images_all"
+            images_to_label = root / "images_to_label"
+            labels.mkdir()
+            images_all.mkdir()
+            images_to_label.mkdir()
+            label_line = "0 0.500000 0.500000 0.200000 0.200000 0.100000 0.100000 2\n"
+            (labels / "frame1.txt").write_text(label_line, encoding="utf-8")
+            (images_all / "frame1.png").write_bytes(b"fake-image")
+            seg_labels = root / "labels_seg_all"
+            seg_labels.mkdir()
+            seg_line = "0 0.100000 0.100000 0.500000 0.100000 0.500000 0.500000\n"
+            (seg_labels / "frame1.txt").write_text(seg_line, encoding="utf-8")
+
+            pose_result = normalize_label_directory(
+                labels_dir=str(labels),
+                images_all_dir=str(images_all),
+                images_to_label_dir=str(images_to_label),
+                mode=DATASET_POSE,
+                class_count=0,
+                keypoint_count=1,
+            )
+            seg_result = normalize_label_directory(
+                labels_dir=str(seg_labels),
+                images_all_dir=str(images_all),
+                images_to_label_dir=str(images_to_label),
+                mode=DATASET_SEGMENT,
+                class_count=0,
+            )
+
+            for result in (pose_result, seg_result):
+                self.assertEqual(result.quarantined, 0)
+                self.assertEqual(result.untouched, 1)
+                self.assertEqual(result.warnings, [])
+            self.assertEqual((labels / "frame1.txt").read_text(encoding="utf-8"), label_line)
+            self.assertEqual((seg_labels / "frame1.txt").read_text(encoding="utf-8"), seg_line)
+
     def test_normalize_quarantines_completely_invalid_label_after_backup(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

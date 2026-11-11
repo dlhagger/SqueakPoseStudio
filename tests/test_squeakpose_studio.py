@@ -802,6 +802,178 @@ class StudioVideoReviewTests(unittest.TestCase):
             self.assertEqual(app.kp_names, ["nose"])
             self.assertEqual(app.class_keypoints, {"mouse": ["nose"]})
 
+    def test_class_manager_results_sync_layer_mirrors_and_selection(self):
+        with TemporaryDirectory() as tmp:
+
+            class SelectorStub:
+                def __init__(self, items):
+                    self.items = list(items)
+                    self.index = 0
+                    self.minimum_contents_length = None
+
+                def currentText(self):
+                    return self.items[self.index] if 0 <= self.index < len(self.items) else ""
+
+                def currentIndex(self):
+                    return self.index
+
+                def setCurrentIndex(self, index):
+                    self.index = index
+
+                def clear(self):
+                    self.items = []
+                    self.index = -1
+
+                def addItems(self, names):
+                    self.items.extend(names)
+
+                def blockSignals(self, _blocked):
+                    return None
+
+                def setMinimumContentsLength(self, value):
+                    self.minimum_contents_length = value
+
+            class SchemaDummy:
+                active_layer = "keypoints"
+                _persist_active_layer_state = LabelingApp._persist_active_layer_state
+                _fit_class_selector_to_items = LabelingApp._fit_class_selector_to_items
+
+                def _schema_is_locked(self):
+                    return False
+
+                def _is_keypoints_layer(self):
+                    return True
+
+                def _is_segmentation_layer(self):
+                    return False
+
+                def _refresh_kp_index_lookup(self):
+                    return None
+
+                def load_image(self):
+                    self.loaded = True
+
+            class CacheStub:
+                def clear(self):
+                    return None
+
+            class SessionStub:
+                def __init__(self):
+                    self.selected = []
+
+                def select_class(self, class_id):
+                    self.selected.append(class_id)
+
+            app = SchemaDummy()
+            app.classes = ["mouse"]
+            app.kp_names = ["nose"]
+            app.class_keypoints = {"mouse": ["nose"]}
+            app.pose_classes = ["mouse"]
+            app.pose_kp_names = ["nose"]
+            app.pose_class_keypoints = {"mouse": ["nose"]}
+            app.class_file = os.path.join(tmp, "classes.txt")
+            app.keypoint_file = os.path.join(tmp, "keypoints.txt")
+            app.class_keypoints_path = os.path.join(tmp, "class_keypoints.json")
+            app.class_selector = SelectorStub(["mouse"])
+            app.annotation_cache = CacheStub()
+            app._active_class_id = 0
+            app.layer_model_paths = {}
+            app.predict_model_path = ""
+
+            with patch("squeakpose.ui.main_window.QMessageBox.warning"):
+                changed = LabelingApp._apply_class_manager_results(
+                    app,
+                    ["rat", "mouse"],
+                    ["nose", "tail"],
+                    {"mouse": ["nose"], "rat": ["nose", "tail"]},
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual(app.pose_classes, ["rat", "mouse"])
+            self.assertEqual(app.pose_kp_names, ["nose", "tail"])
+            self.assertEqual(app.pose_class_keypoints, {"rat": ["nose", "tail"], "mouse": ["nose"]})
+            self.assertEqual(app.class_selector.currentIndex(), 1)
+            self.assertEqual(app._active_class_id, 1)
+            self.assertTrue(app.loaded)
+
+            # With a project session bound, the selection is pushed into it too.
+            session = SessionStub()
+            app._project_session = session
+            app.loaded = False
+            with (
+                patch.object(SchemaDummy, "_persist_active_layer_state", lambda self_app: None),
+                patch("squeakpose.ui.main_window.QMessageBox.warning"),
+            ):
+                changed = LabelingApp._apply_class_manager_results(
+                    app,
+                    ["rat", "mouse", "object"],
+                    ["nose", "tail"],
+                    {"mouse": ["nose"], "rat": ["nose", "tail"], "object": ["nose"]},
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual(session.selected, [1])
+            self.assertEqual(app._active_class_id, 1)
+
+    def test_refresh_image_list_relocates_displayed_image_by_name(self):
+        class QueueDummy:
+            def __init__(self):
+                self.images_queue = []
+                self.loaded = 0
+                self.progress_updates = 0
+
+            def _refresh_queue_images(self):
+                self.images_queue = self.rescanned[:]
+
+            def _update_progress_label(self):
+                self.progress_updates += 1
+
+            def load_image(self):
+                self.loaded += 1
+
+        app = QueueDummy()
+        app.images = ["vid_f000100.png", "vid_f000200.png"]
+        app.current_idx = 1
+        app._queue_current_idx = 1
+        app.current_image_path = "/project/images_to_label/vid_f000200.png"
+        # A newly exported frame sorts before the displayed one.
+        app.rescanned = ["vid_f000050.png", "vid_f000100.png", "vid_f000200.png"]
+
+        LabelingApp.refresh_image_list(app)
+
+        self.assertEqual(app.images[app.current_idx], "vid_f000200.png")
+        self.assertEqual(app._queue_current_idx, 2)
+        self.assertEqual(app.loaded, 0)
+        self.assertEqual(app.progress_updates, 1)
+
+        # Displayed image vanished from the queue: clamp and reload.
+        app.rescanned = ["vid_f000050.png"]
+        LabelingApp.refresh_image_list(app)
+
+        self.assertEqual(app.current_idx, 0)
+        self.assertEqual(app._queue_current_idx, 0)
+        self.assertEqual(app.loaded, 1)
+
+    def test_inference_busy_release_derives_predict_busy_from_coordinator(self):
+        from types import SimpleNamespace
+
+        window = SimpleNamespace(
+            _predict_busy=False,
+            _prediction_coordinator=SimpleNamespace(is_busy=False),
+        )
+
+        LabelingApp._inference_controller_busy_changed(window, True)
+        self.assertTrue(window._predict_busy)
+
+        # A single-image prediction started while video inference was running.
+        window._prediction_coordinator.is_busy = True
+        LabelingApp._inference_controller_busy_changed(window, False)
+        self.assertTrue(window._predict_busy)
+
+        window._prediction_coordinator.is_busy = False
+        LabelingApp._inference_controller_busy_changed(window, False)
+        self.assertFalse(window._predict_busy)
+
     def test_video_export_dedupe_is_scoped_to_source_id(self):
         with TemporaryDirectory() as tmp:
             for name in (

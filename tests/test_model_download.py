@@ -60,6 +60,28 @@ class ModelDownloadTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     download_sam_weights(root, key, downloader=lambda **_: str(target))
 
+    def test_accepts_resolved_path_when_destination_contains_symlink(self):
+        for key, model in SAM_MODELS.items():
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                real_root = os.path.join(tmp, "real_project")
+                os.makedirs(real_root)
+                link_root = os.path.join(tmp, "linked_project")
+                try:
+                    os.symlink(real_root, link_root, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+
+                def downloader(**kwargs):
+                    # hf_hub_download returns a path under Path(local_dir).resolve().
+                    target = Path(os.path.realpath(kwargs["local_dir"]), kwargs["filename"])
+                    target.write_bytes(b"weights")
+                    return str(target)
+
+                result = download_sam_weights(link_root, key, downloader=downloader)
+
+                self.assertEqual(result, os.path.join(link_root, model.filename))
+                self.assertTrue(os.path.isfile(result))
+
     def test_invalid_models_are_rejected_before_download(self):
         for key in ("sam2", "facebook/sam3", "../sam3.pt", ""):
             with self.subTest(key=key), self.assertRaises(ValueError):

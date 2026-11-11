@@ -82,6 +82,12 @@ from squeakpose.workers.process import (
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 from ui_style import ThemedComboBox, analysis_dialog_stylesheet
 
+# Analysis checks for cancel at every step and video frame; the only long
+# uninterruptible stretch is UMAP/HDBSCAN clustering, so allow generous time
+# before escalating to a kill (which skips the rollback and leaves a staging
+# folder for project recovery to clean up).
+ANALYSIS_CANCEL_KILL_AFTER_MS = 60_000
+
 POSE_PREVIEW_CONNECTIONS = (
     ("nose", "head"),
     ("head", "left_ear"),
@@ -1087,6 +1093,13 @@ class AnalysisDialog(QDialog):
         self.run_btn = QPushButton("Run Analysis")
         self.run_btn.clicked.connect(self._start_analysis)
         buttons.addButton(self.run_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        self.cancel_analysis_btn = QPushButton("Cancel Analysis")
+        self.cancel_analysis_btn.setToolTip(
+            "Stop the running analysis. Previous results in the output folder are kept."
+        )
+        self.cancel_analysis_btn.setEnabled(False)
+        self.cancel_analysis_btn.clicked.connect(self._cancel_analysis)
+        buttons.addButton(self.cancel_analysis_btn, QDialogButtonBox.ButtonRole.ActionRole)
         self.open_output_btn = QPushButton("Open Output")
         self.open_output_btn.setEnabled(False)
         self.open_output_btn.clicked.connect(self._open_output_dir)
@@ -1851,6 +1864,10 @@ class AnalysisDialog(QDialog):
     def _set_running(self, running: bool) -> None:
         self.run_btn.setEnabled(not running and self.frame_view.polygon_vertex_count == 0)
         self.load_frame_btn.setEnabled(not running)
+        if hasattr(self, "cancel_analysis_btn"):
+            self._analysis_cancel_requested = False
+            self.cancel_analysis_btn.setText("Cancel Analysis")
+            self.cancel_analysis_btn.setEnabled(running)
         if running:
             self.status_label.setText("Running")
             self.progress.setRange(0, 8)
@@ -1979,6 +1996,24 @@ class AnalysisDialog(QDialog):
         if not started:
             QMessageBox.warning(self, "Analysis failed", "Could not start the analysis worker.")
 
+    def _cancel_analysis(self) -> None:
+        """First click asks the worker to stop cleanly; a second click force-stops it."""
+        controller = self.analysis_controller
+        if controller is None or not controller.is_running:
+            return
+        if getattr(self, "_analysis_cancel_requested", False):
+            self._append_log("Force-stopping the analysis worker.")
+            controller.force_stop()
+            return
+        self._analysis_cancel_requested = True
+        self.status_label.setText("Canceling")
+        self.cancel_analysis_btn.setText("Force Stop")
+        self._append_log(
+            "Cancel requested. Stopping at the next checkpoint; "
+            "previous results in the output folder are kept."
+        )
+        controller.cancel(kill_after_ms=ANALYSIS_CANCEL_KILL_AFTER_MS)
+
     def _show_result_summary(self, event: dict[str, Any]) -> None:
         summary = event.get("summary") or {}
         if summary.get("analysis_kind") == "all_classes":
@@ -2071,6 +2106,23 @@ class AnalysisDialog(QDialog):
             self.progress.setRange(0, total)
             self.progress.setValue(step)
             self._append_log(str(event.get("message") or "Working"))
+        elif kind == "result" and event.get("canceled"):
+            self.status_label.setText("Canceled")
+            completed = [str(layer) for layer in event.get("completed_layers") or []]
+            if completed:
+                self._append_log(
+                    "Analysis canceled. Updated layers: "
+                    + ", ".join(completed)
+                    + ". Other layers keep their previous results."
+                )
+                for layer_id, result in (event.get("results_by_layer") or {}).items():
+                    self._append_log(f"{layer_id} features: {result.get('feature_csv', '')}")
+            else:
+                self._append_log("Analysis canceled. Previous results were left unchanged.")
+            self.open_output_btn.setEnabled(
+                bool(self.last_output_dir) and os.path.isdir(self.last_output_dir)
+            )
+            self._refresh_analysis_coverage()
         elif kind == "result":
             self.progress.setValue(self.progress.maximum())
             self.status_label.setText("Complete")
@@ -2125,7 +2177,11 @@ class AnalysisDialog(QDialog):
         self.analysis_controller = None
         self.analysis_config_path = None
         self.analysis_process = None
-        if not result.succeeded and self.status_label.text() == "Running":
+        if self.status_label.text() == "Canceling":
+            # No canceled result arrived (force stop or kill escalation).
+            self.status_label.setText("Canceled")
+            self._append_log("Analysis worker stopped.")
+        elif not result.succeeded and self.status_label.text() == "Running":
             self.status_label.setText("Failed")
         self._set_running(False)
         if controller is not None:
@@ -2135,7 +2191,7 @@ class AnalysisDialog(QDialog):
         if self.last_output_dir and os.path.isdir(self.last_output_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
 
-    def closeEvent(self, event):
+    def _cleanup_before_close(self) -> None:
         self._save_analysis_setup()
         if self.analysis_controller is not None:
             self.analysis_controller.shutdown()
@@ -2145,4 +2201,13 @@ class AnalysisDialog(QDialog):
         self.analysis_controller = None
         self.analysis_process = None
         self.analysis_config_path = None
+
+    def reject(self):
+        # Close button / Escape go through QDialog.done(), which bypasses
+        # closeEvent; WA_DeleteOnClose would otherwise destroy a running worker.
+        self._cleanup_before_close()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._cleanup_before_close()
         super().closeEvent(event)

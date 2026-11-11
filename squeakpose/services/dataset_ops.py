@@ -449,23 +449,31 @@ def _ensure_matching_image(
     images_all_dir: str,
     images_to_label_dir: str,
 ) -> tuple[bool, int, list[str]]:
-    for ext in IMAGE_EXTENSIONS:
-        candidate = os.path.join(images_all_dir, stem + ext)
-        if os.path.exists(candidate):
-            return True, 0, []
+    if _find_image_for_stem(images_all_dir, stem):
+        return True, 0, []
 
-    for ext in IMAGE_EXTENSIONS:
-        src = os.path.join(images_to_label_dir, stem + ext)
-        if os.path.exists(src):
-            dst = os.path.join(images_all_dir, os.path.basename(src))
-            try:
-                os.makedirs(images_all_dir, exist_ok=True)
-                shutil.copy2(src, dst)
-                return True, 1, []
-            except Exception as exc:
-                return False, 0, [f"{stem}{ext}: copy failed ({exc})"]
+    source_name = _find_image_for_stem(images_to_label_dir, stem)
+    if source_name:
+        src = os.path.join(images_to_label_dir, source_name)
+        dst = os.path.join(images_all_dir, source_name)
+        try:
+            os.makedirs(images_all_dir, exist_ok=True)
+            shutil.copy2(src, dst)
+            return True, 1, []
+        except Exception as exc:
+            return False, 0, [f"{source_name}: copy failed ({exc})"]
 
     return False, 0, [f"{label_name}: no matching image found in images_all or images_to_label"]
+
+
+def _find_image_for_stem(images_dir: str, stem: str) -> str:
+    """Return the image file name whose stem matches ``stem`` case-insensitively."""
+
+    wanted = stem.casefold()
+    for name in sorted(list_image_files(images_dir)):
+        if os.path.splitext(name)[0].casefold() == wanted:
+            return name
+    return ""
 
 
 def normalize_label_directory(
@@ -512,13 +520,13 @@ def normalize_label_directory(
         if is_segmentation_mode(mode):
             normalized_lines, line_warnings, line_changed = normalize_segmentation_label_lines(
                 lines,
-                class_count=class_count,
+                class_count=max(1, class_count),
             )
             unusable_msg = f"{fname}: no usable segmentation rows"
         else:
             normalized_lines, line_warnings, line_changed = normalize_pose_label_lines(
                 lines,
-                class_count=class_count,
+                class_count=max(1, class_count),
                 keypoint_count=keypoint_count,
             )
             unusable_msg = f"{fname}: no usable pose rows"

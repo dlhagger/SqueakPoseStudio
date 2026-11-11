@@ -49,6 +49,35 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(buffer.finish(), '{"event":"result"}')
         self.assertEqual(buffer.pending, "")
 
+    def test_json_line_buffer_splits_only_on_newline_and_carriage_return(self):
+        buffer = JsonLineBuffer()
+
+        # Form feed and unicode line/paragraph separators are not protocol
+        # terminators; ``str.splitlines`` would split on them and the pending
+        # text would be overwritten instead of appended.
+        first = buffer.feed('tqdm\x0c progress {"ev')
+        second = buffer.feed('ent":"progress"}\n{"event":"re')
+        third = buffer.feed('sult","message":"a b c"}\n')
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, ['tqdm\x0c progress {"event":"progress"}'])
+        self.assertEqual(third, ['{"event":"result","message":"a b c"}'])
+        self.assertEqual(buffer.pending, "")
+
+    def test_json_line_buffer_handles_carriage_returns_and_split_crlf(self):
+        buffer = JsonLineBuffer()
+
+        self.assertEqual(buffer.feed('{"event":"a"}\r\n{"event":"b"}\r'), ['{"event":"a"}'])
+        self.assertEqual(
+            buffer.feed('\n{"event":"c"}\r{"event":"d"}'),
+            ['{"event":"b"}', '{"event":"c"}'],
+        )
+        self.assertEqual(buffer.pending, '{"event":"d"}')
+        self.assertEqual(buffer.finish(), '{"event":"d"}')
+
+        buffer.feed('{"event":"e"}\r')
+        self.assertEqual(buffer.finish(), '{"event":"e"}')
+
     def test_read_config_requires_json_object(self):
         with TemporaryDirectory() as tmp:
             config_path = os.path.join(tmp, "config.json")

@@ -133,15 +133,7 @@ def load_video_analysis_setup(
     raw_rois = payload.get("rois")
     if isinstance(raw_rois, list):
         state.replace_rois(raw_rois)
-    if not state.rois and not payload.get(ROIS_CLEARED_FIELD):
-        recovered = _recover_analysis_summary_setup(
-            project_root,
-            clean_name,
-            persist=True,
-        )
-        if recovered is not None:
-            return recovered
-    return VideoAnalysisSetup(
+    setup = VideoAnalysisSetup(
         video_name=clean_name,
         frame_width=width,
         frame_height=height,
@@ -150,17 +142,38 @@ def load_video_analysis_setup(
         rois=tuple(state.worker_rois()),
         saved_at=str(payload.get("saved_at") or ""),
     )
+    # Legacy ROI recovery runs at most once per setup file: every save records
+    # SUMMARY_RECOVERY_FIELD, so a file that already carries it (including one the
+    # user saved after deliberately leaving the ROI list empty) is never re-armed.
+    if (
+        not state.rois
+        and not payload.get(ROIS_CLEARED_FIELD)
+        and not payload.get(SUMMARY_RECOVERY_FIELD)
+    ):
+        recovered = _recover_analysis_summary_setup(
+            project_root,
+            clean_name,
+            base=setup,
+            persist=True,
+        )
+        if recovered is not None:
+            return recovered
+    return setup
 
 
 def _recover_analysis_summary_setup(
     project_root: str,
     video_name: str,
     *,
-    frame_width: int = 0,
-    frame_height: int = 0,
+    base: VideoAnalysisSetup | None = None,
     persist: bool = False,
 ) -> VideoAnalysisSetup | None:
-    """Recover legacy ROIs from the newest matching analysis summary once."""
+    """Recover legacy ROIs from the newest matching analysis summary once.
+
+    When ``base`` is given (the setup already saved for this video), only the ROIs
+    are taken from the legacy summary; the saved frame size and scale calibration
+    are preserved so recovery never discards the user's mm/px calibration.
+    """
     summaries_root = os.path.join(os.path.abspath(project_root), "analysis outputs")
     matches: list[tuple[float, str, Mapping[str, Any]]] = []
     for layer_name in ("keypoints", "segmentation"):
@@ -199,15 +212,26 @@ def _recover_analysis_summary_setup(
         state.replace_rois(summary["rois"])
     except (KeyError, TypeError, ValueError):
         return None
-    setup = VideoAnalysisSetup(
-        video_name=video_name,
-        frame_width=state.frame.width,
-        frame_height=state.frame.height,
-        scale_points=(),
-        real_world_distance_mm=1.0,
-        rois=tuple(state.worker_rois()),
-        saved_at="",
-    )
+    if base is not None:
+        setup = VideoAnalysisSetup(
+            video_name=video_name,
+            frame_width=base.frame_width,
+            frame_height=base.frame_height,
+            scale_points=base.scale_points,
+            real_world_distance_mm=base.real_world_distance_mm,
+            rois=tuple(state.worker_rois()),
+            saved_at=base.saved_at,
+        )
+    else:
+        setup = VideoAnalysisSetup(
+            video_name=video_name,
+            frame_width=state.frame.width,
+            frame_height=state.frame.height,
+            scale_points=(),
+            real_world_distance_mm=1.0,
+            rois=tuple(state.worker_rois()),
+            saved_at="",
+        )
     if persist:
         save_video_analysis_setup(
             project_root,

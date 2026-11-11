@@ -178,12 +178,23 @@ class ClassManagerDialog(QDialog):
         row = self.class_list.currentRow()
         if not 0 <= row < len(self._classes):
             return
+        # Persist the editor into the class being removed before the list shifts;
+        # otherwise the synchronous currentRowChanged -> _save_current_keypoints
+        # would write the removed class's keypoints into the class that follows it.
+        self._save_current_keypoints()
+        self._current_row = -1
         name = self._classes.pop(row)
         self._kp_map.pop(name, None)
-        item = self.class_list.takeItem(row)
-        del item
+        new_row = min(row, len(self._classes) - 1)
+        self.class_list.blockSignals(True)
+        try:
+            item = self.class_list.takeItem(row)
+            del item
+            self.class_list.setCurrentRow(new_row)
+        finally:
+            self.class_list.blockSignals(False)
+        self._load_selected_class(new_row)
         QMessageBox.information(self, "Class removed", f"Removed '{name}'.")
-        self.class_list.setCurrentRow(min(row, len(self._classes) - 1))
 
     def _update_count_label(self) -> None:
         keypoints = [

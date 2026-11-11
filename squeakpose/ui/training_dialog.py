@@ -68,6 +68,11 @@ from squeakpose.workers.process import (
 )
 from squeakpose.workers.protocol import WorkerProtocolError, parse_event_line
 
+# After a cancel Ultralytics finishes the current batch, runs validation, and
+# saves checkpoints; on a large validation set or CPU that can take minutes.
+# The user can always click "Force Stop" sooner.
+TRAINING_CANCEL_KILL_AFTER_MS = 10 * 60 * 1000
+
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -834,7 +839,9 @@ class TrainDialog(QDialog):
         return cleaned.replace("\r", "\n").replace("\x1b", "")
 
     def _write_training_terminal_output(self, text: str):
-        for line in self.training_console.feed(text):
+        # stderr lines arrive with their newline stripped; terminate them so the
+        # console buffer commits each line instead of concatenating the whole log.
+        for line in self.training_console.feed(text + "\n"):
             self.log_view.appendPlainText(line)
         self.log_view.ensureCursorVisible()
         QApplication.processEvents()
@@ -852,32 +859,46 @@ class TrainDialog(QDialog):
         self.log_view.ensureCursorVisible()
         QApplication.processEvents()
 
+    def _confirm_and_stop_running_training(self) -> bool:
+        """Return True when the dialog may close (no training, or user canceled it)."""
+        if not self.training_running:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Cancel training?",
+            "Training is still running. Cancel it and close this dialog?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        if self.training_controller is not None:
+            try:
+                self.training_controller.terminal.disconnect(self._finish_training_job)
+            except (TypeError, RuntimeError):
+                pass
+            self.training_controller.shutdown()
+            self.training_controller.deleteLater()
+            self.training_controller = None
+        else:
+            _shutdown_qprocess(self.train_process)
+            _remove_file_quietly(self.train_config_path)
+        self.train_process = None
+        self.train_config_path = None
+        self.training_running = False
+        return True
+
+    def reject(self):
+        # Close button / Escape go through QDialog.done(), which bypasses
+        # closeEvent, so the running-training guard must be applied here too.
+        if not self._confirm_and_stop_running_training():
+            return
+        super().reject()
+
     def closeEvent(self, event):
-        if self.training_running:
-            answer = QMessageBox.question(
-                self,
-                "Cancel training?",
-                "Training is still running. Cancel it and close this dialog?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            if self.training_controller is not None:
-                try:
-                    self.training_controller.terminal.disconnect(self._finish_training_job)
-                except (TypeError, RuntimeError):
-                    pass
-                self.training_controller.shutdown()
-                self.training_controller.deleteLater()
-                self.training_controller = None
-            else:
-                _shutdown_qprocess(self.train_process)
-                _remove_file_quietly(self.train_config_path)
-            self.train_process = None
-            self.train_config_path = None
-            self.training_running = False
+        if not self._confirm_and_stop_running_training():
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def _resolve_model_config(
@@ -1110,10 +1131,17 @@ class TrainDialog(QDialog):
             self._set_training_status("Loading", "running")
         elif event_type == "training":
             self._log(str(event.get("message") or "Training started"))
-            self._set_training_status("Running", "running")
+            if not self.train_cancel_requested:
+                self._set_training_status("Running", "running")
         elif event_type in {"training_setup", "epoch_start", "batch_progress", "epoch_end"}:
             self._update_training_monitor(event)
-            self._set_training_status("Running", "running")
+            # Progress keeps arriving while a cancel winds down (validation and
+            # checkpoint save); do not flip "Canceling" back to "Running".
+            if not self.train_cancel_requested:
+                self._set_training_status("Running", "running")
+        elif event_type == "training_stopping":
+            self._log(str(event.get("message") or "Stopping training..."))
+            self.phase_label.setText("Stopping — saving checkpoints")
         elif event_type == "result":
             self.train_result_event = event
         elif event_type == "error":
@@ -1126,13 +1154,22 @@ class TrainDialog(QDialog):
             }
 
     def _cancel_training_process(self):
+        """First click stops after the current batch and saves; a second click force-stops."""
         controller = self.training_controller
         if controller is None or not controller.is_running:
             return
+        if self.train_cancel_requested:
+            self._log("Force-stopping the training worker. Unsaved progress is lost.")
+            controller.force_stop()
+            return
         self.train_cancel_requested = True
         self._set_training_status("Canceling", "canceled")
-        self._log("Cancel requested. Stopping training worker process...")
-        controller.cancel(kill_after_ms=5000)
+        self.cancel_train_btn.setText("Force Stop")
+        self._log(
+            "Cancel requested. Training stops after the current batch, then validates "
+            "and saves last.pt/best.pt. Click Force Stop to end immediately."
+        )
+        controller.cancel(kill_after_ms=TRAINING_CANCEL_KILL_AFTER_MS)
 
     def _kill_training_process_if_running(self):
         process = (
@@ -1179,6 +1216,7 @@ class TrainDialog(QDialog):
         self.training_running = False
         self.run_btn.setEnabled(True)
         self.cancel_train_btn.setEnabled(False)
+        self.cancel_train_btn.setText("Cancel Training")
         self.train_process = None
         self.train_config_path = None
         self.train_result_event = None
@@ -1212,9 +1250,19 @@ class TrainDialog(QDialog):
 
         if canceled and not had_error:
             self._set_training_status("Canceled", "canceled")
-            self.phase_label.setText("Training canceled")
-            self._log("Training canceled.")
-            QMessageBox.information(self, "Training canceled", "Training was canceled.")
+            if save_dir:
+                self.phase_label.setText("Training stopped early")
+                self._log(f"Training stopped early. Checkpoints saved to: {save_dir}")
+                QMessageBox.information(
+                    self,
+                    "Training stopped",
+                    "Training was stopped early. The last completed checkpoint "
+                    f"(last.pt, best.pt) is saved in:\n{save_dir}",
+                )
+            else:
+                self.phase_label.setText("Training canceled")
+                self._log("Training canceled.")
+                QMessageBox.information(self, "Training canceled", "Training was canceled.")
             return
 
         if (

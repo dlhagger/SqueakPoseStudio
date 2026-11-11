@@ -36,6 +36,7 @@ from analysis_ops import (
 )
 from segmentation_analysis_ops import _parse_polygon, compute_segmentation_detection_features
 from squeakpose.services.analysis_subjects import select_subject_rows
+from squeakpose.services.cancellation import raise_if_canceled
 
 POSE_SKELETON = (
     ("nose", "head"),
@@ -662,12 +663,11 @@ def build_unified_frame_table(
             ].copy()
             # A one-animal recording can safely recover tracker fragments and
             # blank IDs on frames where the selected track is absent. This is
-            # intentionally disabled for multi-animal recordings.
-            if (
-                expected_animals == 1
-                and "subject_class" not in segmentation_raw
-                and "subject_class" not in pose_raw
-            ):
+            # intentionally disabled for multi-animal recordings. The analysis
+            # class selection does not change this: by the time we get here the
+            # raw tables already contain only the selected class, so a one-mouse
+            # recording gets the same recovery whether or not a class was chosen.
+            if expected_animals == 1:
                 pose_primary = _pose_primary(pose_raw)
                 missing = ~pose_primary["frame_index"].isin(pose_layer["frame_index"])
                 pose_layer = pd.concat([pose_layer, pose_primary.loc[missing]], ignore_index=True)
@@ -1302,6 +1302,7 @@ def render_unified_annotated_video(
     try:
         with _open_h264_video_writer(output_path, video_fps, width, height) as writer:
             while True:
+                raise_if_canceled()
                 ok, frame = cap.read()
                 if not ok:
                     break

@@ -200,6 +200,20 @@ def run_predict_server(
                 }
             )
         except Exception as exc:
+            if command == "load":
+                # Mirror sam_worker: a failed warm-up is an ``error`` event so
+                # the service can route it as a background load error (the
+                # load request id is never the current prediction request id)
+                # instead of dropping a ``result`` for an unknown request.
+                event_writer(
+                    {
+                        "event": "error",
+                        "request_id": request_id,
+                        "model_path": model_path,
+                        "error_message": str(exc),
+                    }
+                )
+                continue
             event_writer(
                 {
                     "event": "result",

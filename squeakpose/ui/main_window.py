@@ -174,7 +174,7 @@ from squeakpose.project.safety import (
     break_stale_project_lock,
     canonical_path,
 )
-from squeakpose.project.session import ProjectSession
+from squeakpose.project.session import ProjectSession, require_unique_schema_names
 from squeakpose.services.annotation_save import save_annotation_transaction
 from squeakpose.services.dataset import export_dataset_transaction
 from squeakpose.services.dataset_ops import (
@@ -1007,6 +1007,21 @@ class LabelingApp(QMainWindow):
         except (OSError, UnicodeError) as error:
             self._preserve_invalid_schema_file(path, error)
             return []
+
+    def _require_unique_schema_file(self, path: str, *, kind: str) -> None:
+        """Raise ``ProjectSchemaError`` when a schema file repeats a name.
+
+        Raw lines are passed through so the error reports real file line numbers.
+        Unreadable files are handled by the existing recovery path, not here.
+        """
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw_lines = handle.read().splitlines()
+        except (OSError, UnicodeError):
+            return
+        require_unique_schema_names(raw_lines, source=os.path.basename(path), kind=kind)
 
     def _show_schema_recoveries(self) -> None:
         recoveries = list(getattr(self, "_schema_recoveries", []) or [])
@@ -3394,8 +3409,20 @@ class LabelingApp(QMainWindow):
         """Reload queue file list (used after exporting a frame from video)."""
         self._refresh_queue_images()
         self.images = self.images_queue[:]
-        if self.current_idx >= len(self.images):
+        # Relocate the displayed image by name: a newly exported frame may sort
+        # before it, which shifts every numeric index in the rescanned list.
+        current_name = os.path.basename(getattr(self, "current_image_path", "") or "")
+        if current_name and current_name in self.images:
+            self.current_idx = self.images.index(current_name)
+            self._queue_current_idx = self.current_idx
+        elif current_name and self.images:
+            if self.current_idx >= len(self.images):
+                self.current_idx = max(0, len(self.images) - 1)
+            self._queue_current_idx = self.current_idx
+            self.load_image()
+        elif self.current_idx >= len(self.images):
             self.current_idx = max(0, len(self.images) - 1)
+            self._queue_current_idx = self.current_idx
         self._update_progress_label()
 
     def _warn_image_stem_collisions(self):
@@ -3526,6 +3553,11 @@ class LabelingApp(QMainWindow):
         self.pose_classes, self.pose_kp_names, self._created_label_files = self._ensure_label_files(
             self.pose_class_file, self.pose_keypoint_file
         )
+        # Positional schema files define label indices. Refuse duplicates before any
+        # schema file is rewritten below so no label data is touched.
+        self._require_unique_schema_file(self.pose_class_file, kind="class names")
+        self._require_unique_schema_file(self.pose_keypoint_file, kind="keypoint names")
+        self._require_unique_schema_file(self.seg_class_file, kind="class names")
         self.classes = self.pose_classes[:]
         self.kp_names = self.pose_kp_names[:]
         self.class_keypoints_path = self.pose_class_keypoints_path
@@ -5444,10 +5476,15 @@ class LabelingApp(QMainWindow):
 
     def _inference_controller_busy_changed(self, busy: bool) -> None:
         if busy:
-            self._inference_previous_busy = self._predict_busy
             self._predict_busy = True
         else:
-            self._predict_busy = getattr(self, "_inference_previous_busy", False)
+            # Derive from the live prediction coordinator rather than a saved
+            # copy: a single-image prediction may have finished (or started)
+            # while video inference was running.
+            prediction_coordinator = getattr(self, "_prediction_coordinator", None)
+            self._predict_busy = bool(
+                prediction_coordinator is not None and prediction_coordinator.is_busy
+            )
         if hasattr(self, "predict_btn"):
             self.predict_btn.setEnabled(not busy)
         if hasattr(self, "inference_btn"):
@@ -6403,6 +6440,14 @@ class LabelingApp(QMainWindow):
         else:
             self.class_selector.setCurrentIndex(0)
         self.class_selector.blockSignals(False)
+        self._active_class_id = self.class_selector.currentIndex()
+        session = getattr(self, "_project_session", None)
+        if session is not None:
+            session.select_class(self._active_class_id)
+        # Propagate the new schema to the per-layer mirrors (pose_classes,
+        # pose_kp_names, ...) now rather than at the next layer switch, so
+        # video inference planned immediately afterwards sees it.
+        self._persist_active_layer_state()
         self.annotation_cache.clear()
         self.load_image()
         return True
@@ -6739,10 +6784,21 @@ class LabelingApp(QMainWindow):
             QMessageBox.warning(self, "Invalid class", "Select a valid class before adding boxes.")
             return
         class_name = self.classes[cid]
+        # Keep the existing annotation as the undo baseline so redrawing a box
+        # over a finished annotation can be undone (set_box snapshots the
+        # state it replaces, so restore it after the scene/cache are cleared).
+        prior_state = self.pose_edit_state
+        prior_snapshot = None
+        if prior_state.active_class_id == cid and (
+            prior_state.box is not None or bool(prior_state.keypoints)
+        ):
+            prior_snapshot = prior_state.snapshot()
         self._clear_class_items(cid, drop_cache=True)
         controller = self._bind_pose_annotation_controller()
         if controller is not None:
             controller.select_class(cid)
+            if prior_snapshot is not None:
+                self.pose_edit_state.restore(prior_snapshot)
             controller.set_box(BoundingBox(rect.x(), rect.y(), rect.width(), rect.height(), cid))
         else:
             self.pose_edit_state.select_class(
@@ -6750,6 +6806,8 @@ class LabelingApp(QMainWindow):
                 self._kp_names_for_index(cid),
                 canonical_names=self.kp_names,
             )
+            if prior_snapshot is not None:
+                self.pose_edit_state.restore(prior_snapshot)
             self.pose_edit_state.push_undo_snapshot()
             self.pose_edit_state.set_box(
                 BoundingBox(rect.x(), rect.y(), rect.width(), rect.height(), cid)

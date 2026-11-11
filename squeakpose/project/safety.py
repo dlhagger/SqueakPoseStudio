@@ -132,17 +132,63 @@ def inspect_project_lock(project_root: str) -> tuple[ProjectLockInfo | None, boo
     return info, lock_is_stale(info)
 
 
+def _restore_claimed_lock(claimed: str, path: str, project_root: str) -> None:
+    """Put back a lock that changed hands while it was being broken, never clobbering."""
+
+    try:
+        os.link(claimed, path)
+    except FileExistsError:
+        pass
+    except OSError:
+        logger.warning(
+            "Could not restore a project lock that changed while being broken",
+            exc_info=True,
+            extra={
+                "event": "project_lock_restore_failed",
+                "operation": "break_project_lock",
+                "project_root": os.path.abspath(project_root),
+                "target_path": path,
+            },
+        )
+    try:
+        os.unlink(claimed)
+    except OSError:
+        logger.warning(
+            "Could not remove a claimed project lock",
+            exc_info=True,
+            extra={
+                "event": "project_lock_claim_cleanup_failed",
+                "operation": "break_project_lock",
+                "project_root": os.path.abspath(project_root),
+                "target_path": claimed,
+            },
+        )
+
+
 def break_stale_project_lock(project_root: str) -> ProjectLockInfo:
-    """Remove a provably stale lock after its identity is revalidated."""
+    """Remove a provably stale lock after its identity is revalidated.
+
+    The lock is first renamed to a unique sibling so that only one breaker can claim
+    it; the claimed file is re-read and only unlinked when it still carries the stale
+    identity. Losing the race (the lock vanished or was replaced) reports the project
+    as still locked instead of removing another writer's lock.
+    """
 
     path = project_lock_path(project_root)
     info = _read_lock_info(path)
     if info is None or not lock_is_stale(info):
         raise ProjectLockedError(path, info, stale=False)
-    current = _read_lock_info(path)
+    claimed = f"{path}.breaking-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        os.rename(path, claimed)
+    except FileNotFoundError as exc:
+        current = _read_lock_info(path)
+        raise ProjectLockedError(path, current, stale=lock_is_stale(current)) from exc
+    current = _read_lock_info(claimed)
     if current != info:
+        _restore_claimed_lock(claimed, path, project_root)
         raise ProjectLockedError(path, current, stale=lock_is_stale(current))
-    os.unlink(path)
+    os.unlink(claimed)
     logger.warning(
         "Removed stale project lock",
         extra={

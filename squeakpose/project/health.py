@@ -17,7 +17,7 @@ from squeakpose.project.recovery import (
 )
 
 _IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
-_COPY_SUFFIX_RE = re.compile(r"^(?P<base>.+) (?P<number>[2-9][0-9]*)$")
+_COPY_SUFFIX_RE = re.compile(r"^(?P<base>.+) (?P<number>(?:[2-9]|[1-9][0-9]+))$")
 
 
 @dataclass

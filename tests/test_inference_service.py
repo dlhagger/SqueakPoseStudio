@@ -45,8 +45,8 @@ class InferenceServiceTests(unittest.TestCase):
                 model_paths={LAYER_KEYPOINTS: "pose.pt"},
                 run_id="session-run",
             )
-            self.assertEqual(plan.video_path, str(original))
-            self.assertEqual(plan.jobs[0].video_path, str(original))
+            self.assertEqual(plan.video_path, os.path.realpath(original))
+            self.assertEqual(plan.jobs[0].video_path, os.path.realpath(original))
             prepare_inference_run(plan)
             Path(plan.jobs[0].csv_path).write_text(
                 "frame_index,detection_index,model_path\n0,0,pose.pt\n",
@@ -56,7 +56,7 @@ class InferenceServiceTests(unittest.TestCase):
             accumulator.record(plan.jobs[0], {"event": "result", "rows_written": 1})
             summary = accumulator.finalize()
             manifest = json.loads(Path(summary.manifest_path).read_text(encoding="utf-8"))
-            self.assertEqual(manifest["video_path"], str(original))
+            self.assertEqual(manifest["video_path"], os.path.realpath(original))
             self.assertIn(video_identity(str(link)), project_video_inference_statuses(tmp))
 
             link.unlink()

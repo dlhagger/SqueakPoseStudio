@@ -65,12 +65,16 @@ class PoseEditState:
         entry: Mapping[str, Any] | None = None,
     ) -> None:
         """Replace the active class and optionally restore its cached annotation."""
-        self.active_class_id = None if class_id is None else int(class_id)
+        new_class_id = None if class_id is None else int(class_id)
+        if new_class_id != self.active_class_id:
+            # Undo history belongs to one class edit; re-selecting the same
+            # class (e.g. redrawing its box) must keep it.
+            self._undo_snapshots.clear()
+        self.active_class_id = new_class_id
         self.keypoint_order = [str(name) for name in keypoint_order]
         self.canonical_names = [str(name) for name in canonical_names]
         self.box = None
         self.keypoints = {}
-        self._undo_snapshots.clear()
         if entry is not None and self.active_class_id is not None:
             self.load_annotation(entry)
 

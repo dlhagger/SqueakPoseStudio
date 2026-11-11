@@ -4,6 +4,7 @@ import socket
 import unittest
 from dataclasses import asdict, replace
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from squeakpose.project.paths import ensure_project_structure
 from squeakpose.project.safety import (
@@ -110,6 +111,63 @@ class ProjectLockTests(unittest.TestCase):
             self.assertEqual(removed.token, stale.token)
             lock.acquire()
             lock.release()
+
+    def test_breaking_stale_lock_leaves_no_claim_files_behind(self):
+        with TemporaryDirectory() as tmp:
+            lock = ProjectLock(tmp)
+            stale = replace(lock.info, pid=999_999_999, hostname=socket.gethostname())
+            with open(lock.path, "w", encoding="utf-8") as handle:
+                json.dump(asdict(stale), handle)
+
+            removed = break_stale_project_lock(tmp)
+
+            self.assertEqual(removed, stale)
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_breaking_stale_lock_detects_replacement_before_claim(self):
+        with TemporaryDirectory() as tmp:
+            lock = ProjectLock(tmp)
+            stale = replace(lock.info, pid=999_999_999, hostname=socket.gethostname())
+            with open(lock.path, "w", encoding="utf-8") as handle:
+                json.dump(asdict(stale), handle)
+            live = ProjectLock(tmp)
+            real_rename = os.rename
+
+            def replace_then_rename(src, dst, *args, **kwargs):
+                os.unlink(lock.path)
+                live.acquire()
+                return real_rename(src, dst, *args, **kwargs)
+
+            with patch("squeakpose.project.safety.os.rename", side_effect=replace_then_rename):
+                with self.assertRaises(ProjectLockedError) as raised:
+                    break_stale_project_lock(tmp)
+
+            self.assertFalse(raised.exception.stale)
+            self.assertEqual(raised.exception.info, live.info)
+            self.assertEqual(os.listdir(tmp), [PROJECT_LOCK_FILENAME])
+            status = inspect_project_lock(tmp)
+            self.assertEqual(status, (live.info, False))
+            live.release()
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_breaking_stale_lock_reports_lock_that_disappeared(self):
+        with TemporaryDirectory() as tmp:
+            lock = ProjectLock(tmp)
+            stale = replace(lock.info, pid=999_999_999, hostname=socket.gethostname())
+            with open(lock.path, "w", encoding="utf-8") as handle:
+                json.dump(asdict(stale), handle)
+
+            def vanish_then_rename(src, dst, *args, **kwargs):
+                os.unlink(lock.path)
+                raise FileNotFoundError(src)
+
+            with patch("squeakpose.project.safety.os.rename", side_effect=vanish_then_rename):
+                with self.assertRaises(ProjectLockedError) as raised:
+                    break_stale_project_lock(tmp)
+
+            self.assertIsNone(raised.exception.info)
+            self.assertFalse(raised.exception.stale)
+            self.assertEqual(os.listdir(tmp), [])
 
     def test_invalid_lock_is_not_automatically_treated_as_stale(self):
         with TemporaryDirectory() as tmp:

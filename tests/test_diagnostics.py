@@ -93,6 +93,30 @@ class ProjectLoggingTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(log_path))
             self.assertTrue(os.path.isfile(f"{log_path}.1"))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes only")
+    def test_log_stays_owner_only_after_rollover(self):
+        previous_umask = os.umask(0o022)
+        try:
+            with TemporaryDirectory() as tmp:
+                log_path = configure_project_logging(tmp, max_bytes=256, backup_count=2)
+                self.assertEqual(stat.S_IMODE(os.stat(log_path).st_mode), 0o600)
+                handler = next(
+                    handler
+                    for handler in logging.getLogger().handlers
+                    if getattr(handler, "_squeakpose_project_handler", False)
+                )
+                handler.doRollover()
+                logging.getLogger("squeakpose.test").info(
+                    "after rollover", extra={"event": "rotation_test"}
+                )
+                self._flush_project_handlers()
+
+                self.assertTrue(os.path.isfile(f"{log_path}.1"))
+                self.assertEqual(stat.S_IMODE(os.stat(log_path).st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(os.stat(f"{log_path}.1").st_mode), 0o600)
+        finally:
+            os.umask(previous_umask)
+
 
 if __name__ == "__main__":
     unittest.main()

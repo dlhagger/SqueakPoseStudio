@@ -12,15 +12,29 @@ from typing import Any, Callable, Optional
 
 from squeakpose.core import model_task_mismatch_message
 from squeakpose.project.layers import normalize_layer_id
-from squeakpose.workers.protocol import read_config, write_event
+from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
 
 _CANCEL_REQUESTED = False
 
 
-def _handle_cancel_signal(_signum, _frame):
+class TrainingCanceled(Exception):
+    """Raised from a callback when a cancel arrives before the first training batch."""
+
+
+def _request_cancel() -> None:
     global _CANCEL_REQUESTED
     _CANCEL_REQUESTED = True
-    raise SystemExit(130)
+
+
+def _handle_cancel_signal(_signum, _frame):
+    # Only set the flag. The training callbacks translate it into Ultralytics'
+    # own ``trainer.stop`` so the current batch finishes, the model is
+    # validated, and last.pt/best.pt are saved before ``train()`` returns.
+    _request_cancel()
+
+
+def _cancel_requested() -> bool:
+    return _CANCEL_REQUESTED
 
 
 def _stdout_event_writer(payload: dict[str, Any]) -> None:
@@ -70,8 +84,14 @@ def _trainer_losses(trainer: Any) -> dict[str, float]:
 def _register_training_callbacks(
     model: Any,
     event_writer: Callable[[dict[str, Any]], None],
+    cancel_requested: Callable[[], bool] = _cancel_requested,
 ) -> bool:
-    """Bridge Ultralytics lifecycle callbacks to stable GUI progress events."""
+    """Bridge Ultralytics lifecycle callbacks to stable GUI progress events.
+
+    The same callbacks honor cancel requests: before the first batch training
+    is aborted (nothing worth keeping yet); afterwards ``trainer.stop`` is set
+    so Ultralytics ends at the next batch boundary and saves checkpoints.
+    """
     add_callback = getattr(model, "add_callback", None)
     if not callable(add_callback):
         return False
@@ -80,6 +100,8 @@ def _register_training_callbacks(
         "batch": 0,
         "epoch_started": time.monotonic(),
         "last_batch_emit": 0.0,
+        "batches_run": 0,
+        "stop_announced": False,
     }
 
     def emit(payload: dict[str, Any]) -> None:
@@ -97,7 +119,30 @@ def _register_training_callbacks(
             batches = 0
         return epoch, epochs, max(0, int(batches))
 
+    def honor_cancel(trainer: Any) -> None:
+        if not cancel_requested():
+            return
+        if int(state.get("batches_run", 0)) == 0:
+            raise TrainingCanceled("Training canceled before the first batch.")
+        trainer.stop = True
+        if not state.get("stop_announced"):
+            state["stop_announced"] = True
+            emit(
+                {
+                    "event": "training_stopping",
+                    "message": (
+                        "Stopping after the current batch; validating and saving "
+                        "last.pt/best.pt before exiting."
+                    ),
+                    "save_dir": str(getattr(trainer, "save_dir", "") or ""),
+                }
+            )
+
+    def on_pretrain_routine_end(trainer: Any) -> None:
+        honor_cancel(trainer)
+
     def on_train_start(trainer: Any) -> None:
+        honor_cancel(trainer)
         epoch, epochs, batches = dimensions(trainer)
         emit(
             {
@@ -111,6 +156,7 @@ def _register_training_callbacks(
         )
 
     def on_train_epoch_start(trainer: Any) -> None:
+        honor_cancel(trainer)
         state["batch"] = 0
         state["epoch_started"] = time.monotonic()
         state["last_batch_emit"] = 0.0
@@ -118,6 +164,8 @@ def _register_training_callbacks(
         emit({"event": "epoch_start", "epoch": epoch, "epochs": epochs, "batches": batches})
 
     def on_train_batch_end(trainer: Any) -> None:
+        state["batches_run"] = int(state.get("batches_run", 0)) + 1
+        honor_cancel(trainer)
         epoch, epochs, batches = dimensions(trainer)
         state["batch"] = int(state.get("batch", 0)) + 1
         batch = int(state["batch"])
@@ -178,6 +226,7 @@ def _register_training_callbacks(
             }
         )
 
+    add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
     add_callback("on_train_start", on_train_start)
     add_callback("on_train_epoch_start", on_train_epoch_start)
     add_callback("on_train_batch_end", on_train_batch_end)
@@ -190,10 +239,12 @@ def run_training_worker(
     *,
     model_factory: Optional[Callable[[str], Any]] = None,
     event_writer: Callable[[dict[str, Any]], None] = _stdout_event_writer,
+    reset_cancel: bool = True,
 ) -> int:
     """Run one YOLO training job and emit JSON-compatible event payloads."""
     global _CANCEL_REQUESTED
-    _CANCEL_REQUESTED = False
+    if reset_cancel:
+        _CANCEL_REQUESTED = False
 
     model_cfg = str(config.get("model_cfg") or "")
     layer_id = normalize_layer_id(
@@ -261,11 +312,17 @@ def run_training_worker(
         with contextlib.redirect_stdout(sys.stderr):
             results = model.train(**params)
         save_dir = str(getattr(results, "save_dir", "") or "")
+        if not save_dir:
+            trainer = getattr(model, "trainer", None)
+            save_dir = str(getattr(trainer, "save_dir", "") or "")
+        # A cancel honored via trainer.stop returns normally with checkpoints
+        # saved; report it as canceled but keep save_dir so the UI can point
+        # at the partial run.
         _emit_event(
             event_writer,
             {
                 "event": "result",
-                "canceled": False,
+                "canceled": bool(_CANCEL_REQUESTED),
                 "had_error": False,
                 "error_message": "",
                 "save_dir": save_dir,
@@ -289,6 +346,7 @@ def run_training_worker(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
+    start_cancel_listener(_request_cancel)
 
     parser = argparse.ArgumentParser(description="Run SqueakPose YOLO training in a child process.")
     parser.add_argument("--config", required=True, help="Path to JSON training config.")
@@ -299,7 +357,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:
         _stdout_event_writer({"event": "error", "error_message": f"Could not read config: {exc}"})
         return 1
-    return run_training_worker(config)
+    # Keep a cancel that arrived while the config was loading.
+    return run_training_worker(config, reset_cancel=False)
 
 
 if __name__ == "__main__":

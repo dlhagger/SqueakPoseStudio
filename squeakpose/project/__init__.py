@@ -52,10 +52,12 @@ _EXPORT_MODULES = {
     "require_path_within_project": "squeakpose.project.safety",
     "ActiveProjectPaths": "squeakpose.project.session",
     "LayerSessionSnapshot": "squeakpose.project.session",
+    "ProjectSchemaError": "squeakpose.project.session",
     "ProjectSession": "squeakpose.project.session",
     "ProjectSessionSnapshot": "squeakpose.project.session",
     "ProjectSessionTransition": "squeakpose.project.session",
     "is_builtin_model_reference": "squeakpose.project.session",
+    "require_unique_schema_names": "squeakpose.project.session",
     "resolve_model_reference": "squeakpose.project.session",
     "store_model_reference": "squeakpose.project.session",
 }

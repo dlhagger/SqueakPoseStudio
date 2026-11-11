@@ -186,6 +186,14 @@ def request_pose_proposal(
             },
             json=payload,
         ) as response:
+            if response.is_error:
+                # Read the streamed error body before raising so the API's
+                # own message is available to ``_safe_http_error``; an unread
+                # stream would otherwise surface ``httpx.ResponseNotRead``.
+                try:
+                    response.read()
+                except httpx.HTTPError:
+                    pass
             response.raise_for_status()
             for event in _iter_sse_events(response.iter_lines()):
                 event_type = str(event.get("type") or "")
@@ -451,7 +459,9 @@ def _safe_http_error(response: httpx.Response) -> str:
         payload = response.json()
         error = payload.get("error", {}) if isinstance(payload, Mapping) else {}
         return str(error.get("message") or error.get("code") or response.status_code)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, httpx.StreamError):
+        # ``httpx.ResponseNotRead`` (a ``StreamError``) is raised when a
+        # streaming body was never consumed; fall back to the status code.
         return str(response.status_code)
 
 

@@ -143,6 +143,40 @@ class PersistentWorkerSessionTests(unittest.TestCase):
         self.assertEqual(terminal[0].stderr, "warning one\npartial warning\n")
         self.assertTrue(process.deleted)
 
+    def test_reentrant_finished_during_event_delivery_keeps_result_before_terminal(self):
+        process = _FakePersistentProcess(None)
+        session = PersistentWorkerSession(process_factory=lambda _parent: process)
+        timeline = []
+
+        def on_event(event):
+            timeline.append(("event", event["event"]))
+            if event["event"] == "started":
+                # A consumer slot re-enters the event loop after the child
+                # exited, so Qt dispatches ``finished`` mid-delivery.
+                process.process_state = QProcess.ProcessState.NotRunning
+                process.finished.emit(0, QProcess.ExitStatus.NormalExit)
+
+        session.event_received.connect(on_event)
+        session.terminal.connect(lambda result: timeline.append(("terminal", result)))
+        self.assertTrue(session.start("/python", ["-m", "worker"]))
+
+        process.stdout = (
+            b'{"event":"ready"}\n'
+            b'{"event":"started","request_id":1}\n'
+            b'{"event":"result","request_id":1}\n'
+        )
+        process.readyReadStandardOutput.emit()
+
+        kinds = [kind for kind, _ in timeline]
+        self.assertEqual(kinds.count("terminal"), 1)
+        self.assertEqual(
+            [name for kind, name in timeline if kind == "event"],
+            ["ready", "started", "result"],
+        )
+        self.assertEqual(timeline[-1][0], "terminal")
+        self.assertEqual(timeline[-1][1].state, "finished")
+        self.assertFalse(session.is_running)
+
     def test_shutdown_writes_command_then_terminates_and_kills(self):
         scheduled = []
         process = _FakePersistentProcess(None)

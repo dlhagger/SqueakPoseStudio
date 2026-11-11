@@ -8,8 +8,10 @@ from squeakpose.project import (
     LAYER_KEYPOINTS,
     LAYER_SEGMENTATION,
     ProjectPathError,
+    ProjectSchemaError,
     ProjectSession,
     is_builtin_model_reference,
+    require_unique_schema_names,
     resolve_model_reference,
     store_model_reference,
 )
@@ -44,6 +46,32 @@ class ProjectModelReferenceTests(unittest.TestCase):
                 resolve_model_reference(tmp, "../outside.pt")
             with self.assertRaises(ProjectPathError):
                 store_model_reference(tmp, "../outside.pt")
+
+    def test_model_under_symlinked_project_directory_is_stored_absolutely(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as outside:
+            root = Path(tmp)
+            external_models = Path(outside) / "models"
+            external_models.mkdir()
+            (external_models / "pose.pt").write_bytes(b"model")
+            link = root / "models"
+            try:
+                os.symlink(external_models, link, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation is unavailable")
+            model_path = str(link / "pose.pt")
+            self.assertTrue(os.path.isfile(model_path))
+
+            stored = store_model_reference(tmp, model_path)
+
+            self.assertTrue(os.path.isabs(stored))
+            self.assertEqual(stored, os.path.abspath(model_path))
+
+            session = ProjectSession(tmp, layer_model_paths={LAYER_KEYPOINTS: model_path})
+            preferences = session.to_preferences()
+            self.assertEqual(preferences["layers"][LAYER_KEYPOINTS]["model_path"], stored)
+
+            restored = ProjectSession.from_preferences(tmp, preferences)
+            self.assertEqual(restored.snapshot().layer(LAYER_KEYPOINTS).model_path, stored)
 
 
 class ProjectSessionPreferenceTests(unittest.TestCase):
@@ -164,6 +192,73 @@ class ProjectSessionPreferenceTests(unittest.TestCase):
             )
             self.assertEqual(restored.active_model_path, str(pose_model))
             self.assertEqual(restored.assistant_model_path, str(assistant_model))
+
+
+class ProjectSchemaNameTests(unittest.TestCase):
+    def test_unique_names_are_stripped_and_blank_lines_dropped(self):
+        self.assertEqual(
+            require_unique_schema_names(
+                [" mouse ", "", "rat\n", "   "], source="classes.txt", kind="class names"
+            ),
+            ["mouse", "rat"],
+        )
+
+    def test_duplicate_names_raise_with_file_and_line_numbers(self):
+        with self.assertRaises(ProjectSchemaError) as raised:
+            require_unique_schema_names(
+                ["mouse", "mouse", "", "rat", "rat "], source="classes.txt", kind="class names"
+            )
+        message = str(raised.exception)
+        self.assertEqual(
+            message,
+            "classes.txt contains duplicate class names: 'mouse' (lines 1, 2), 'rat' (lines 4, 5)",
+        )
+        self.assertIsInstance(raised.exception, ValueError)
+
+    def test_session_rejects_duplicate_pose_classes_without_shifting_indices(self):
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ProjectSchemaError) as raised:
+                ProjectSession(tmp, pose_classes=["mouse", "mouse", "rat"])
+            self.assertIn(
+                "classes.txt contains duplicate class names: 'mouse' (lines 1, 2)",
+                str(raised.exception),
+            )
+
+    def test_session_rejects_duplicate_keypoints_and_segmentation_classes(self):
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ProjectSchemaError) as raised:
+                ProjectSession(tmp, pose_classes=["mouse"], pose_keypoints=["nose", "tail", "nose"])
+            self.assertIn(
+                "keypoints.txt contains duplicate keypoint names: 'nose'", str(raised.exception)
+            )
+            with self.assertRaises(ProjectSchemaError) as raised:
+                ProjectSession(tmp, segmentation_classes=["body", "body"])
+            self.assertIn(
+                "classes_seg.txt contains duplicate class names: 'body'", str(raised.exception)
+            )
+            with self.assertRaises(ProjectSchemaError) as raised:
+                ProjectSession.from_preferences(
+                    tmp, {}, pose_classes=["mouse"], pose_keypoints=["a", "a"]
+                )
+            self.assertIn("keypoints.txt", str(raised.exception))
+
+    def test_session_rejects_duplicate_per_class_keypoints(self):
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ProjectSchemaError) as raised:
+                ProjectSession(
+                    tmp,
+                    pose_classes=["mouse"],
+                    pose_keypoints=["nose", "tail"],
+                    pose_class_keypoints={"mouse": ["nose", "nose"]},
+                )
+            self.assertIn("class_keypoints.json entry 'mouse'", str(raised.exception))
+
+    def test_capture_active_state_rejects_duplicates_and_keeps_previous_schema(self):
+        with TemporaryDirectory() as tmp:
+            session = ProjectSession(tmp, pose_classes=["mouse"], pose_keypoints=["nose"])
+            with self.assertRaises(ProjectSchemaError):
+                session.capture_active_state(classes=["mouse", "mouse"])
+            self.assertEqual(session.snapshot().layer(LAYER_KEYPOINTS).classes, ("mouse",))
 
 
 class ProjectSessionTransitionTests(unittest.TestCase):

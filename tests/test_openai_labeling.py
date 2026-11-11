@@ -156,6 +156,62 @@ class OpenAILabelingTests(unittest.TestCase):
         self.assertEqual(proposal.usage.reasoning_tokens, 125)
         self.assertEqual(proposal.usage.total_tokens, 1500)
 
+    def test_streaming_http_error_surfaces_api_message(self):
+        body = json.dumps(
+            {"error": {"message": "Rate limit reached for gpt-6-astra", "code": "rate_limit"}}
+        ).encode("utf-8")
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            # Passing ``stream=`` (instead of ``content=``) leaves the body
+            # unread, exactly like a real streamed 4xx/5xx response.
+            return httpx.Response(
+                429,
+                headers={"content-type": "application/json"},
+                stream=httpx.ByteStream(body),
+            )
+
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "frame.png"
+            image_path.write_bytes(b"image")
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                with self.assertRaises(OpenAILabelingError) as raised:
+                    request_pose_proposal(
+                        access_token="token",
+                        model="gpt-6-astra",
+                        image_path=str(image_path),
+                        image_width=100,
+                        image_height=100,
+                        class_name="mouse",
+                        keypoint_names=("nose",),
+                        client=client,
+                    )
+
+        message = str(raised.exception)
+        self.assertIn("OpenAI rejected the labeling request", message)
+        self.assertIn("Rate limit reached for gpt-6-astra", message)
+        self.assertNotIn("ResponseNotRead", message)
+        self.assertNotIn("read()", message)
+
+    def test_streaming_http_error_without_json_body_falls_back_to_status_code(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, stream=httpx.ByteStream(b"<html>bad gateway</html>"))
+
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "frame.png"
+            image_path.write_bytes(b"image")
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                with self.assertRaisesRegex(OpenAILabelingError, "503"):
+                    request_pose_proposal(
+                        access_token="token",
+                        model="gpt-6-astra",
+                        image_path=str(image_path),
+                        image_width=100,
+                        image_height=100,
+                        class_name="mouse",
+                        keypoint_names=("nose",),
+                        client=client,
+                    )
+
     def test_missing_requested_keypoint_is_rejected(self):
         with self.assertRaisesRegex(OpenAILabelingError, "tail_base"):
             _parse_single_proposal(

@@ -28,6 +28,7 @@ htmlcov/
 /.codex/
 /.aws/
 /AUDIT_FIX_PLAN.md
+/BUG_REVIEW_*.md
 .env
 .env.*
 !.env.example

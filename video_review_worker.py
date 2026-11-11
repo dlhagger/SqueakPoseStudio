@@ -14,7 +14,7 @@ from squeakpose.services.prediction_serialization import (
     serialize_prediction_result,
     top_prediction_from_payload,
 )
-from squeakpose.workers.protocol import read_config, write_event
+from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
 
 _CANCEL_REQUESTED = False
 
@@ -309,6 +309,9 @@ def run_video_review_worker(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
+    # Portable cancel channel: QProcess.terminate() does not reach console
+    # children on Windows, so the owner also sends a stdin cancel line.
+    start_cancel_listener(lambda: _handle_cancel_signal(None, None))
 
     parser = argparse.ArgumentParser(
         description="Run SqueakPose Video Reviewer prediction in a child process."

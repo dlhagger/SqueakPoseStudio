@@ -101,6 +101,19 @@ output before terminating; the controller captures stderr, escalates cancel from
 terminate to kill, and emits exactly one terminal result. Analysis, training,
 distillation, video-review passes, and inference passes use this mode.
 
+Cancel is cooperative first. `WorkerJobController.cancel()` writes
+`{"command": "cancel"}` to the worker's stdin and then calls `terminate()`; the stdin
+line is the portable channel because `terminate()` does not reach console children on
+Windows. Workers start `start_cancel_listener` and use flag-only SIGTERM handlers, then
+stop at their own checkpoints and still emit a `result` with `canceled: true`:
+inference and video review keep rows/predictions already written; analysis raises
+`OperationCanceled` (a `BaseException`) at every progress step and rendered frame,
+which unwinds through `AnalysisOutputTransaction` so the previous published analysis
+is untouched; training sets Ultralytics' `trainer.stop`, so the current batch finishes
+and `last.pt`/`best.pt` are saved (a cancel before the first batch aborts outright).
+`force_stop()` kills immediately; the analysis and training dialogs expose it as a
+second click on their cancel buttons.
+
 Prediction and the interactive SAM assistant use separate `PersistentWorkerSession`
 instances. Each worker emits `ready`, then accepts newline-delimited request objects on
 stdin. Load and prediction replies carry the caller's `request_id`; their services
@@ -209,7 +222,8 @@ baseline covers `squeakpose/project`, `squeakpose/annotation`, `squeakpose/servi
 `squeakpose/workers`. The configuration checks typed and untyped function bodies,
 rejects implicit optional values, and reports redundant casts and unused suppressions.
 Missing third-party stubs are ignored because the Qt and scientific/model stack does not
-consistently publish typing metadata; no local package is covered by a blanket
+consistently publish typing metadata; `no_site_packages` keeps a full local environment
+checking the same way as CI's dev-only install (PyQt6 6.12.0's bundled stubs do not parse); no local package is covered by a blanket
 `ignore_errors` override.
 
 ## Dependency boundary audit

@@ -26,7 +26,9 @@ def _uv(group: str, *args: str) -> list[str]:
 CHECKS: tuple[tuple[str, list[str]], ...] = (
     ("Ruff lint", _uv("dev", "ruff", "check", ".")),
     ("Ruff format", _uv("dev", "ruff", "format", "--check", ".")),
-    ("mypy", _uv("dev", "mypy")),
+    # Run mypy through the interpreter rather than its generated mypy.exe launcher, which
+    # Windows App Control policies on managed machines can block.
+    ("mypy", _uv("dev", "python", "-m", "mypy")),
     ("Unit tests", _uv("test", "python", "-m", "unittest", "discover", "-s", "tests", "-q")),
 )
 

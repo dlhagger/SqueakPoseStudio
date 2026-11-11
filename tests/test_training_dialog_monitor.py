@@ -61,6 +61,35 @@ class TrainingDialogMonitorTests(unittest.TestCase):
         )
         return parent, dialog
 
+    def test_stale_dataset_yaml_requires_confirmation_before_training(self):
+        with TemporaryDirectory() as tmp:
+            parent, dialog = self._make_dialog(tmp)
+            moved = Path(tmp) / "moved" / "datasets" / "pose"
+            moved.mkdir(parents=True)
+            original = Path(tmp) / "original" / "datasets" / "pose"
+            original.mkdir(parents=True)
+            stale_yaml = moved / "dataset.yaml"
+            stale_yaml.write_text(
+                f"path: {original}\ntrain: images/train\nval: images/val\n", encoding="utf-8"
+            )
+            current_yaml = original / "dataset.yaml"
+            current_yaml.write_text("train: images/train\nval: images/val\n", encoding="utf-8")
+
+            with patch.object(QMessageBox, "question") as question:
+                self.assertTrue(dialog._confirm_dataset_location(str(current_yaml)))
+            question.assert_not_called()
+
+            no = QMessageBox.StandardButton.No
+            with patch.object(QMessageBox, "question", return_value=no) as question:
+                self.assertFalse(dialog._confirm_dataset_location(str(stale_yaml)))
+            question.assert_called_once()
+            self.assertIn(str(original), question.call_args.args[2])
+
+            yes = QMessageBox.StandardButton.Yes
+            with patch.object(QMessageBox, "question", return_value=yes):
+                self.assertTrue(dialog._confirm_dataset_location(str(stale_yaml)))
+            parent.close()
+
     def test_terminal_output_lines_are_committed_individually(self):
         with TemporaryDirectory() as tmp:
             parent, dialog = self._make_dialog(tmp)

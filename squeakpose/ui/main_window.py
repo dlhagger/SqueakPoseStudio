@@ -48,6 +48,7 @@ from PyQt6.QtGui import (
     QTextCursor,
 )
 from PyQt6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QDialog,
     QDialogButtonBox,
@@ -178,6 +179,13 @@ from squeakpose.project.safety import (
     require_path_within_project,
 )
 from squeakpose.project.session import ProjectSession, require_unique_schema_names
+from squeakpose.sam_models import (
+    DEFAULT_SAM_VARIANT,
+    SAM_MODELS,
+    get_sam_model,
+    official_sam_variant,
+    sam_download_target,
+)
 from squeakpose.services.annotation_save import save_annotation_transaction
 from squeakpose.services.dataset import export_dataset_transaction
 from squeakpose.services.dataset_ops import (
@@ -234,13 +242,6 @@ from squeakpose.services.prediction import (
     validate_prediction_identity,
 )
 from squeakpose.services.prediction_serialization import rank_prediction_frames
-from squeakpose.services.sam_models import (
-    DEFAULT_SAM_VARIANT,
-    SAM_MODELS,
-    get_sam_model,
-    official_sam_variant,
-    sam_download_target,
-)
 from squeakpose.services.segmentation_transfer import (
     create_pose_instances,
     incomplete_pose_instances,
@@ -3834,6 +3835,7 @@ class LabelingApp(QMainWindow):
         print(f"🧠 Inference device: {self._device}")
         # Build UI and load first image
         self._setup_ui()
+        self._limit_button_focus_to_keyboard()
         self._depth_preview_presenter = DepthPreviewPresenter(
             self.scene,
             range_view=self.depth_range_frame,
@@ -4662,6 +4664,21 @@ class LabelingApp(QMainWindow):
         self._bind_shortcuts()
 
     # ---------- Class & annotation helpers ----------
+
+    def _limit_button_focus_to_keyboard(self) -> None:
+        """Keep window buttons from taking focus on click (Tab still reaches them).
+
+        On Windows/Linux a clicked button keeps focus, so a later Space press (used for
+        canvas panning) would re-click Next/Skip/Complete or toggle a checkbox.
+        """
+        click_focus = (
+            Qt.FocusPolicy.ClickFocus,
+            Qt.FocusPolicy.StrongFocus,
+            Qt.FocusPolicy.WheelFocus,
+        )
+        for button in self.findChildren(QAbstractButton):
+            if button.focusPolicy() in click_focus:
+                button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
 
     def _bind_pose_annotation_controller(self) -> Optional[PoseAnnotationController]:
         controller = getattr(self, "_pose_controller", None)
@@ -5699,7 +5716,6 @@ class LabelingApp(QMainWindow):
         progress.setLabelText(
             f"{video_prefix}Pass {job.job_index}/{job.job_total} · {job.display_name}\n{detail}"
         )
-        QApplication.processEvents()
 
     def _inference_controller_pass_finished(self, result: InferencePassResult) -> None:
         if self._inference_progress is not None:

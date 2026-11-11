@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from squeakpose.project import safety
 from squeakpose.project.paths import ensure_project_structure
 from squeakpose.project.safety import (
     PROJECT_LOCK_FILENAME,
@@ -274,6 +275,75 @@ class ProjectLockTests(unittest.TestCase):
             with self.assertRaises(ProjectLockedError) as raised:
                 break_stale_project_lock(tmp)
             self.assertFalse(raised.exception.stale)
+
+
+class _FakeExitCode:
+    def __init__(self):
+        self.value = 0
+
+
+class _FakeKernel32:
+    """Stand-in for kernel32 exposing only what _windows_pid_is_running uses."""
+
+    exit_code_type = _FakeExitCode
+
+    def __init__(self, *, handle=1, last_error=0, exit_code=259, query_ok=True):
+        self.handle = handle
+        self.last_error = last_error
+        self.exit_code = exit_code
+        self.query_ok = query_ok
+        self.closed = []
+        self.opened = []
+
+    def OpenProcess(self, access, inherit, pid):
+        self.opened.append((access, inherit, pid))
+        return self.handle
+
+    def GetExitCodeProcess(self, handle, exit_code):
+        exit_code.value = self.exit_code
+        return self.query_ok
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+
+    def get_last_error(self):
+        return self.last_error
+
+    @staticmethod
+    def byref(value):
+        return value
+
+
+class WindowsProcessProbeTests(unittest.TestCase):
+    def test_running_process_is_detected_and_handle_closed(self):
+        kernel32 = _FakeKernel32(exit_code=259)
+        self.assertTrue(safety._windows_pid_is_running(4242, kernel32))
+        self.assertEqual(kernel32.opened, [(0x1000, False, 4242)])
+        self.assertEqual(kernel32.closed, [1])
+
+    def test_exited_process_is_not_running(self):
+        kernel32 = _FakeKernel32(exit_code=0)
+        self.assertFalse(safety._windows_pid_is_running(4242, kernel32))
+        self.assertEqual(kernel32.closed, [1])
+
+    def test_access_denied_means_the_process_exists(self):
+        kernel32 = _FakeKernel32(handle=0, last_error=5)
+        self.assertTrue(safety._windows_pid_is_running(4242, kernel32))
+        self.assertEqual(kernel32.closed, [])
+
+    def test_missing_process_is_not_running(self):
+        kernel32 = _FakeKernel32(handle=0, last_error=87)
+        self.assertFalse(safety._windows_pid_is_running(4242, kernel32))
+
+    def test_windows_never_uses_os_kill_signal_zero(self):
+        with (
+            patch.object(safety.os, "name", "nt"),
+            patch.object(safety, "_windows_pid_is_running", return_value=True) as probe,
+            patch.object(safety.os, "kill") as kill,
+        ):
+            self.assertTrue(safety._pid_is_running(4242))
+        probe.assert_called_once_with(4242)
+        kill.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ import argparse
 import os
 import sys
 
+from squeakpose.sam_models import SAM_MODELS
 from squeakpose.services.model_download import download_sam_weights
-from squeakpose.services.sam_models import SAM_MODELS
 from squeakpose.workers.protocol import write_event
 
 

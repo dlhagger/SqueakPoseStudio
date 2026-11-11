@@ -233,13 +233,13 @@ class PredictionApplicationPlanTests(unittest.TestCase):
                     "class_id": 0,
                     "confidence": 0.7,
                     "xyxy": [0, 1, 10, 11],
-                    "keypoints": [[1, 2, 0.4], [3, 4, 0.5]],
+                    "keypoints": [[1, 2, 0.4], [3, 4, 0.5], [5, 6, 0.1]],
                 },
                 {
                     "class_id": 0,
                     "confidence": 0.7,
                     "xyxy": [5, 6, 25, 26],
-                    "keypoints": [[7, 8, 0.8], [9, 10, 0.9]],
+                    "keypoints": [[7, 8, 0.8], [9, 10, 0.9], [11, 12, 0.2]],
                 },
                 {
                     "class_id": 1,
@@ -271,6 +271,38 @@ class PredictionApplicationPlanTests(unittest.TestCase):
         self.assertEqual([point.name for point in mouse.keypoints], ["nose", "tail"])
         self.assertEqual([point.name for point in rat.keypoints], ["tail"])
         self.assertEqual(rat.keypoints[0].confidence, 0.95)
+
+    def test_pose_plan_rejects_model_with_a_different_keypoint_count(self):
+        prediction = {
+            "detections": [
+                {
+                    "class_id": 0,
+                    "confidence": 0.9,
+                    "xyxy": [0, 1, 10, 11],
+                    "keypoints": [[1, 2, 0.9], [3, 4, 0.9]],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(PredictionValidationError, "outputs 2 keypoints.*defines 3"):
+            plan_prediction_application(
+                prediction,
+                expected_layer="keypoints",
+                class_names=["mouse"],
+                canonical_keypoints=["nose", "tail", "ear"],
+                active_class_id=0,
+            )
+
+        # Detections without keypoints (box-only output) are not a schema mismatch.
+        box_only = {"detections": [{"class_id": 0, "confidence": 0.9, "xyxy": [0, 1, 10, 11]}]}
+        plan = plan_prediction_application(
+            box_only,
+            expected_layer="keypoints",
+            class_names=["mouse"],
+            canonical_keypoints=["nose", "tail", "ear"],
+            active_class_id=0,
+        )
+        self.assertEqual(plan.outcome, "ready")
 
     def test_pose_plan_falls_back_to_active_class_and_reports_bad_boxes(self):
         prediction = {

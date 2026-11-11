@@ -48,7 +48,10 @@ repository-root implementation modules. The supported root modules
 `layer_ops`, `prediction_ops`, `inference_ops`, and `ui_style`) are compatibility shims
 that point inward to canonical package implementations. Internal code must use the
 package path. A focused AST regression test enforces this rule for annotation, project,
-service, and worker packages.
+service, and worker packages, and a second one forbids annotation and project modules
+from importing services, workers, or UI. Dependency-free catalogs shared across layers
+live at the base (for example `squeakpose.sam_models`; `squeakpose.services.sam_models`
+is a compatibility alias).
 
 Package initializers resolve convenience exports lazily. In particular, importing
 `squeakpose.annotation.pose` or `squeakpose.annotation.segmentation` must not initialize

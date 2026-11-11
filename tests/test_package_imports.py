@@ -98,6 +98,34 @@ assert not any(name == "PyQt6" or name.startswith("PyQt6.") for name in sys.modu
 
         self.assertEqual(violations, [])
 
+    def test_project_and_annotation_do_not_import_higher_layers(self):
+        """Project/annotation state sits below services, workers, and UI (ARCHITECTURE.md)."""
+        package_root = Path(__file__).resolve().parents[1] / "squeakpose"
+        higher = ("squeakpose.services", "squeakpose.workers", "squeakpose.ui")
+        violations: list[str] = []
+        for relative_root in ("annotation", "project"):
+            for source_path in (package_root / relative_root).rglob("*.py"):
+                tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        modules = [alias.name for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                        modules = [node.module]
+                    else:
+                        continue
+                    for module in modules:
+                        if any(module == name or module.startswith(f"{name}.") for name in higher):
+                            violations.append(f"{source_path.relative_to(package_root)}: {module}")
+
+        self.assertEqual(violations, [])
+
+    def test_services_sam_models_is_a_compatibility_alias(self):
+        import squeakpose.sam_models as canonical
+        import squeakpose.services.sam_models as compatibility
+
+        for name in canonical.__all__:
+            self.assertIs(getattr(compatibility, name), getattr(canonical, name))
+
 
 if __name__ == "__main__":
     unittest.main()

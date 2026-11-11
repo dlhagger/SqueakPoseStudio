@@ -11,7 +11,6 @@ from PyQt6.QtCore import QProcess, Qt
 from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -41,6 +40,7 @@ from squeakpose.project.distillation import (
     distillation_export_search_roots as _distillation_export_search_roots,
 )
 from squeakpose.project.layers import layer_definition, normalize_layer_id
+from squeakpose.services.dataset_yaml import stale_dataset_root
 from squeakpose.services.training import (
     TrainingConfigError,
     TrainingConsoleBuffer,
@@ -870,7 +870,6 @@ class TrainDialog(QDialog):
         for line in self.training_console.feed(text + "\n"):
             self.log_view.appendPlainText(line)
         self.log_view.ensureCursorVisible()
-        QApplication.processEvents()
 
     def _flush_training_terminal_output(self):
         for line in self.training_console.finish():
@@ -883,7 +882,26 @@ class TrainDialog(QDialog):
             return
         self.log_view.appendPlainText(cleaned.rstrip())
         self.log_view.ensureCursorVisible()
-        QApplication.processEvents()
+
+    def _confirm_dataset_location(self, yaml_path: str) -> bool:
+        """Warn before training on images outside this project (moved/copied project).
+
+        Datasets exported by older versions stored an absolute ``path``; after moving or
+        copying the project it still points at the original location.
+        """
+        stale_root = stale_dataset_root(yaml_path)
+        if stale_root is None:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Dataset points to another location",
+            "This dataset.yaml was exported before the project was moved or copied, so "
+            f"training would use the images in:\n{stale_root}\n\n"
+            "Re-export the dataset to train on this project's images. Train anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _confirm_and_stop_running_training(self) -> bool:
         """Return True when the dialog may close (no training, or user canceled it)."""
@@ -1001,6 +1019,9 @@ class TrainDialog(QDialog):
                 "run_name": "Run name required",
             }.get(exc.code, "Invalid training configuration")
             QMessageBox.warning(self, title, str(exc))
+            return
+
+        if plan.dataset_yaml and not self._confirm_dataset_location(plan.dataset_yaml):
             return
 
         resolved = plan.dataset_yaml

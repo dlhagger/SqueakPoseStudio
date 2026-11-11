@@ -19,7 +19,7 @@ from squeakpose.project.layers import (
 from squeakpose.project.metadata import ProjectMetadataStore
 from squeakpose.project.paths import ProjectPaths
 from squeakpose.project.safety import ProjectPathError, require_path_within_project
-from squeakpose.services.sam_models import resolve_sam_variant
+from squeakpose.sam_models import resolve_sam_variant
 
 PathExists = Callable[[str], bool]
 BUILTIN_DEPTH_MODEL_REFERENCES = frozenset(f"yolo26{size}-depth.pt" for size in "nslmx")

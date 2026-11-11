@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from squeakpose.project.layers import LAYER_DEPTH, LAYER_KEYPOINTS, LAYER_SEGMENTATION
-from squeakpose.services.sam_models import DEFAULT_SAM_VARIANT, SAM_MODELS, get_sam_model
+from squeakpose.sam_models import DEFAULT_SAM_VARIANT, SAM_MODELS, get_sam_model
 from squeakpose.ui.style import (
     ThemedComboBox,
     apply_panel_shadow,

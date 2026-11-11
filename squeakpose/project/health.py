@@ -177,7 +177,11 @@ def scan_project_health(
             and not os.path.islink(os.path.join(current, name))
         ]
         for name in file_names:
-            if name.startswith(".") and name.endswith(".json") and "config" in name:
+            # Leftover worker configs and their cancel markers (``<config>.cancel``) from a
+            # crashed run. Config names are unique per run, so a stale marker can never
+            # cancel a later job; they are reported for manual cleanup only.
+            is_config = name.endswith(".json") or name.endswith(".json.cancel")
+            if name.startswith(".") and is_config and "config" in name:
                 report.worker_config_paths.append(os.path.join(current, name))
 
     report.worker_config_paths = sorted(set(report.worker_config_paths), key=str.casefold)

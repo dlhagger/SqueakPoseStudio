@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 
-from squeakpose.services.sam_models import get_sam_model
+from squeakpose.sam_models import get_sam_model
 
 
 def download_sam_weights(

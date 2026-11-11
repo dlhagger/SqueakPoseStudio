@@ -1006,7 +1006,6 @@ class VideoReviewDialog(QDialog):
                     f"Pass {self._review_pass_index}/{self._review_pass_total} · "
                     f"{layer_definition(self._review_current_layer).display_name}\n{detail}"
                 )
-            QApplication.processEvents()
         elif event_type == "batch_adjusted":
             effective_batch = int(event.get("effective_batch") or 1)
             if self._review_run_meta is not None:
@@ -1016,7 +1015,6 @@ class VideoReviewDialog(QDialog):
                 progress.setLabelText(
                     str(event.get("message") or f"Reducing inference batch to {effective_batch}")
                 )
-            QApplication.processEvents()
         elif event_type == "result":
             self._review_result_event = event
         elif event_type == "error":

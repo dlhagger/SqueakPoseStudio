@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -443,6 +443,10 @@ def plan_prediction_application(
         raise PredictionValidationError(f"Unsupported prediction layer: {layer_id}")
     keypoint_names = tuple(str(name) for name in canonical_keypoints)
     class_keypoint_map = class_keypoints or {}
+    _require_matching_keypoint_count(
+        (detections[index].get("keypoints") for _cid, index in selected_items),
+        keypoint_names,
+    )
     boxes: list[PoseDetectionPlan] = []
     for class_id, detection_index in selected_items:
         detection = detections[detection_index]
@@ -477,6 +481,26 @@ def plan_prediction_application(
         selected_classes=selected_classes,
         pose=tuple(boxes),
     )
+
+
+def _require_matching_keypoint_count(
+    raw_keypoint_lists: Iterable[Any], keypoint_names: Sequence[str]
+) -> None:
+    """Reject a model whose keypoint count differs from the project schema.
+
+    Keypoints are matched by position, so a model trained on another schema would
+    silently attach its points to the wrong names.
+    """
+    expected = len(keypoint_names)
+    for raw in raw_keypoint_lists:
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or not raw:
+            continue
+        if len(raw) != expected:
+            raise PredictionValidationError(
+                f"The prediction model outputs {len(raw)} keypoints, but this project defines "
+                f"{expected} ({', '.join(keypoint_names)}). Select a model trained on this "
+                "project's keypoint schema."
+            )
 
 
 def _best_detections_by_class(

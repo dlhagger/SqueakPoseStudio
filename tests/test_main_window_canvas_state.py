@@ -144,6 +144,24 @@ class MainWindowRegressionTests(unittest.TestCase):
 
     # Item 1 -------------------------------------------------------------------------
 
+    def test_window_buttons_do_not_take_focus_on_click(self):
+        with TemporaryDirectory() as tmp:
+            stack, window, _paths = self._open_window(Path(tmp))
+            with stack:
+                buttons = window.findChildren(qt_widgets.QAbstractButton)
+                self.assertTrue(buttons)
+                click_focus = (
+                    Qt.FocusPolicy.ClickFocus,
+                    Qt.FocusPolicy.StrongFocus,
+                    Qt.FocusPolicy.WheelFocus,
+                )
+                offenders = [
+                    button.objectName() or button.text()
+                    for button in buttons
+                    if button.focusPolicy() in click_focus
+                ]
+                self.assertEqual(offenders, [])
+
     def test_clearing_the_last_image_drops_view_owned_scene_items(self):
         with TemporaryDirectory() as tmp:
             stack, window, _paths = self._open_window(Path(tmp))

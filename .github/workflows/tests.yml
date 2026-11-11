@@ -88,3 +88,41 @@ jobs:
           MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
           QT_QPA_PLATFORM: offscreen
         run: uv run --locked --only-group test python tests/render_ui_screenshots.py --output-dir "${{ runner.temp }}/squeakpose-ui"
+
+  windows-unit-tests:
+    # Windows has its own code paths (cancel marker files, process liveness checks,
+    # credential file locking, file replacement while open) that Linux CI cannot exercise.
+    name: Unit tests (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          prune-cache: true
+          version: "0.12.2"
+
+      - name: Install Python
+        run: uv python install
+
+      - name: Install locked test dependencies
+        run: uv sync --locked --only-group test
+
+      - name: Run unit tests
+        env:
+          MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --locked --only-group test python -m unittest discover -s tests -q
+
+      - name: Construct and render the application UI
+        env:
+          MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --locked --only-group test python tests/render_ui_screenshots.py --output-dir "${{ runner.temp }}/squeakpose-ui"

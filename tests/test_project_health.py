@@ -43,6 +43,26 @@ class ProjectHealthTests(unittest.TestCase):
                 sorted(("frame.png", f"frame {number}.png") for number in range(10, 20)),
             )
 
+    def test_scan_reports_leftover_worker_configs_and_cancel_markers(self):
+        with TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs"
+            logs.mkdir()
+            config = logs / ".analysis_config_ab12cd34.json"
+            config.write_text("{}", encoding="utf-8")
+            marker = logs / ".analysis_config_ab12cd34.json.cancel"
+            marker.write_text("", encoding="utf-8")
+            (logs / "squeakpose.jsonl").write_text("", encoding="utf-8")
+            (logs / "notes.cancel").write_text("", encoding="utf-8")
+
+            report = scan_project_health(
+                tmp,
+                pose_class_count=1,
+                pose_keypoint_count=1,
+                segmentation_class_count=1,
+            )
+
+            self.assertEqual(sorted(report.worker_config_paths), sorted([str(config), str(marker)]))
+
     def test_dataset_ops_reexports_project_health_api(self):
         self.assertIs(dataset_ops.ProjectHealthReport, ProjectHealthReport)
         self.assertIs(dataset_ops.scan_project_health, scan_project_health)

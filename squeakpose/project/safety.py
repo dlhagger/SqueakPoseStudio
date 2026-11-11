@@ -9,6 +9,7 @@ import os
 import socket
 import uuid
 from dataclasses import asdict, dataclass
+from typing import Any
 
 from squeakpose.json_io import read_json_file
 
@@ -115,9 +116,19 @@ def _read_lock_info(lock_path: str) -> ProjectLockInfo | None:
         return None
 
 
+_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WINDOWS_STILL_ACTIVE = 259
+_WINDOWS_ERROR_ACCESS_DENIED = 5
+
+
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is not a liveness probe on Windows: signal 0 is
+        # CTRL_C_EVENT, so it tries to send Ctrl+C and fails for ordinary GUI
+        # processes, which would make a live lock look stale.
+        return _windows_pid_is_running(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -127,6 +138,32 @@ def _pid_is_running(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _windows_pid_is_running(pid: int, kernel32: Any = None) -> bool:
+    """Query a Windows process without signalling it (OpenProcess/GetExitCodeProcess)."""
+    if kernel32 is None:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]
+        exit_code_type = ctypes.c_ulong
+        by_ref = ctypes.byref
+    else:
+        get_last_error = kernel32.get_last_error
+        exit_code_type = kernel32.exit_code_type
+        by_ref = kernel32.byref
+    handle = kernel32.OpenProcess(_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        # Access denied means the process exists but belongs to another user/session.
+        return get_last_error() == _WINDOWS_ERROR_ACCESS_DENIED
+    try:
+        exit_code = exit_code_type()
+        if not kernel32.GetExitCodeProcess(handle, by_ref(exit_code)):
+            return True
+        return exit_code.value == _WINDOWS_STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def lock_is_stale(info: ProjectLockInfo | None) -> bool:

@@ -842,8 +842,8 @@ lockfile, audits the Linux/Python 3.12 dependency set, and publishes a
 CycloneDX SBOM artifact. Dependabot checks both uv dependencies and pinned
 GitHub Actions each week.
 
-The CLIP Git dependency and every third-party workflow action are pinned to
-immutable commit revisions. Version comments next to workflow action pins keep
+Every third-party workflow action is pinned to an
+immutable commit revision. Version comments next to workflow action pins keep
 the corresponding release visible to reviewers.
 
 ## Benchmarking

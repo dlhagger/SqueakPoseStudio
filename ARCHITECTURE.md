@@ -258,6 +258,15 @@ clean-install behavior for the bundled analysis notebook or distillation/model
 workflows. They must be validated from clean feature-specific environments before any
 removal from the runtime group.
 
+The 2026-11 audit removed four direct requirements: `iprogress` (an unrelated,
+unused progress-bar package), `clip` (only Ultralytics' text-prompted models need it;
+interactive SAM 3 is built without a text encoder), and `tqdm` and `numba` (never
+imported directly; still installed through huggingface-hub/umap-learn). Packages that
+are never imported directly but remain required: `timm` (SAM 3's ViT backbone), `lap`
+(Ultralytics trackers), `torchvision` (must stay direct so the Windows CUDA index in
+`[tool.uv.sources]` applies), and `ipykernel`/`ipywidgets` (bundled notebook kernel and
+UMAP progress bars). Without the first two, Ultralytics would attempt a runtime install.
+
 The `test` group intentionally repeats its small scientific/Qt surface because CI uses
 `uv sync --locked --only-group test`, which does not install the project runtime
 dependencies. OpenCV and PyAV (`av`) are explicit in that group because tests import

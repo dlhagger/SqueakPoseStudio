@@ -13,16 +13,13 @@ authors = [
 
 dependencies = [
     "av>=18.0.0",
-    "clip",
     "hdbscan>=0.8.44",
     "huggingface-hub>=1.0.0",
-    "iprogress>=0.4",
     "ipykernel>=7.3.0",
     "ipywidgets>=8.1.8",
     "lap>=0.5.12",
     "lightly-train>=0.17.0",
     "matplotlib>=3.11.1",
-    "numba>=0.66.0",
     "numpy>=2.4.6",
     "oneeurofilter>=0.2.1",
     "opencv-python>=5.0.0.93",
@@ -36,7 +33,6 @@ dependencies = [
     "timm>=1.0.28",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
-    "tqdm>=4.70.0",
     "ultralytics>=8.4.148",
     "umap-learn>=0.5.12",
 ]
@@ -104,7 +100,6 @@ select = [
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
 torchvision = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
-clip = { git = "https://github.com/ultralytics/CLIP/", rev = "488e81a6711eea7346872b46ea928b367da8889d" }
 
 [[tool.uv.index]]
 name = "pytorch-cu132"

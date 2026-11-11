@@ -1567,7 +1567,8 @@ def _run_unified_analysis_workflow_unpublished(
         for key, value in analysis["prediction_qc_status"].value_counts().items()
     }
     qc_reason_counts: dict[str, int] = {}
-    for value in analysis["prediction_qc_reasons"].fillna("").astype(str):
+    # An all-empty reasons column is float64; fill as strings (pandas 4 rejects "" on floats).
+    for value in analysis["prediction_qc_reasons"].astype("string").fillna(""):
         for reason in filter(None, value.split(";")):
             qc_reason_counts[reason] = qc_reason_counts.get(reason, 0) + 1
     summary = {

@@ -311,6 +311,123 @@ class OpenAILabelingTests(unittest.TestCase):
         proposal = self._parse_batch({"instances": [instance]}, keypoints=())
         self.assertEqual(proposal.instances[0].keypoints, ())
 
+    def _stream_request(self, events):
+        body = "\n".join(f"data: {json.dumps(event)}" for event in events) + "\ndata: [DONE]\n"
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=body)
+
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "frame.png"
+            image_path.write_bytes(b"image")
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                return request_pose_proposal(
+                    access_token="token",
+                    model="gpt-6-astra",
+                    image_path=str(image_path),
+                    image_width=100,
+                    image_height=100,
+                    class_name="mouse",
+                    keypoint_names=("nose",),
+                    client=client,
+                )
+
+    def test_top_level_stream_error_event_surfaces_message_and_code(self):
+        with self.assertRaises(OpenAILabelingError) as raised:
+            self._stream_request(
+                [
+                    {
+                        "type": "error",
+                        "code": "usage_limit_reached",
+                        "message": "You've hit your usage limit.",
+                        "param": None,
+                    }
+                ]
+            )
+        message = str(raised.exception)
+        self.assertIn("You've hit your usage limit.", message)
+        # main_window._openai_error looks for "usage_limit"/"rate_limit" after
+        # normalising spaces and hyphens to underscores.
+        self.assertIn("usage_limit", message.casefold().replace(" ", "_").replace("-", "_"))
+        self.assertNotIn("ended before completion", message)
+
+    def test_top_level_stream_error_with_code_only_or_nested_error(self):
+        with self.assertRaisesRegex(OpenAILabelingError, "rate_limit_exceeded"):
+            self._stream_request([{"type": "error", "code": "rate_limit_exceeded"}])
+        with self.assertRaisesRegex(OpenAILabelingError, "Server overloaded"):
+            self._stream_request(
+                [{"type": "error", "error": {"message": "Server overloaded", "code": None}}]
+            )
+
+    def test_failed_and_incomplete_events_tolerate_null_nested_objects(self):
+        for event in (
+            {"type": "response.failed", "response": None},
+            {"type": "response.failed", "response": {"error": None}},
+        ):
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(OpenAILabelingError, "unknown error"):
+                    self._stream_request([event])
+        with self.assertRaisesRegex(OpenAILabelingError, "failed: quota gone"):
+            self._stream_request(
+                [{"type": "response.failed", "response": {"error": {"message": "quota gone"}}}]
+            )
+        for event in (
+            {"type": "response.incomplete", "response": None},
+            {"type": "response.incomplete", "response": {"incomplete_details": None}},
+        ):
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(OpenAILabelingError, r"incomplete labeling response\."):
+                    self._stream_request([event])
+        with self.assertRaisesRegex(OpenAILabelingError, r"\(max_output_tokens\)"):
+            self._stream_request(
+                [
+                    {
+                        "type": "response.incomplete",
+                        "response": {"incomplete_details": {"reason": "max_output_tokens"}},
+                    }
+                ]
+            )
+
+    def _point(self, name, x):
+        return {"name": name, "x": x, "y": 200, "visibility": 2, "confidence": 0.9}
+
+    def _box(self):
+        return {"x_min": 100, "y_min": 100, "x_max": 900, "y_max": 900}
+
+    def test_keypoint_names_differing_only_by_case_or_punctuation_stay_distinct(self):
+        for names in (("tail_base", "tail base"), ("L", "l"), ("Nose", "nose", "NOSE")):
+            with self.subTest(names=names):
+                points = [self._point(name, 100 + i * 100) for i, name in enumerate(names)]
+                instance = {"keypoints": list(reversed(points)), "bounding_box": self._box()}
+                proposal = self._parse_batch({"instances": [instance]}, keypoints=names)
+                keypoints = proposal.instances[0].keypoints
+                self.assertEqual([point.name for point in keypoints], list(names))
+                expected_x = [10 + i * 10 for i in range(len(names))]
+                self.assertEqual([point.x for point in keypoints], expected_x)
+
+    def test_ambiguous_normalized_name_is_rejected_but_unique_fallback_still_works(self):
+        names = ("tail_base", "tail base", "left_ear")
+        instance = {
+            "keypoints": [
+                self._point("TailBase", 100),  # ambiguous: matches two configured names
+                self._point("tail base", 200),
+                self._point("left ear", 300),
+            ],
+            "bounding_box": self._box(),
+        }
+        with self.assertRaisesRegex(OpenAILabelingError, "unexpected keypoint name"):
+            self._parse_batch({"instances": [instance]}, keypoints=names)
+        instance["keypoints"][0] = self._point("tail_base", 100)
+        proposal = self._parse_batch({"instances": [instance]}, keypoints=names)
+        self.assertEqual(
+            [point.name for point in proposal.instances[0].keypoints],
+            ["tail_base", "tail base", "left_ear"],
+        )
+        # An exact name and its normalized alias for the same point are duplicates.
+        instance["keypoints"].append(self._point("LEFT-EAR", 400))
+        with self.assertRaisesRegex(OpenAILabelingError, "duplicate keypoint name"):
+            self._parse_batch({"instances": [instance]}, keypoints=names)
+
 
 if __name__ == "__main__":
     unittest.main()

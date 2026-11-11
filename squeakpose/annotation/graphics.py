@@ -87,6 +87,7 @@ class BoxItem(QGraphicsRectItem):
         self._drag_edges = 0
         self._press_rect = QRectF()
         self._press_pos_local = QPointF()
+        self._press_scene_pos = QPointF()
         self._press_item_pos = QPointF()
 
         self.update_model()  # ✅ now exists
@@ -185,13 +186,16 @@ class BoxItem(QGraphicsRectItem):
             self._drag_edges = edges
             self._press_rect = QRectF(self.rect())
             self._press_pos_local = QPointF(event.pos())
+            self._press_scene_pos = QPointF(event.scenePos())
             self._press_item_pos = QPointF(self.pos())
             self.setZValue(2.5)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._drag_edges:
-            delta = event.pos() - self._press_pos_local
+            # Measure in scene coordinates: moving the left/top edge moves the item,
+            # which would shift item-local coordinates under the cursor.
+            delta = event.scenePos() - self._press_scene_pos
             self._apply_resize(self._drag_edges, delta)
             event.accept()
             return
@@ -207,30 +211,39 @@ class BoxItem(QGraphicsRectItem):
 
     # --- resize & clamp ---
     def _apply_resize(self, edges: int, delta_local: QPointF):
-        new_rect = QRectF(self._press_rect)
-        new_pos = QPointF(self._press_item_pos)
+        """Move only the dragged edge(s); the opposite edge stays fixed.
 
-        if edges & self.LEFT:
-            new_pos.setX(self._press_item_pos.x() + delta_local.x())
-            new_rect.setWidth(max(self.MIN_W, self._press_rect.width() - delta_local.x()))
-        if edges & self.RIGHT:
-            new_rect.setWidth(max(self.MIN_W, self._press_rect.width() + delta_local.x()))
-        if edges & self.TOP:
-            new_pos.setY(self._press_item_pos.y() + delta_local.y())
-            new_rect.setHeight(max(self.MIN_H, self._press_rect.height() - delta_local.y()))
-        if edges & self.BOTTOM:
-            new_rect.setHeight(max(self.MIN_H, self._press_rect.height() + delta_local.y()))
+        Each moving edge is clamped to the scene bounds and to at least the
+        minimum size away from the fixed edge, then position and size are
+        derived from the resulting edges.
+        """
+        left0 = self._press_item_pos.x()
+        top0 = self._press_item_pos.y()
+        right0 = left0 + self._press_rect.width()
+        bottom0 = top0 + self._press_rect.height()
 
         scene = self.scene()
         if scene is not None:
             sr = scene.sceneRect()
-            new_pos.setX(max(sr.left(), new_pos.x()))
-            new_pos.setY(max(sr.top(), new_pos.y()))
-            new_pos.setX(min(new_pos.x(), sr.right() - new_rect.width()))
-            new_pos.setY(min(new_pos.y(), sr.bottom() - new_rect.height()))
+            min_x, max_x, min_y, max_y = sr.left(), sr.right(), sr.top(), sr.bottom()
+        else:
+            min_x = min_y = float("-inf")
+            max_x = max_y = float("inf")
 
-        self.setPos(new_pos)
-        self.setRect(0, 0, new_rect.width(), new_rect.height())
+        left, right, top, bottom = left0, right0, top0, bottom0
+        if edges & self.LEFT:
+            left = min(max(left0 + delta_local.x(), min_x), right0 - self.MIN_W)
+        if edges & self.RIGHT:
+            right = max(min(right0 + delta_local.x(), max_x), left0 + self.MIN_W)
+        if edges & self.TOP:
+            top = min(max(top0 + delta_local.y(), min_y), bottom0 - self.MIN_H)
+        if edges & self.BOTTOM:
+            bottom = max(min(bottom0 + delta_local.y(), max_y), top0 + self.MIN_H)
+
+        # Resize before moving: the position clamp in itemChange uses the current
+        # rect size, so it must already describe the final box.
+        self.setRect(0, 0, right - left, bottom - top)
+        self.setPos(QPointF(left, top))
         self.update_model()
 
     # --- sync bbox dataclass ---
@@ -406,6 +419,9 @@ class LabelView(QGraphicsView):
         self._seg_brush_add = True
         self._seg_brush_last_pos: Optional[QPointF] = None
         self._seg_brush_cursor_ring: Optional[QGraphicsEllipseItem] = None
+        self._space_pan_active = False
+        self._space_panning = False
+        self._space_prev_interactive = True
 
         self.setMouseTracking(True)
         viewport = self.viewport()
@@ -440,17 +456,90 @@ class LabelView(QGraphicsView):
         else:
             super().wheelEvent(event)
 
+    # Keys the main window interprets (frame browsing, keypoint nudging, Space-to-pan).
+    # QAbstractScrollArea would otherwise consume arrow keys to scroll the canvas
+    # whenever the view has focus, so they never reached the window.
+    _APP_KEYS = frozenset(
+        {
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+            Qt.Key.Key_Space,
+        }
+    )
+
+    def keyPressEvent(self, event):
+        if event is not None and event.key() in self._APP_KEYS:
+            handler = getattr(self.app, "keyPressEvent", None)
+            if callable(handler):
+                handler(event)
+                return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event is not None and event.key() in self._APP_KEYS:
+            handler = getattr(self.app, "keyReleaseEvent", None)
+            if callable(handler):
+                handler(event)
+                return
+        super().keyReleaseEvent(event)
+
+    def forget_scene_items(self) -> None:
+        """Remove view-owned scene items and reset drag state.
+
+        Call before ``scene.clear()``: the scene deletes every item it owns, so any
+        Python reference kept here would point at a deleted C++ object and the next
+        hover/move would raise ``RuntimeError``.
+        """
+        self._remove_crosshairs()
+        self._reset_seg_brush_cursor()
+        temp_rect = self._temp_rect
+        self._temp_rect = None
+        if temp_rect is not None:
+            try:
+                owner_scene = temp_rect.scene()
+                if owner_scene is not None:
+                    owner_scene.removeItem(temp_rect)
+            except RuntimeError:
+                pass
+        self._start_pos = None
+        self._drawing_cancelled = False
+        self._seg_brush_active = False
+        self._seg_brush_last_pos = None
+
+    def is_space_panning(self) -> bool:
+        return self._space_panning
+
+    def set_space_pan_active(self, active: bool) -> None:
+        """Route left-button presses to hand panning while Space is held."""
+        active = bool(active)
+        if active == self._space_pan_active:
+            return
+        self._space_pan_active = active
+        if active:
+            self._space_prev_interactive = self.isInteractive()
+            # Non-interactive so scene items do not take the press: Space+drag pans.
+            self.setInteractive(False)
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._remove_crosshairs()
+        elif not self._space_panning:
+            self.setInteractive(self._space_prev_interactive)
+
     def _remove_crosshairs(self):
-        if self._crosshair_v:
-            owner_scene = self._crosshair_v.scene()
-            if owner_scene is not None:
-                owner_scene.removeItem(self._crosshair_v)
-            self._crosshair_v = None
-        if self._crosshair_h:
-            owner_scene = self._crosshair_h.scene()
-            if owner_scene is not None:
-                owner_scene.removeItem(self._crosshair_h)
-            self._crosshair_h = None
+        for attr in ("_crosshair_v", "_crosshair_h"):
+            item = getattr(self, attr)
+            setattr(self, attr, None)
+            if item is None:
+                continue
+            try:
+                owner_scene = item.scene()
+                if owner_scene is not None:
+                    owner_scene.removeItem(item)
+            except RuntimeError:
+                # Already deleted with its scene; only the reference remained.
+                pass
 
     def _ensure_crosshairs(self):
         """Create crosshair items with consistent styling if they do not exist."""
@@ -505,11 +594,14 @@ class LabelView(QGraphicsView):
             return False
 
     def _ensure_seg_brush_cursor_ring(self):
-        if (
-            self._seg_brush_cursor_ring is not None
-            and self._seg_brush_cursor_ring.scene() is self.scene()
-        ):
-            return
+        ring = self._seg_brush_cursor_ring
+        if ring is not None:
+            try:
+                if ring.scene() is self.scene():
+                    return
+            except RuntimeError:
+                # Deleted by an external scene clear; recreate below.
+                self._seg_brush_cursor_ring = None
         self._seg_brush_cursor_ring = QGraphicsEllipseItem()
         pen = QPen(QColor(118, 188, 255, 220))
         pen.setCosmetic(True)
@@ -527,7 +619,10 @@ class LabelView(QGraphicsView):
     def _hide_seg_brush_cursor(self):
         ring = self._seg_brush_cursor_ring
         if ring is not None:
-            ring.setVisible(False)
+            try:
+                ring.setVisible(False)
+            except RuntimeError:
+                self._seg_brush_cursor_ring = None
 
     def _reset_seg_brush_cursor(self):
         ring = self._seg_brush_cursor_ring
@@ -584,6 +679,17 @@ class LabelView(QGraphicsView):
             self.app.update_status_bar("Box drawing cancelled.")
 
     def mousePressEvent(self, event):
+        if self._space_pan_active:
+            if event.button() != Qt.MouseButton.LeftButton:
+                # Space held: no negative SAM prompts, erase strokes, or depth probes.
+                event.accept()
+                return
+            # Space held: pan instead of placing boxes, keypoints, or SAM prompts.
+            self._space_panning = True
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            super().mousePressEvent(event)
+            event.accept()
+            return
         scene_pos = self.mapToScene(event.position().toPoint())
         if event.button() == Qt.MouseButton.RightButton and self.app._is_depth_layer():
             self.app._probe_depth_at(scene_pos)
@@ -631,6 +737,9 @@ class LabelView(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._space_panning:
+            super().mouseMoveEvent(event)
+            return
         scene_pos = self.mapToScene(event.position().toPoint())
         self._update_seg_brush_cursor(scene_pos)
         if self.app.mode == "segedit" and self._seg_brush_active:
@@ -674,6 +783,17 @@ class LabelView(QGraphicsView):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._space_panning and event.button() == Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            self._space_panning = False
+            if not self._space_pan_active:
+                # Space was released mid-drag; restore the active tool now.
+                self.setInteractive(self._space_prev_interactive)
+                restore = getattr(self.app, "set_mode", None)
+                if callable(restore):
+                    restore(self.app.mode)
+            event.accept()
+            return
         if self.app.mode == "segedit" and self._seg_brush_active:
             scene_pos = self.mapToScene(event.position().toPoint())
             self.app._apply_seg_brush(

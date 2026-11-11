@@ -18,10 +18,16 @@ from analysis_ops import (
 from squeakpose.project.layers import LAYER_KEYPOINTS, LAYER_SEGMENTATION
 from squeakpose.services.analysis import AnalysisConfigError, validate_analysis_output_dir
 from squeakpose.services.cancellation import OperationCanceled, cancel_check_scope
-from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
+from squeakpose.workers.protocol import (
+    cancel_marker_path,
+    read_config,
+    start_cancel_file_watcher,
+    write_event,
+)
 from unified_analysis_ops import run_unified_analysis_workflow
 
 _CANCEL_REQUESTED = False
+_CANCEL_SIGNAL_COUNT = 0
 
 
 def _request_cancel() -> None:
@@ -30,11 +36,17 @@ def _request_cancel() -> None:
 
 
 def _handle_cancel_signal(_signum, _frame):
-    # Only set the flag. Analysis checks it at every progress step and every
-    # rendered video frame, then unwinds through the output transaction so the
-    # previous published analysis is left untouched and a canceled ``result``
-    # is emitted. The owner's kill escalation still covers a stuck worker.
+    # The first signal only sets the flag. Analysis checks it at every progress
+    # step and every rendered video frame, then unwinds through the output
+    # transaction so the previous published analysis is left untouched and a
+    # canceled ``result`` is emitted. A second signal (the owner's forced-close
+    # escalation) raises SystemExit, which still unwinds the transaction and
+    # ``finally`` blocks before the kill would arrive.
+    global _CANCEL_SIGNAL_COUNT
+    _CANCEL_SIGNAL_COUNT += 1
     _request_cancel()
+    if _CANCEL_SIGNAL_COUNT > 1:
+        raise SystemExit(130)
 
 
 def _cancel_requested() -> bool:
@@ -67,9 +79,10 @@ def run_analysis_worker(
     reset_cancel: bool = True,
 ) -> int:
     """Run one analysis job and emit JSON-compatible event payloads."""
-    global _CANCEL_REQUESTED
+    global _CANCEL_REQUESTED, _CANCEL_SIGNAL_COUNT
     if reset_cancel:
         _CANCEL_REQUESTED = False
+        _CANCEL_SIGNAL_COUNT = 0
     with cancel_check_scope(_cancel_requested):
         return _run_analysis_worker(config, event_writer=event_writer)
 
@@ -326,13 +339,14 @@ def _run_analysis_job(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
-    start_cancel_listener(_request_cancel)
 
     parser = argparse.ArgumentParser(
         description="Run SqueakPose inference analysis in a child process."
     )
     parser.add_argument("--config", required=True, help="Path to JSON analysis config.")
     args = parser.parse_args(argv)
+    # Portable cancel channel: the owner creates ``<config>.cancel``.
+    start_cancel_file_watcher(cancel_marker_path(args.config), _request_cancel)
 
     try:
         config = read_config(args.config)

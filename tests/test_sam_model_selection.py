@@ -181,6 +181,33 @@ class SamModelSelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(window._read_project_meta()["sam_model_path"], target.name)
 
+    def test_finished_download_does_not_warm_outside_segmentation_or_while_busy(self):
+        with TemporaryDirectory() as root, self.window(root) as window:
+            target = Path(sam_download_target(root, window.sam_model_variant))
+            target.touch()
+
+            def finish_download():
+                window._sam3_download_event({"event": "result", "model_path": str(target)})
+                window._sam3_download_finished(SimpleNamespace(succeeded=True))
+
+            # Keypoints layer active: the model is not loaded behind the user's back.
+            with patch.object(window, "_warm_sam_model") as warm:
+                finish_download()
+            warm.assert_not_called()
+            self.assertIn("Segmentation layer", window.status.currentMessage())
+
+            # Segmentation layer with a SAM request in flight: no worker restart.
+            window._switch_workflow(studio.WORKFLOW_SEG)
+            window._sam_assistant_controller.is_busy = True
+            with patch.object(window, "_warm_sam_model") as warm:
+                finish_download()
+            warm.assert_not_called()
+
+            window._sam_assistant_controller.is_busy = False
+            with patch.object(window, "_warm_sam_model") as warm:
+                finish_download()
+            warm.assert_called_once_with(str(target))
+
     def test_manual_load_switches_checkpoint_and_preserves_custom_path(self):
         with TemporaryDirectory() as root, self.window(root) as window:
             custom = Path(root, "my-sam3.pth")

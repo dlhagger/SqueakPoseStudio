@@ -166,6 +166,43 @@ class SamAssistantControllerTests(unittest.TestCase):
         self.assertEqual(session.requests[-1]["command"], "load")
         self.assertEqual(session.requests[-1]["model_path"], "new.pt")
 
+    def _restart_with_queued_resume(self):
+        scheduled = []
+        controller = SamAssistantController(
+            displayed_image_path=lambda: self.displayed,
+            session_factory=FakeSession,
+            schedule=scheduled.append,
+        )
+        controller.warm_model(model_path="old.pt")
+        session = controller.session
+        session.become_ready()
+        self.assertTrue(controller.restart_model(model_path="new.pt"))
+        session.is_running = False
+        session.is_ready = False
+        session.terminal.emit(PersistentWorkerResult(state="stopped", exit_code=0))
+        self.assertEqual(len(scheduled), 1)
+        return controller, session, scheduled
+
+    def test_shutdown_after_restart_terminal_drops_queued_resume(self):
+        controller, session, scheduled = self._restart_with_queued_resume()
+
+        # Worker already stopped, so shutdown() takes its early-return path.
+        self.assertFalse(controller.shutdown())
+        scheduled.pop()()
+
+        self.assertEqual(len(session.starts), 1)
+        self.assertFalse(session.is_running)
+        self.assertEqual(session.requests[-1]["model_path"], "old.pt")
+
+    def test_cancel_after_restart_terminal_drops_queued_resume(self):
+        controller, session, scheduled = self._restart_with_queued_resume()
+
+        self.assertFalse(controller.cancel())
+        scheduled.pop()()
+
+        self.assertEqual(len(session.starts), 1)
+        self.assertFalse(session.is_running)
+
     def test_shutdown_requests_bounded_escalation_without_cancel_decision(self):
         decisions = []
         self.controller.decision_ready.connect(decisions.append)

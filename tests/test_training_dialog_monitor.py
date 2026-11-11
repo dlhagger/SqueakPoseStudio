@@ -208,6 +208,105 @@ class TrainingDialogMonitorTests(unittest.TestCase):
             dialog.close()
             parent.close()
 
+    def test_final_validation_updates_metrics_without_new_history_row(self):
+        with TemporaryDirectory() as tmp:
+            parent, dialog = self._make_dialog(tmp)
+            dialog._reset_training_monitor(100)
+            dialog._handle_training_event(
+                {
+                    "event": "epoch_end",
+                    "epoch": 100,
+                    "epochs": 100,
+                    "metrics": {"metrics/mAP50-95(M)": 0.40},
+                    "best_fitness": 0.45,
+                }
+            )
+
+            dialog._handle_training_event(
+                {
+                    "event": "final_validation",
+                    "epochs_completed": 100,
+                    "epochs": 100,
+                    "metrics": {
+                        "metrics/precision(M)": 0.9,
+                        "metrics/mAP50-95(M)": 0.47,
+                    },
+                    "model_path": "/runs/segment/train/weights/best.pt",
+                }
+            )
+
+            self.assertEqual(dialog.history_table.rowCount(), 1)
+            self.assertEqual(dialog.epoch_label.text(), "Epoch 100 / 100")
+            self.assertNotIn("101", dialog.epoch_label.text())
+            self.assertEqual(dialog.phase_label.text(), "Final validation (best.pt)")
+            self.assertEqual(dialog.metric_values["primary_map"].text(), "0.4700")
+            self.assertIn("Final validation (best.pt)", dialog.log_view.toPlainText())
+            dialog.close()
+            parent.close()
+
+    def test_canceled_result_points_to_resumable_checkpoint(self):
+        with TemporaryDirectory() as tmp:
+            parent, dialog = self._make_dialog(tmp)
+            dialog.training_controller = _FakeTrainingController()
+            dialog.training_running = True
+            dialog.train_cancel_requested = True
+            resumable = "/runs/pose/train7/weights/last_resumable.pt"
+            dialog.train_result_event = {
+                "event": "result",
+                "canceled": True,
+                "had_error": False,
+                "error_message": "",
+                "save_dir": "/runs/pose/train7",
+                "resume_checkpoint": resumable,
+            }
+
+            with patch.object(QMessageBox, "information") as info:
+                dialog._finish_training_job(WorkerJobResult(state="cancelled", exit_code=0))
+
+            message = info.call_args.args[2]
+            self.assertIn(resumable, message)
+            self.assertIn("Resume YOLO run (exact)", message)
+            self.assertIn(f"Resumable checkpoint: {resumable}", dialog.log_view.toPlainText())
+            parent.close()
+
+    def test_cancel_during_final_validation_of_finished_run_reports_completion(self):
+        with TemporaryDirectory() as tmp:
+            parent, dialog = self._make_dialog(tmp)
+            dialog.training_controller = _FakeTrainingController()
+            dialog.training_running = True
+            dialog.train_cancel_requested = True
+            dialog.train_result_event = {
+                "event": "result",
+                "canceled": False,
+                "had_error": False,
+                "error_message": "",
+                "save_dir": "/runs/pose/train8",
+            }
+
+            with patch.object(QMessageBox, "information") as info:
+                dialog._finish_training_job(WorkerJobResult(state="cancelled", exit_code=0))
+
+            self.assertEqual(info.call_args.args[1], "Training complete")
+            self.assertEqual(dialog.train_status_label.text(), "Complete")
+            self.assertIn("completed normally", dialog.log_view.toPlainText())
+            parent.close()
+
+    def test_resume_list_offers_resumable_checkpoint(self):
+        with TemporaryDirectory() as tmp:
+            parent, dialog = self._make_dialog(tmp)
+            weights = Path(tmp) / "runs" / "train" / "pose" / "mouse" / "weights"
+            weights.mkdir(parents=True)
+            (weights / "last.pt").write_bytes(b"stripped")
+            (weights / "last_resumable.pt").write_bytes(b"full")
+            dialog.project_runs_dir = str(Path(tmp) / "runs")
+
+            dialog._refresh_resume_list()
+
+            paths = [path for _label, path in dialog.resume_exports]
+            self.assertIn(str(weights / "last_resumable.pt"), paths)
+            dialog.close()
+            parent.close()
+
 
 if __name__ == "__main__":
     unittest.main()

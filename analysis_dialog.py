@@ -88,6 +88,9 @@ from ui_style import ThemedComboBox, analysis_dialog_stylesheet
 # folder for project recovery to clean up).
 ANALYSIS_CANCEL_KILL_AFTER_MS = 60_000
 
+# Reference length shown for a video with no saved (or restorable) scale setup.
+DEFAULT_REAL_DISTANCE_MM = 1.0
+
 POSE_PREVIEW_CONNECTIONS = (
     ("nose", "head"),
     ("head", "left_ear"),
@@ -641,6 +644,11 @@ class AnalysisDialog(QDialog):
         self._analysis_statuses: dict[str, ProjectVideoAnalysisStatus] = {}
         self._active_setup_video_name = ""
         self._suspend_setup_persistence = False
+        # Set when the active video's saved setup exists but could not be restored
+        # (frame size changed, unsupported schema, unreadable file). Automatic saves
+        # are then skipped so the saved scale/ROIs are not replaced by the empty live
+        # state; an explicit user edit clears it.
+        self._setup_restore_refused = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -766,7 +774,7 @@ class AnalysisDialog(QDialog):
         self.real_distance_spin = QDoubleSpinBox()
         self.real_distance_spin.setRange(0.000001, 1_000_000.0)
         self.real_distance_spin.setDecimals(4)
-        self.real_distance_spin.setValue(1.0)
+        self.real_distance_spin.setValue(DEFAULT_REAL_DISTANCE_MM)
         self.real_distance_spin.setMinimumWidth(130)
         self.real_distance_spin.valueChanged.connect(self._real_distance_changed)
         scale_row.addWidget(self.pixel_distance_label, 0)
@@ -1214,16 +1222,27 @@ class AnalysisDialog(QDialog):
             self.input_detail_label.setText("No project videos have analysis-ready inference yet.")
 
     def _project_video_changed(self, index: int) -> None:
-        self._save_analysis_setup()
+        self._save_analysis_setup(user_edit=False)
         self._active_setup_video_name = ""
+        self._setup_restore_refused = False
         self._clear_annotations(persist=False)
         option = self.project_video_combo.itemData(index)
         if not isinstance(option, ProjectAnalysisBundle):
             self._selected_bundle = None
             self.analysis_inputs = {LAYER_KEYPOINTS: "", LAYER_SEGMENTATION: ""}
-            self.analysis_mode_combo.clear()
+            # Clear the inputs before the mode combo: clearing it emits a change that
+            # reloads the preview, which must not find the previous video's path.
             self.csv_edit.clear()
             self.video_edit.clear()
+            self.analysis_mode_combo.blockSignals(True)
+            try:
+                self.analysis_mode_combo.clear()
+            finally:
+                self.analysis_mode_combo.blockSignals(False)
+            self.output_edit.clear()
+            self._reset_real_distance()
+            self._clear_preview_frame()
+            self._refresh_analysis_classes()
             if self.project_video_combo.count() > 1:
                 self.input_detail_label.setText("Select a project video to load its inference.")
             self.setup_persistence_label.setText(
@@ -1406,8 +1425,9 @@ class AnalysisDialog(QDialog):
             "CSV files (*.csv);;All files (*.*)",
         )
         if path:
-            self._save_analysis_setup()
+            self._save_analysis_setup(user_edit=False)
             self._active_setup_video_name = ""
+            self._setup_restore_refused = False
             self.csv_edit.setText(path)
             self.output_edit.setText(self._default_output_dir_for_csv(path))
             self._clear_annotations()
@@ -1422,10 +1442,12 @@ class AnalysisDialog(QDialog):
             "Video files (*.mp4 *.avi *.mov *.mkv);;All files (*.*)",
         )
         if path:
-            self._save_analysis_setup()
+            self._save_analysis_setup(user_edit=False)
             self._active_setup_video_name = ""
+            self._setup_restore_refused = False
             self.video_edit.setText(path)
             self._clear_annotations()
+            self._reset_real_distance()
             self._load_preview_frame(silent=False)
 
     def _browse_other_inputs(self) -> None:
@@ -1461,8 +1483,9 @@ class AnalysisDialog(QDialog):
         self.project_video_combo.blockSignals(True)
         self.project_video_combo.setCurrentIndex(0)
         self.project_video_combo.blockSignals(False)
-        self._save_analysis_setup()
+        self._save_analysis_setup(user_edit=False)
         self._active_setup_video_name = ""
+        self._setup_restore_refused = False
         self._selected_bundle = None
         self.analysis_inputs = {LAYER_KEYPOINTS: "", LAYER_SEGMENTATION: ""}
         self.analysis_inputs[self.layer_id] = csv_path
@@ -1474,6 +1497,7 @@ class AnalysisDialog(QDialog):
             f"External files · {os.path.basename(video_path)} · {os.path.basename(csv_path)}"
         )
         self._clear_annotations()
+        self._reset_real_distance()
         self._load_preview_frame(silent=False)
         self.setup_persistence_label.setText(
             "External inputs are not attached to a project-video setup."
@@ -1650,8 +1674,18 @@ class AnalysisDialog(QDialog):
 
     def _set_scale_points(self, points: list[tuple[float, float]]) -> None:
         self.annotation_state.set_scale_points(points)
+        self._refresh_pixel_distance_label()
         self._update_scale_label()
         self._save_analysis_setup()
+
+    def _refresh_pixel_distance_label(self) -> None:
+        # A third click restarts the line and a zero-length line has no scale, so the
+        # label must follow the state rather than only the last positive distance.
+        distance = self.annotation_state.pixel_distance
+        if len(self.annotation_state.scale_points) == 2 and distance > 0:
+            self.pixel_distance_label.setText(f"{distance:.1f} px")
+        else:
+            self.pixel_distance_label.setText("Draw scale")
 
     def _apply_scale_distance(self, distance: float) -> None:
         if distance > 0:
@@ -1701,10 +1735,21 @@ class AnalysisDialog(QDialog):
         else:
             self.scale_status_label.setText(f"Scale unset | {len(self.scale_points)}/2")
 
-    def _save_analysis_setup(self, *, rois_cleared: bool = False) -> None:
+    def _save_analysis_setup(self, *, rois_cleared: bool = False, user_edit: bool = True) -> None:
+        """Persist the active video's setup.
+
+        ``user_edit`` is False for automatic saves on video switch and close. Those
+        are skipped while a saved setup failed to restore: the live state is then
+        empty, and writing it would replace the user's saved scale and ROIs.
+        """
         video_name = str(self._active_setup_video_name or "")
         if self._suspend_setup_persistence or not video_name:
             return
+        if self._setup_restore_refused:
+            if not user_edit:
+                return
+            # An explicit edit replaces the unrestorable setup deliberately.
+            self._setup_restore_refused = False
         try:
             save_video_analysis_setup(
                 self.project_root,
@@ -1723,14 +1768,21 @@ class AnalysisDialog(QDialog):
 
     def _restore_analysis_setup(self) -> None:
         video_name = str(self._active_setup_video_name or "")
+        self._setup_restore_refused = False
         if not video_name:
             return
+        keep_note = " Your saved setup is kept until you edit the scale or ROIs."
         try:
             setup = load_video_analysis_setup(self.project_root, video_name)
         except (OSError, TypeError, ValueError) as exc:
-            self.setup_persistence_label.setText(f"Could not restore video setup: {exc}")
+            self._setup_restore_refused = True
+            self._reset_real_distance()
+            self.setup_persistence_label.setText(
+                f"Could not restore video setup: {exc}.{keep_note}"
+            )
             return
         if setup is None:
+            self._reset_real_distance()
             self.setup_persistence_label.setText(
                 f"No saved setup for {video_name} yet · changes save automatically."
             )
@@ -1740,9 +1792,12 @@ class AnalysisDialog(QDialog):
         saved_size = (setup.frame_width, setup.frame_height)
         current_size = (current_width, current_height)
         if all(saved_size) and all(current_size) and saved_size != current_size:
+            self._setup_restore_refused = True
+            self._reset_real_distance()
             self.setup_persistence_label.setText(
                 "Saved setup was not loaded because the video's frame size changed "
                 f"({setup.frame_width}×{setup.frame_height} → {current_width}×{current_height})."
+                f"{keep_note}"
             )
             return
 
@@ -1766,6 +1821,34 @@ class AnalysisDialog(QDialog):
             f"Restored saved scale and {len(setup.rois)} ROI"
             f"{'s' if len(setup.rois) != 1 else ''} for {video_name}."
         )
+
+    def _reset_real_distance(self) -> None:
+        """Return the reference length to its default without autosaving.
+
+        A video without a restorable setup must not inherit the previous video's
+        reference length.
+        """
+        previous = self._suspend_setup_persistence
+        self._suspend_setup_persistence = True
+        try:
+            self.real_distance_spin.setValue(DEFAULT_REAL_DISTANCE_MM)
+            self._update_scale_label()
+        finally:
+            self._suspend_setup_persistence = previous
+
+    def _clear_preview_frame(self) -> None:
+        """Show no frame, so nothing can be drawn while no video is selected."""
+        self.annotation_state.set_frame_dimensions(0, 0)
+        frame_view = getattr(self, "frame_view", None)
+        if frame_view is not None:
+            frame_view.cancel_polygon()
+            frame_view.set_frame(QPixmap(), 0, 0)
+            frame_view.set_segmentation_polygons([])
+            frame_view.set_pose_overlay((), [])
+            frame_view.set_scale_points([])
+        frame_info_label = getattr(self, "frame_info_label", None)
+        if frame_info_label is not None:
+            frame_info_label.setText("No frame loaded")
 
     def _add_roi_from_canvas(self, roi: dict[str, Any]) -> None:
         default_name = f"ROI {len(self.rois) + 1}"
@@ -2117,12 +2200,20 @@ class AnalysisDialog(QDialog):
                 )
                 for layer_id, result in (event.get("results_by_layer") or {}).items():
                     self._append_log(f"{layer_id} features: {result.get('feature_csv', '')}")
+                # Completed layers were published, so the output folder is real and
+                # the project video's analysis record must point at it.
+                self.last_output_dir = str(event.get("output_dir") or self.last_output_dir)
+                self._record_analysis_output()
             else:
                 self._append_log("Analysis canceled. Previous results were left unchanged.")
             self.open_output_btn.setEnabled(
                 bool(self.last_output_dir) and os.path.isdir(self.last_output_dir)
             )
             self._refresh_analysis_coverage()
+            if completed and self._selected_bundle is not None:
+                self._show_analysis_status(
+                    self._analysis_statuses.get(self._selected_bundle.video_name)
+                )
         elif kind == "result":
             self.progress.setValue(self.progress.maximum())
             self.status_label.setText("Complete")
@@ -2152,15 +2243,7 @@ class AnalysisDialog(QDialog):
                 self._append_log(f"Prediction QC: {event.get('prediction_qc_csv')}")
             self._show_result_summary(event)
             self.open_output_btn.setEnabled(bool(self.last_output_dir))
-            if self._selected_bundle is not None and self.last_output_dir:
-                try:
-                    record_project_video_analysis_output(
-                        self.project_root,
-                        self._selected_bundle.video_name,
-                        self.last_output_dir,
-                    )
-                except OSError as exc:
-                    self._append_log(f"Could not save analysis output location: {exc}")
+            self._record_analysis_output()
             self._refresh_analysis_coverage()
             if self._selected_bundle is not None:
                 self._show_analysis_status(
@@ -2171,6 +2254,18 @@ class AnalysisDialog(QDialog):
             self._append_log(f"Error: {event.get('error_message', '')}")
         else:
             self._append_log(json.dumps(event, sort_keys=True))
+
+    def _record_analysis_output(self) -> None:
+        if self._selected_bundle is None or not self.last_output_dir:
+            return
+        try:
+            record_project_video_analysis_output(
+                self.project_root,
+                self._selected_bundle.video_name,
+                self.last_output_dir,
+            )
+        except OSError as exc:
+            self._append_log(f"Could not save analysis output location: {exc}")
 
     def _analysis_job_finished(self, result: WorkerJobResult) -> None:
         controller = self.analysis_controller
@@ -2192,7 +2287,7 @@ class AnalysisDialog(QDialog):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
 
     def _cleanup_before_close(self) -> None:
-        self._save_analysis_setup()
+        self._save_analysis_setup(user_edit=False)
         if self.analysis_controller is not None:
             self.analysis_controller.shutdown()
         else:

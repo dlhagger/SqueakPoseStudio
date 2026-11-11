@@ -16,6 +16,9 @@ _BACKUP_RE = re.compile(r"^(?P<target>.+)\.backup-(?P<token>[0-9a-f]{32})$")
 _TEMPFILE_TOKEN = r"[a-z0-9_]{8}"
 _STAGING_FILE_RE = re.compile(rf"^\..+\.{_TEMPFILE_TOKEN}\.tmp(?:\.[^./\\]+)?$")
 _EXPORT_STAGING_DIR_RE = re.compile(rf"^\.(?:pose|segment|detect)-export-{_TEMPFILE_TOKEN}$")
+# ``AnalysisOutputTransaction.__enter__`` stages into
+# ``tempfile.mkdtemp(prefix=f".{output_name}.analysis-", suffix=".tmp", dir=parent)``.
+_ANALYSIS_STAGING_DIR_RE = re.compile(rf"^\..+\.analysis-{_TEMPFILE_TOKEN}\.tmp$")
 _PRUNED_DIRECTORIES = {".git", ".venv", "__pycache__"}
 
 
@@ -102,6 +105,16 @@ def scan_transaction_artifacts(project_root: str) -> TransactionRecoveryReport:
                     )
                 )
                 continue
+            if _ANALYSIS_STAGING_DIR_RE.fullmatch(name):
+                report.staging_paths.append(
+                    require_path_within_project(
+                        root,
+                        path,
+                        purpose="analysis output staging directory",
+                        allow_root=False,
+                    )
+                )
+                continue
             retained_directories.append(name)
         directory_names[:] = retained_directories
 
@@ -174,7 +187,7 @@ def restore_missing_transaction_targets(project_root: str) -> TransactionRecover
 
 
 def cleanup_transaction_staging(project_root: str) -> TransactionRecoveryResult:
-    """Remove only currently recognized staging files and export directories."""
+    """Remove only recognized staging files and export/analysis staging directories."""
 
     report = scan_transaction_artifacts(project_root)
     result = TransactionRecoveryResult(

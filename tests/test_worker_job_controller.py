@@ -6,7 +6,6 @@ from tempfile import TemporaryDirectory
 from PyQt6.QtCore import QCoreApplication, QProcess
 
 from squeakpose.workers.process import WorkerJobController
-from squeakpose.workers.protocol import cancel_command_bytes
 
 
 class _FakeSignal:
@@ -39,6 +38,12 @@ class _FakeProcess:
         self.signals_blocked = False
         self.stdin = b""
         self.call_order = []
+        self.wait_timeouts = []
+        # Number of terminate() calls after which waitForFinished reports exit;
+        # None exits on the first wait (the default cooperative worker).
+        self.exit_after_terminates = None
+        self.marker_path = None
+        self.marker_seen_at_terminate = []
 
     def write(self, data):
         self.stdin += bytes(data)
@@ -78,16 +83,23 @@ class _FakeProcess:
     def terminate(self):
         self.terminate_calls += 1
         self.call_order.append("terminate")
+        if self.marker_path is not None:
+            self.marker_seen_at_terminate.append(os.path.exists(self.marker_path))
 
     def blockSignals(self, blocked):
         self.signals_blocked = bool(blocked)
 
-    def waitForFinished(self, _timeout):
-        self.process_state = QProcess.ProcessState.NotRunning
-        return True
+    def waitForFinished(self, timeout):
+        self.wait_timeouts.append(timeout)
+        if self.kill_calls or self.exit_after_terminates is None:
+            self.process_state = QProcess.ProcessState.NotRunning
+        elif self.terminate_calls >= self.exit_after_terminates:
+            self.process_state = QProcess.ProcessState.NotRunning
+        return self.process_state == QProcess.ProcessState.NotRunning
 
     def kill(self):
         self.kill_calls += 1
+        self.call_order.append("kill")
         self.process_state = QProcess.ProcessState.NotRunning
 
 
@@ -207,21 +219,39 @@ class WorkerJobControllerTests(unittest.TestCase):
         self.assertEqual(len(terminal), 1)
         self.assertEqual(terminal[0].state, "cancelled")
 
-    def test_cancel_sends_stdin_cancel_request_before_terminate(self):
-        process = _FakeProcess(None)
-        controller = WorkerJobController(
-            process_factory=lambda _parent: process,
-            schedule=lambda _delay, _callback: None,
-        )
-        self.assertTrue(controller.start("/python", ["worker.py"]))
+    def test_cancel_creates_cancel_marker_before_terminate_and_never_writes_stdin(self):
+        with TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, ".train_config_test.json")
+            Path(config_path).write_text("{}", encoding="utf-8")
+            marker = f"{config_path}.cancel"
+            process = _FakeProcess(None)
+            process.marker_path = marker
+            controller = WorkerJobController(
+                process_factory=lambda _parent: process,
+                schedule=lambda _delay, _callback: None,
+            )
+            terminal = []
+            controller.terminal.connect(terminal.append)
+            self.assertTrue(controller.start("/python", [], config_path=config_path))
 
-        self.assertTrue(controller.cancel(kill_after_ms=60_000))
+            self.assertTrue(controller.cancel(kill_after_ms=60_000))
 
-        # The stdin line is the portable channel (Windows terminate() is a no-op
-        # for console children); SIGTERM follows for POSIX.
-        self.assertEqual(process.stdin, cancel_command_bytes())
-        self.assertEqual(process.call_order, ["write", "terminate"])
-        self.assertEqual(process.kill_calls, 0)
+            # The marker file is the portable channel (Windows terminate() is a
+            # no-op for console children); SIGTERM follows for POSIX. Nothing
+            # is written to stdin, so workers never block reading it.
+            self.assertTrue(os.path.isfile(marker))
+            self.assertEqual(process.marker_seen_at_terminate, [True])
+            self.assertEqual(process.stdin, b"")
+            self.assertEqual(process.call_order, ["terminate"])
+            self.assertEqual(process.kill_calls, 0)
+            self.assertEqual([name for name in os.listdir(tmp) if name.endswith(".tmp")], [])
+
+            process.process_state = QProcess.ProcessState.NotRunning
+            process.finished.emit(0, QProcess.ExitStatus.NormalExit)
+
+            self.assertEqual(len(terminal), 1)
+            self.assertFalse(os.path.exists(marker))
+            self.assertFalse(os.path.exists(config_path))
 
     def test_force_stop_kills_immediately_and_reports_cancelled(self):
         process = _FakeProcess(None)
@@ -242,27 +272,70 @@ class WorkerJobControllerTests(unittest.TestCase):
         self.assertEqual(terminal[0].state, "cancelled")
         self.assertFalse(controller.force_stop())
 
-    def test_shutdown_sends_cancel_request_first(self):
+    def test_shutdown_creates_marker_then_terminates_twice_before_kill(self):
+        with TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, ".analysis_config_test.json")
+            Path(config_path).write_text("{}", encoding="utf-8")
+            process = _FakeProcess(None)
+            process.marker_path = f"{config_path}.cancel"
+            process.exit_after_terminates = 99  # ignores terminate entirely
+            controller = WorkerJobController(process_factory=lambda _parent: process)
+            terminal = []
+            controller.terminal.connect(terminal.append)
+            self.assertTrue(controller.start("/python", [], config_path=config_path))
+
+            self.assertTrue(controller.shutdown(terminate_timeout_ms=2000, kill_timeout_ms=1000))
+
+            self.assertEqual(process.marker_seen_at_terminate, [True, True])
+            self.assertEqual(process.call_order, ["terminate", "terminate", "kill"])
+            # Total terminate budget is unchanged: half, then the rest.
+            self.assertEqual(process.wait_timeouts, [1000, 1000, 1000])
+            self.assertEqual(process.stdin, b"")
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(terminal[0].state, "cancelled")
+            self.assertFalse(os.path.exists(process.marker_path))
+            self.assertFalse(os.path.exists(config_path))
+
+    def test_shutdown_second_terminate_lets_worker_roll_back_without_kill(self):
         process = _FakeProcess(None)
+        process.exit_after_terminates = 2
         controller = WorkerJobController(process_factory=lambda _parent: process)
         self.assertTrue(controller.start("/python", ["worker.py"]))
 
-        controller.shutdown()
+        self.assertTrue(controller.shutdown())
 
-        self.assertEqual(process.stdin, cancel_command_bytes())
-        self.assertEqual(process.call_order[:2], ["write", "terminate"])
+        self.assertEqual(process.call_order, ["terminate", "terminate"])
+        self.assertEqual(process.kill_calls, 0)
 
-    def test_cancel_tolerates_process_without_write(self):
-        process = _FakeProcess(None)
-        process.write = None
-        controller = WorkerJobController(
-            process_factory=lambda _parent: process,
-            schedule=lambda _delay, _callback: None,
-        )
-        self.assertTrue(controller.start("/python", ["worker.py"]))
+    def test_cancel_without_config_relies_on_signals_only(self):
+        with TemporaryDirectory() as tmp:
+            process = _FakeProcess(None)
+            controller = WorkerJobController(
+                process_factory=lambda _parent: process,
+                schedule=lambda _delay, _callback: None,
+            )
+            self.assertTrue(controller.start("/python", ["worker.py"], working_directory=tmp))
 
-        self.assertTrue(controller.cancel())
-        self.assertEqual(process.terminate_calls, 1)
+            self.assertTrue(controller.cancel())
+
+            self.assertIsNone(controller.cancel_marker_path)
+            self.assertEqual(process.terminate_calls, 1)
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_cancel_marker_failure_does_not_block_terminate(self):
+        with TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "missing-dir", ".cfg.json")
+            process = _FakeProcess(None)
+            controller = WorkerJobController(
+                process_factory=lambda _parent: process,
+                schedule=lambda _delay, _callback: None,
+            )
+            self.assertTrue(controller.start("/python", [], config_path=config_path))
+
+            with self.assertLogs("squeakpose.workers.process", level="WARNING"):
+                self.assertTrue(controller.cancel())
+
+            self.assertEqual(process.terminate_calls, 1)
 
     def test_reentrant_finished_during_event_delivery_keeps_result_before_terminal(self):
         process = _FakeProcess(None)

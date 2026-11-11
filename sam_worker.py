@@ -135,10 +135,14 @@ def run_sam_server(
                     "image_path": image_path,
                 }
             )
+            # Ultralytics treats a flat (N, 2) points array as N separate objects with
+            # one click each, so negative clicks would never subtract and extra positive
+            # clicks would never refine. Nest the prompt as a single object: (1, N, 2)
+            # points with (1, N) labels.
             predict_kwargs: dict[str, Any] = {
                 "source": image_path,
-                "points": points,
-                "labels": labels,
+                "points": [points],
+                "labels": [labels],
                 "verbose": False,
             }
             device = str(request.get("device") or "")

@@ -9,11 +9,11 @@ import json
 import logging
 import os
 import platform
-import random
 import re
 import shlex
 import shutil
 import sys
+import uuid
 from dataclasses import replace
 from typing import List, Optional
 
@@ -37,6 +37,8 @@ from PyQt6.QtGui import (
     QFont,
     QFontDatabase,
     QFontInfo,
+    QImage,
+    QImageReader,
     QKeySequence,
     QPainter,
     QPainterPath,
@@ -173,6 +175,7 @@ from squeakpose.project.safety import (
     ProjectPathError,
     break_stale_project_lock,
     canonical_path,
+    require_path_within_project,
 )
 from squeakpose.project.session import ProjectSession, require_unique_schema_names
 from squeakpose.services.annotation_save import save_annotation_transaction
@@ -190,8 +193,9 @@ from squeakpose.services.dataset_ops import (
     list_label_files,
     normalize_label_directory,
     partition_images_by_usable_labels,
-    split_train_val_images,
+    plan_grouped_train_val_split,
 )
+from squeakpose.services.dataset_yaml import unpaired_sided_keypoints
 from squeakpose.services.frame_annotations import (
     SegmentationBoxUnavailableError,
     build_pose_save_request,
@@ -450,8 +454,9 @@ def _recover_project_transactions_for_ui(
         parent,
         "Remove Interrupted Transaction Files?",
         (
-            f"Found {len(report.staging_paths)} recognized staging file(s) or "
-            "export folder(s) from an interrupted transaction. Remove them?\n\n"
+            f"Found {len(report.staging_paths)} recognized staging file(s), dataset "
+            "export folder(s), or analysis staging folder(s) from an interrupted "
+            "transaction or canceled analysis. Remove them?\n\n"
             "Transaction backups and project data will not be removed."
         ),
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -688,6 +693,89 @@ try:
     import torch as _torch
 except Exception:
     _torch = None
+
+
+def load_oriented_image(path: str) -> QImage:
+    """Read an image with its EXIF orientation applied.
+
+    Qt leaves JPEG EXIF orientation unapplied unless auto-transform is requested,
+    while OpenCV and Ultralytics (training and prediction) apply it. Labels must use
+    the same pixel frame as those consumers, so project images are always read
+    through this helper.
+    """
+
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    image = reader.read()
+    return image if image is not None else QImage()
+
+
+def load_oriented_pixmap(path: str) -> QPixmap:
+    """Return a pixmap for ``path`` with EXIF orientation applied (null on failure)."""
+
+    image = load_oriented_image(path)
+    if image.isNull():
+        return QPixmap()
+    return QPixmap.fromImage(image)
+
+
+def _remove_files_transactionally(paths: list[str]) -> None:
+    """Delete files so that either all of them go or none do.
+
+    Each existing file is first moved to a ``.backup-<token>`` sibling (the name
+    project recovery restores after a crash); if any move fails, earlier moves are
+    reverted and the error is raised. Backups are discarded once every move succeeds.
+    """
+
+    moved: list[tuple[str, str]] = []
+    try:
+        for path in paths:
+            if not os.path.lexists(path):
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                raise IsADirectoryError(path)
+            backup = f"{path}.backup-{uuid.uuid4().hex}"
+            os.replace(path, backup)
+            moved.append((path, backup))
+    except OSError:
+        for original, backup in reversed(moved):
+            try:
+                os.replace(backup, original)
+            except OSError:
+                logger.exception(
+                    "Could not restore file after failed removal",
+                    extra={
+                        "event": "label_removal_rollback_failed",
+                        "operation": "remove_saved_label",
+                        "target_path": original,
+                    },
+                )
+        raise
+    for original, backup in moved:
+        try:
+            os.unlink(backup)
+        except OSError:
+            logger.warning(
+                "Could not discard removed-file backup",
+                exc_info=True,
+                extra={
+                    "event": "label_removal_cleanup_failed",
+                    "operation": "remove_saved_label",
+                    "target_path": backup,
+                },
+            )
+
+
+def _read_depth_array(path: str):
+    """Load a depth map fully into memory.
+
+    Memory-mapping keeps an open handle to the ``.npy`` file, and Windows refuses to
+    replace a mapped file when a new prediction for the displayed image is committed.
+    """
+
+    if _np is None:
+        raise RuntimeError("NumPy is unavailable")
+    return _np.load(path, allow_pickle=False)
 
 
 def _auto_device() -> str:
@@ -2089,11 +2177,13 @@ class LabelingApp(QMainWindow):
                     return
             self.update_status_bar("Setup skipped; using defaults until edited.")
 
-    def _write_list_file(self, path: str, items: list[str]):
+    def _write_list_file(self, path: str, items: list[str]) -> bool:
         try:
             atomic_write_text(path, "".join(f"{item}\n" for item in items))
         except Exception as e:
             QMessageBox.warning(self, "File write error", f"Could not write {path}:\n{e}")
+            return False
+        return True
 
     def _backup_label_dir(self, labels_dir: str) -> str:
         return backup_label_dir(labels_dir)
@@ -2138,7 +2228,7 @@ class LabelingApp(QMainWindow):
         preview_path = os.path.join(self.depth_preview_dir, f"{base}_depth.png")
         if not os.path.isfile(preview_path):
             return
-        depth_pixmap = QPixmap(preview_path)
+        depth_pixmap = load_oriented_pixmap(preview_path)
         if depth_pixmap.isNull():
             return
         self._scene_presenter.add_depth_reference(
@@ -2683,8 +2773,24 @@ class LabelingApp(QMainWindow):
         reported = self.__dict__.pop("_sam_download_result_path", "")
         target = os.path.abspath(reported) if reported else ""
         if result.succeeded and target == expected and os.path.isfile(target):
-            self.update_status_bar(f"Downloaded {model.filename}. Loading {model.display_name}…")
-            self._warm_sam_model(target)
+            sam_controller = self.__dict__.get("_sam_assistant_controller")
+            sam_busy = bool(getattr(sam_controller, "is_busy", False))
+            if self._is_seg_workflow() and not sam_busy:
+                self.update_status_bar(
+                    f"Downloaded {model.filename}. Loading {model.display_name}…"
+                )
+                self._warm_sam_model(target)
+            else:
+                # Restarting the SAM worker now would drop an in-flight request or
+                # load a large model the user is not using; the button offers Load.
+                when = (
+                    "when the current SAM request finishes"
+                    if self._is_seg_workflow()
+                    else "in the Segmentation layer when ready"
+                )
+                self.update_status_bar(
+                    f"Downloaded {model.filename}. Use Load {model.display_name} {when}."
+                )
         elif result.state != "cancelled":
             detail = result.stderr.strip() or result.error_message
             QMessageBox.warning(
@@ -2704,7 +2810,17 @@ class LabelingApp(QMainWindow):
             self._draw_seg_prompt_marker(float(x), float(y), positive=bool(label))
         self._refresh_sam_controls()
 
+    def _refuse_read_only_edit(self) -> bool:
+        """Return True (and explain) when Analysis holds the project read-only."""
+
+        if not getattr(self, "_analysis_read_only", False):
+            return False
+        self.update_status_bar("Project editing is paused while Analysis is open.")
+        return True
+
     def _add_seg_prompt(self, scene_pos: QPointF, positive: bool = True):
+        if self._refuse_read_only_edit():
+            return
         if not self._is_seg_workflow() or self.mode != "segment":
             return
         sam_controller = self.__dict__.get("_sam_assistant_controller")
@@ -3420,6 +3536,13 @@ class LabelingApp(QMainWindow):
                 self.current_idx = max(0, len(self.images) - 1)
             self._queue_current_idx = self.current_idx
             self.load_image()
+        elif self.images:
+            # Nothing was displayed (empty queue or unreadable image): show the
+            # frames that just arrived instead of leaving a blank canvas.
+            if self.current_idx >= len(self.images) or self.current_idx < 0:
+                self.current_idx = 0
+            self._queue_current_idx = self.current_idx
+            self.load_image()
         elif self.current_idx >= len(self.images):
             self.current_idx = max(0, len(self.images) - 1)
             self._queue_current_idx = self.current_idx
@@ -3546,6 +3669,8 @@ class LabelingApp(QMainWindow):
         self.images = self.images_queue[:]
         self.active_image_dir = self.image_dir_queue
         self.current_image_path = ""
+        self.img_w = 0
+        self.img_h = 0
         self.current_idx = 0
         self._queue_current_idx = 0
 
@@ -4570,6 +4695,9 @@ class LabelingApp(QMainWindow):
             )
         if not self.images or self.current_idx < 0 or self.current_idx >= len(self.images):
             raise SegmentationBoxUnavailableError("Load an image first.")
+        if not getattr(self, "current_image_path", "") or self.img_w <= 0 or self.img_h <= 0:
+            # The selected image could not be read; there is no frame to scale into.
+            raise SegmentationBoxUnavailableError("Load an image first.")
         class_id = self.class_selector.currentIndex()
         base = os.path.splitext(self.images[self.current_idx])[0]
         label_file = os.path.join(self.seg_label_dir, f"{base}.txt")
@@ -5042,7 +5170,7 @@ class LabelingApp(QMainWindow):
         # Build a background from the currently loaded source image when possible.
         base_pix = QPixmap()
         if self.current_image_path:
-            base_pix = QPixmap(self.current_image_path)
+            base_pix = load_oriented_pixmap(self.current_image_path)
         if base_pix.isNull() and self.images:
             file_name = self.images[self.current_idx]
             for cand in (
@@ -5052,7 +5180,7 @@ class LabelingApp(QMainWindow):
             ):
                 if not os.path.exists(cand):
                     continue
-                probe = QPixmap(cand)
+                probe = load_oriented_pixmap(cand)
                 if not probe.isNull():
                     base_pix = probe
                     break
@@ -5206,6 +5334,22 @@ class LabelingApp(QMainWindow):
         self.update_status_bar(f"Browsing: {mode} ({fi.index(self.current_idx) + 1}/{len(fi)})")
         self.load_image()
 
+    def _reset_mode_for_navigation(self) -> None:
+        """Return to the layer's default drawing mode after changing frames.
+
+        While Analysis holds the project read-only the view stays in Pan/Zoom (set by
+        ``_set_analysis_read_only``); the mode is left alone so the reset never
+        bypasses the guard in ``set_mode``.
+        """
+
+        if getattr(self, "_analysis_read_only", False):
+            return
+        self.mode = (
+            "segment"
+            if self._is_seg_workflow()
+            else ("panzoom" if self._is_depth_layer() else "bbox")
+        )
+
     def prev_index(self):
         selection = self._sync_image_queue_navigator().move(
             -1,
@@ -5216,11 +5360,7 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("No images found for current filter.")
             return
         self._apply_image_queue_selection(selection.current_index)
-        self.mode = (
-            "segment"
-            if self._is_seg_workflow()
-            else ("panzoom" if self._is_depth_layer() else "bbox")
-        )
+        self._reset_mode_for_navigation()
         self.load_image()
 
     def next_index(self):
@@ -5233,11 +5373,7 @@ class LabelingApp(QMainWindow):
             self.update_status_bar("No images found for current filter.")
             return
         self._apply_image_queue_selection(selection.current_index)
-        self.mode = (
-            "segment"
-            if self._is_seg_workflow()
-            else ("panzoom" if self._is_depth_layer() else "bbox")
-        )
+        self._reset_mode_for_navigation()
         self.load_image()
 
     def complete_and_next_unlabeled(self):
@@ -5279,7 +5415,7 @@ class LabelingApp(QMainWindow):
                 return
             self.current_idx = next_idx
             self._queue_current_idx = self.current_idx
-            self.mode = "segment"
+            self._reset_mode_for_navigation()
             self.load_image()
             return
         if not self._is_fully_labeled():
@@ -5298,11 +5434,7 @@ class LabelingApp(QMainWindow):
             return
         self.current_idx = next_idx
         self._queue_current_idx = self.current_idx
-        self.mode = (
-            "segment"
-            if self._is_seg_workflow()
-            else ("panzoom" if self._is_depth_layer() else "bbox")
-        )
+        self._reset_mode_for_navigation()
         self.load_image()
 
     def skip_to_next_unlabeled(self):
@@ -5316,11 +5448,7 @@ class LabelingApp(QMainWindow):
             popup.exec()
             return
         self._apply_image_queue_selection(next_idx)
-        self.mode = (
-            "segment"
-            if self._is_seg_workflow()
-            else ("panzoom" if self._is_depth_layer() else "bbox")
-        )
+        self._reset_mode_for_navigation()
         self.load_image()
 
     def _image_deletion_plan(self, image_name: str) -> ImageDeletionPlan:
@@ -5357,6 +5485,8 @@ class LabelingApp(QMainWindow):
 
     def _clear_loaded_image_state(self):
         self.current_image_path = ""
+        self.img_w = 0
+        self.img_h = 0
         self.annotation_cache.clear()
         self.seg_edit_state.reset()
         self.bboxes.clear()
@@ -5365,9 +5495,52 @@ class LabelingApp(QMainWindow):
         depth_presenter = self.__dict__.get("_depth_preview_presenter")
         if depth_presenter is not None:
             depth_presenter.clear()
+        self._forget_view_scene_items()
         self._scene_presenter.forget_scene_items()
         self.scene.clear()
         self._item_refs.clear()
+
+    def _forget_view_scene_items(self) -> None:
+        """Drop the canvas view's own items before the scene deletes them."""
+
+        view = self.__dict__.get("view")
+        forget = getattr(view, "forget_scene_items", None)
+        if callable(forget):
+            forget()
+
+    def _reset_unloaded_image_state(self) -> None:
+        """Leave no previous-image annotation state behind when nothing is displayed.
+
+        Used when the selected image cannot be read: saving must not write the
+        previous image's annotations, normalized with its size, under a new name.
+        """
+
+        self.current_image_path = ""
+        self.img_w = 0
+        self.img_h = 0
+        self.bboxes.clear()
+        self.kps.clear()
+        self.current_kp_idx = 0
+        self.current_box = None
+        self.current_kps = []
+        self.current_class_id = None
+        self._active_depth_map = None
+        if self._is_seg_workflow():
+            self.annotation_cache = SegmentationAnnotationDocument()
+            self._segmentation_document = self.annotation_cache
+            self._sync_segmentation_state_from_cache()
+        else:
+            self.annotation_cache = PoseAnnotationDocument()
+            self.seg_edit_state.reset()
+            pose_controller = self._bind_pose_annotation_controller()
+            if pose_controller is not None:
+                pose_controller.select_class(None)
+            else:
+                self.pose_edit_state.select_class(None)
+        self._clear_seg_prompt_state()
+        self._refresh_segmentation_box_action()
+        if self.__dict__.get("annotation_panel") is not None:
+            self._update_status()
 
     def _reload_after_current_image_delete(self):
         self._queue_current_idx = self.current_idx
@@ -6225,9 +6398,11 @@ class LabelingApp(QMainWindow):
             "Shift+I": self._add_animal_instance,
             Qt.Key.Key_Delete: self.delete_selected,
             Qt.Key.Key_Backspace: self.delete_selected,  # optional: Mac-friendly
-            Qt.Key.Key_P: self.prev_index,
-            Qt.Key.Key_N: self.next_index,
+            "P": self.prev_index,
+            "N": self.next_index,
         }
+        # Navigation and view keys stay usable while Analysis holds the project
+        # read-only. Keys are compared as written in ``mapping``.
         view_only_keys = {"1", "R", "P", "N"}
         for key, func in mapping.items():
             shortcut = QShortcut(QKeySequence(key), self)
@@ -6272,8 +6447,14 @@ class LabelingApp(QMainWindow):
     def keyPressEvent(self, event):
         # Space = temporary pan
         if event.key() == Qt.Key.Key_Space:
-            self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.view.setCursor(Qt.CursorShape.OpenHandCursor)
+            if event.isAutoRepeat():
+                return
+            set_space_pan = getattr(self.view, "set_space_pan_active", None)
+            if callable(set_space_pan):
+                set_space_pan(True)
+            else:
+                self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+                self.view.setCursor(Qt.CursorShape.OpenHandCursor)
             return
 
         # Arrow keys:
@@ -6281,7 +6462,7 @@ class LabelingApp(QMainWindow):
         # - Else -> browse frames prev/next
         if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
             selected_kp = any(isinstance(it, KeypointItem) for it in self.scene.selectedItems())
-            if self.mode == "keypoint" and selected_kp:
+            if self.mode == "keypoint" and selected_kp and not self._analysis_read_only:
                 step = 0.5
                 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                     step = 3.0
@@ -6311,6 +6492,15 @@ class LabelingApp(QMainWindow):
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
+            if event.isAutoRepeat():
+                return
+            set_space_pan = getattr(self.view, "set_space_pan_active", None)
+            if callable(set_space_pan):
+                set_space_pan(False)
+            is_panning = getattr(self.view, "is_space_panning", None)
+            if callable(is_panning) and is_panning():
+                # The view restores the tool when the drag ends.
+                return
             self.set_mode(self.mode)  # restore cursor/drag per current tool
             return
         super().keyReleaseEvent(event)
@@ -6509,8 +6699,11 @@ class LabelingApp(QMainWindow):
                     "Labeled data already exists for this segmentation project.",
                 )
                 return
+        # Commit the new schema only after classes_seg.txt is written, so the
+        # in-memory class list never disagrees with the file labels are indexed by.
+        if not self._write_list_file(self.seg_class_file, classes_clean):
+            return
         self.seg_classes = classes_clean[:]
-        self._write_list_file(self.seg_class_file, self.seg_classes)
         self.classes = self.seg_classes[:]
         self._refresh_class_selector_for_workflow()
         self.annotation_cache.clear()
@@ -6617,10 +6810,9 @@ class LabelingApp(QMainWindow):
     # ---------- Image load / navigation ----------
 
     def load_image(self):
-        if hasattr(self.view, "_remove_crosshairs"):
-            self.view._remove_crosshairs()
-        if hasattr(self.view, "_reset_seg_brush_cursor"):
-            self.view._reset_seg_brush_cursor()
+        forget_view_items = getattr(self.view, "forget_scene_items", None)
+        if callable(forget_view_items):
+            forget_view_items()
         self._clear_seg_edit_handles()
         self._clear_seg_prompt_state()
         selected = self.class_selector.currentIndex() if self._is_seg_workflow() else -1
@@ -6642,7 +6834,7 @@ class LabelingApp(QMainWindow):
         self._item_refs.clear()
         self._active_depth_map = None
         if not self.images:
-            self._refresh_segmentation_box_action()
+            self._reset_unloaded_image_state()
             return
 
         current_image_name = self.images[self.current_idx]
@@ -6658,9 +6850,10 @@ class LabelingApp(QMainWindow):
 
         img_path = os.path.join(self.active_image_dir, current_image_name)
         self.current_image_path = img_path
-        pix = QPixmap(img_path)
+        pix = load_oriented_pixmap(img_path)
         if pix.isNull():
-            self.update_status_bar(f"Failed to load image: {self.images[self.current_idx]}")
+            self._reset_unloaded_image_state()
+            self.update_status_bar(f"Failed to load image: {current_image_name}")
             return
         self.img_w, self.img_h = pix.width(), pix.height()
         self.scene.setSceneRect(0, 0, self.img_w, self.img_h)
@@ -6680,11 +6873,7 @@ class LabelingApp(QMainWindow):
                 image_height=self.img_h,
                 project_root=self.project_root,
             )
-            array_reader = (
-                (lambda path: _np.load(path, mmap_mode="r", allow_pickle=False))
-                if _np is not None
-                else None
-            )
+            array_reader = _read_depth_array if _np is not None else None
             metadata_reader = lambda path: read_json_file(
                 path,
                 max_bytes=1024 * 1024,
@@ -6774,6 +6963,8 @@ class LabelingApp(QMainWindow):
         self.view.centerOn(scene_center)
 
     def add_bbox(self, rect: QRectF):
+        if self._refuse_read_only_edit():
+            return
         if not self.classes:
             QMessageBox.warning(
                 self, "No classes", "Define at least one class before adding boxes."
@@ -6826,6 +7017,8 @@ class LabelingApp(QMainWindow):
                 self._jump_to_next_pending_class()
 
     def add_keypoint(self, pos: QPointF):
+        if self._refuse_read_only_edit():
+            return
         if not self.bboxes:
             self.update_status_bar("Place a bounding box first.")
             return
@@ -7152,6 +7345,13 @@ class LabelingApp(QMainWindow):
     def save_labels(self) -> bool:
         if not self.images:
             return False
+        if not self.current_image_path or self.img_w <= 0 or self.img_h <= 0:
+            QMessageBox.warning(
+                self,
+                "No image loaded",
+                "The selected image could not be loaded, so there is nothing to save.",
+            )
+            return False
         if LabelingApp._is_depth_layer(self):
             QMessageBox.information(
                 self,
@@ -7169,12 +7369,17 @@ class LabelingApp(QMainWindow):
             return False
 
         if self._is_pose_workflow() and not self._cache_active_annotation():
-            QMessageBox.warning(
-                self,
-                "Save Error",
-                "Place one bounding box and all keypoints for the selected class before saving.",
-            )
-            return False
+            # A selected class whose box was deleted is a deliberate removal, not an
+            # incomplete annotation: save the remaining classes (or offer to remove
+            # the saved label below when nothing remains).
+            if self.pose_edit_state.box is not None:
+                QMessageBox.warning(
+                    self,
+                    "Save Error",
+                    "Place one bounding box and all keypoints for the selected class "
+                    "before saving.",
+                )
+                return False
         if (
             self._is_pose_workflow()
             and LabelingApp._multi_animal_enabled(self)
@@ -7258,6 +7463,8 @@ class LabelingApp(QMainWindow):
             )
 
         if not save_request.label_text.strip():
+            if os.path.lexists(label_out_path):
+                return self._remove_saved_label(file_name, label_out_path, annotated_out_path)
             QMessageBox.warning(self, "No annotations", "Nothing to save for this image.")
             return False
 
@@ -7327,6 +7534,64 @@ class LabelingApp(QMainWindow):
         )
         self._schema_locked = True
         self._update_progress_label()
+        return True
+
+    def _remove_saved_label(self, file_name: str, label_path: str, overlay_path: str) -> bool:
+        """Confirm and delete a saved label whose annotations were all removed.
+
+        The annotation save service refuses empty label text by design, so an image
+        whose every annotation was deleted would otherwise keep training on its old
+        label. The source image stays in images_all; without a label it is skipped by
+        dataset export.
+        """
+
+        layer_name = self._workflow_label()
+        decision = QMessageBox.question(
+            self,
+            "Remove Saved Label",
+            f"Remove the saved label for {file_name}?\n\n"
+            f"Every {layer_name} annotation on this image was removed. The saved label "
+            "file and its annotated preview will be deleted; the image itself is kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            targets = [
+                require_path_within_project(
+                    self.project_root, path, purpose="saved label removal target"
+                )
+                for path in (label_path, overlay_path)
+            ]
+            _remove_files_transactionally(targets)
+        except (OSError, ProjectPathError) as exc:
+            logger.exception(
+                "Saved label removal failed",
+                extra={
+                    "event": "label_removal_failed",
+                    "operation": "remove_saved_label",
+                    "project_root": self.project_root,
+                    "target_path": label_path,
+                },
+            )
+            QMessageBox.warning(
+                self,
+                "Remove Label Error",
+                f"Could not remove the saved label. Existing project files were kept.\n\n{exc}",
+            )
+            return False
+        logger.info(
+            "Saved label removed",
+            extra={
+                "event": "label_removed",
+                "operation": "remove_saved_label",
+                "project_root": self.project_root,
+                "target_path": label_path,
+            },
+        )
+        self._update_progress_label()
+        self.update_status_bar(f"Removed the saved label for {file_name}.")
         return True
 
     # ---------- Video ----------
@@ -7429,9 +7694,7 @@ class LabelingApp(QMainWindow):
             if confirm != QMessageBox.StandardButton.Yes:
                 return
 
-        images = sorted(images)
-        random.Random(split_seed).shuffle(images)
-        train_images, val_images = split_train_val_images(images, ratio)
+        train_images, val_images = plan_grouped_train_val_split(images, ratio, seed=split_seed)
 
         total = len(train_images) + len(val_images)
         prog = QProgressDialog("Copying dataset…", "Cancel", 0, total, self)
@@ -7509,9 +7772,16 @@ class LabelingApp(QMainWindow):
             )
             return
 
-        QMessageBox.information(
-            self, "Dataset exported", format_dataset_export_summary(export_result)
-        )
+        summary = format_dataset_export_summary(export_result)
+        if dataset_mode == DATASET_POSE:
+            unpaired = unpaired_sided_keypoints(self.kp_names)
+            if unpaired:
+                summary += (
+                    "\n\nWarning: these left/right keypoints have no mirrored partner, so "
+                    "horizontal-flip augmentation will not swap them: "
+                    f"{', '.join(unpaired)}. Rename them as left/right pairs if they are sided."
+                )
+        QMessageBox.information(self, "Dataset exported", summary)
         self.update_status_bar("Dataset export complete.")
 
     def show_project_health(self):

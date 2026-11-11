@@ -1028,6 +1028,7 @@ def _directory_snapshot(root: str) -> dict[str, bytes]:
 class AnalysisCancelTests(unittest.TestCase):
     def tearDown(self):
         analysis_worker._CANCEL_REQUESTED = False
+        analysis_worker._CANCEL_SIGNAL_COUNT = 0
 
     def _pose_config(self, csv_path, out_dir):
         return {
@@ -1137,8 +1138,53 @@ class AnalysisCancelTests(unittest.TestCase):
 
     def test_signal_handler_only_sets_flag(self):
         analysis_worker._CANCEL_REQUESTED = False
+        analysis_worker._CANCEL_SIGNAL_COUNT = 0
         analysis_worker._handle_cancel_signal(None, None)  # must not raise SystemExit
         self.assertTrue(analysis_worker._CANCEL_REQUESTED)
+
+    def test_second_signal_exits_and_still_rolls_back_staged_output(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "detections.csv")
+            out_dir = os.path.join(tmp, "analysis")
+            _write_demo_detections(csv_path)
+            self.assertEqual(
+                run_analysis_worker(self._pose_config(csv_path, out_dir), event_writer=[].append),
+                0,
+            )
+            before = _directory_snapshot(out_dir)
+            siblings_before = sorted(os.listdir(tmp))
+
+            def writer(event):
+                if event.get("event") == "progress" and int(event.get("step") or 0) >= 3:
+                    # Forced close: the owner's terminate, then its second terminate.
+                    analysis_worker._handle_cancel_signal(None, None)
+                    analysis_worker._handle_cancel_signal(None, None)
+
+            with self.assertRaises(SystemExit) as raised:
+                run_analysis_worker(
+                    {**self._pose_config(csv_path, out_dir), "fps": 20.0},
+                    event_writer=writer,
+                )
+
+            self.assertEqual(raised.exception.code, 130)
+            self.assertEqual(_directory_snapshot(out_dir), before)
+            self.assertEqual(sorted(os.listdir(tmp)), siblings_before)
+
+    def test_main_watches_cancel_marker_next_to_config(self):
+        with TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, ".analysis_config_x.json")
+            Path(config_path).write_text("{}", encoding="utf-8")
+            with (
+                patch("analysis_worker.signal.signal"),
+                patch("analysis_worker.start_cancel_file_watcher") as watcher,
+                patch("analysis_worker.run_analysis_worker", return_value=0) as run,
+            ):
+                self.assertEqual(analysis_worker.main(["--config", config_path]), 0)
+
+            watcher.assert_called_once_with(
+                f"{config_path}.cancel", analysis_worker._request_cancel
+            )
+            self.assertEqual(run.call_args.kwargs, {"reset_cancel": False})
 
 
 if __name__ == "__main__":

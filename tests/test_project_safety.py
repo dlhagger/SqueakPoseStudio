@@ -150,6 +150,100 @@ class ProjectLockTests(unittest.TestCase):
             live.release()
             self.assertEqual(os.listdir(tmp), [])
 
+    def _break_while_lock_changes_hands(self, tmp, *, link_error, rename_fails_on_restore):
+        lock = ProjectLock(tmp)
+        stale = replace(lock.info, pid=999_999_999, hostname=socket.gethostname())
+        with open(lock.path, "w", encoding="utf-8") as handle:
+            json.dump(asdict(stale), handle)
+        live = ProjectLock(tmp)
+        real_rename = os.rename
+        calls = []
+
+        def rename(src, dst, *args, **kwargs):
+            calls.append((src, dst))
+            if len(calls) == 1:
+                os.unlink(lock.path)
+                live.acquire()
+            elif rename_fails_on_restore:
+                raise PermissionError(1, "Operation not permitted")
+            return real_rename(src, dst, *args, **kwargs)
+
+        with (
+            patch("squeakpose.project.safety.os.rename", side_effect=rename),
+            patch("squeakpose.project.safety.os.link", side_effect=link_error),
+        ):
+            with self.assertRaises(ProjectLockedError) as raised:
+                break_stale_project_lock(tmp)
+        return live, raised.exception
+
+    def test_breaking_stale_lock_restores_live_lock_without_hard_links(self):
+        for error in (
+            PermissionError(1, "Operation not permitted"),
+            OSError(45, "Operation not supported"),
+        ):
+            with self.subTest(error=error), TemporaryDirectory() as tmp:
+                live, exc = self._break_while_lock_changes_hands(
+                    tmp, link_error=error, rename_fails_on_restore=False
+                )
+
+                self.assertIsNone(exc.claimed_path)
+                self.assertEqual(os.listdir(tmp), [PROJECT_LOCK_FILENAME])
+                self.assertEqual(inspect_project_lock(tmp), (live.info, False))
+                live.release()
+                self.assertEqual(os.listdir(tmp), [])
+
+    def test_breaking_stale_lock_never_deletes_live_lock_it_cannot_restore(self):
+        with TemporaryDirectory() as tmp:
+            live, exc = self._break_while_lock_changes_hands(
+                tmp,
+                link_error=PermissionError(1, "Operation not permitted"),
+                rename_fails_on_restore=True,
+            )
+
+            self.assertIsNotNone(exc.claimed_path)
+            self.assertIn(exc.claimed_path, str(exc))
+            self.assertEqual(exc.info, live.info)
+            self.assertTrue(os.path.isfile(exc.claimed_path))
+            names = os.listdir(tmp)
+            self.assertEqual(names, [os.path.basename(exc.claimed_path)])
+            with open(exc.claimed_path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["token"], live.info.token)
+            live.acquired = False
+
+    def test_breaking_stale_lock_does_not_clobber_lock_created_during_restore(self):
+        with TemporaryDirectory() as tmp:
+            lock = ProjectLock(tmp)
+            stale = replace(lock.info, pid=999_999_999, hostname=socket.gethostname())
+            with open(lock.path, "w", encoding="utf-8") as handle:
+                json.dump(asdict(stale), handle)
+            live = ProjectLock(tmp)
+            newcomer = ProjectLock(tmp)
+            real_rename = os.rename
+            calls = []
+
+            def rename(src, dst, *args, **kwargs):
+                calls.append((src, dst))
+                if len(calls) == 1:
+                    os.unlink(lock.path)
+                    live.acquire()
+                return real_rename(src, dst, *args, **kwargs)
+
+            def link(src, dst):
+                newcomer.acquire()
+                raise PermissionError(1, "Operation not permitted")
+
+            with (
+                patch("squeakpose.project.safety.os.rename", side_effect=rename),
+                patch("squeakpose.project.safety.os.link", side_effect=link),
+            ):
+                with self.assertRaises(ProjectLockedError):
+                    break_stale_project_lock(tmp)
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(inspect_project_lock(tmp), (newcomer.info, False))
+            newcomer.release()
+            live.acquired = False
+
     def test_breaking_stale_lock_reports_lock_that_disappeared(self):
         with TemporaryDirectory() as tmp:
             lock = ProjectLock(tmp)

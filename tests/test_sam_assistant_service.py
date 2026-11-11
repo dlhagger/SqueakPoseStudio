@@ -116,8 +116,8 @@ class SamAssistantServiceTests(unittest.TestCase):
             [
                 {
                     "source": "frame.png",
-                    "points": [[2.0, 3.0]],
-                    "labels": [1],
+                    "points": [[[2.0, 3.0]]],
+                    "labels": [[1]],
                     "verbose": False,
                     "device": "cpu",
                 }
@@ -171,13 +171,42 @@ class SamAssistantServiceTests(unittest.TestCase):
             [
                 {
                     "source": "frame.png",
-                    "points": [[2.0, 3.0]],
-                    "labels": [1],
+                    "points": [[[2.0, 3.0]]],
+                    "labels": [[1]],
                     "verbose": False,
                     "device": "cpu",
                 }
             ],
         )
+
+    def test_worker_sends_mixed_positive_negative_prompt_as_one_object(self):
+        model = _Model()
+        events = []
+        requests = [
+            json.dumps(
+                {
+                    "command": "predict",
+                    "request_id": 1,
+                    "model_path": "sam2.1_b.pt",
+                    "image_path": "frame.png",
+                    "points": [[2, 3], [5.5, 6], [9, 1]],
+                    "labels": [1, 1, 0],
+                }
+            ),
+        ]
+
+        run_sam_server(requests, model_factory=lambda _path: model, event_writer=events.append)
+
+        self.assertEqual(len(model.calls), 1)
+        call = model.calls[0]
+        # One object with three clicks: (1, N, 2) points and (1, N) labels. A flat
+        # (N, 2) list would be segmented by Ultralytics as N single-click objects.
+        self.assertEqual(call["points"], [[[2.0, 3.0], [5.5, 6.0], [9.0, 1.0]]])
+        self.assertEqual(call["labels"], [[1, 1, 0]])
+        self.assertEqual(len(call["points"]), len(call["labels"]))
+        self.assertEqual(len(call["points"][0]), len(call["labels"][0]))
+        result = next(event for event in events if event["event"] == "result")
+        self.assertFalse(result["had_error"])
 
     def test_worker_returns_json_safe_no_mask_and_validation_errors(self):
         model = _Model(results=[])

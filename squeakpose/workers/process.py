@@ -18,7 +18,7 @@ from squeakpose.project.safety import require_path_within_project
 from squeakpose.workers.protocol import (
     JsonLineBuffer,
     WorkerProtocolError,
-    cancel_command_bytes,
+    cancel_marker_path,
     parse_event_line,
 )
 
@@ -132,15 +132,15 @@ class WorkerJobController(QObject):
     def cancel(self, *, kill_after_ms: int = 5000) -> bool:
         """Request a graceful stop and force-kill this job if it remains active.
 
-        The worker receives a ``{"command": "cancel"}`` stdin line (portable,
-        including Windows where ``terminate()`` does not reach console
-        children) followed by ``terminate()`` (SIGTERM on POSIX).
+        When the job has a config file, a ``<config>.cancel`` marker is created
+        first (portable, including Windows where ``terminate()`` does not reach
+        console children); ``terminate()`` (SIGTERM on POSIX) follows.
         """
         process = self._process
         if process is None or self._terminal_result is not None:
             return False
         self._cancel_requested = True
-        self._send_cancel_request(process)
+        self._write_cancel_marker()
         return request_qprocess_stop(
             process,
             schedule=self._schedule,
@@ -157,15 +157,44 @@ class WorkerJobController(QObject):
         self._force_kill()
         return True
 
-    @staticmethod
-    def _send_cancel_request(process: Any) -> None:
-        writer = getattr(process, "write", None)
-        if not callable(writer):
+    @property
+    def cancel_marker_path(self) -> str | None:
+        config_path = self._config_path
+        return cancel_marker_path(config_path) if config_path else None
+
+    def _write_cancel_marker(self) -> None:
+        """Best-effort atomic creation of the worker's cancel marker file."""
+        marker = self.cancel_marker_path
+        if not marker or os.path.lexists(marker):
             return
+        directory = os.path.dirname(marker) or "."
+        fd = -1
+        temp_path = ""
         try:
-            writer(cancel_command_bytes())
-        except (RuntimeError, OSError):
-            return
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(marker)}.",
+                suffix=".tmp",
+                dir=directory,
+            )
+            os.close(fd)
+            fd = -1
+            os.replace(temp_path, marker)
+            temp_path = ""
+        except OSError:
+            logger.warning(
+                "Could not create worker cancel marker",
+                exc_info=True,
+                extra={
+                    "event": "worker_cancel_marker_failed",
+                    "operation": "cancel_worker",
+                    "target_path": marker,
+                },
+            )
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temp_path:
+                remove_file_quietly(temp_path)
 
     def shutdown(
         self,
@@ -173,15 +202,22 @@ class WorkerJobController(QObject):
         terminate_timeout_ms: int = 2000,
         kill_timeout_ms: int = 1000,
     ) -> bool:
-        """Synchronously stop an owned job, clean up, and emit its terminal result."""
+        """Synchronously stop an owned job, clean up, and emit its terminal result.
+
+        Escalation: cancel marker + ``terminate()``, wait half the terminate
+        timeout, ``terminate()`` again (workers treat a second signal as a
+        forced exit that still unwinds their rollback/``finally`` blocks), wait
+        the rest, then ``kill()``.
+        """
         process = self._process
         self._cancel_requested = True
         if process is not None and self._terminal_result is None:
-            self._send_cancel_request(process)
+            self._write_cancel_marker()
         stopped = shutdown_qprocess(
             process,
             terminate_timeout_ms=terminate_timeout_ms,
             kill_timeout_ms=kill_timeout_ms,
+            escalate_terminate=True,
         )
         if self._terminal_result is None:
             self._drain_output()
@@ -294,6 +330,8 @@ class WorkerJobController(QObject):
             return
         config_path = self._config_path
         self._config_path = None
+        if config_path:
+            remove_file_quietly(cancel_marker_path(config_path))
         remove_file_quietly(config_path)
         result = WorkerJobResult(
             state=state,
@@ -769,8 +807,15 @@ def shutdown_qprocess(
     *,
     terminate_timeout_ms: int = 2000,
     kill_timeout_ms: int = 1000,
+    escalate_terminate: bool = False,
 ) -> bool:
-    """Synchronously stop a QProcess-like object owned by a closing window."""
+    """Synchronously stop a QProcess-like object owned by a closing window.
+
+    With ``escalate_terminate`` the terminate budget is split: ``terminate()``,
+    wait half, ``terminate()`` again, wait the rest. Protocol workers treat the
+    second signal as a forced exit that still runs their rollback. ``kill()``
+    follows if the process is still running.
+    """
     if process is None:
         return True
 
@@ -782,8 +827,18 @@ def shutdown_qprocess(
         process.blockSignals(True)
     except (AttributeError, RuntimeError):
         pass
+    terminate_timeout_ms = max(0, int(terminate_timeout_ms))
     process.terminate()
-    if process.waitForFinished(terminate_timeout_ms):
+    if escalate_terminate:
+        first_wait_ms = terminate_timeout_ms // 2
+        if process.waitForFinished(first_wait_ms):
+            return True
+        if process.state() == QProcess.ProcessState.NotRunning:
+            return True
+        process.terminate()
+        if process.waitForFinished(terminate_timeout_ms - first_wait_ms):
+            return True
+    elif process.waitForFinished(terminate_timeout_ms):
         return True
     process.kill()
     process.waitForFinished(kill_timeout_ms)

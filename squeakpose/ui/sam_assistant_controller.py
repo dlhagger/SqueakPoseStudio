@@ -106,10 +106,12 @@ class SamAssistantController(QObject):
         return request_id
 
     def cancel(self) -> bool:
+        # Drop any queued restart before the early return: a restart whose worker has
+        # already stopped may have a 0 ms _resume_restart pending on the event loop.
+        self._restart_request = None
         session = self._session
         if session is None or not session.is_running:
             return False
-        self._restart_request = None
         self._cancel_requested = True
         self._expected_stop = True
         return bool(session.shutdown(terminate_after_ms=250, kill_after_ms=3000))
@@ -133,10 +135,12 @@ class SamAssistantController(QObject):
         return False
 
     def shutdown(self) -> bool:
+        # Clear first so a queued _resume_restart cannot start an orphan model load
+        # after the segmentation layer was left (the worker may already be stopped).
+        self._restart_request = None
         session = self._session
         if session is None or not session.is_running:
             return False
-        self._restart_request = None
         self._expected_stop = True
         return bool(session.shutdown(terminate_after_ms=250, kill_after_ms=3000))
 
@@ -239,10 +243,15 @@ class SamAssistantController(QObject):
             self._schedule(self._resume_restart)
 
     def _resume_restart(self) -> None:
+        # shutdown()/cancel() clear _restart_request, so a restart that was abandoned
+        # while this callback sat on the event loop resolves to a no-op here.
         request = self._restart_request
         self._restart_request = None
-        if request is not None:
-            self.warm_model(**request)
+        if request is None:
+            return
+        if self._busy or self._pending_request is not None:
+            return
+        self.warm_model(**request)
 
     def _clear_active_request(self) -> None:
         self._current_request_id = None

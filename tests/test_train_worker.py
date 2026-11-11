@@ -1,7 +1,12 @@
+import json
+import os
 import time
 import unittest
 from collections import defaultdict
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import train_worker
 from train_worker import run_training_worker
@@ -208,6 +213,7 @@ class _StoppableTrainModel:
 class TrainWorkerCancelTests(unittest.TestCase):
     def tearDown(self):
         train_worker._CANCEL_REQUESTED = False
+        train_worker._CANCEL_SIGNAL_COUNT = 0
 
     def test_cancel_mid_training_stops_at_batch_boundary_and_keeps_checkpoint(self):
         model = _StoppableTrainModel(epochs=3, batches=4, cancel_at_batch=6)
@@ -250,8 +256,18 @@ class TrainWorkerCancelTests(unittest.TestCase):
 
     def test_signal_handler_only_sets_flag(self):
         train_worker._CANCEL_REQUESTED = False
+        train_worker._CANCEL_SIGNAL_COUNT = 0
         train_worker._handle_cancel_signal(None, None)  # must not raise SystemExit
         self.assertTrue(train_worker._CANCEL_REQUESTED)
+
+    def test_second_signal_forces_exit(self):
+        train_worker._CANCEL_REQUESTED = False
+        train_worker._CANCEL_SIGNAL_COUNT = 0
+        train_worker._handle_cancel_signal(None, None)
+        with self.assertRaises(SystemExit) as raised:
+            train_worker._handle_cancel_signal(None, None)
+        self.assertEqual(raised.exception.code, 130)
+        train_worker._CANCEL_SIGNAL_COUNT = 0
 
     def test_uncanceled_run_reports_not_canceled(self):
         model = _StoppableTrainModel(epochs=1, batches=2)
@@ -267,6 +283,250 @@ class TrainWorkerCancelTests(unittest.TestCase):
         self.assertEqual(model.batches_run, 2)
         result = next(event for event in events if event["event"] == "result")
         self.assertFalse(result["canceled"])
+
+
+class _UltralyticsLikeModel:
+    """Mirror ``BaseTrainer._do_train`` + ``final_eval`` callback ordering.
+
+    Per epoch: on_train_epoch_start, batches (on_train_batch_end, ``if stop:
+    break``), validation, ``stop |= final_epoch``, save_model (last.pt with
+    optimizer state) + on_model_save, on_fit_epoch_end, ``if stop: break``.
+    Then final_eval strips last.pt and calls on_fit_epoch_end with epoch + 1.
+    """
+
+    def __init__(
+        self,
+        save_dir,
+        *,
+        epochs=3,
+        batches=4,
+        cancel_at_batch=None,
+        cancel_during_validation_of=None,
+        cancel_during_final_eval=False,
+        ckpt=None,
+    ):
+        self.callbacks = defaultdict(list)
+        self.save_dir = Path(save_dir)
+        self.epochs = epochs
+        self.batches = batches
+        self.cancel_at_batch = cancel_at_batch
+        self.cancel_during_validation_of = cancel_during_validation_of
+        self.cancel_during_final_eval = cancel_during_final_eval
+        self.batches_run = 0
+        self.validations = 0
+        self.epochs_completed = 0
+        if ckpt is not None:
+            self.ckpt = ckpt
+        self.train_calls = []
+
+    def add_callback(self, event, callback):
+        self.callbacks[event].append(callback)
+
+    def _emit(self, event, trainer):
+        for callback in self.callbacks[event]:
+            callback(trainer)
+
+    def _save(self, trainer):
+        payload = {"epoch": trainer.epoch, "optimizer": {"state": 1}}
+        trainer.last.write_text(json.dumps(payload), encoding="utf-8")
+        trainer.best.write_text(json.dumps(payload), encoding="utf-8")
+
+    def train(self, **params):
+        self.train_calls.append(params)
+        wdir = self.save_dir / "weights"
+        wdir.mkdir(parents=True, exist_ok=True)
+        trainer = SimpleNamespace(
+            epoch=0,
+            epochs=self.epochs,
+            start_epoch=0,
+            train_loader=list(range(self.batches)),
+            device="cpu",
+            save_dir=self.save_dir,
+            last=wdir / "last.pt",
+            best=wdir / "best.pt",
+            stop=False,
+            metrics={},
+            train_time_start=time.time(),
+        )
+        self._emit("on_pretrain_routine_end", trainer)
+        self._emit("on_train_start", trainer)
+        epoch = 0
+        while True:
+            trainer.epoch = epoch
+            self._emit("on_train_epoch_start", trainer)
+            for _batch in range(self.batches):
+                self.batches_run += 1
+                if self.batches_run == self.cancel_at_batch:
+                    train_worker._request_cancel()
+                self._emit("on_train_batch_end", trainer)
+                if trainer.stop:
+                    break
+            final_epoch = epoch + 1 >= self.epochs
+            self.validations += 1
+            if self.cancel_during_validation_of == epoch:
+                train_worker._request_cancel()
+            trainer.metrics = {"metrics/mAP50-95(P)": 0.1 * (epoch + 1)}
+            trainer.stop |= final_epoch
+            self._save(trainer)
+            self._emit("on_model_save", trainer)
+            self._emit("on_fit_epoch_end", trainer)
+            self.epochs_completed += 1
+            if trainer.stop:
+                break
+            epoch += 1
+        # final_eval(): strip_optimizer(last.pt), validate best.pt, log at epoch + 1.
+        trainer.last.write_text(json.dumps({"epoch": -1, "optimizer": None}), encoding="utf-8")
+        if self.cancel_during_final_eval:
+            train_worker._request_cancel()
+        trainer.metrics = {"metrics/mAP50-95(P)": 0.99}
+        trainer.epoch += 1
+        self._emit("on_fit_epoch_end", trainer)
+        trainer.epoch -= 1
+        return SimpleNamespace(save_dir=str(self.save_dir))
+
+
+class TrainWorkerUltralyticsLifecycleTests(unittest.TestCase):
+    def tearDown(self):
+        train_worker._CANCEL_REQUESTED = False
+        train_worker._CANCEL_SIGNAL_COUNT = 0
+
+    def _run(self, model, params=None):
+        events = []
+        exit_code = run_training_worker(
+            {"model_cfg": "yolo26n-pose.yaml", "params": params or {"epochs": model.epochs}},
+            model_factory=lambda _cfg: model,
+            event_writer=events.append,
+        )
+        result = next(event for event in events if event["event"] == "result")
+        return exit_code, events, result
+
+    def test_final_eval_is_reported_as_final_validation_not_extra_epoch(self):
+        with TemporaryDirectory() as tmp:
+            model = _UltralyticsLikeModel(tmp, epochs=2, batches=2)
+
+            exit_code, events, result = self._run(model)
+
+            self.assertEqual(exit_code, 0)
+            epoch_ends = [event for event in events if event["event"] == "epoch_end"]
+            self.assertEqual([event["epoch"] for event in epoch_ends], [1, 2])
+            self.assertTrue(all(event["epoch"] <= event["epochs"] for event in epoch_ends))
+            finals = [event for event in events if event["event"] == "final_validation"]
+            self.assertEqual(len(finals), 1)
+            self.assertEqual(finals[0]["epochs_completed"], 2)
+            self.assertEqual(finals[0]["metrics"], {"metrics/mAP50-95(P)": 0.99})
+            self.assertFalse(result["canceled"])
+
+    def test_cancel_during_validation_stops_at_epoch_end_without_another_epoch(self):
+        with TemporaryDirectory() as tmp:
+            model = _UltralyticsLikeModel(tmp, epochs=5, batches=3, cancel_during_validation_of=1)
+
+            exit_code, events, result = self._run(model)
+
+            self.assertEqual(exit_code, 0)
+            # Epochs 0 and 1 ran; no extra batches or validation after the cancel.
+            self.assertEqual(model.batches_run, 6)
+            self.assertEqual(model.validations, 2)
+            self.assertTrue(result["canceled"])
+            names = [event["event"] for event in events]
+            self.assertEqual(names.count("training_stopping"), 1)
+
+    def test_cancel_saves_resumable_checkpoint_before_final_eval_strips_last(self):
+        with TemporaryDirectory() as tmp:
+            model = _UltralyticsLikeModel(tmp, epochs=5, batches=4, cancel_at_batch=6)
+
+            exit_code, _events, result = self._run(model)
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(result["canceled"])
+            resumable = Path(tmp) / "weights" / "last_resumable.pt"
+            self.assertEqual(result["resume_checkpoint"], str(resumable))
+            saved = json.loads(resumable.read_text(encoding="utf-8"))
+            self.assertEqual(saved["epoch"], 1)
+            self.assertIsNotNone(saved["optimizer"])
+            stripped = json.loads((Path(tmp) / "weights" / "last.pt").read_text("utf-8"))
+            self.assertEqual(stripped["epoch"], -1)
+
+    def test_cancel_during_validation_also_saves_resumable_checkpoint(self):
+        with TemporaryDirectory() as tmp:
+            model = _UltralyticsLikeModel(tmp, epochs=5, batches=2, cancel_during_validation_of=0)
+
+            _exit_code, _events, result = self._run(model)
+
+            resumable = Path(tmp) / "weights" / "last_resumable.pt"
+            self.assertEqual(result["resume_checkpoint"], str(resumable))
+            self.assertEqual(json.loads(resumable.read_text("utf-8"))["epoch"], 0)
+
+    def test_cancel_during_final_eval_of_completed_run_reports_completion(self):
+        with TemporaryDirectory() as tmp:
+            stale = Path(tmp) / "weights" / "last_resumable.pt"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("{}", encoding="utf-8")
+            model = _UltralyticsLikeModel(tmp, epochs=2, batches=2, cancel_during_final_eval=True)
+
+            exit_code, events, result = self._run(model)
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(result["canceled"])
+            self.assertNotIn("resume_checkpoint", result)
+            self.assertNotIn("training_stopping", [event["event"] for event in events])
+            self.assertEqual(model.epochs_completed, 2)
+            # A finished run drops the older snapshot so it cannot rewind the run.
+            self.assertFalse(stale.exists())
+
+    def test_cancel_during_final_epoch_validation_reports_completion(self):
+        with TemporaryDirectory() as tmp:
+            model = _UltralyticsLikeModel(tmp, epochs=2, batches=2, cancel_during_validation_of=1)
+
+            _exit_code, _events, result = self._run(model)
+
+            self.assertFalse(result["canceled"])
+            self.assertFalse((Path(tmp) / "weights" / "last_resumable.pt").exists())
+
+    def test_exact_resume_of_finalized_checkpoint_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            for ckpt in ({"epoch": -1, "optimizer": None}, {"epoch": 3, "optimizer": None}, {}):
+                model = _UltralyticsLikeModel(tmp, ckpt=ckpt)
+                events = []
+
+                exit_code = run_training_worker(
+                    {"model_cfg": "last.pt", "params": {"resume": True, "device": "cpu"}},
+                    model_factory=lambda _cfg, model=model: model,
+                    event_writer=events.append,
+                )
+
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(events[-1]["event"], "error")
+                self.assertIn("cannot be resumed exactly", events[-1]["error_message"])
+                self.assertIn("last_resumable.pt", events[-1]["error_message"])
+                self.assertEqual(model.train_calls, [])
+
+    def test_exact_resume_of_full_checkpoint_trains(self):
+        with TemporaryDirectory() as tmp:
+            model = _UltralyticsLikeModel(
+                tmp, epochs=1, batches=1, ckpt={"epoch": 4, "optimizer": {"state": 1}}
+            )
+
+            exit_code, _events, result = self._run(model, {"resume": True, "device": "cpu"})
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(model.train_calls, [{"resume": True, "device": "cpu"}])
+            self.assertFalse(result["had_error"])
+
+
+class TrainWorkerMainTests(unittest.TestCase):
+    def test_train_main_watches_cancel_marker_next_to_config(self):
+        with TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, ".train_config_x.json")
+            Path(config_path).write_text("{}", encoding="utf-8")
+            with (
+                patch("train_worker.signal.signal"),
+                patch("train_worker.start_cancel_file_watcher") as watcher,
+                patch("train_worker.run_training_worker", return_value=0) as run,
+            ):
+                self.assertEqual(train_worker.main(["--config", config_path]), 0)
+
+            watcher.assert_called_once_with(f"{config_path}.cancel", train_worker._request_cancel)
+            self.assertEqual(run.call_args.kwargs, {"reset_cancel": False})
 
 
 if __name__ == "__main__":

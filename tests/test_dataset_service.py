@@ -3,9 +3,12 @@ import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import yaml
+
 from dataset_ops import DATASET_DETECT, dataset_export_paths
 from squeakpose.project.safety import ProjectPathError
 from squeakpose.services.dataset import export_dataset_transaction
+from squeakpose.services.dataset_yaml import resolve_dataset_root
 
 
 class DatasetServiceTests(unittest.TestCase):
@@ -40,6 +43,14 @@ class DatasetServiceTests(unittest.TestCase):
 
             self.assertEqual(result.split_seed, 17)
             self.assertTrue(os.path.isfile(paths.dataset_yaml_path))
+            with open(paths.dataset_yaml_path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            # No absolute root: a moved or copied project must train on its own images.
+            self.assertNotIn("path", yaml.safe_load(text))
+            self.assertNotIn(tmp, text)
+            self.assertEqual(
+                resolve_dataset_root(paths.dataset_yaml_path), os.path.abspath(paths.base_dir)
+            )
             self.assertTrue(os.path.isfile(os.path.join(paths.images_train_dir, "frame.jpg")))
             with open(
                 os.path.join(paths.labels_train_dir, "frame.txt"), "r", encoding="utf-8"

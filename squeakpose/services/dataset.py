@@ -91,7 +91,6 @@ def export_dataset_transaction(
             mode,
             classes,
             keypoint_names,
-            dataset_path=final_paths.base_dir,
         )
         os.makedirs(final_paths.base_dir, exist_ok=True)
         committer(

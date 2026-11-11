@@ -91,6 +91,8 @@ class DatasetOpsTests(unittest.TestCase):
             data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
             self.assertEqual(data["names"], ["mouse"])
             self.assertNotIn("task", data)
+            self.assertNotIn("path", data)
+            self.assertEqual((data["train"], data["val"]), ("images/train", "images/val"))
 
     def test_dataset_export_summary_includes_split_seed(self):
         with TemporaryDirectory() as tmp:
@@ -369,6 +371,73 @@ class DatasetOpsTests(unittest.TestCase):
             self.assertEqual(result.warnings, [])
             self.assertEqual(result.copied_images, 1)
             self.assertTrue((images_all / "frame2.JPG").exists())
+
+    def test_normalize_lists_each_image_directory_once_for_many_labels(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            labels = root / "labels_all"
+            images_all = root / "images_all"
+            images_to_label = root / "images_to_label"
+            labels.mkdir()
+            images_all.mkdir()
+            images_to_label.mkdir()
+            label_line = "0 0.500000 0.500000 0.200000 0.200000 0.100000 0.100000 2\n"
+            for index in range(200):
+                (labels / f"frame{index:04d}.txt").write_text(label_line, encoding="utf-8")
+                target = images_all if index % 2 else images_to_label
+                ext = ".PNG" if index % 3 == 0 else ".jpg"
+                (target / f"Frame{index:04d}{ext}").write_bytes(b"fake-image")
+            for index in range(1000):
+                (images_all / f"unrelated{index:05d}.png").write_bytes(b"x")
+
+            real_listdir = os.listdir
+            listed: list[str] = []
+
+            def counting_listdir(path="."):
+                listed.append(os.path.abspath(os.fspath(path)))
+                return real_listdir(path)
+
+            with patch("squeakpose.services.dataset_ops.os.listdir", side_effect=counting_listdir):
+                result = normalize_label_directory(
+                    labels_dir=str(labels),
+                    images_all_dir=str(images_all),
+                    images_to_label_dir=str(images_to_label),
+                    mode=DATASET_POSE,
+                    class_count=1,
+                    keypoint_count=1,
+                )
+
+            self.assertEqual(result.warnings, [])
+            self.assertEqual(result.copied_images, 100)
+            self.assertEqual(listed.count(str(images_all)), 1)
+            self.assertEqual(listed.count(str(images_to_label)), 1)
+            self.assertTrue((images_all / "Frame0000.PNG").exists())
+            self.assertTrue((images_all / "Frame0002.jpg").exists())
+
+    def test_normalize_does_not_copy_image_twice_for_case_variant_labels(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            labels = root / "labels_all"
+            images_all = root / "images_all"
+            images_to_label = root / "images_to_label"
+            labels.mkdir()
+            images_all.mkdir()
+            images_to_label.mkdir()
+            label_line = "0 0.500000 0.500000 0.200000 0.200000 0.100000 0.100000 2\n"
+            (labels / "frame1.txt").write_text(label_line, encoding="utf-8")
+            (images_to_label / "frame1.png").write_bytes(b"fake-image")
+
+            result = normalize_label_directory(
+                labels_dir=str(labels),
+                images_all_dir=str(images_all),
+                images_to_label_dir=str(images_to_label),
+                mode=DATASET_POSE,
+                class_count=1,
+                keypoint_count=1,
+                label_files=["frame1.txt", "FRAME1.txt"],
+            )
+
+            self.assertEqual(result.copied_images, 1)
 
     def test_normalize_with_zero_class_count_keeps_valid_rows(self):
         with TemporaryDirectory() as tmp:

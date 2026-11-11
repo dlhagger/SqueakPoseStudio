@@ -143,6 +143,22 @@ class TrainingServiceTests(unittest.TestCase):
             self.assertIsNone(resumed.dataset_yaml)
             self.assertEqual(resumed.params, {"resume": True, "device": "mps"})
 
+            # The snapshot the worker keeps for a canceled run is also accepted.
+            resumable = checkpoint.with_name("last_resumable.pt")
+            resumable.write_bytes(b"checkpoint")
+            resumed_snapshot = build_training_run_plan(
+                source_mode="resume",
+                dataset_path="",
+                base_model_cfg="ignored.yaml",
+                checkpoint_path=str(resumable),
+                device="cpu",
+                epochs=99,
+                batch=0,
+                project_runs_dir=tmp,
+            )
+            self.assertEqual(resumed_snapshot.model_cfg, str(resumable))
+            self.assertEqual(resumed_snapshot.params, {"resume": True, "device": "cpu"})
+
     def test_run_plan_passes_a_safe_custom_ultralytics_name(self):
         with TemporaryDirectory() as tmp:
             dataset = Path(tmp, "dataset.yaml")

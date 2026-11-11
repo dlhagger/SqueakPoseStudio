@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-import sys
+import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, TextIO
@@ -17,48 +18,46 @@ class WorkerProtocolError(ValueError):
 
 
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
-CANCEL_COMMAND = "cancel"
+CANCEL_FILE_SUFFIX = ".cancel"
+CANCEL_POLL_INTERVAL_SECONDS = 0.25
 
 
-def cancel_command_bytes() -> bytes:
-    """Return the stdin request a Qt owner sends to ask a one-shot worker to stop.
+def cancel_marker_path(config_path: str) -> str:
+    """Return the cancel marker a Qt owner creates next to a one-shot worker config.
 
-    ``QProcess.terminate()`` is a no-op for console children on Windows, so a
-    stdin line is the portable graceful-cancel channel; SIGTERM remains the
-    POSIX fallback.
+    ``QProcess.terminate()`` does not reach console children on Windows, and a
+    worker thread blocked reading stdin makes inherited-stdin grandchildren
+    (Ultralytics runs ``nvidia-smi``/``git``) hang during CRT start-up there.
+    A marker file beside the project-local config is the portable graceful
+    channel; SIGTERM remains the POSIX fallback.
     """
-    return (json.dumps({"command": CANCEL_COMMAND}) + "\n").encode("utf-8")
+    return f"{config_path}{CANCEL_FILE_SUFFIX}"
 
 
-def start_cancel_listener(
+def start_cancel_file_watcher(
+    path: str,
     on_cancel: Callable[[], None],
     *,
-    stream: TextIO | None = None,
+    interval: float = CANCEL_POLL_INTERVAL_SECONDS,
+    exists: Callable[[str], bool] = os.path.exists,
 ) -> threading.Thread:
-    """Call ``on_cancel`` once when a ``{"command": "cancel"}`` line arrives on stdin.
+    """Call ``on_cancel`` once when ``path`` appears, polling every ``interval`` seconds.
 
-    Runs on a daemon thread so a worker that never receives the request still
-    exits normally. Other lines are ignored; EOF ends the listener.
+    Runs on a daemon thread so a worker that is never canceled exits normally.
     """
 
-    source = stream if stream is not None else sys.stdin
+    def watch() -> None:
+        while True:
+            try:
+                present = exists(path)
+            except (OSError, ValueError):
+                present = False
+            if present:
+                on_cancel()
+                return
+            time.sleep(max(0.01, float(interval)))
 
-    def listen() -> None:
-        if source is None:
-            return
-        try:
-            for raw_line in source:
-                try:
-                    request = json.loads(raw_line)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(request, dict) and request.get("command") == CANCEL_COMMAND:
-                    on_cancel()
-                    return
-        except (OSError, ValueError):
-            return
-
-    thread = threading.Thread(target=listen, name="squeakpose-cancel-listener", daemon=True)
+    thread = threading.Thread(target=watch, name="squeakpose-cancel-watcher", daemon=True)
     thread.start()
     return thread
 

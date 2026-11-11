@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
+import math
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
@@ -138,6 +141,95 @@ def split_train_val_images(
     if train_count >= len(items) and len(items) > 1:
         train_count = len(items) - 1
     return items[:train_count], items[train_count:]
+
+
+_FRAME_NAME_RE = re.compile(r"^(?P<group>.+)_f(?P<index>\d{6,})(?:_\d+)?$")
+_SPLIT_FALLBACK_BLOCKS = 10
+
+
+def _split_group_and_frame(image_name: str) -> tuple[str, Optional[int]]:
+    """Return ``(group_key, frame_index)`` for one image name.
+
+    Video exports are named ``{video_base}_{source_id}_f{index:06d}`` (optionally with a
+    ``_N`` collision suffix); their group is everything before ``_f<digits>``. Any other
+    image is its own group keyed by its stem and has no frame index.
+    """
+
+    stem = os.path.splitext(os.path.basename(image_name))[0]
+    match = _FRAME_NAME_RE.match(stem)
+    if match is None:
+        return stem, None
+    return match.group("group"), int(match.group("index"))
+
+
+def _stable_unit_interval(seed: int, key: str) -> float:
+    digest = hashlib.sha256(f"{int(seed)}:{key}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / float(1 << 64)
+
+
+def _assign_units_to_val(
+    keys: list[str], val_fraction: float, *, seed: int
+) -> tuple[set[str], dict[str, float]]:
+    """Pick val keys by stable hash, forcing at least one key onto each side."""
+
+    scores = {key: _stable_unit_interval(seed, key) for key in keys}
+    val_keys = {key for key in keys if scores[key] < val_fraction}
+    if len(keys) >= 2:
+        if not val_keys:
+            val_keys = {min(keys, key=lambda key: (scores[key], key))}
+        elif len(val_keys) == len(keys):
+            val_keys.discard(max(keys, key=lambda key: (scores[key], key)))
+    return val_keys, scores
+
+
+def plan_grouped_train_val_split(
+    images: Iterable[str], train_ratio: float, *, seed: int
+) -> tuple[list[str], list[str]]:
+    """Split images into train/val so frames of one video stay on one side.
+
+    Each group (see :func:`_split_group_and_frame`) goes to val when a stable hash of
+    ``f"{seed}:{group}"`` falls below ``1 - train_ratio``. The decision for a group does
+    not depend on which other images exist, so adding images never moves existing
+    groups. With two or more images both sides are non-empty: when hashing puts every
+    group on one side, the group whose hash is closest to the other side is moved; when
+    there is only one group, its frames are cut into contiguous frame-index blocks that
+    are assigned the same way, keeping val frames temporally apart from train frames.
+    Both returned lists are sorted.
+    """
+
+    items = sorted(dict.fromkeys(images))
+    if len(items) < 2:
+        return items, []
+    ratio = float(train_ratio)
+    if math.isnan(ratio):
+        raise ValueError("train_ratio must be a number")
+    val_fraction = min(1.0, max(0.0, 1.0 - ratio))
+
+    groups: dict[str, list[tuple[Optional[int], str]]] = {}
+    for name in items:
+        group, frame_index = _split_group_and_frame(name)
+        groups.setdefault(group, []).append((frame_index, name))
+
+    if len(groups) >= 2:
+        val_groups, _ = _assign_units_to_val(list(groups), val_fraction, seed=seed)
+        train: list[str] = []
+        val: list[str] = []
+        for group, members in groups.items():
+            (val if group in val_groups else train).extend(name for _, name in members)
+        return sorted(train), sorted(val)
+
+    # Single group: fall back to contiguous frame-index blocks.
+    group, members = next(iter(groups.items()))
+    ordered = sorted(members, key=lambda member: (member[0] is None, member[0] or 0, member[1]))
+    block_count = min(_SPLIT_FALLBACK_BLOCKS, len(ordered))
+    blocks: dict[str, list[str]] = {}
+    for position, (_, name) in enumerate(ordered):
+        block = position * block_count // len(ordered)
+        blocks.setdefault(f"{group}#block{block}", []).append(name)
+    val_blocks, _ = _assign_units_to_val(list(blocks), val_fraction, seed=seed)
+    train = [name for key, names in blocks.items() if key not in val_blocks for name in names]
+    val = [name for key, names in blocks.items() if key in val_blocks for name in names]
+    return sorted(train), sorted(val)
 
 
 def partition_images_by_usable_labels(
@@ -328,13 +420,20 @@ def write_dataset_yaml_for_mode(
         raise ImportError("PyYAML is required to write dataset.yaml.") from exc
 
     cls_list = list(class_names)
-    payload = {
-        "path": dataset_path or base_dir,
-        "train": "images/train",
-        "val": "images/val",
-        "nc": len(cls_list),
-        "names": cls_list,
-    }
+    # ``path`` is omitted by default so Ultralytics resolves train/val against the
+    # YAML's own directory; an absolute root would keep pointing at the original
+    # location after a project is moved or copied.
+    payload: dict[str, object] = {}
+    if dataset_path:
+        payload["path"] = dataset_path
+    payload.update(
+        {
+            "train": "images/train",
+            "val": "images/val",
+            "nc": len(cls_list),
+            "names": cls_list,
+        }
+    )
     if is_segmentation_mode(mode):
         payload["task"] = "segment"
     out_path = os.path.join(base_dir, "dataset.yaml")
@@ -442,26 +541,43 @@ def label_file_has_usable_rows(
     return bool(normalized)
 
 
+def _build_image_stem_index(images_dir: str) -> dict[str, str]:
+    """Map case-folded image stems to file names, keeping the first name in sorted order."""
+
+    index: dict[str, str] = {}
+    for name in sorted(list_image_files(images_dir)):
+        index.setdefault(os.path.splitext(name)[0].casefold(), name)
+    return index
+
+
 def _ensure_matching_image(
     *,
     stem: str,
     label_name: str,
     images_all_dir: str,
     images_to_label_dir: str,
+    images_all_index: Optional[dict[str, str]] = None,
+    images_to_label_index: Optional[dict[str, str]] = None,
 ) -> tuple[bool, int, list[str]]:
-    if _find_image_for_stem(images_all_dir, stem):
+    if images_all_index is None:
+        images_all_index = _build_image_stem_index(images_all_dir)
+    wanted = stem.casefold()
+    if images_all_index.get(wanted):
         return True, 0, []
 
-    source_name = _find_image_for_stem(images_to_label_dir, stem)
+    if images_to_label_index is None:
+        images_to_label_index = _build_image_stem_index(images_to_label_dir)
+    source_name = images_to_label_index.get(wanted, "")
     if source_name:
         src = os.path.join(images_to_label_dir, source_name)
         dst = os.path.join(images_all_dir, source_name)
         try:
             os.makedirs(images_all_dir, exist_ok=True)
             shutil.copy2(src, dst)
-            return True, 1, []
         except Exception as exc:
             return False, 0, [f"{source_name}: copy failed ({exc})"]
+        images_all_index[wanted] = source_name
+        return True, 1, []
 
     return False, 0, [f"{label_name}: no matching image found in images_all or images_to_label"]
 
@@ -469,11 +585,7 @@ def _ensure_matching_image(
 def _find_image_for_stem(images_dir: str, stem: str) -> str:
     """Return the image file name whose stem matches ``stem`` case-insensitively."""
 
-    wanted = stem.casefold()
-    for name in sorted(list_image_files(images_dir)):
-        if os.path.splitext(name)[0].casefold() == wanted:
-            return name
-    return ""
+    return _build_image_stem_index(images_dir).get(stem.casefold(), "")
 
 
 def normalize_label_directory(
@@ -490,6 +602,13 @@ def normalize_label_directory(
 ) -> LabelNormalizationResult:
     files = sorted(list(label_files) if label_files is not None else list_label_files(labels_dir))
     result = LabelNormalizationResult(mode=mode, total_files=len(files))
+    # Each image directory is listed once; per-label lookups are then O(1).
+    image_indexes: dict[str, dict[str, str]] = {}
+
+    def image_index(directory: str) -> dict[str, str]:
+        if directory not in image_indexes:
+            image_indexes[directory] = _build_image_stem_index(directory)
+        return image_indexes[directory]
 
     for idx, fname in enumerate(files, start=1):
         if cancel_requested and cancel_requested():
@@ -561,6 +680,8 @@ def normalize_label_directory(
             label_name=fname,
             images_all_dir=images_all_dir,
             images_to_label_dir=images_to_label_dir,
+            images_all_index=image_index(images_all_dir),
+            images_to_label_index=image_index(images_to_label_dir),
         )
         result.copied_images += copied
         result.warnings.extend(image_warnings)

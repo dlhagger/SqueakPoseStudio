@@ -646,6 +646,102 @@ class InferenceOpsTests(unittest.TestCase):
             with open(csv_path, "r", encoding="utf-8", newline="") as fh:
                 self.assertEqual(len(list(csv.DictReader(fh))), 1)
 
+    def _pose_worker_config(self, csv_path, frames):
+        return {
+            "mode": "pose",
+            "model_path": "model.pt",
+            "video_path": "video.mp4",
+            "csv_path": csv_path,
+            "classes": ["mouse"],
+            "kp_names": ["nose"],
+            "device": "cpu",
+            "batch_size": 1,
+            "total_frames": frames,
+            "fps": 10.0,
+        }
+
+    def test_inference_worker_keeps_cancel_that_arrived_during_startup(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "startup_cancel.csv")
+            cv2 = _FakeCv2(["frame0", "frame1"], fps=10.0)
+            fake_model = _PoseModel(
+                [
+                    _Result(boxes=_Boxes(), orig_shape=(20, 40)),
+                    _Result(boxes=_Boxes(), orig_shape=(20, 40)),
+                ]
+            )
+            events = []
+            try:
+                inference_worker._request_cancel()  # cancel marker seen while loading config
+
+                exit_code = run_inference_worker(
+                    self._pose_worker_config(csv_path, 2),
+                    model_factory=lambda _path: fake_model,
+                    cv2_module=cv2,
+                    event_writer=events.append,
+                    reset_cancel=False,
+                )
+            finally:
+                inference_worker._CANCEL_REQUESTED = False
+                inference_worker._CANCEL_SIGNAL_COUNT = 0
+
+            self.assertEqual(exit_code, 0)
+            result_event = events[-1]
+            self.assertEqual(result_event["event"], "result")
+            self.assertTrue(result_event["canceled"])
+            self.assertEqual(result_event["rows_written"], 0)
+
+    def test_inference_worker_main_does_not_reset_startup_cancel(self):
+        with TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, ".inference_config_x.json")
+            Path(config_path).write_text("{}", encoding="utf-8")
+            with (
+                patch("inference_worker.signal.signal"),
+                patch("inference_worker.start_cancel_file_watcher") as watcher,
+                patch("inference_worker.run_inference_worker", return_value=0) as run,
+            ):
+                self.assertEqual(inference_worker.main(["--config", config_path]), 0)
+
+            watcher.assert_called_once_with(
+                f"{config_path}.cancel", inference_worker._request_cancel
+            )
+            self.assertEqual(run.call_args.kwargs, {"reset_cancel": False})
+
+    def test_inference_worker_second_signal_forces_exit_and_closes_csv(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "forced.csv")
+            cv2 = _FakeCv2(["frame0", "frame1", "frame2"], fps=10.0)
+            fake_model = _PoseModel(
+                [_Result(boxes=_Boxes(), orig_shape=(20, 40)) for _ in range(3)]
+            )
+            original_predict = fake_model.predict
+            calls = []
+
+            def predict_then_force(**kwargs):
+                out = original_predict(**kwargs)
+                calls.append(kwargs)
+                if len(calls) == 2:
+                    inference_worker._handle_cancel_signal(signal.SIGTERM, None)
+                    inference_worker._handle_cancel_signal(signal.SIGTERM, None)
+                return out
+
+            fake_model.predict = predict_then_force
+            try:
+                with self.assertRaises(SystemExit) as raised:
+                    run_inference_worker(
+                        self._pose_worker_config(csv_path, 3),
+                        model_factory=lambda _path: fake_model,
+                        cv2_module=cv2,
+                        event_writer=[].append,
+                    )
+            finally:
+                inference_worker._CANCEL_REQUESTED = False
+                inference_worker._CANCEL_SIGNAL_COUNT = 0
+
+            self.assertEqual(raised.exception.code, 130)
+            with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+                self.assertEqual(len(list(csv.DictReader(fh))), 1)
+
     def test_inference_worker_writes_segmentation_source_metadata(self):
         with TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "worker_segmentation.csv")

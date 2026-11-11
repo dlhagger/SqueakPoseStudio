@@ -16,20 +16,34 @@ from squeakpose.services.inference_runtime import (
     tracking_dependency_error,
 )
 from squeakpose.services.tracking import resolve_tracking_config
-from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
+from squeakpose.workers.protocol import (
+    cancel_marker_path,
+    read_config,
+    start_cancel_file_watcher,
+    write_event,
+)
 
 _CANCEL_REQUESTED = False
+_CANCEL_SIGNAL_COUNT = 0
+
+
+def _request_cancel() -> None:
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = True
 
 
 def _handle_cancel_signal(_signum, _frame):
-    # Only set the flag. The per-frame ``cancel_requested()`` checks in the
-    # inference runtime stop the pass cooperatively and the worker then emits a
-    # ``result`` with ``canceled=True`` and the real ``rows_written``, so the
-    # Qt owner keeps the partial CSV. Raising ``SystemExit`` here would unwind
-    # out of the predict loop before that result is written; the owner's kill
-    # escalation still covers a worker that does not stop in time.
-    global _CANCEL_REQUESTED
-    _CANCEL_REQUESTED = True
+    # The first signal only sets the flag. The per-frame ``cancel_requested()``
+    # checks in the inference runtime stop the pass cooperatively and the
+    # worker then emits a ``result`` with ``canceled=True`` and the real
+    # ``rows_written``, so the Qt owner keeps the partial CSV. A second signal
+    # (the owner's forced-close escalation) raises SystemExit, which unwinds
+    # the predict loop and closes the CSV through its ``finally`` blocks.
+    global _CANCEL_SIGNAL_COUNT
+    _CANCEL_SIGNAL_COUNT += 1
+    _request_cancel()
+    if _CANCEL_SIGNAL_COUNT > 1:
+        raise SystemExit(130)
 
 
 def _cancel_requested() -> bool:
@@ -50,10 +64,13 @@ def run_inference_worker(
     model_factory: Optional[Callable[[str], Any]] = None,
     cv2_module: Any = None,
     event_writer: Callable[[dict[str, Any]], None] = _stdout_event_writer,
+    reset_cancel: bool = True,
 ) -> int:
     """Run one inference job and emit JSON-compatible event payloads."""
-    global _CANCEL_REQUESTED
-    _CANCEL_REQUESTED = False
+    global _CANCEL_REQUESTED, _CANCEL_SIGNAL_COUNT
+    if reset_cancel:
+        _CANCEL_REQUESTED = False
+        _CANCEL_SIGNAL_COUNT = 0
 
     mode = str(config.get("mode", "pose")).lower()
     layer_id = normalize_layer_id(config.get("layer_id") or mode)
@@ -251,22 +268,23 @@ def run_inference_worker(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
-    # Portable cancel channel: QProcess.terminate() does not reach console
-    # children on Windows, so the owner also sends a stdin cancel line.
-    start_cancel_listener(lambda: _handle_cancel_signal(None, None))
 
     parser = argparse.ArgumentParser(
         description="Run SqueakPose video inference in a child process."
     )
     parser.add_argument("--config", required=True, help="Path to JSON inference config.")
     args = parser.parse_args(argv)
+    # Portable cancel channel: QProcess.terminate() does not reach console
+    # children on Windows, so the owner also creates ``<config>.cancel``.
+    start_cancel_file_watcher(cancel_marker_path(args.config), _request_cancel)
 
     try:
         config = read_config(args.config)
     except Exception as exc:
         _stdout_event_writer({"event": "error", "error_message": f"Could not read config: {exc}"})
         return 1
-    return run_inference_worker(config)
+    # Keep a cancel that arrived while the config was loading.
+    return run_inference_worker(config, reset_cancel=False)
 
 
 if __name__ == "__main__":

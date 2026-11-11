@@ -12,6 +12,15 @@ import yaml
 from squeakpose.core import infer_dataset_task
 from squeakpose.project.layers import normalize_layer_id
 
+# Names accepted for "Resume YOLO run (exact)". ``last_resumable.pt`` is the
+# copy the training worker saves when a run is canceled, before Ultralytics'
+# final evaluation strips the optimizer state from ``last.pt``.
+RESUMABLE_CHECKPOINT_NAMES = ("last.pt", "last_resumable.pt")
+FINALIZED_CHECKPOINT_RESUME_MESSAGE = (
+    "This checkpoint was finalized and cannot be resumed exactly; use 'Continue from "
+    "YOLO checkpoint' or pick last_resumable.pt."
+)
+
 
 class TrainingConfigError(ValueError):
     """A user-correctable training configuration error."""
@@ -222,10 +231,11 @@ def build_training_run_plan(
                 "checkpoint_required",
                 message,
             )
-        if exact_resume and os.path.basename(checkpoint).lower() != "last.pt":
+        if exact_resume and os.path.basename(checkpoint).lower() not in RESUMABLE_CHECKPOINT_NAMES:
             raise TrainingConfigError(
                 "resume_checkpoint",
-                "For exact run continuation, select a weights/last.pt checkpoint.",
+                "For exact run continuation, select a weights/last.pt or "
+                "weights/last_resumable.pt checkpoint.",
             )
 
     if not exact_resume and str(device).lower() == "mps" and int(batch) <= 0:
@@ -311,6 +321,8 @@ def build_training_run_plan(
 
 
 __all__ = [
+    "FINALIZED_CHECKPOINT_RESUME_MESSAGE",
+    "RESUMABLE_CHECKPOINT_NAMES",
     "TrainingConsoleBuffer",
     "TrainingConfigError",
     "TrainingWorkerConfig",

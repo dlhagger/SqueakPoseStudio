@@ -126,6 +126,9 @@ class DistillationDialog(QDialog):
         self.cancel_requested = False
         self._starting_process = False
         self._deferred_terminal_result: Optional[WorkerJobResult] = None
+        # Output directory captured when the active run started; the run-name
+        # field stays editable while the run is in progress.
+        self._active_output_dir = ""
         self._current_task = "pose"
 
         layout = QVBoxLayout(self)
@@ -611,6 +614,7 @@ class DistillationDialog(QDialog):
         controller.stderr_received.connect(self._handle_process_output)
         controller.terminal.connect(self._handle_process_terminal)
         self.cancel_requested = False
+        self._active_output_dir = str(plan.output_dir)
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.create_dataset_btn.setEnabled(False)
@@ -644,7 +648,10 @@ class DistillationDialog(QDialog):
         if not text:
             return
         self._append_log(text + "\n")
-        self._set_status("Running", "running")
+        # Output keeps arriving while a cancel winds down; do not flip
+        # "Canceling" back to "Running".
+        if not self.cancel_requested:
+            self._set_status("Running", "running")
 
     def _handle_process_event(self, event: dict) -> None:
         self._handle_process_output(json.dumps(event, sort_keys=True))
@@ -662,7 +669,8 @@ class DistillationDialog(QDialog):
         text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         if text:
             self._append_log(text)
-            self._set_status("Running", "running")
+            if not self.cancel_requested:
+                self._set_status("Running", "running")
 
     def _process_error(self, _error) -> None:
         """Compatibility helper for callers that still own a raw process."""
@@ -703,6 +711,8 @@ class DistillationDialog(QDialog):
 
     def _finish_process_result(self, result: WorkerJobResult) -> None:
         canceled = self.cancel_requested or result.state == "cancelled"
+        output_dir = self._active_output_dir or self._output_dir()
+        self._active_output_dir = ""
         controller = self.process_controller
         self.process_controller = None
         self.process = None
@@ -727,7 +737,7 @@ class DistillationDialog(QDialog):
             return
 
         self._set_status("Complete", "complete")
-        self._append_log(f"\nDistillation complete. Output: {self._output_dir()}\n")
+        self._append_log(f"\nDistillation complete. Output: {output_dir}\n")
         QMessageBox.information(
             self,
             "Distillation complete",

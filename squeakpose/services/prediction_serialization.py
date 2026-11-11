@@ -23,10 +23,65 @@ def _to_list(value: Any) -> list:
         return []
 
 
-def _mask_segments_from_data(
-    mask_data: Any, det_idx: int, *, cv2_module: Any = None, numpy_module: Any = None
+def _shape_hw(shape: Any) -> tuple[int, int] | None:
+    try:
+        height, width = int(shape[0]), int(shape[1])
+    except Exception:
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return height, width
+
+
+def _scale_mask_points_to_original(
+    points: list[list[float]], mask_shape: tuple[int, int], orig_shape: tuple[int, int]
 ) -> list[list[float]]:
-    if cv2_module is None or numpy_module is None:
+    """Undo YOLO letterboxing for points measured on a ``masks.data`` grid.
+
+    Mirrors ``ultralytics.utils.ops.scale_coords`` (with ``ratio_pad=None`` and
+    ``padding=True``), which is what ``Masks.xy`` uses, without requiring torch.
+    """
+
+    mask_h, mask_w = mask_shape
+    orig_h, orig_w = orig_shape
+    if (mask_h, mask_w) == (orig_h, orig_w):
+        return points
+    gain = min(mask_h / orig_h, mask_w / orig_w)
+    new_h = max(round(orig_h * gain), 1)
+    new_w = max(round(orig_w * gain), 1)
+    gain_y, gain_x = new_h / orig_h, new_w / orig_w
+    pad_x = round((mask_w - new_w) / 2 - 0.1)
+    pad_y = round((mask_h - new_h) / 2 - 0.1)
+    scaled: list[list[float]] = []
+    for x, y in points:
+        sx = min(max((x - pad_x) / gain_x, 0.0), float(orig_w))
+        sy = min(max((y - pad_y) / gain_y, 0.0), float(orig_h))
+        scaled.append([sx, sy])
+    return scaled
+
+
+def _result_orig_shape(result: Any) -> tuple[int, int] | None:
+    shape = _shape_hw(getattr(result, "orig_shape", None))
+    if shape is None:
+        shape = _shape_hw(getattr(getattr(result, "masks", None), "orig_shape", None))
+    return shape
+
+
+def _mask_segments_from_data(
+    mask_data: Any,
+    det_idx: int,
+    *,
+    orig_shape: tuple[int, int] | None = None,
+    cv2_module: Any = None,
+    numpy_module: Any = None,
+) -> list[list[float]]:
+    """Trace the largest contour of one mask and return it in original-image pixels.
+
+    ``masks.data`` is at model-input (letterboxed) resolution unless ``retina_masks`` was
+    used, so points are rescaled to ``orig_shape``. Without a known ``orig_shape`` the
+    contour cannot be placed correctly and no fallback polygon is produced.
+    """
+    if cv2_module is None or numpy_module is None or orig_shape is None:
         return []
     try:
         if mask_data is None or det_idx >= len(mask_data):
@@ -36,9 +91,13 @@ def _mask_segments_from_data(
             mask_arr = mask_arr.cpu()
         if hasattr(mask_arr, "numpy"):
             mask_arr = mask_arr.numpy()
+        mask_arr = numpy_module.asarray(mask_arr)
         if getattr(mask_arr, "ndim", 0) == 3:
             mask_arr = mask_arr[0]
-        mask_u8 = (numpy_module.asarray(mask_arr) > 0.5).astype(numpy_module.uint8) * 255
+        mask_shape = _shape_hw(getattr(mask_arr, "shape", None))
+        if mask_shape is None:
+            return []
+        mask_u8 = (mask_arr > 0.5).astype(numpy_module.uint8) * 255
         contours_info = cv2_module.findContours(
             mask_u8, cv2_module.RETR_EXTERNAL, cv2_module.CHAIN_APPROX_NONE
         )
@@ -46,7 +105,8 @@ def _mask_segments_from_data(
         if not contours:
             return []
         contour = max(contours, key=cv2_module.contourArea)
-        return [[float(pt[0][0]), float(pt[0][1])] for pt in contour if len(pt[0]) >= 2]
+        points = [[float(pt[0][0]), float(pt[0][1])] for pt in contour if len(pt[0]) >= 2]
+        return _scale_mask_points_to_original(points, mask_shape, orig_shape)
     except Exception:
         return []
 
@@ -86,6 +146,7 @@ def serialize_prediction_result(
         except Exception:
             mask_polys = []
         mask_data = getattr(result.masks, "data", None)
+    orig_shape = _result_orig_shape(result)
 
     detections: list[dict[str, Any]] = []
     for det_idx, box in enumerate(xyxy):
@@ -124,7 +185,11 @@ def serialize_prediction_result(
                 det["segments"] = points
         if not det["segments"]:
             fallback = _mask_segments_from_data(
-                mask_data, det_idx, cv2_module=cv2_module, numpy_module=numpy_module
+                mask_data,
+                det_idx,
+                orig_shape=orig_shape,
+                cv2_module=cv2_module,
+                numpy_module=numpy_module,
             )
             if len(fallback) >= 3:
                 det["segments"] = fallback

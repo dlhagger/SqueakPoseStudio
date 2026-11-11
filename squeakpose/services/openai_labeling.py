@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -199,12 +199,22 @@ def request_pose_proposal(
                 event_type = str(event.get("type") or "")
                 if event_type == "response.output_text.delta":
                     output_parts.append(str(event.get("delta") or ""))
+                elif event_type == "error":
+                    # A top-level stream error (for example a usage limit) carries
+                    # code/message directly on the event rather than in "response".
+                    nested = event.get("error")
+                    message = _error_text(nested if isinstance(nested, Mapping) else event)
+                    raise OpenAILabelingError(f"OpenAI auto-labeling failed: {message}")
                 elif event_type == "response.failed":
-                    error = event.get("response", {}).get("error", {})
-                    message = str(error.get("message") or error.get("code") or "unknown error")
+                    message = _error_text(_mapping(_mapping(event.get("response")).get("error")))
                     raise OpenAILabelingError(f"OpenAI auto-labeling failed: {message}")
                 elif event_type == "response.incomplete":
-                    raise OpenAILabelingError("OpenAI returned an incomplete labeling response.")
+                    details = _mapping(_mapping(event.get("response")).get("incomplete_details"))
+                    reason = str(details.get("reason") or "")
+                    suffix = f" ({reason})" if reason else ""
+                    raise OpenAILabelingError(
+                        f"OpenAI returned an incomplete labeling response{suffix}."
+                    )
                 elif event_type == "response.completed":
                     completed = True
                     completed_response = event.get("response")
@@ -293,18 +303,19 @@ def _parse_instance(
     if not isinstance(raw_points, list):
         raise OpenAILabelingError("OpenAI returned no keypoint list.")
     points_by_name: dict[str, Mapping[str, Any]] = {}
+    resolve = _keypoint_name_resolver(requested)
     for point in raw_points:
         if not isinstance(point, Mapping):
             raise OpenAILabelingError("OpenAI returned an invalid keypoint.")
-        name = _normalized_name(point.get("name"))
+        name = resolve(point.get("name"))
+        if name is None:
+            raise OpenAILabelingError("OpenAI returned an unexpected keypoint name.")
         if name in points_by_name:
             raise OpenAILabelingError("OpenAI returned a duplicate keypoint name.")
-        if name not in {_normalized_name(requested_name) for requested_name in requested}:
-            raise OpenAILabelingError("OpenAI returned an unexpected keypoint name.")
         points_by_name[name] = point
     points: list[ProposedKeypoint] = []
     for name in requested:
-        raw = points_by_name.get(_normalized_name(name))
+        raw = points_by_name.get(name)
         if raw is None:
             raise OpenAILabelingError(f"OpenAI omitted the '{name}' keypoint.")
         visibility = _bounded_int(raw.get("visibility"), minimum=0, maximum=2)
@@ -454,6 +465,23 @@ def _completed_output_text(response: Any) -> str:
     return "".join(parts)
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    # Stream payloads may carry JSON null (or other non-objects) where an object
+    # is documented; treat those as empty rather than raising AttributeError.
+    return value if isinstance(value, Mapping) else {}
+
+
+def _error_text(value: Any) -> str:
+    error = _mapping(value)
+    message = str(error.get("message") or "").strip()
+    code = str(error.get("code") or "").strip()
+    if message and code and code not in message:
+        # Keep the machine-readable code (for example ``usage_limit_reached``)
+        # so the UI can still recognise usage-limit failures.
+        return f"{message} ({code})"
+    return message or code or "unknown error"
+
+
 def _safe_http_error(response: httpx.Response) -> str:
     try:
         payload = response.json()
@@ -469,6 +497,28 @@ def _normalized_name(value: Any) -> str:
     # Model output commonly varies only in separators (for example tailbase,
     # tail_base, or "tail base"). Those forms identify the same configured point.
     return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
+def _keypoint_name_resolver(requested: Sequence[str]) -> Callable[[Any], str | None]:
+    """Map a model-returned name to one configured keypoint name, or ``None``.
+
+    Exact names win. The separator/case-insensitive form is only a fallback when
+    it identifies exactly one configured name, so schemas such as ``L``/``l`` or
+    ``tail_base``/``tail base`` keep their points distinct.
+    """
+    exact = set(requested)
+    by_normalized: dict[str, list[str]] = {}
+    for name in dict.fromkeys(requested):
+        by_normalized.setdefault(_normalized_name(name), []).append(name)
+
+    def resolve(value: Any) -> str | None:
+        text = str(value or "")
+        if text in exact:
+            return text
+        candidates = by_normalized.get(_normalized_name(text), [])
+        return candidates[0] if len(candidates) == 1 else None
+
+    return resolve
 
 
 def _bounded_float(value: Any, *, minimum: float, maximum: float) -> float:

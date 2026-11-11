@@ -262,6 +262,83 @@ class PredictionOpsTests(unittest.TestCase):
             [[1.0, 2.0], [11.0, 2.0], [11.0, 12.0], [1.0, 12.0]],
         )
 
+    def test_mask_data_fallback_is_rescaled_from_letterbox_to_original_image(self):
+        import cv2
+        import numpy as np
+
+        # Original 100x200 (h, w) image letterboxed into a 64x64 mask grid:
+        # gain 0.32 -> 32x64 content with 16 rows of padding above and below.
+        mask = np.zeros((1, 64, 64), dtype=np.float32)
+        mask[0, 24:33, 16:33] = 1.0
+        result = _Result(
+            boxes=_Boxes(xyxy=[[50, 25, 100, 50]], conf=[0.9], cls=[0]),
+            masks=_Masks(xy=[[[1, 2]]], data=mask.tolist()),
+        )
+        result.orig_shape = (100, 200)
+
+        payload = serialize_prediction_result(
+            result, workflow="segmentation", cv2_module=cv2, numpy_module=np
+        )
+
+        points = np.asarray(payload["detections"][0]["segments"])
+        self.assertGreaterEqual(len(points), 3)
+        self.assertAlmostEqual(points[:, 0].min(), 50.0)
+        self.assertAlmostEqual(points[:, 0].max(), 100.0)
+        self.assertAlmostEqual(points[:, 1].min(), 25.0)
+        self.assertAlmostEqual(points[:, 1].max(), 50.0)
+
+    def test_mask_data_fallback_matches_ultralytics_scale_coords(self):
+        import numpy as np
+
+        try:
+            import torch
+            from ultralytics.utils import ops
+        except Exception:
+            self.skipTest("ultralytics/torch are not installed")
+        points = [[3.0, 20.0], [40.5, 27.25], [63.0, 47.0]]
+        expected = ops.scale_coords((64, 64), torch.tensor(points), (100, 200)).tolist()
+        actual = prediction_serialization._scale_mask_points_to_original(
+            points, (64, 64), (100, 200)
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_mask_data_fallback_keeps_retina_mask_coordinates(self):
+        import cv2
+        import numpy as np
+
+        mask = np.zeros((1, 40, 60), dtype=np.float32)
+        mask[0, 10:21, 5:16] = 1.0
+        result = _Result(
+            boxes=_Boxes(xyxy=[[5, 10, 15, 20]], conf=[0.9], cls=[0]),
+            masks=_Masks(xy=[], data=mask.tolist()),
+        )
+        result.orig_shape = (40, 60)
+
+        payload = serialize_prediction_result(
+            result, workflow="segmentation", cv2_module=cv2, numpy_module=np
+        )
+
+        points = np.asarray(payload["detections"][0]["segments"])
+        self.assertEqual((points[:, 0].min(), points[:, 0].max()), (5.0, 15.0))
+        self.assertEqual((points[:, 1].min(), points[:, 1].max()), (10.0, 20.0))
+
+    def test_mask_data_fallback_is_dropped_without_original_shape(self):
+        import cv2
+        import numpy as np
+
+        mask = np.zeros((1, 64, 64), dtype=np.float32)
+        mask[0, 24:33, 16:33] = 1.0
+        result = _Result(
+            boxes=_Boxes(xyxy=[[50, 25, 100, 50]], conf=[0.9], cls=[0]),
+            masks=_Masks(xy=[], data=mask.tolist()),
+        )
+
+        payload = serialize_prediction_result(
+            result, workflow="segmentation", cv2_module=cv2, numpy_module=np
+        )
+
+        self.assertEqual(payload["detections"][0]["segments"], [])
+
     def test_top_prediction_from_payload_picks_highest_confidence_detection(self):
         payload = {
             "detections": [

@@ -32,16 +32,31 @@ class ProjectLockInfo:
 class ProjectLockedError(RuntimeError):
     """Raised when a project already has a lock that cannot be replaced."""
 
-    def __init__(self, lock_path: str, info: ProjectLockInfo | None, *, stale: bool):
+    def __init__(
+        self,
+        lock_path: str,
+        info: ProjectLockInfo | None,
+        *,
+        stale: bool,
+        claimed_path: str | None = None,
+    ):
         self.lock_path = lock_path
         self.info = info
         self.stale = bool(stale)
+        self.claimed_path = claimed_path
         if info is None:
             detail = "the lock file is invalid or unreadable"
         else:
             detail = f"PID {info.pid} on {info.hostname} since {info.created_at}"
         state = "stale" if stale else "active"
-        super().__init__(f"Project has a {state} writer lock: {detail}")
+        message = f"Project has a {state} writer lock: {detail}"
+        if claimed_path:
+            message += (
+                f". The lock changed hands while being broken and could not be restored; "
+                f"it was left at {claimed_path}. Rename it back to {lock_path} only after "
+                "confirming no other SqueakPose session is using this project."
+            )
+        super().__init__(message)
 
 
 def canonical_path(path: str) -> str:
@@ -132,24 +147,37 @@ def inspect_project_lock(project_root: str) -> tuple[ProjectLockInfo | None, boo
     return info, lock_is_stale(info)
 
 
-def _restore_claimed_lock(claimed: str, path: str, project_root: str) -> None:
-    """Put back a lock that changed hands while it was being broken, never clobbering."""
+def _restore_claimed_lock(claimed: str, path: str, project_root: str) -> bool:
+    """Put back a lock that changed hands while it was being broken, never clobbering.
 
+    Returns ``False`` when the claimed lock could not be restored and was therefore left
+    in place at ``claimed``; a live lock is never deleted in that case.
+    """
+
+    log_extra = {
+        "operation": "break_project_lock",
+        "project_root": os.path.abspath(project_root),
+        "target_path": path,
+    }
     try:
         os.link(claimed, path)
     except FileExistsError:
         pass
     except OSError:
-        logger.warning(
-            "Could not restore a project lock that changed while being broken",
-            exc_info=True,
-            extra={
-                "event": "project_lock_restore_failed",
-                "operation": "break_project_lock",
-                "project_root": os.path.abspath(project_root),
-                "target_path": path,
-            },
-        )
+        # Filesystems such as FAT/exFAT and many SMB shares have no hard links. Fall
+        # back to a rename only while the lock path is still free so that a lock created
+        # in the meantime is never clobbered.
+        if not os.path.lexists(path):
+            try:
+                os.rename(claimed, path)
+            except OSError:
+                logger.warning(
+                    "Could not restore a project lock that changed while being broken",
+                    exc_info=True,
+                    extra={**log_extra, "event": "project_lock_restore_failed"},
+                )
+                return False
+            return True
     try:
         os.unlink(claimed)
     except OSError:
@@ -157,12 +185,12 @@ def _restore_claimed_lock(claimed: str, path: str, project_root: str) -> None:
             "Could not remove a claimed project lock",
             exc_info=True,
             extra={
+                **log_extra,
                 "event": "project_lock_claim_cleanup_failed",
-                "operation": "break_project_lock",
-                "project_root": os.path.abspath(project_root),
                 "target_path": claimed,
             },
         )
+    return True
 
 
 def break_stale_project_lock(project_root: str) -> ProjectLockInfo:
@@ -186,7 +214,10 @@ def break_stale_project_lock(project_root: str) -> ProjectLockInfo:
         raise ProjectLockedError(path, current, stale=lock_is_stale(current)) from exc
     current = _read_lock_info(claimed)
     if current != info:
-        _restore_claimed_lock(claimed, path, project_root)
+        if not _restore_claimed_lock(claimed, path, project_root):
+            raise ProjectLockedError(
+                path, current, stale=lock_is_stale(current), claimed_path=claimed
+            )
         raise ProjectLockedError(path, current, stale=lock_is_stale(current))
     os.unlink(claimed)
     logger.warning(

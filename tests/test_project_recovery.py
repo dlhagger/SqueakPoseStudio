@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -94,6 +95,44 @@ class ProjectTransactionRecoveryTests(unittest.TestCase):
             self.assertFalse(staged_file.exists())
             self.assertFalse(staged_dir.exists())
             self.assertTrue(all(path.exists() for path in lookalikes))
+
+    def test_cleanup_removes_abandoned_analysis_staging_directories_only(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            analysis_parent = root / "analysis"
+            published = analysis_parent / "session1"
+            published.mkdir(parents=True)
+            (published / "summary.csv").write_text("published", encoding="utf-8")
+            # Same call AnalysisOutputTransaction.__enter__ makes before a kill.
+            staged_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{published.name}.analysis-",
+                    suffix=".tmp",
+                    dir=analysis_parent,
+                )
+            )
+            (staged_dir / "summary.csv").write_text("partial", encoding="utf-8")
+            lookalikes = [
+                analysis_parent / ".session1.analysis-user.tmp",
+                analysis_parent / ".session1.analysis-abcdefgh",
+                analysis_parent / "session1.analysis-abcdefgh.tmp",
+                analysis_parent / ".analysis-abcdefgh.tmp",
+            ]
+            for path in lookalikes:
+                path.mkdir()
+            lookalike_file = analysis_parent / ".session2.analysis-abcdefgh.tmp"
+            lookalike_file.write_text("user file", encoding="utf-8")
+
+            report = scan_transaction_artifacts(tmp)
+            self.assertEqual(report.staging_paths, [str(staged_dir)])
+
+            result = cleanup_transaction_staging(tmp)
+
+            self.assertEqual(result.removed_staging_paths, [str(staged_dir)])
+            self.assertFalse(staged_dir.exists())
+            self.assertEqual((published / "summary.csv").read_text(encoding="utf-8"), "published")
+            self.assertTrue(all(path.exists() for path in lookalikes))
+            self.assertTrue(lookalike_file.exists())
 
     def test_scan_does_not_follow_symlinked_directories(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as outside:

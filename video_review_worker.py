@@ -14,14 +14,31 @@ from squeakpose.services.prediction_serialization import (
     serialize_prediction_result,
     top_prediction_from_payload,
 )
-from squeakpose.workers.protocol import read_config, start_cancel_listener, write_event
+from squeakpose.workers.protocol import (
+    cancel_marker_path,
+    read_config,
+    start_cancel_file_watcher,
+    write_event,
+)
 
 _CANCEL_REQUESTED = False
+_CANCEL_SIGNAL_COUNT = 0
+
+
+def _request_cancel() -> None:
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = True
 
 
 def _handle_cancel_signal(_signum, _frame):
-    global _CANCEL_REQUESTED
-    _CANCEL_REQUESTED = True
+    # The first signal only sets the flag so the pass stops cooperatively and
+    # keeps streamed predictions. A second signal (the owner's forced-close
+    # escalation) raises SystemExit, which still releases the capture.
+    global _CANCEL_SIGNAL_COUNT
+    _CANCEL_SIGNAL_COUNT += 1
+    _request_cancel()
+    if _CANCEL_SIGNAL_COUNT > 1:
+        raise SystemExit(130)
 
 
 def _stdout_event_writer(payload: dict[str, Any]) -> None:
@@ -79,9 +96,12 @@ def run_video_review_worker(
     model_factory: Optional[Callable[[str], Any]] = None,
     cv2_module: Any = None,
     event_writer: Callable[[dict[str, Any]], None] = _stdout_event_writer,
+    reset_cancel: bool = True,
 ) -> int:
-    global _CANCEL_REQUESTED
-    _CANCEL_REQUESTED = False
+    global _CANCEL_REQUESTED, _CANCEL_SIGNAL_COUNT
+    if reset_cancel:
+        _CANCEL_REQUESTED = False
+        _CANCEL_SIGNAL_COUNT = 0
 
     model_path = str(config.get("model_path") or "")
     video_path = str(config.get("video_path") or "")
@@ -309,9 +329,6 @@ def run_video_review_worker(
 def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
-    # Portable cancel channel: QProcess.terminate() does not reach console
-    # children on Windows, so the owner also sends a stdin cancel line.
-    start_cancel_listener(lambda: _handle_cancel_signal(None, None))
 
     parser = argparse.ArgumentParser(
         description="Run SqueakPose Video Reviewer prediction in a child process."
@@ -320,13 +337,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--config", required=True, help="Path to JSON video review prediction config."
     )
     args = parser.parse_args(argv)
+    # Portable cancel channel: QProcess.terminate() does not reach console
+    # children on Windows, so the owner also creates ``<config>.cancel``.
+    start_cancel_file_watcher(cancel_marker_path(args.config), _request_cancel)
 
     try:
         config = read_config(args.config)
     except Exception as exc:
         _stdout_event_writer({"event": "error", "error_message": f"Could not read config: {exc}"})
         return 1
-    return run_video_review_worker(config)
+    # Keep a cancel that arrived while the config was loading.
+    return run_video_review_worker(config, reset_cancel=False)
 
 
 if __name__ == "__main__":

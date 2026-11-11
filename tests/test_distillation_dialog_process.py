@@ -137,6 +137,40 @@ class DistillationDialogProcessTests(unittest.TestCase):
         )
         information.assert_called_once()
 
+    def test_completion_message_uses_output_dir_captured_at_start(self):
+        started_output = os.path.join(self.temp_dir.name, "runs", "started_run")
+        self.dialog._active_output_dir = started_output
+        # The run-name field stays editable while the run is in progress.
+        self.dialog.run_name_edit.setText("edited_after_start")
+
+        with patch("squeakpose.ui.distillation_dialog.QMessageBox.information"):
+            self.dialog._finish_process_result(
+                WorkerJobResult(
+                    state="finished",
+                    exit_code=0,
+                    exit_status=QProcess.ExitStatus.NormalExit,
+                )
+            )
+
+        log = self.dialog.log_view.toPlainText()
+        self.assertIn(f"Distillation complete. Output: {started_output}", log)
+        self.assertNotIn("edited_after_start", log)
+        self.assertEqual(self.dialog._active_output_dir, "")
+
+    def test_output_after_cancel_keeps_canceling_status(self):
+        controller = Mock()
+        controller.is_running = True
+        self.dialog.process_controller = controller
+
+        self.dialog._cancel_process()
+        self.dialog._handle_process_output("epoch 3 loss 0.1")
+        self.dialog._handle_process_event({"event": "metric", "value": 3})
+
+        self.assertEqual(self.dialog.status_label.text(), "Canceling")
+        self.assertIn("epoch 3 loss 0.1", self.dialog.log_view.toPlainText())
+        controller.cancel.assert_called_once_with(kill_after_ms=5000)
+        self.dialog.process_controller = None
+
     def test_failure_and_cancellation_keep_distinct_terminal_behavior(self):
         with patch("squeakpose.ui.distillation_dialog.QMessageBox.critical") as critical:
             self.dialog._finish_process_result(

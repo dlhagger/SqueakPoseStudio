@@ -101,16 +101,32 @@ output before terminating; the controller captures stderr, escalates cancel from
 terminate to kill, and emits exactly one terminal result. Analysis, training,
 distillation, video-review passes, and inference passes use this mode.
 
-Cancel is cooperative first. `WorkerJobController.cancel()` writes
-`{"command": "cancel"}` to the worker's stdin and then calls `terminate()`; the stdin
-line is the portable channel because `terminate()` does not reach console children on
-Windows. Workers start `start_cancel_listener` and use flag-only SIGTERM handlers, then
-stop at their own checkpoints and still emit a `result` with `canceled: true`:
-inference and video review keep rows/predictions already written; analysis raises
-`OperationCanceled` (a `BaseException`) at every progress step and rendered frame,
-which unwinds through `AnalysisOutputTransaction` so the previous published analysis
-is untouched; training sets Ultralytics' `trainer.stop`, so the current batch finishes
-and `last.pt`/`best.pt` are saved (a cancel before the first batch aborts outright).
+Cancel is cooperative first. `WorkerJobController.cancel()` atomically creates a
+`<config_path>.cancel` marker next to the job's project-local config (best-effort,
+only when the job has a config) and then calls `terminate()`; the marker is the
+portable channel because `terminate()` does not reach console children on Windows.
+Nothing is written to stdin: a worker thread blocked reading the stdin pipe makes
+inherited-stdin grandchildren (Ultralytics runs `nvidia-smi`, `git`) hang during CRT
+start-up on Windows. Workers poll for the marker with `start_cancel_file_watcher`
+(daemon thread, every 0.25 s) and keep a cancel that arrives while the config loads;
+workers launched without a config rely on signals only. The controller removes the
+marker together with the config on every terminal path. The first SIGTERM/SIGINT
+only sets the cancel flag; workers then stop at their own checkpoints and still emit
+a `result` with `canceled: true`: inference and video review keep rows/predictions
+already written; analysis raises `OperationCanceled` (a `BaseException`) at every
+progress step and rendered frame, which unwinds through `AnalysisOutputTransaction`
+so the previous published analysis is untouched; training sets Ultralytics'
+`trainer.stop` (checked after every batch and after each epoch's validation), so the
+current batch finishes and `last.pt`/`best.pt` are saved (a cancel before the first
+batch aborts outright). Training reports `canceled: true` only when the stop actually
+skipped work, and copies the full checkpoint to `weights/last_resumable.pt` (reported
+as `resume_checkpoint`) before Ultralytics' final evaluation strips the optimizer
+from `last.pt`; exact resume accepts that file and rejects finalized checkpoints.
+Escalation is two-stage: a second signal raises `SystemExit(130)`, which still
+unwinds transactions and `finally` blocks. `WorkerJobController.shutdown()` (window
+close) creates the marker, calls `terminate()`, waits half the terminate timeout,
+calls `terminate()` again, waits the rest, then kills; plain `shutdown_qprocess()`
+for processes without a controller keeps a single terminate before the kill.
 `force_stop()` kills immediately; the analysis and training dialogs expose it as a
 second click on their cancel buttons.
 

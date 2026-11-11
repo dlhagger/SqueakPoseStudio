@@ -1,7 +1,8 @@
-import io
-import json
+import os
 import threading
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from squeakpose.services.cancellation import (
     OperationCanceled,
@@ -9,49 +10,63 @@ from squeakpose.services.cancellation import (
     cancel_requested,
     raise_if_canceled,
 )
-from squeakpose.workers.protocol import (
-    CANCEL_COMMAND,
-    cancel_command_bytes,
-    start_cancel_listener,
-)
+from squeakpose.workers.protocol import cancel_marker_path, start_cancel_file_watcher
 
 
-class CancelCommandTests(unittest.TestCase):
-    def test_cancel_command_is_one_json_line(self):
-        raw = cancel_command_bytes()
-        self.assertTrue(raw.endswith(b"\n"))
-        self.assertEqual(raw.count(b"\n"), 1)
-        self.assertEqual(json.loads(raw), {"command": CANCEL_COMMAND})
+class CancelFileWatcherTests(unittest.TestCase):
+    def test_marker_path_sits_next_to_config(self):
+        config = os.path.join("project", "logs", ".analysis_config_abc.json")
+        self.assertEqual(cancel_marker_path(config), f"{config}.cancel")
 
-    def test_listener_fires_once_on_cancel_line_and_ignores_noise(self):
-        stream = io.StringIO(
-            "not json\n"
-            + json.dumps({"command": "other"})
-            + "\n"
-            + cancel_command_bytes().decode("utf-8")
-            + cancel_command_bytes().decode("utf-8")
-        )
-        fired = []
+    def test_watcher_fires_once_when_marker_appears(self):
+        with TemporaryDirectory() as tmp:
+            marker = Path(tmp) / ".train_config_x.json.cancel"
+            fired = []
+            done = threading.Event()
+
+            def on_cancel():
+                fired.append(True)
+                done.set()
+
+            thread = start_cancel_file_watcher(str(marker), on_cancel, interval=0.01)
+            self.assertTrue(thread.daemon)
+            self.assertFalse(done.wait(0.05))
+            marker.write_text("", encoding="utf-8")
+
+            self.assertTrue(done.wait(2))
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(fired, [True])
+
+    def test_watcher_never_reads_stdin_and_keeps_polling_through_errors(self):
+        calls = []
         done = threading.Event()
 
-        def on_cancel():
-            fired.append(True)
-            done.set()
+        def flaky_exists(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError("transient")
+            return len(calls) >= 3
 
-        thread = start_cancel_listener(on_cancel, stream=stream)
+        thread = start_cancel_file_watcher(
+            "/project/logs/.cfg.json.cancel",
+            done.set,
+            interval=0.01,
+            exists=flaky_exists,
+        )
+
+        self.assertTrue(done.wait(2))
         thread.join(timeout=2)
+        self.assertEqual(len(calls), 3)
 
-        self.assertTrue(done.is_set())
-        self.assertEqual(fired, [True])
-        self.assertTrue(thread.daemon)
-
-    def test_listener_exits_quietly_at_eof_without_cancel(self):
-        fired = []
-        thread = start_cancel_listener(lambda: fired.append(True), stream=io.StringIO("{}\n"))
-        thread.join(timeout=2)
-
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(fired, [])
+    def test_watcher_without_marker_does_not_fire(self):
+        with TemporaryDirectory() as tmp:
+            fired = []
+            start_cancel_file_watcher(
+                os.path.join(tmp, "missing.cancel"), lambda: fired.append(True), interval=0.01
+            )
+            threading.Event().wait(0.05)
+            self.assertEqual(fired, [])
 
 
 class CancellationScopeTests(unittest.TestCase):

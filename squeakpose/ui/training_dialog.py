@@ -561,7 +561,7 @@ class TrainDialog(QDialog):
                 for dirpath, _, _ in os.walk(runs_root):
                     if "weights" not in dirpath:
                         continue
-                    for name in ("last.pt", "best.pt"):
+                    for name in ("last_resumable.pt", "last.pt", "best.pt"):
                         candidate = os.path.join(dirpath, name)
                         if os.path.isfile(candidate):
                             label = os.path.relpath(candidate, runs_root)
@@ -778,8 +778,34 @@ class TrainDialog(QDialog):
             self.history_table.setItem(row, column, item)
         self.history_table.scrollToBottom()
 
+    def _show_final_validation(self, event: dict):
+        """Show Ultralytics' final best.pt validation without adding an epoch row."""
+        metrics = self._numeric_mapping(event.get("metrics"))
+        self.phase_label.setText("Final validation (best.pt)")
+        self.epoch_progress.setValue(1000)
+        self.epoch_progress.setFormat("Final validation complete")
+        self._update_metric_cards({}, metrics)
+        summary = [
+            f"{label} {self._metric_text(value)}"
+            for label, value in (
+                ("mAP50-95", self._preferred_metric(metrics, "map50-95")),
+                ("mAP50", self._preferred_metric(metrics, "map50")),
+                ("precision", self._preferred_metric(metrics, "precision")),
+                ("recall", self._preferred_metric(metrics, "recall")),
+            )
+            if value is not None
+        ]
+        model_path = str(event.get("model_path") or "")
+        source = f" ({os.path.basename(model_path)})" if model_path else ""
+        self._log(
+            f"Final validation{source}: " + ("  •  ".join(summary) if summary else "complete")
+        )
+
     def _update_training_monitor(self, event: dict):
         event_type = str(event.get("event") or "")
+        if event_type == "final_validation":
+            self._show_final_validation(event)
+            return
         epoch = max(0, int(event.get("epoch") or 0))
         epochs = max(epoch, int(event.get("epochs") or epoch))
         if event_type == "training_setup":
@@ -969,7 +995,7 @@ class TrainDialog(QDialog):
                 "required": "Dataset required",
                 "yaml_missing": "dataset.yaml missing",
                 "checkpoint_required": "Checkpoint required",
-                "resume_checkpoint": "Exact resume requires last.pt",
+                "resume_checkpoint": "Exact resume requires last.pt or last_resumable.pt",
                 "mps_batch": "Batch size required",
                 "task_mismatch": "Dataset Task Mismatch",
                 "run_name": "Run name required",
@@ -1133,7 +1159,13 @@ class TrainDialog(QDialog):
             self._log(str(event.get("message") or "Training started"))
             if not self.train_cancel_requested:
                 self._set_training_status("Running", "running")
-        elif event_type in {"training_setup", "epoch_start", "batch_progress", "epoch_end"}:
+        elif event_type in {
+            "training_setup",
+            "epoch_start",
+            "batch_progress",
+            "epoch_end",
+            "final_validation",
+        }:
             self._update_training_monitor(event)
             # Progress keeps arriving while a cancel winds down (validation and
             # checkpoint save); do not flip "Canceling" back to "Running".
@@ -1244,8 +1276,12 @@ class TrainDialog(QDialog):
             return
 
         had_error = bool(event.get("had_error"))
-        canceled = bool(event.get("canceled")) or cancel_requested
+        # The worker's result is authoritative: a cancel that arrived only
+        # during the final validation of a finished run is a normal completion.
+        canceled = bool(event.get("canceled"))
+        completed_despite_cancel = cancel_requested and not canceled and not had_error
         save_dir = str(event.get("save_dir") or "")
+        resume_checkpoint = str(event.get("resume_checkpoint") or "")
         error_message = str(event.get("error_message") or stderr_text or "Unknown training error")
 
         if canceled and not had_error:
@@ -1253,23 +1289,30 @@ class TrainDialog(QDialog):
             if save_dir:
                 self.phase_label.setText("Training stopped early")
                 self._log(f"Training stopped early. Checkpoints saved to: {save_dir}")
-                QMessageBox.information(
-                    self,
-                    "Training stopped",
+                message = (
                     "Training was stopped early. The last completed checkpoint "
-                    f"(last.pt, best.pt) is saved in:\n{save_dir}",
+                    f"(last.pt, best.pt) is saved in:\n{save_dir}"
                 )
+                if resume_checkpoint:
+                    self._log(f"Resumable checkpoint: {resume_checkpoint}")
+                    message += (
+                        '\n\nTo continue this run later, choose "Resume YOLO run (exact)" '
+                        f"and select:\n{resume_checkpoint}"
+                    )
+                QMessageBox.information(self, "Training stopped", message)
             else:
                 self.phase_label.setText("Training canceled")
                 self._log("Training canceled.")
                 QMessageBox.information(self, "Training canceled", "Training was canceled.")
             return
 
-        if (
-            had_error
-            or exit_status == QProcess.ExitStatus.CrashExit
-            or exit_code != 0
-            or result.state in {"failed", "start_failed"}
+        if had_error or (
+            not completed_despite_cancel
+            and (
+                exit_status == QProcess.ExitStatus.CrashExit
+                or exit_code != 0
+                or result.state in {"failed", "start_failed"}
+            )
         ):
             self._set_training_status("Failed", "failed")
             self.phase_label.setText("Training failed")
@@ -1282,6 +1325,8 @@ class TrainDialog(QDialog):
         self.eta_label.setText("Complete")
         self.overall_progress.setValue(1000)
         self.overall_progress.setFormat("Training complete")
+        if completed_despite_cancel:
+            self._log("Cancel arrived after the last epoch; training completed normally.")
         if save_dir:
             self._log(f"Training complete. Artifacts saved to: {save_dir}")
         else:

@@ -3,7 +3,7 @@ name = "SqueakPoseStudio"
 version = "0.2.0"
 description = "Tools for small-animal pose estimation, tracking, and behavioral analysis. Built for reproducibility, rapid prototyping, and seamless integration into research pipelines."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 
 authors = [
     { name = "David Haggerty", email = "david.haggerty@nih.gov" },
@@ -58,7 +58,7 @@ dev = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 files = [
     "squeakpose/project",
     "squeakpose/annotation",
@@ -77,7 +77,7 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py314"
 line-length = 100
 extend-exclude = [
     "analysis_toolset/analysis_toolkit.ipynb",

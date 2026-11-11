@@ -42,7 +42,7 @@ block the main interface.
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/)
-- Python 3.12 or newer (`.python-version` selects 3.12)
+- Python 3.14 or newer (`.python-version` selects 3.14; uv downloads it automatically)
 - A desktop environment supported by PyQt6
 - Optional CUDA or Apple Silicon acceleration
 - Optional SAM 3 or SAM 3.1 weights for interactive segmentation prompts
@@ -838,7 +838,7 @@ uv audit --locked --no-default-groups
 The audit command is built into uv and queries the OSV vulnerability database,
 so security tooling does not need to be added to the `dev` or GitHub-only
 `test` dependency groups. The weekly Supply Chain workflow also validates the
-lockfile, audits the Linux/Python 3.12 dependency set, and publishes a
+lockfile, audits the Linux/Python 3.14 dependency set, and publishes a
 CycloneDX SBOM artifact. Dependabot checks both uv dependencies and pinned
 GitHub Actions each week.
 

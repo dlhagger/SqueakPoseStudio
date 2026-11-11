@@ -50,7 +50,7 @@ def start_cancel_file_watcher(
         while True:
             try:
                 present = exists(path)
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 present = False
             if present:
                 on_cancel()

@@ -34,7 +34,7 @@ class DepthRangeSummary:
             low = float(metadata["p02_depth"])
             high = float(metadata["p98_depth"])
             median = float(metadata["median_depth"])
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             return None
         if not all(math.isfinite(value) for value in (low, high, median)):
             return None
@@ -42,7 +42,7 @@ class DepthRangeSummary:
             minimum = _optional_finite_float(metadata.get("min_depth"))
             maximum = _optional_finite_float(metadata.get("max_depth"))
             valid_pixels = _optional_nonnegative_int(metadata.get("valid_pixels"))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return cls(
             p02_depth=low,
@@ -68,7 +68,7 @@ class DepthProbe:
         raw_depth = value.get("depth")
         try:
             depth = float(raw_depth) if raw_depth is not None else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             depth = None
         valid = bool(value.get("valid", depth is not None))
         if depth is None or not math.isfinite(depth) or depth <= 0 or not valid:

@@ -195,7 +195,7 @@ def normalize_polygon_points(points: Iterable[object]) -> list[Point]:
     for pair in points:
         try:
             normalized.append((float(pair[0]), float(pair[1])))  # type: ignore[index]
-        except (IndexError, KeyError, TypeError, ValueError):
+        except IndexError, KeyError, TypeError, ValueError:
             continue
     return normalized
 
@@ -291,7 +291,7 @@ def mask_to_polygon(
     for node in contour:
         try:
             points.append((float(node[0][0]), float(node[0][1])))
-        except (IndexError, KeyError, TypeError, ValueError):
+        except IndexError, KeyError, TypeError, ValueError:
             continue
     if len(points) < 3:
         return []

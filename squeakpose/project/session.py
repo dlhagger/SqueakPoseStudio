@@ -508,6 +508,6 @@ def _normalize_selected_id(selected: Any, classes: Sequence[str]) -> int:
         return -1
     try:
         selected_id = int(selected)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         selected_id = 0
     return min(max(0, selected_id), len(classes) - 1)

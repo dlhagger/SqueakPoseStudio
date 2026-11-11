@@ -347,7 +347,7 @@ class WorkerJobController(QObject):
         if process is not None:
             try:
                 process.deleteLater()
-            except (AttributeError, RuntimeError):
+            except AttributeError, RuntimeError:
                 pass
 
     @staticmethod
@@ -356,7 +356,7 @@ class WorkerJobController(QObject):
             return ""
         try:
             return str(process.errorString() or "")
-        except (AttributeError, RuntimeError):
+        except AttributeError, RuntimeError:
             return ""
 
 
@@ -528,7 +528,7 @@ class PersistentWorkerSession(QObject):
         payload = (json.dumps(dict(request), separators=(",", ":")) + "\n").encode("utf-8")
         try:
             return int(process.write(payload)) >= 0
-        except (AttributeError, RuntimeError):
+        except AttributeError, RuntimeError:
             return False
 
     def shutdown(
@@ -727,7 +727,7 @@ class PersistentWorkerSession(QObject):
         if process is not None:
             try:
                 process.deleteLater()
-            except (AttributeError, RuntimeError):
+            except AttributeError, RuntimeError:
                 pass
 
     @staticmethod
@@ -736,7 +736,7 @@ class PersistentWorkerSession(QObject):
             return ""
         try:
             return str(process.errorString() or "")
-        except (AttributeError, RuntimeError):
+        except AttributeError, RuntimeError:
             return ""
 
 
@@ -825,7 +825,7 @@ def shutdown_qprocess(
         return True
     try:
         process.blockSignals(True)
-    except (AttributeError, RuntimeError):
+    except AttributeError, RuntimeError:
         pass
     terminate_timeout_ms = max(0, int(terminate_timeout_ms))
     process.terminate()

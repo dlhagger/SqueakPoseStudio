@@ -642,7 +642,7 @@ class TrainDialog(QDialog):
     def _format_duration(seconds) -> str:
         try:
             total = max(0, int(float(seconds)))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return "—"
         hours, remainder = divmod(total, 3600)
         minutes, secs = divmod(remainder, 60)
@@ -682,7 +682,7 @@ class TrainDialog(QDialog):
         for key, value in payload.items():
             try:
                 result[str(key)] = float(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
         return result
 
@@ -742,7 +742,7 @@ class TrainDialog(QDialog):
         try:
             if memory_gb is not None:
                 details.append(f"device memory {float(memory_gb):.2f} GB")
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
         if details:
             self.loss_detail_label.setText("  •  ".join(details))
@@ -758,7 +758,7 @@ class TrainDialog(QDialog):
         best = event.get("best_fitness")
         try:
             best_text = f"{float(best):.4f}" if best is not None else "—"
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             best_text = "—"
         row = self.history_table.rowCount()
         self.history_table.insertRow(row)
@@ -919,7 +919,7 @@ class TrainDialog(QDialog):
         if self.training_controller is not None:
             try:
                 self.training_controller.terminal.disconnect(self._finish_training_job)
-            except (TypeError, RuntimeError):
+            except TypeError, RuntimeError:
                 pass
             self.training_controller.shutdown()
             self.training_controller.deleteLater()

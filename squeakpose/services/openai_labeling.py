@@ -370,7 +370,7 @@ def _parse_usage(value: Any) -> OpenAIUsage:
 def _nonnegative_int(value: Any) -> int:
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -487,7 +487,7 @@ def _safe_http_error(response: httpx.Response) -> str:
         payload = response.json()
         error = payload.get("error", {}) if isinstance(payload, Mapping) else {}
         return str(error.get("message") or error.get("code") or response.status_code)
-    except (ValueError, TypeError, httpx.StreamError):
+    except ValueError, TypeError, httpx.StreamError:
         # ``httpx.ResponseNotRead`` (a ``StreamError``) is raised when a
         # streaming body was never consumed; fall back to the status code.
         return str(response.status_code)

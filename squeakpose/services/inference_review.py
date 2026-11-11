@@ -532,7 +532,7 @@ def _model_path_from_csv(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
             row = next(csv.DictReader(handle), {})
-    except (OSError, csv.Error):
+    except OSError, csv.Error:
         return ""
     return str(row.get("model_path") or "").strip()
 
@@ -572,7 +572,7 @@ def _overlay_from_inference_row(
                             parsed.append((x, y))
             if len(parsed) >= 3:
                 polygon = tuple(parsed)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except TypeError, ValueError, json.JSONDecodeError:
             pass
     keypoints: list[tuple[str, float, float, float]] = []
     if layer_id == LAYER_KEYPOINTS:
@@ -610,7 +610,7 @@ def _append_int(destination: list[int], raw: object) -> None:
 def _finite(raw: object) -> float | None:
     try:
         value = float(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return value if math.isfinite(value) else None
 

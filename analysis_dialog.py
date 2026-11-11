@@ -115,7 +115,7 @@ def _safe_stem(path: str) -> str:
 def _fmt_number(value: Any, decimals: int = 2) -> str:
     try:
         numeric = float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return "n/a"
     if math.isnan(numeric):
         return "n/a"
@@ -471,7 +471,7 @@ class FrameAnnotationView(QWidget):
                 pose_points[name] = self._image_to_widget(
                     float(keypoint["x"]), float(keypoint["y"])
                 )
-            except (KeyError, TypeError, ValueError):
+            except KeyError, TypeError, ValueError:
                 continue
 
         painter.setPen(QPen(QColor("#d98cff"), 2))
@@ -506,7 +506,7 @@ class FrameAnnotationView(QWidget):
             confidence = keypoint.get("confidence")
             try:
                 low_confidence = math.isfinite(float(confidence)) and float(confidence) < 0.25
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 low_confidence = False
             color = keypoint_colors[index % len(keypoint_colors)]
             pen = QPen(color, 2)
@@ -571,7 +571,7 @@ class FrameAnnotationView(QWidget):
                     bounds = polygon.boundingRect()
                 else:
                     bounds = self._roi_to_widget_rect(roi)
-            except (KeyError, TypeError, ValueError):
+            except KeyError, TypeError, ValueError:
                 continue
             selected = roi_index == self._selected_roi_index
             painter.setPen(QPen(QColor("#76c7ff") if selected else roi_pen.color(), 2))

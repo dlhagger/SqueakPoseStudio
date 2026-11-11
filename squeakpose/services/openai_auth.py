@@ -164,7 +164,7 @@ class ChatGPTCredentialStore:
                     host_id = str(value.get("ext_agent_host_id") or "")
                     if host_id.startswith("urn:uuid:"):
                         return host_id
-                except (OSError, ValueError, TypeError):
+                except OSError, ValueError, TypeError:
                     pass
             host_id = f"urn:uuid:{uuid.uuid4()}"
             self._write_json(self.host_path, {"ext_agent_host_id": host_id})
@@ -177,7 +177,7 @@ class ChatGPTCredentialStore:
             try:
                 payload = json.loads(self.profile_path.read_text(encoding="utf-8"))
                 profile = ChatGPTProfile.from_mapping(payload)
-            except (OSError, ValueError, TypeError):
+            except OSError, ValueError, TypeError:
                 return None
             if not profile.client_id or not profile.subject or not profile.host_id:
                 return None
@@ -491,7 +491,7 @@ def revoke_profile(
                     },
                 )
                 response.raise_for_status()
-    except (httpx.HTTPError, ValueError, TypeError):
+    except httpx.HTTPError, ValueError, TypeError:
         # Local sign-out must still stop use of a credential. The UI tells the user
         # that remote revocation could not be confirmed through the raised error.
         store.clear_tokens()

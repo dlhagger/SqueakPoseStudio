@@ -35,7 +35,7 @@ def distillation_run_task(run_dir: str) -> str:
         task = normalize_distillation_task(payload.get("task"))
         if task:
             return task
-    except (OSError, ValueError, TypeError, AttributeError):
+    except OSError, ValueError, TypeError, AttributeError:
         pass
 
     # Runs created before task manifests used the default ``dinov3-pose`` name.

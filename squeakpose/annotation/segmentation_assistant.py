@@ -62,7 +62,7 @@ def discover_sam_weight_candidates(
     root = os.path.abspath(raw_root)
     try:
         names = sorted(str(name) for name in list_directory(root))
-    except (OSError, TypeError, ValueError):
+    except OSError, TypeError, ValueError:
         return ()
 
     exact: list[str] = []
@@ -112,7 +112,7 @@ def inspect_sam_contour(
     """Select a contour while preserving user-facing empty-result semantics."""
     try:
         result = next(iter(results))
-    except (StopIteration, TypeError):
+    except StopIteration, TypeError:
         return SamContourSelection(failure="no_masks")
 
     masks = getattr(result, "masks", None)
@@ -122,7 +122,7 @@ def inspect_sam_contour(
         contours = getattr(masks, "xy")
         if len(contours) == 0:
             return SamContourSelection(failure="no_masks")
-    except (AttributeError, TypeError):
+    except AttributeError, TypeError:
         return SamContourSelection(failure="no_masks")
 
     scores = _confidence_values(getattr(result, "boxes", None))
@@ -136,7 +136,7 @@ def inspect_sam_contour(
         points = tuple(
             (float(point[0]), float(point[1])) for point in contours[best_index] if len(point) >= 2
         )
-    except (IndexError, TypeError, ValueError):
+    except IndexError, TypeError, ValueError:
         return SamContourSelection(failure="no_polygon")
     if len(points) < 3:
         return SamContourSelection(failure="no_polygon")
@@ -153,7 +153,7 @@ def _confidence_values(boxes: Any) -> list[float]:
             cpu_value.tolist() if callable(getattr(cpu_value, "tolist", None)) else cpu_value
         )
         return [float(value) for value in raw_values]
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return []
 
 

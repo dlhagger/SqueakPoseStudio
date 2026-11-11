@@ -112,7 +112,7 @@ def _read_lock_info(lock_path: str) -> ProjectLockInfo | None:
             token=str(payload["token"]),
             version=str(payload.get("version") or ""),
         )
-    except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError):
+    except OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError:
         return None
 
 

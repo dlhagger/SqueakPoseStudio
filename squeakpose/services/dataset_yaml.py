@@ -261,7 +261,7 @@ def _load_yaml_mapping(yaml_path: str) -> Mapping[str, Any]:
     try:
         with open(yaml_path, "r", encoding="utf-8") as handle:
             payload = yaml.safe_load(handle)
-    except (OSError, yaml.YAMLError):
+    except OSError, yaml.YAMLError:
         return {}
     return payload if isinstance(payload, Mapping) else {}
 

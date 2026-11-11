@@ -38,7 +38,7 @@ class ProjectPathSafetyTests(unittest.TestCase):
             link = os.path.join(tmp, "labels_all")
             try:
                 os.symlink(outside, link)
-            except (OSError, NotImplementedError):
+            except OSError, NotImplementedError:
                 self.skipTest("symlink creation is unavailable")
 
             self.assertFalse(is_path_within_project(tmp, os.path.join(link, "frame.txt")))
@@ -58,7 +58,7 @@ class ProjectPathSafetyTests(unittest.TestCase):
             link = os.path.join(tmp, "squeakpose_project.json")
             try:
                 os.symlink(outside_metadata, link)
-            except (OSError, NotImplementedError):
+            except OSError, NotImplementedError:
                 self.skipTest("symlink creation is unavailable")
 
             with self.assertRaises(ProjectPathError):

@@ -174,7 +174,7 @@ class PoseEditState:
                 named[name] = raw
             try:
                 index = int(raw.get("idx", -1))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 index = -1
             if index >= 0:
                 indexed[index] = raw
@@ -227,7 +227,7 @@ class PoseEditState:
                 continue
             try:
                 index = int(raw.get("idx", -1))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if index >= 0:
                 indexed[index] = raw

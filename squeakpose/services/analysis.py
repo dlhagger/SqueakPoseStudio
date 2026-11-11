@@ -227,7 +227,7 @@ def _analysis_csv_model_path(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
             row = next(csv.DictReader(handle), {})
-    except (OSError, csv.Error):
+    except OSError, csv.Error:
         return ""
     return str(row.get("model_path") or "").strip()
 
@@ -270,7 +270,7 @@ def project_analysis_inputs(
         try:
             manifest = read_json_file(manifest_path, max_bytes=1024 * 1024, require_object=True)
             modified = os.path.getmtime(manifest_path)
-        except (JsonFileError, OSError):
+        except JsonFileError, OSError:
             continue
         video_path = _manifest_video_path(root, str(manifest.get("video_path") or ""))
         passes = manifest.get("passes")
@@ -668,7 +668,7 @@ def analysis_csv_matches_layer(path: str, layer_id: str) -> bool:
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
             fieldnames = set(next(csv.reader(handle), []))
-    except (OSError, UnicodeError, csv.Error):
+    except OSError, UnicodeError, csv.Error:
         return False
     has_frame = bool({"frame", "frame_index"} & fieldnames)
     is_segmentation = has_frame and {"det", "mask_polygon"}.issubset(fieldnames)
@@ -699,13 +699,13 @@ def inspect_analysis_csv(path: str, *, row_limit: int = 1000) -> AnalysisCsvCont
                     video_path = candidate
                 try:
                     width = max(width, int(float(row.get("image_width") or 0)))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     pass
                 try:
                     height = max(height, int(float(row.get("image_height") or 0)))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     pass
-    except (OSError, csv.Error):
+    except OSError, csv.Error:
         pass
     if not video_path:
         video_path = _existing_manifest_video_path(path)
@@ -727,7 +727,7 @@ def load_segmentation_preview(path: str, *, row_limit: int = 10_000) -> Segmenta
                 try:
                     frame_index = int(float(row.get("frame") or row.get("frame_index") or 0))
                     raw_polygon = json.loads(str(row.get("mask_polygon") or ""))
-                except (TypeError, ValueError, json.JSONDecodeError):
+                except TypeError, ValueError, json.JSONDecodeError:
                     continue
                 if not isinstance(raw_polygon, list):
                     continue
@@ -737,7 +737,7 @@ def load_segmentation_preview(path: str, *, row_limit: int = 10_000) -> Segmenta
                         continue
                     try:
                         x, y = float(point[0]), float(point[1])
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         continue
                     if math.isfinite(x) and math.isfinite(y):
                         points.append((x, y))
@@ -776,7 +776,7 @@ def load_segmentation_preview(path: str, *, row_limit: int = 10_000) -> Segmenta
                 if score > primary_score and all(math.isfinite(value) for value in bbox_values):
                     primary_score = score
                     primary_bbox = bbox_values
-    except (OSError, csv.Error):
+    except OSError, csv.Error:
         pass
     return SegmentationPreview(selected_frame or 0, tuple(polygons), primary_bbox)
 
@@ -785,7 +785,7 @@ def _finite_csv_float(row: Mapping[str, Any], *names: str) -> float:
     for name in names:
         try:
             value = float(row.get(name) or "")
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         if math.isfinite(value):
             return value
@@ -870,7 +870,7 @@ def load_pose_preview(
                     class_name=str(row.get("class_name") or ""),
                     confidence=confidence,
                 )
-    except (OSError, csv.Error):
+    except OSError, csv.Error:
         return PosePreview(frame_index=max(0, requested_frame or 0))
     return best_preview
 

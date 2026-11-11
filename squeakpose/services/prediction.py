@@ -145,7 +145,7 @@ class DepthApplicationPlan:
             return None
         try:
             return float(raw_value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
 
@@ -410,7 +410,7 @@ def plan_prediction_application(
         for index, detection in enumerate(detections):
             try:
                 cid = int(detection.get("class_id", active_class_id))
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 continue
             if 0 <= cid < len(classes):
                 selected_items.append((cid, index))
@@ -516,7 +516,7 @@ def _best_detections_by_class(
         confidences.append(confidence)
         try:
             class_id = int(detection.get("class_id", active_class_id))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             class_id = active_class_id
         if class_id < 0 or class_id >= class_count:
             continue
@@ -532,7 +532,7 @@ def _best_detections_by_class(
 def _pose_box(value: Any) -> tuple[float, float, float, float] | None:
     try:
         x1, y1, x2, y2 = [float(item) for item in value[:4]]
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     width = x2 - x1
     height = y2 - y1
@@ -546,7 +546,7 @@ def _prediction_keypoint(value: Any, name: str) -> PredictionKeypointPlan | None
         if len(value) < 3:
             return None
         x, y, confidence = float(value[0]), float(value[1]), float(value[2])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return PredictionKeypointPlan(name=name, x=x, y=y, confidence=confidence)
 
@@ -562,7 +562,7 @@ def _segmentation_points(value: Any) -> list[tuple[float, float]]:
             if len(pair) < 2:
                 continue
             points.append((float(pair[0]), float(pair[1])))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return points
 
@@ -570,5 +570,5 @@ def _segmentation_points(value: Any) -> list[tuple[float, float]]:
 def _float_or_default(value: Any, default: float) -> float:
     try:
         return float(value or default)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default

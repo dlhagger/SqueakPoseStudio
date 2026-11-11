@@ -49,7 +49,7 @@ def is_segmentation_inference_csv(df: pd.DataFrame) -> bool:
 def _safe_float(value: Any) -> float:
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return math.nan
 
 

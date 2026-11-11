@@ -44,6 +44,6 @@ def analysis_class_names(paths: list[str]) -> list[str]:
                     name = str(row.get("class_name") or "").strip()
                     if name and name not in {"nan", "None"}:
                         names.add(name)
-        except (OSError, csv.Error):
+        except OSError, csv.Error:
             continue
     return sorted(names)

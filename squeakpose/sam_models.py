@@ -42,7 +42,7 @@ DEFAULT_SAM_VARIANT = "sam3.1"
 def get_sam_model(key: str) -> SamModel:
     try:
         return SAM_MODELS[key]
-    except (KeyError, TypeError):
+    except KeyError, TypeError:
         raise ValueError(f"Unsupported SAM model variant: {key!r}") from None
 
 

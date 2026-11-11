@@ -254,7 +254,7 @@ def load_last_project(*, state_file: str = LAST_PROJECT_STATE_FILE) -> str | Non
         path = str(data.get("last_project", "")).strip()
         if path and os.path.isdir(path):
             return os.path.abspath(path)
-    except (OSError, ValueError, TypeError, AttributeError):
+    except OSError, ValueError, TypeError, AttributeError:
         return None
     return None
 

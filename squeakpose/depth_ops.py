@@ -220,7 +220,7 @@ def serialize_depth_prediction_result(
     try:
         if raw_source_shape is not None and len(raw_source_shape) >= 2:
             source_shape = (int(raw_source_shape[0]), int(raw_source_shape[1]))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         source_shape = None
     metadata = write_depth_prediction_files(
         depth_map,

@@ -221,7 +221,7 @@ def project_video_inference_statuses(project_root: str) -> dict[str, VideoInfere
         manifest_path = os.path.join(runs_dir, name)
         try:
             payload = read_json_file(manifest_path, require_object=True)
-        except (OSError, UnicodeError, ValueError):
+        except OSError, UnicodeError, ValueError:
             continue
         if not isinstance(payload, dict) or not str(payload.get("video_path") or ""):
             continue
@@ -505,7 +505,7 @@ def aggregate_inference_result(
     for raw_track_id in payload.get("unique_track_ids") or ():
         try:
             unique_track_ids.append(int(raw_track_id))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     tracking_enabled = bool(payload.get("tracking_enabled", job.tracking.enabled))
 
@@ -573,7 +573,7 @@ def _tracking_from_manifest(payload: Mapping[str, Any]) -> TrackingConfig:
             tracker_profile=str(profile or DEFAULT_TRACKER_PROFILE),
             subject_class=str(tracking.get("subject_class") or ""),
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return resolve_tracking_config()
 
 

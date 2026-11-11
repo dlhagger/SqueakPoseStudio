@@ -91,7 +91,7 @@ def migrate_project_metadata(
 
     try:
         version = int(migrated.get("schema_version", 1))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         version = 1
         changed = True
 

@@ -763,7 +763,7 @@ class DistillationDialog(QDialog):
         if controller is not None:
             try:
                 controller.terminal.disconnect(self._handle_process_terminal)
-            except (TypeError, RuntimeError):
+            except TypeError, RuntimeError:
                 pass
             controller.shutdown()
             controller.deleteLater()

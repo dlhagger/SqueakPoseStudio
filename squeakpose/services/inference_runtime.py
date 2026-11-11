@@ -207,7 +207,7 @@ def _normalized_track_id(value: Any) -> Any:
         numeric = float(value)
         if numeric.is_integer():
             return int(numeric)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         pass
     return value
 
@@ -273,7 +273,7 @@ def _record_tracking_qc(
                 ids.add(normalized)
                 if not subject_class or row.get("class_name") == subject_class:
                     frame_ids.add(normalized)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     result.unique_track_ids = tuple(sorted(ids))
     if expected_animal_count > 0 and len(frame_ids) != int(expected_animal_count):
@@ -939,7 +939,7 @@ def run_segmentation_video_inference(
                 shape = getattr(inference_result, "orig_shape", None) or (0, 0)
                 try:
                     image_height, image_width = int(shape[0]), int(shape[1])
-                except (IndexError, TypeError, ValueError):
+                except IndexError, TypeError, ValueError:
                     image_height, image_width = 0, 0
                 csv_row.update(
                     {

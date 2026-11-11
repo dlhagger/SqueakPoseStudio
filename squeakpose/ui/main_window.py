@@ -977,7 +977,7 @@ class LabelingApp(QMainWindow):
             low = float(metadata["p02_depth"])
             high = float(metadata["p98_depth"])
             median = float(metadata["median_depth"])
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except OSError, ValueError, TypeError, KeyError, json.JSONDecodeError:
             controller = getattr(self, "_depth_controller", None)
             if controller is not None:
                 controller.state.set_metadata({})
@@ -1108,7 +1108,7 @@ class LabelingApp(QMainWindow):
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 raw_lines = handle.read().splitlines()
-        except (OSError, UnicodeError):
+        except OSError, UnicodeError:
             return
         require_unique_schema_names(raw_lines, source=os.path.basename(path), kind=kind)
 
@@ -3868,7 +3868,7 @@ class LabelingApp(QMainWindow):
         if inference_coordinator is not None and inference_coordinator.is_busy:
             try:
                 inference_coordinator.completed.disconnect(self._inference_controller_completed)
-            except (TypeError, RuntimeError):
+            except TypeError, RuntimeError:
                 pass
             inference_coordinator.shutdown()
         prediction_coordinator = getattr(self, "_prediction_coordinator", None)
@@ -5725,7 +5725,7 @@ class LabelingApp(QMainWindow):
             # cancellation, so detach the destructive batch-cancel handler first.
             try:
                 progress.canceled.disconnect(self._cancel_inference_process)
-            except (TypeError, RuntimeError):
+            except TypeError, RuntimeError:
                 pass
             progress.close()
         self._inference_progress = None

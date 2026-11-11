@@ -148,7 +148,7 @@ def load_pose_document(
                 extra_rows += int(had_extra)
                 if entry:
                     annotations.append(entry)
-    except (OSError, UnicodeError):
+    except OSError, UnicodeError:
         return PoseFrameLoadResult(document=document)
     document.replace_instance_entries(annotations)
     return PoseFrameLoadResult(document=document, extra_keypoint_rows=extra_rows)
@@ -175,7 +175,7 @@ def load_segmentation_document(
                 )
                 if entry:
                     annotations.append(entry)
-    except (OSError, UnicodeError):
+    except OSError, UnicodeError:
         return document
     document.replace_instance_entries(annotations)
     return document

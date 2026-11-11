@@ -276,7 +276,7 @@ def _bbox_iou(left: pd.Series, right: pd.Series, left_prefix: str, right_prefix:
             float(right[f"{right_prefix}_{suffix}"])
             for suffix in ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return math.nan
     if not np.isfinite([lx1, ly1, lx2, ly2, rx1, ry1, rx2, ry2]).all():
         return math.nan

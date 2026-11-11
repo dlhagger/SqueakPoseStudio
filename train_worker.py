@@ -67,7 +67,7 @@ def _safe_number(value: Any) -> float | None:
         if hasattr(value, "item"):
             value = value.item()
         number = float(value)
-    except (TypeError, ValueError, RuntimeError):
+    except TypeError, ValueError, RuntimeError:
         return None
     return number if number == number and abs(number) != float("inf") else None
 
@@ -378,7 +378,7 @@ def _finalized_resume_error(model: Any, params: Mapping[str, Any]) -> str:
         return FINALIZED_CHECKPOINT_RESUME_MESSAGE
     try:
         epoch = int(ckpt.get("epoch", -1))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         epoch = -1
     if epoch < 0 or ckpt.get("optimizer") is None:
         return FINALIZED_CHECKPOINT_RESUME_MESSAGE

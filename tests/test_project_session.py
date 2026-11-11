@@ -56,7 +56,7 @@ class ProjectModelReferenceTests(unittest.TestCase):
             link = root / "models"
             try:
                 os.symlink(external_models, link, target_is_directory=True)
-            except (OSError, NotImplementedError):
+            except OSError, NotImplementedError:
                 self.skipTest("symlink creation is unavailable")
             model_path = str(link / "pose.pt")
             self.assertTrue(os.path.isfile(model_path))

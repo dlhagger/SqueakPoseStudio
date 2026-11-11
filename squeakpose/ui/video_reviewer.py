@@ -539,7 +539,7 @@ class VideoReviewDialog(QDialog):
     def _load_cache_if_valid(self) -> bool:
         try:
             fp = self._cache_path()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             logger.warning(
                 "Rejected unsafe video prediction cache path",
                 exc_info=True,
@@ -577,7 +577,7 @@ class VideoReviewDialog(QDialog):
             else:
                 self.preds = decision.predictions_by_layer.get(normalize_layer_id(active_layer), {})
             return decision.has_predictions
-        except (OSError, UnicodeError, TypeError, ValueError, AttributeError):
+        except OSError, UnicodeError, TypeError, ValueError, AttributeError:
             logger.warning(
                 "Ignored invalid video prediction cache",
                 exc_info=True,
@@ -593,7 +593,7 @@ class VideoReviewDialog(QDialog):
     def _save_cache(self, meta: dict):
         try:
             fp = self._cache_path()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             logger.warning(
                 "Rejected unsafe video prediction cache path",
                 exc_info=True,
@@ -623,7 +623,7 @@ class VideoReviewDialog(QDialog):
                 return
             os.makedirs(os.path.dirname(fp), exist_ok=True)
             atomic_write_text(fp, serialized)
-        except (OSError, TypeError, ValueError):
+        except OSError, TypeError, ValueError:
             logger.warning(
                 "Could not save video prediction cache",
                 exc_info=True,
@@ -978,7 +978,7 @@ class VideoReviewDialog(QDialog):
                 for raw_idx, prediction in streamed_predictions.items():
                     try:
                         frame_idx = int(raw_idx)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         continue
                     if isinstance(prediction, dict):
                         self._review_partial_preds[frame_idx] = prediction
@@ -987,7 +987,7 @@ class VideoReviewDialog(QDialog):
                 prediction = event.get("prediction")
                 if isinstance(prediction, dict):
                     self._review_partial_preds[frame_idx] = prediction
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 pass
             progress = self._review_progress
             if progress is not None:
@@ -1135,7 +1135,7 @@ class VideoReviewDialog(QDialog):
             # a successful run is not reported as canceled.
             try:
                 progress.canceled.disconnect(self._cancel_review_prediction_process)
-            except (TypeError, RuntimeError):
+            except TypeError, RuntimeError:
                 pass
             progress.close()
         self._review_job = None
@@ -1921,7 +1921,7 @@ class VideoReviewDialog(QDialog):
                 # handler so closing the reviewer does not re-enter the finish path.
                 try:
                     progress.canceled.disconnect(self._cancel_review_prediction_process)
-                except (TypeError, RuntimeError):
+                except TypeError, RuntimeError:
                     pass
                 progress.close()
             self._review_job = None

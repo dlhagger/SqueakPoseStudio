@@ -189,7 +189,7 @@ def _recover_analysis_summary_setup(
                     summary_path, max_bytes=4 * 1024 * 1024, require_object=True
                 )
                 modified = os.path.getmtime(summary_path)
-            except (JsonFileError, OSError):
+            except JsonFileError, OSError:
                 continue
             recorded_video = str(summary.get("video_path") or "").strip()
             if Path(recorded_video).name.casefold() != video_name.casefold():
@@ -210,7 +210,7 @@ def _recover_analysis_summary_setup(
     )
     try:
         state.replace_rois(summary["rois"])
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
     if base is not None:
         setup = VideoAnalysisSetup(

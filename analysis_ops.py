@@ -345,7 +345,7 @@ def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
                     break
                 try:
                     x, y = float(point[0]), float(point[1])
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     points = []
                     break
                 if not math.isfinite(x) or not math.isfinite(y):
@@ -371,7 +371,7 @@ def normalize_rois(raw_rois: Any) -> list[dict[str, Any]]:
             y1 = float(raw.get("y1"))
             x2 = float(raw.get("x2"))
             y2 = float(raw.get("y2"))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         if any(math.isnan(value) for value in (x1, y1, x2, y2)):
             continue
@@ -1189,7 +1189,7 @@ def _nvenc_available() -> bool:
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return False
     return result.returncode == 0
 

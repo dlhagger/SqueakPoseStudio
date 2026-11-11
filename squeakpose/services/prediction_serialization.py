@@ -322,7 +322,7 @@ def prediction_confidences_by_class(prediction: dict[str, Any]) -> dict[int, flo
         try:
             class_id = int(detection.get("cls", 0))
             confidence = float(detection.get("conf", 0.0) or 0.0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         if class_id not in confidences or confidence >= confidences[class_id]:
             confidences[class_id] = confidence

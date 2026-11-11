@@ -214,7 +214,7 @@ def decide_video_review_cache(
                         for frame_index, prediction in raw.items()
                         if isinstance(prediction, dict)
                     }
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return VideoReviewCacheDecision(loaded)
 
@@ -233,7 +233,7 @@ def decide_video_review_cache(
             for frame_index, prediction in raw_predictions.items()
             if isinstance(prediction, dict)
         }
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     legacy_layer = normalize_layer_id(layer_id or saved_workflow)
     loaded = {LAYER_KEYPOINTS: {}, LAYER_SEGMENTATION: {}}
@@ -290,7 +290,7 @@ def complete_video_review_pass(
         for frame_index, value in raw_predictions.items():
             try:
                 predictions[int(frame_index)] = value if isinstance(value, dict) else {"ok": False}
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
     canceled = bool(event.get("canceled")) or canceled

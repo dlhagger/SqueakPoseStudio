@@ -145,8 +145,10 @@ def _windows_pid_is_running(pid: int, kernel32: Any = None) -> bool:
     if kernel32 is None:
         import ctypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-        get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]
+        # These ctypes names exist only on Windows. getattr keeps mypy quiet on every
+        # platform; a type: ignore would be flagged as unused when mypy runs on Windows.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        get_last_error = getattr(ctypes, "get_last_error")
         exit_code_type = ctypes.c_ulong
         by_ref = ctypes.byref
     else:

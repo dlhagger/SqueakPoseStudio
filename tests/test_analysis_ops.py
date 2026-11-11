@@ -278,7 +278,10 @@ class AnalysisOpsTests(unittest.TestCase):
             (target / "analysis_features.csv").write_text("old", encoding="utf-8")
             (target / "research_notes.txt").write_text("keep", encoding="utf-8")
             output_link = Path(tmp, "analysis-link")
-            output_link.symlink_to(target, target_is_directory=True)
+            try:
+                output_link.symlink_to(target, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
 
             with AnalysisOutputTransaction(output_link) as staging:
                 (staging / "analysis_features.csv").write_text("new", encoding="utf-8")

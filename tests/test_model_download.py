@@ -56,7 +56,10 @@ class ModelDownloadTests(unittest.TestCase):
                 target.unlink()
                 outside = Path(root, "outside.pt")
                 outside.touch()
-                target.symlink_to(outside)
+                try:
+                    target.symlink_to(outside)
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
                 with self.assertRaises(RuntimeError):
                     download_sam_weights(root, key, downloader=lambda **_: str(target))
 

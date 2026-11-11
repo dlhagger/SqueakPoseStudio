@@ -30,6 +30,7 @@ from squeakpose.services.tracking import (
     resolve_subject_class,
     resolve_tracking_config,
 )
+from squeakpose.services.video_library import resolve_video_path
 
 ManifestWriter = Callable[[str, str], None]
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -196,8 +197,8 @@ class VideoInferenceStatus:
 
 
 def video_identity(video_path: str) -> str:
-    """Return a stable comparison key for local files and project symlinks."""
-    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(video_path))))
+    """Return a stable comparison key for local files and project library links."""
+    return os.path.normcase(resolve_video_path(video_path))
 
 
 def project_video_inference_statuses(project_root: str) -> dict[str, VideoInferenceStatus]:
@@ -330,7 +331,7 @@ def plan_inference_run(
     # Project library entries are commonly symlinks. Snapshot their current
     # target before planning so a later retarget cannot change the identity in
     # the run manifest or make an already queued job process a different video.
-    source_video_path = os.path.realpath(os.path.abspath(os.fspath(video_path)))
+    source_video_path = resolve_video_path(video_path)
     if int(batch_size) < 1:
         raise ValueError("batch_size must be at least 1")
     video_tracking = resolve_tracking_config(

@@ -141,6 +141,27 @@ def _legacy_macos_alias_target(videos_dir: str, path: str) -> str:
     return str(matches[0]) if len(matches) == 1 else ""
 
 
+_POINTER_HOP_LIMIT = 8
+
+
+def resolve_video_path(path: str) -> str:
+    """Return the real file behind a video path, following symlinks and pointer files.
+
+    ``os.path.realpath`` follows symlinks only, so on Windows machines that store
+    library links as pointer files it would return the 1 KB pointer itself. Paths that
+    are neither are returned in their realpath form, matching the previous behavior.
+    """
+    resolved = os.path.realpath(os.path.abspath(os.fspath(path)))
+    for _hop in range(_POINTER_HOP_LIMIT):
+        recorded = _xsym_recorded_target(resolved) if os.path.isfile(resolved) else ""
+        if not recorded:
+            break
+        directory = os.path.dirname(resolved)
+        target = _legacy_macos_alias_target(directory, resolved) or recorded
+        resolved = os.path.realpath(os.path.join(directory, target))
+    return resolved
+
+
 def list_project_videos(videos_dir: str) -> list[VideoLibraryEntry]:
     """List video files and links, including broken video links."""
     directory = os.path.abspath(videos_dir)

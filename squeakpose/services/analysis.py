@@ -22,7 +22,7 @@ from squeakpose.project.layers import (
     LAYER_SEGMENTATION,
     normalize_layer_id,
 )
-from squeakpose.services.video_library import list_project_videos
+from squeakpose.services.video_library import list_project_videos, resolve_video_path
 
 DEFAULT_ONE_EURO_MIN_CUTOFF = 1.0
 DEFAULT_ONE_EURO_BETA = 0.1
@@ -173,7 +173,7 @@ class ProjectVideoAnalysisStatus:
 
 
 def _video_identity(path: str) -> str:
-    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+    return os.path.normcase(resolve_video_path(path))
 
 
 def _relocated_inference_csv(inference_root: str, recorded_path: str, layer_id: str) -> str:
@@ -422,14 +422,15 @@ def _existing_manifest_video_path(csv_path: str) -> str:
     if candidate and not os.path.isabs(candidate):
         candidate = str(inference_root.parent / candidate)
     if candidate and os.path.isfile(candidate):
-        return candidate
+        # Pointer-file library links (Windows without symlink rights) are files too.
+        return resolve_video_path(candidate)
 
     # A project video link may have been retargeted after inference. Prefer the
     # current link with the same filename when the manifest's original path is stale.
     if candidate:
         project_video = inference_root.parent / "videos" / os.path.basename(candidate)
         if project_video.is_file():
-            return str(project_video)
+            return resolve_video_path(str(project_video))
     return ""
 
 

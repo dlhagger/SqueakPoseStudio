@@ -120,6 +120,25 @@ class VideoLibraryServiceTests(unittest.TestCase):
             remove_video_link(str(videos_dir), "gone.mp4")
             self.assertEqual(os.listdir(videos_dir), [])
 
+    def test_resolve_video_path_follows_pointer_files_and_stops_on_loops(self):
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp, "session.mp4")
+            source.write_bytes(b"video")
+            pointer = Path(tmp, "pointer.mp4")
+            video_library._write_pointer_file(str(pointer), str(source))
+            first = Path(tmp, "first.mp4")
+            second = Path(tmp, "second.mp4")
+            video_library._write_pointer_file(str(first), str(second))
+            video_library._write_pointer_file(str(second), str(first))
+
+            resolve = video_library.resolve_video_path
+            self.assertEqual(resolve(str(pointer)), os.path.realpath(source))
+            self.assertEqual(resolve(str(source)), os.path.realpath(source))
+            self.assertIn(
+                resolve(str(first)),
+                {os.path.realpath(first), os.path.realpath(second)},
+            )
+
     def test_other_link_errors_are_not_hidden_by_the_fallback(self):
         with TemporaryDirectory() as project, TemporaryDirectory() as sources:
             source = Path(sources) / "session.mp4"

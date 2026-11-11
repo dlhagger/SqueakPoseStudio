@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from squeakpose.project.layers import LAYER_DEPTH, LAYER_KEYPOINTS, LAYER_SEGMENTATION
 from squeakpose.project.safety import ProjectPathError
+from squeakpose.services import video_library
 from squeakpose.services.analysis import project_analysis_inputs
 from squeakpose.services.inference import (
     InferenceRunAccumulator,
@@ -19,9 +20,35 @@ from squeakpose.services.inference import (
     project_video_inference_statuses,
     video_identity,
 )
+from squeakpose.services.video_library import resolve_video_path
 
 
 class InferenceServiceTests(unittest.TestCase):
+    def test_plan_and_identity_follow_pointer_file_links(self):
+        # Windows machines without symlink rights store library links as pointer files;
+        # inference must decode the video they name, never the 1 KB pointer itself.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source" / "session.mp4"
+            source.parent.mkdir()
+            source.write_bytes(b"video")
+            videos = root / "videos"
+            videos.mkdir()
+            pointer = videos / "session.mp4"
+            video_library._write_pointer_file(str(pointer), str(source))
+
+            plan = plan_inference_run(
+                project_root=tmp,
+                video_path=str(pointer),
+                active_layer=LAYER_KEYPOINTS,
+                model_paths={LAYER_KEYPOINTS: "pose.pt"},
+                run_id="pointer-run",
+            )
+
+            self.assertEqual(plan.video_path, os.path.realpath(source))
+            self.assertEqual(plan.jobs[0].video_path, os.path.realpath(source))
+            self.assertEqual(video_identity(str(pointer)), video_identity(str(source)))
+
     def test_plan_snapshots_symlink_target_and_retarget_does_not_reuse_output(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -36,7 +63,8 @@ class InferenceServiceTests(unittest.TestCase):
             videos = root / "videos"
             videos.mkdir()
             link = videos / "session.mp4"
-            link.symlink_to(original)
+            # Real symlink where allowed, pointer file otherwise (Windows without admin).
+            video_library._create_link(str(original), str(link))
 
             plan = plan_inference_run(
                 project_root=tmp,
@@ -60,11 +88,14 @@ class InferenceServiceTests(unittest.TestCase):
             self.assertIn(video_identity(str(link)), project_video_inference_statuses(tmp))
 
             link.unlink()
-            link.symlink_to(replacement)
+            video_library._create_link(str(replacement), str(link))
 
             inputs = project_analysis_inputs(tmp, LAYER_KEYPOINTS)
             self.assertEqual(len(inputs), 1)
-            self.assertEqual(inputs[0].video_path, str(link))
+            self.assertEqual(inputs[0].video_name, link.name)
+            self.assertEqual(
+                resolve_video_path(inputs[0].video_path), os.path.realpath(replacement)
+            )
             self.assertFalse(inputs[0].inference_ready)
 
     def test_project_video_statuses_combine_successful_layers_and_ignore_bad_manifests(self):
@@ -75,7 +106,7 @@ class InferenceServiceTests(unittest.TestCase):
             videos = root / "videos"
             videos.mkdir()
             link = videos / "session.mp4"
-            link.symlink_to(source)
+            video_library._create_link(str(source), str(link))
             runs = root / "inference outputs" / "runs"
             runs.mkdir(parents=True)
             (runs / "first.json").write_text(

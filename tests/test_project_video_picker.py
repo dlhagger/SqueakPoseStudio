@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
+from squeakpose.services import video_library
 from squeakpose.ui.project_video_picker import ProjectVideoPickerDialog
 
 
@@ -23,9 +24,9 @@ class ProjectVideoPickerDialogTests(unittest.TestCase):
             second_source = Path(sources) / "second.mov"
             first_source.write_bytes(b"first")
             second_source.write_bytes(b"second")
-            (videos_dir / first_source.name).symlink_to(first_source)
-            (videos_dir / second_source.name).symlink_to(second_source)
-            (videos_dir / "missing.mp4").symlink_to(Path(sources) / "missing.mp4")
+            # Real symlinks where allowed, pointer files otherwise (Windows without admin).
+            for source in (first_source, second_source, Path(sources) / "missing.mp4"):
+                video_library._create_link(str(source), str(videos_dir / source.name))
 
             dialog = ProjectVideoPickerDialog(str(videos_dir), selected_names={second_source.name})
 

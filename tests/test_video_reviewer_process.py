@@ -207,7 +207,9 @@ class VideoReviewerProcessTests(unittest.TestCase):
 
             self.assertEqual(choose.call_args.args[3], [source.name])
             self.assertIn("1 missing", choose.call_args.args[2])
-            open_video.assert_called_once_with(str(link))
+            # A pointer file cannot be decoded, so the reviewer opens the video it names.
+            expected = str(link) if link.is_symlink() else str(source)
+            open_video.assert_called_once_with(expected)
 
     def test_controller_runs_passes_sequentially_and_merges_streamed_results(self):
         with TemporaryDirectory() as tmp:

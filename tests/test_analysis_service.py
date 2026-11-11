@@ -3,7 +3,9 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from squeakpose.services import video_library
 from squeakpose.services.analysis import (
     AnalysisConfigError,
     analysis_csv_matches_layer,
@@ -21,9 +23,49 @@ from squeakpose.services.analysis import (
     project_video_analysis_status,
     record_project_video_analysis_output,
 )
+from squeakpose.services.video_library import resolve_video_path
 
 
 class AnalysisServiceTests(unittest.TestCase):
+    def test_project_analysis_inputs_match_manifests_recorded_through_pointer_files(self):
+        # Windows machines without symlink rights store library links as pointer files.
+        # A manifest that recorded the pointer path must still pair with that video.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source" / "session.mp4"
+            source.parent.mkdir()
+            source.write_bytes(b"video")
+            videos = root / "videos"
+            videos.mkdir()
+            pointer = videos / "session.mp4"
+            video_library._write_pointer_file(str(pointer), str(source))
+            csv_path = root / "inference outputs" / "keypoints" / "session_pose.csv"
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text(
+                "frame_index,detection_index,model_path\n0,0,pose.pt\n", encoding="utf-8"
+            )
+            runs = root / "inference outputs" / "runs"
+            runs.mkdir()
+            (runs / "run.json").write_text(
+                json.dumps(
+                    {
+                        "video_path": str(pointer),
+                        "created_at": "2026-11-11T12:00:00",
+                        "passes": [{"layer_id": "keypoints", "csv_path": str(csv_path)}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "squeakpose.services.analysis.analysis_csv_matches_layer", return_value=True
+            ):
+                options = project_analysis_inputs(tmp, "keypoints")
+
+            self.assertEqual(len(options), 1)
+            self.assertEqual(options[0].video_path, str(source))
+            self.assertEqual(options[0].csv_path, str(csv_path))
+
     def test_project_video_analysis_status_requires_completed_artifacts(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -301,7 +343,8 @@ class AnalysisServiceTests(unittest.TestCase):
             replacement.write_bytes(b"replacement")
             videos = root / "videos"
             videos.mkdir()
-            (videos / "session.mp4").symlink_to(replacement)
+            # Real symlink where allowed, pointer file otherwise (Windows without admin).
+            video_library._create_link(str(replacement), str(videos / "session.mp4"))
             outputs = root / "inference outputs"
             csv_path = outputs / "segmentation" / "old_segmentation.csv"
             csv_path.parent.mkdir(parents=True)
@@ -322,7 +365,10 @@ class AnalysisServiceTests(unittest.TestCase):
             options = project_analysis_inputs(tmp, "segmentation")
 
             self.assertEqual(len(options), 1)
-            self.assertEqual(options[0].video_path, str(videos / "session.mp4"))
+            self.assertEqual(options[0].video_name, "session.mp4")
+            self.assertEqual(
+                resolve_video_path(options[0].video_path), os.path.realpath(replacement)
+            )
             self.assertFalse(options[0].inference_ready)
 
     def test_segmentation_preview_uses_first_frame_with_valid_masks(self):

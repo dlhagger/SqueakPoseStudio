@@ -741,6 +741,7 @@ train_worker.py            Ultralytics training process
 tests/                     Unit test suite
 analysis_toolset/          Example inference analysis notebook
 distillation/              Project-aware DINO distillation entry point
+fonts/                     Bundled Fira Sans interface font (SIL Open Font License)
 ```
 
 `squeakpose_studio.py` remains the compatible direct launcher while UI
@@ -863,3 +864,7 @@ https://doc.qt.io/qtforpython-6/
 ## License
 
 See [`LICENSE`](LICENSE).
+
+The bundled Fira Sans font in `fonts/` is Copyright (c) 2012-2015 The Mozilla
+Foundation and Telefonica S.A. and is distributed under the SIL Open Font License 1.1;
+see [`fonts/OFL.txt`](fonts/OFL.txt).

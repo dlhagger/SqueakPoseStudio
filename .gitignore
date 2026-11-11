@@ -75,3 +75,6 @@ htmlcov/
 /.squeakpose.lock
 /squeakpose_project.json
 *.sqp_preds.json
+
+# Full font download; only the weights the interface uses live in /fonts/
+/fonts/*/

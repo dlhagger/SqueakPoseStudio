@@ -37,6 +37,33 @@ def _save_last_project_best_effort(project_root: str) -> bool:
     return True
 
 
+def load_bundled_fonts(fonts_dir: str, *, font_database=None) -> str:
+    """Register every bundled .ttf/.otf font and return the interface family name.
+
+    All weights are registered (not only Regular) so bold text uses the real bold
+    cut instead of a synthesized one. Returns "" when nothing could be loaded, so the
+    caller falls back to the system font.
+    """
+
+    database = font_database if font_database is not None else QFontDatabase
+    try:
+        names = sorted(os.listdir(fonts_dir))
+    except OSError:
+        return ""
+    families: list[str] = []
+    for name in names:
+        if not name.lower().endswith((".ttf", ".otf")):
+            continue
+        font_id = database.addApplicationFont(os.path.join(fonts_dir, name))
+        if font_id == -1:
+            print(f"Failed to load bundled font {name}; continuing without it.")
+            continue
+        families.extend(database.applicationFontFamilies(font_id))
+    if "Fira Sans" in families:
+        return "Fira Sans"
+    return families[0] if families else ""
+
+
 def make_console_output_lossless() -> None:
     """Never crash on text the console encoding cannot represent.
 
@@ -125,17 +152,8 @@ def run(argv: list[str] | None = None) -> int:
         (screen_geometry.height() - splash_pix.height()) // 2,
     )
 
-    font_path = os.path.join(app_base, "fonts", "FiraSans-Regular.ttf")
     system_family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
-    preferred_family = system_family
-    if os.path.exists(font_path):
-        font_id = QFontDatabase.addApplicationFont(font_path)
-        if font_id != -1:
-            loaded_families = QFontDatabase.applicationFontFamilies(font_id)
-            if loaded_families:
-                preferred_family = loaded_families[0]
-        else:
-            print("Failed to load bundled Fira Sans font; using system font.")
+    preferred_family = load_bundled_fonts(os.path.join(app_base, "fonts")) or system_family
 
     app.setStyleSheet(app_stylesheet(preferred_family, system_family))
 

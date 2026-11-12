@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -134,7 +135,7 @@ class FrameAnnotationView(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setObjectName("AnalysisFrameView")
-        self.setMinimumSize(480, 330)
+        self.setMinimumSize(480, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -920,6 +921,7 @@ class AnalysisDialog(QDialog):
         workspace_layout = QVBoxLayout(workspace_panel)
         workspace_layout.setContentsMargins(12, 12, 12, 10)
         workspace_layout.setSpacing(8)
+        workspace_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         workspace_header = QHBoxLayout()
         workspace_title = QLabel("Interactive Setup")
@@ -1059,7 +1061,11 @@ class AnalysisDialog(QDialog):
         roi_actions.addStretch(1)
         roi_row.addLayout(roi_actions)
         workspace_layout.addLayout(roi_row)
-        body.addWidget(workspace_panel, 1)
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workspace_scroll.setWidget(workspace_panel)
+        body.addWidget(self.workspace_scroll, 1)
 
         progress_panel = QFrame()
         progress_panel.setObjectName("AnalysisPanel")

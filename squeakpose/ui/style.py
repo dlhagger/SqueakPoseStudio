@@ -6,6 +6,8 @@ focus on layout and behavior.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QComboBox, QFrame, QGraphicsDropShadowEffect, QWidget
@@ -176,6 +178,7 @@ def _font_stack(preferred_family: str, system_family: str) -> str:
 def app_stylesheet(preferred_family: str, system_family: str) -> str:
     """Global application stylesheet."""
     font_stack = _font_stack(preferred_family, system_family)
+    icons = (Path(__file__).parent / "icons").as_posix()
     return f"""
     QWidget {{
         background-color: {COLORS["app_bg"]};
@@ -252,6 +255,22 @@ def app_stylesheet(preferred_family: str, system_family: str) -> str:
         background-color: #20262b;
         border-color: #39434c;
     }}
+    QCheckBox::indicator {{
+        width: 16px; height: 16px; border-radius: 3px;
+        border: 1px solid #8397a5; background: #15191d;
+    }}
+    QCheckBox::indicator:hover {{ border-color: #bddcf0; }}
+    QCheckBox::indicator:checked {{
+        background: #356b91; border-color: #91b9d6;
+        image: url("{icons}/check.svg");
+    }}
+    QCheckBox::indicator:indeterminate {{
+        background: #356b91; image: url("{icons}/minus.svg");
+    }}
+    QCheckBox::indicator:disabled {{ background: #252b31; border-color: #4f5d68; }}
+    QComboBox::down-arrow {{ image: url("{icons}/chevron-down.svg"); width: 12px; height: 8px; }}
+    QSplitter::handle {{ background: #303b44; }}
+    QSplitter::handle:hover {{ background: #5e8ab4; }}
     QComboBox::drop-down {{
         border-left: 1px solid #3f4a53;
         width: 22px;
@@ -375,6 +394,28 @@ def sidebar_stylesheet() -> str:
         color: {COLORS["text"]};
         padding-bottom: 5px;
         border-bottom: 1px solid {COLORS["panel_border"]};
+    }}
+    QFrame#InstanceWorkflow {{
+        background-color: #21313d;
+        border: 1px solid #52758e;
+        border-radius: 8px;
+    }}
+    QFrame#InstanceWorkflow[active="true"] {{
+        background-color: #223b4c;
+        border-color: #78b5dc;
+    }}
+    QFrame#InstanceWorkflow QFrame {{ background: transparent; border: none; }}
+    QCheckBox#InstanceWorkflowToggle {{
+        background: transparent; color: #e4f3ff;
+        font-size: 11pt; font-weight: 700; spacing: 8px;
+    }}
+    QLabel#InstanceWorkflowHint {{ color: #bed1df; font-size: 9pt; }}
+    QPushButton#AddInstanceButton {{
+        background-color: #315e7b; border-color: #75a6c6; color: #ffffff;
+    }}
+    QPushButton#AddInstanceButton:hover {{ background-color: #3b7193; }}
+    QPushButton#AddInstanceButton:disabled {{
+        background-color: #29353e; border-color: #4f5d68; color: #84909b;
     }}
     QLabel#fieldLabel {{
         font-size: 9pt;

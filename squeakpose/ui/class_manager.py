@@ -22,8 +22,9 @@ from squeakpose.core import find_duplicate_names
 
 
 class AddClassDialog(QDialog):
-    def __init__(self, existing_keypoints: list[str], parent=None):
+    def __init__(self, existing_keypoints: list[str], parent=None, *, existing_classes=()):
         super().__init__(parent)
+        self._existing_classes = set(existing_classes)
         self.setWindowTitle("Add Class")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(360, 300)
@@ -46,7 +47,7 @@ class AddClassDialog(QDialog):
         self.keypoints_edit.textChanged.connect(self._update_count_label)
         self._update_count_label()
 
-        info = QLabel("Keypoint names apply to all classes. Enter one per line.")
+        info = QLabel("Enter keypoint names for this class, one per line.")
         info.setWordWrap(True)
         layout.addLayout(form)
         layout.addWidget(info)
@@ -59,6 +60,28 @@ class AddClassDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def accept(self) -> None:
+        name, keypoints = self.get_data()
+        if not name:
+            QMessageBox.warning(self, "Class name required", "Enter a class name.")
+            self.name_edit.setFocus()
+            return
+        if name in self._existing_classes:
+            QMessageBox.warning(self, "Duplicate class", "That class already exists.")
+            self.name_edit.setFocus()
+            self.name_edit.selectAll()
+            return
+        duplicates = find_duplicate_names(keypoints)
+        if duplicates:
+            QMessageBox.warning(
+                self,
+                "Duplicate keypoints",
+                "Each keypoint name must be unique within this class: " + ", ".join(duplicates),
+            )
+            self.keypoints_edit.setFocus()
+            return
+        super().accept()
 
     def _update_count_label(self) -> None:
         lines = [line for line in self.keypoints_edit.toPlainText().splitlines() if line.strip()]
@@ -152,7 +175,7 @@ class ClassManagerDialog(QDialog):
             seed = self._kp_map.get(self._classes[current], [])
         if not seed:
             seed = self._canonical_default[:]
-        dialog = AddClassDialog(seed, self)
+        dialog = AddClassDialog(seed, self, existing_classes=self._classes)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         name, keypoints = dialog.get_data()

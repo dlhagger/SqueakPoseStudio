@@ -186,7 +186,7 @@ class DistillerTests(unittest.TestCase):
                 self.distiller.run_distillation(
                     project_root=tmp, data_dir=tmp, model=str(checkpoint)
                 )
-            yolo.assert_called_once_with(str(checkpoint.resolve()))
+            yolo.assert_called_once_with(os.path.abspath(checkpoint))
             self.assertIs(fake.pretrain.call_args.kwargs["model"], model)
             self.assertEqual(fake.pretrain.call_args.kwargs["precision"], "auto")
             self.assertEqual(fake.pretrain.call_args.kwargs["gradient_accumulation_steps"], 2)

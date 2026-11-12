@@ -142,7 +142,7 @@ class DatasetOperationsPanel(_OperationFrame):
         self.distillation_btn = _button(
             "Distillation",
             self.callbacks.distill,
-            "Create an unlabeled image corpus and distill a DINO-backed pose model",
+            "Create an unlabeled image corpus and distill a DINO-backed pose or segmentation model",
         )
         self.grid.addWidget(self.validate_btn, 0, 0)
         self.grid.addWidget(self.export_btn, 0, 1)
@@ -154,7 +154,6 @@ class DatasetOperationsPanel(_OperationFrame):
 
     def set_layer(self, layer_id: str) -> None:
         is_depth = str(layer_id) == LAYER_DEPTH
-        is_pose = str(layer_id) == LAYER_KEYPOINTS
         self.title_label.setText(
             "Project Tools"
             if is_depth
@@ -163,7 +162,7 @@ class DatasetOperationsPanel(_OperationFrame):
         for button in (self.validate_btn, self.export_btn, self.train_btn):
             button.setEnabled(not is_depth)
             button.setVisible(not is_depth)
-        self.distillation_btn.setEnabled(is_pose)
+        self.distillation_btn.setEnabled(not is_depth)
         self.distillation_btn.setVisible(not is_depth)
         self.grid.addWidget(self.health_btn, 0 if is_depth else 1, 0, 1, 2 if is_depth else 1)
 
@@ -211,10 +210,10 @@ class ModelOperationsPanel(_OperationFrame):
 
     def set_layer(self, layer_id: str) -> None:
         is_depth = str(layer_id) == LAYER_DEPTH
-        is_pose = str(layer_id) == LAYER_KEYPOINTS
         self.title_label.setText("Project Inference" if is_depth else "Project Models & Inference")
         self.models_btn.setVisible(not is_depth)
         self.status_label.setVisible(not is_depth)
+        is_pose = str(layer_id) == LAYER_KEYPOINTS
         self.apply_template_btn.setVisible(is_pose)
         self.apply_template_btn.setEnabled(is_pose)
         self.save_template_btn.setVisible(is_pose)

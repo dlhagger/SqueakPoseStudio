@@ -42,6 +42,7 @@ class DepthDisplayCallbacks:
 class DepthModelCallbacks:
     select_model: Callable[[str], None] = _ignore_model
     choose_model: Callable[[], None] = _ignore_action
+    delete_data: Callable[[], None] = _ignore_action
 
 
 class _DepthFrame(QFrame):
@@ -191,6 +192,16 @@ class DepthModelPanel(_DepthFrame):
         self.grid.addWidget(self.choose_model_btn, 0, 1)
         self.grid.addWidget(self.clear_model_btn, 1, 0, 1, 2)
         self.panel_layout.addLayout(self.grid)
+        self.delete_data_btn = _button(
+            "Delete All Depth Data…",
+            self.callbacks.delete_data,
+            "Delete generated depth maps, previews, and depth video outputs for this project.",
+        )
+        self.delete_data_btn.setStyleSheet(
+            "QPushButton { color: #ffb5b5; border-color: #8b555b; }"
+            "QPushButton:hover { background-color: #503039; }"
+        )
+        self.panel_layout.addWidget(self.delete_data_btn)
 
     def set_model_status(self, text: str, *, tooltip: str = "", can_clear: bool = False) -> None:
         self.status_label.setText(str(text))

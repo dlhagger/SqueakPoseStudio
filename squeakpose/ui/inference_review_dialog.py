@@ -238,11 +238,14 @@ class InferenceReviewDialog(QDialog):
         self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         for column, width in ((1, 66), (2, 82), (3, 76), (5, 68), (6, 78), (7, 78), (8, 88)):
-            self.table.setColumnWidth(column, width)
+            text_width = header.fontMetrics().horizontalAdvance(
+                self.table.horizontalHeaderItem(column).text()
+            )
+            self.table.setColumnWidth(column, max(width, text_width + 24))
         self.table.itemSelectionChanged.connect(self._show_selected_candidate)
 
         preview_panel = QWidget(splitter)

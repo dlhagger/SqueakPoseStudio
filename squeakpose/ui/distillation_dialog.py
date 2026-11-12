@@ -6,9 +6,10 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Optional
 
-from PyQt6.QtCore import QProcess, Qt
+from PyQt6.QtCore import QProcess, Qt, QTimer
 from PyQt6.QtGui import QFontDatabase, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -24,6 +26,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QScrollArea,
@@ -34,6 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from squeakpose.project.distillation import normalize_distillation_task
 from squeakpose.project.paths import ProjectPaths
 from squeakpose.services.distillation import (
     DISTILLATION_IMAGE_EXTENSIONS,
@@ -105,6 +109,35 @@ class _OpenCVVideoReader:
         self._capture.release()
 
 
+def distillation_stylesheet() -> str:
+    """Visual grouping specific to the distillation workflow."""
+    return """
+    QFrame#DistillationSection {
+        background: #222a30; border: 1px solid #40515c; border-radius: 10px;
+    }
+    QFrame#DistillationSection QWidget { background: transparent; }
+    QFrame#DistillationSection QLineEdit, QFrame#DistillationSection QSpinBox,
+    QFrame#DistillationSection QListWidget {
+        background: #141b20; border: 1px solid #4c626f; border-radius: 6px;
+    }
+    QFrame#DistillationSection QPushButton { background: #2d3a44; }
+    QFrame#DistillationSection QPushButton:hover { background: #3b505f; }
+    QLabel#DistillationEmpty {
+        color: #aabcc8; background: #1a2228; border: 1px dashed #40515c;
+        border-radius: 6px; padding: 12px;
+    }
+    QLabel#DistillationCount { color: #b9dfc9; font-weight: 600; }
+    QPushButton#DistillationPrimary {
+        background: #286588; border: 1px solid #5aa5cf; color: #ffffff;
+    }
+    QPushButton#DistillationPrimary:hover { background: #337fa8; }
+    QPushButton#DistillationPrimary:disabled {
+        background: #26343d; border-color: #40515c; color: #83939e;
+    }
+    QScrollArea { border: none; background: transparent; }
+    """
+
+
 class DistillationDialog(QDialog):
     """Prepare a project image corpus and launch DINO distillation."""
 
@@ -116,7 +149,7 @@ class DistillationDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("DINO Distillation")
         self.setSizeGripEnabled(True)
-        self.resize(1050, 760)
+        self.resize(1000, 760)
         self.setMinimumSize(780, 560)
 
         self.app_base_dir = os.path.abspath(getattr(parent, "app_base_dir", APP_BASE_DIR))
@@ -132,6 +165,12 @@ class DistillationDialog(QDialog):
         # field stays editable while the run is in progress.
         self._active_output_dir = ""
         self._current_task = "pose"
+        self._run_epochs = 0
+        self._last_progress_position = (-1, -1)
+        self._run_started_at = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -149,14 +188,15 @@ class DistillationDialog(QDialog):
         layout.addLayout(header)
 
         intro = QLabel(
-            "Build the unlabeled image corpus only when you are ready, then run Lightly Train "
-            "against that corpus. No frames are generated automatically."
+            "Prepare unlabeled images from your videos, then configure and run model distillation."
         )
         intro.setWordWrap(True)
         intro.setObjectName("TrainHintLabel")
         layout.addWidget(intro)
 
-        tabs = QTabWidget()
+        tabs = self.tabs = QTabWidget()
+        tabs.setObjectName("TrainOutputTabs")
+        tabs.tabBar().setExpanding(False)
         tabs.addTab(self._build_dataset_tab(), "1. Prepare Images")
         tabs.addTab(self._build_run_tab(), "2. Run Distillation")
         layout.addWidget(tabs, 1)
@@ -164,94 +204,170 @@ class DistillationDialog(QDialog):
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         button_box.rejected.connect(self.reject)
 
+        self.next_btn = QPushButton("Continue to Run Settings →")
+        self.next_btn.setObjectName("DistillationPrimary")
+        self.next_btn.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        button_box.addButton(self.next_btn, QDialogButtonBox.ButtonRole.ActionRole)
+
         self.run_btn = QPushButton("Start Distillation")
+        self.run_btn.setObjectName("DistillationPrimary")
         self.run_btn.clicked.connect(self._start_distillation)
         button_box.addButton(self.run_btn, QDialogButtonBox.ButtonRole.ActionRole)
 
         self.cancel_btn = QPushButton("Cancel Distillation")
         self.cancel_btn.clicked.connect(self._cancel_process)
         self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setVisible(False)
         button_box.addButton(self.cancel_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        self.cancel_btn.setVisible(False)
         layout.addWidget(button_box)
+        tabs.currentChanged.connect(self._update_step_actions)
+        self._update_step_actions(0)
 
-        self.setStyleSheet(train_dialog_stylesheet())
+        initial_task = normalize_distillation_task(getattr(parent, "active_layer", None)) or "pose"
+        self.task_combo.setCurrentIndex(self.task_combo.findData(initial_task))
+
+        self.setStyleSheet(train_dialog_stylesheet() + distillation_stylesheet())
         self._refresh_dataset_summary()
         self._update_output_path()
 
-    def _build_dataset_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+    def _update_step_actions(self, index: int) -> None:
+        self.next_btn.setVisible(index == 0)
+        self.run_btn.setVisible(index == 1)
 
-        source_label = QLabel("Source videos")
-        source_label.setObjectName("TrainPanelTitle")
-        layout.addWidget(source_label)
+    @staticmethod
+    def _section(title: str, description: str) -> tuple[QFrame, QVBoxLayout]:
+        frame = QFrame()
+        frame.setObjectName("DistillationSection")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        heading = QLabel(title)
+        heading.setObjectName("TrainPanelTitle")
+        layout.addWidget(heading)
+        hint = QLabel(description)
+        hint.setObjectName("TrainHintLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        return frame, layout
+
+    def _build_dataset_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 14, 12, 14)
+        layout.setSpacing(14)
+
+        source, source_layout = self._section(
+            "Source videos",
+            "Select videos to sample, or use an existing image folder below.",
+        )
+        video_buttons = QHBoxLayout()
+        add_btn = QPushButton("Select Project Videos…")
+        add_btn.clicked.connect(self._add_videos)
+        video_buttons.addWidget(add_btn)
+        video_buttons.addStretch(1)
+        self.remove_video_btn = QPushButton("Remove Selected")
+        self.remove_video_btn.clicked.connect(self._remove_selected_videos)
+        video_buttons.addWidget(self.remove_video_btn)
+        self.clear_video_btn = QPushButton("Clear All")
+        self.clear_video_btn.clicked.connect(self._clear_videos)
+        video_buttons.addWidget(self.clear_video_btn)
+        source_layout.addLayout(video_buttons)
 
         self.video_list = QListWidget()
         self.video_list.setAlternatingRowColors(True)
-        self.video_list.setMinimumHeight(110)
+        self.video_list.setMinimumHeight(100)
+        self.video_list.setMaximumHeight(150)
         self.video_list.setToolTip("Only videos listed here will be sampled")
-        layout.addWidget(self.video_list)
+        source_layout.addWidget(self.video_list)
+        self.video_empty_label = QLabel(
+            "No videos selected\nChoose project videos to create or add to your image set."
+        )
+        self.video_empty_label.setObjectName("DistillationEmpty")
+        self.video_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_empty_label.setWordWrap(True)
+        self.video_empty_label.setMinimumHeight(100)
+        source_layout.addWidget(self.video_empty_label)
+        self.video_list.itemSelectionChanged.connect(self._update_video_controls)
+        self.video_list.model().rowsInserted.connect(self._update_video_controls)
+        self.video_list.model().rowsRemoved.connect(self._update_video_controls)
+        self.video_list.model().modelReset.connect(self._update_video_controls)
+        self._update_video_controls()
+        layout.addWidget(source)
 
-        video_buttons = QHBoxLayout()
-        add_btn = QPushButton("Select Project Videos...")
-        add_btn.clicked.connect(self._add_videos)
-        video_buttons.addWidget(add_btn)
-        remove_btn = QPushButton("Remove Selected")
-        remove_btn.clicked.connect(self._remove_selected_videos)
-        video_buttons.addWidget(remove_btn)
-        clear_btn = QPushButton("Clear")
-        clear_btn.clicked.connect(self._clear_videos)
-        video_buttons.addWidget(clear_btn)
-        video_buttons.addStretch(1)
-        layout.addLayout(video_buttons)
-
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
+        corpus, corpus_layout = self._section(
+            "Image set",
+            "Choose where sampled images are saved, or browse to images you already prepared.",
+        )
         data_row = QHBoxLayout()
         self.data_dir_edit = QLineEdit(self.paths["distillation_unlabeled_images"])
+        self.data_dir_edit.setAccessibleName("Image folder")
+        self.data_dir_edit.editingFinished.connect(self._refresh_dataset_summary)
         data_row.addWidget(self.data_dir_edit, 1)
-        browse_btn = QPushButton("Browse...")
+        browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_data_dir)
         data_row.addWidget(browse_btn)
-        form.addRow("Image corpus:", data_row)
+        corpus_layout.addLayout(data_row)
 
+        sampling_row = QHBoxLayout()
+        sampling_row.setSpacing(20)
         self.stride_spin = QSpinBox()
         self.stride_spin.setRange(1, 100000)
         self.stride_spin.setValue(30)
         self.stride_spin.setSuffix(" frames")
-        form.addRow("Sample every:", self.stride_spin)
-
         self.max_frames_spin = QSpinBox()
         self.max_frames_spin.setRange(0, 10000000)
         self.max_frames_spin.setSpecialValueText("No limit")
         self.max_frames_spin.setValue(10000)
-        form.addRow("Maximum per video:", self.max_frames_spin)
-
         self.jpeg_quality_spin = QSpinBox()
         self.jpeg_quality_spin.setRange(50, 100)
         self.jpeg_quality_spin.setValue(95)
-        form.addRow("JPEG quality:", self.jpeg_quality_spin)
-        layout.addLayout(form)
+        for title, control in (
+            ("Sample every", self.stride_spin),
+            ("Max. images per video", self.max_frames_spin),
+            ("JPEG quality", self.jpeg_quality_spin),
+        ):
+            field = QVBoxLayout()
+            label = QLabel(title)
+            label.setObjectName("TrainHintLabel")
+            label.setBuddy(control)
+            field.addWidget(label)
+            field.addWidget(control)
+            sampling_row.addLayout(field, 1)
+        corpus_layout.addLayout(sampling_row)
 
-        self.dataset_summary = QLabel("")
-        self.dataset_summary.setWordWrap(True)
-        self.dataset_summary.setObjectName("TrainHintLabel")
-        layout.addWidget(self.dataset_summary)
-
+        hint = QLabel(
+            "Existing images are kept. Only new frames are added when you build the image set."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("TrainHintLabel")
+        corpus_layout.addWidget(hint)
         create_row = QHBoxLayout()
-        self.create_dataset_btn = QPushButton("Create / Update Image Corpus")
+        self.create_dataset_btn = QPushButton("Build Image Set")
         self.create_dataset_btn.clicked.connect(self._create_dataset)
         create_row.addWidget(self.create_dataset_btn)
         refresh_btn = QPushButton("Refresh Count")
         refresh_btn.clicked.connect(self._refresh_dataset_summary)
         create_row.addWidget(refresh_btn)
         create_row.addStretch(1)
-        layout.addLayout(create_row)
+        self.dataset_summary = QLabel("")
+        self.dataset_summary.setObjectName("DistillationCount")
+        create_row.addWidget(self.dataset_summary)
+        corpus_layout.addLayout(create_row)
+        layout.addWidget(corpus)
         layout.addStretch(1)
-        return tab
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        return scroll
+
+    def _update_video_controls(self, *_args) -> None:
+        has_videos = self.video_list.count() > 0
+        self.video_list.setVisible(has_videos)
+        self.video_empty_label.setVisible(not has_videos)
+        self.clear_video_btn.setEnabled(has_videos)
+        self.remove_video_btn.setEnabled(bool(self.video_list.selectedItems()))
 
     def _build_run_tab(self) -> QWidget:
         tab = QWidget()
@@ -275,8 +391,8 @@ class DistillationDialog(QDialog):
         self.student_edit = QLineEdit(self.TASK_DEFAULTS["pose"]["student"])
         self.model_size_combo = ThemedComboBox()
         for label, size in (
-            ("Nano (n) ? default", "n"),
-            ("Small (s) — default", "s"),
+            ("Nano (n) — default", "n"),
+            ("Small (s)", "s"),
             ("Medium (m)", "m"),
             ("Large (l)", "l"),
             ("Extra Large (x)", "x"),
@@ -361,11 +477,45 @@ class DistillationDialog(QDialog):
         settings_scroll.setWidget(settings_widget)
         layout.addWidget(settings_scroll, 3)
 
-        output_title = QLabel("Distillation Output")
+        output_title = QLabel("Distillation Monitor")
         output_title.setObjectName("TrainPanelTitle")
         layout.addWidget(output_title)
 
+        self.monitor_tabs = QTabWidget()
+        self.monitor_tabs.setObjectName("TrainOutputTabs")
+        overview = QWidget()
+        monitor_layout = QVBoxLayout(overview)
+        monitor_layout.setContentsMargins(10, 10, 10, 10)
+        metrics = QHBoxLayout()
+        self.epoch_label = QLabel("Epoch —")
+        self.loss_label = QLabel("Batch loss —")
+        self.elapsed_label = QLabel("Elapsed 00:00")
+        for label in (self.epoch_label, self.loss_label, self.elapsed_label):
+            metrics.addWidget(label)
+        monitor_layout.addLayout(metrics)
+        self.overall_progress = QProgressBar()
+        self.overall_progress.setObjectName("TrainOverallProgress")
+        self.overall_progress.setRange(0, 1000)
+        self.overall_progress.setValue(0)
+        self.overall_progress.setFormat("Waiting to start")
+        monitor_layout.addWidget(self.overall_progress)
+        self.epoch_progress = QProgressBar()
+        self.epoch_progress.setObjectName("TrainEpochProgress")
+        self.epoch_progress.setRange(0, 100)
+        self.epoch_progress.setValue(0)
+        self.epoch_progress.setFormat("Waiting for batches")
+        monitor_layout.addWidget(self.epoch_progress)
+        note = QLabel(
+            "Loss is the latest reported batch value. Full output is available in Console."
+        )
+        note.setObjectName("TrainHintLabel")
+        note.setWordWrap(True)
+        monitor_layout.addWidget(note)
+        monitor_layout.addStretch(1)
+        self.monitor_tabs.addTab(overview, "Overview")
+
         self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("TrainLogView")
         self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.log_view.setMaximumBlockCount(12000)
@@ -373,7 +523,8 @@ class DistillationDialog(QDialog):
         terminal_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         terminal_font.setPointSize(10)
         self.log_view.setFont(terminal_font)
-        layout.addWidget(self.log_view, 1)
+        self.monitor_tabs.addTab(self.log_view, "Console")
+        layout.addWidget(self.monitor_tabs, 2)
         self.task_combo.currentIndexChanged.connect(self._on_task_changed)
         return tab
 
@@ -499,10 +650,7 @@ class DistillationDialog(QDialog):
     def _refresh_dataset_summary(self) -> None:
         data_dir = self.data_dir_edit.text().strip()
         count = self._image_count(data_dir)
-        self.dataset_summary.setText(
-            f"Current corpus: {count:,} image(s)\n"
-            f"Frames are written as JPEG files with source-specific names; existing files are skipped."
-        )
+        self.dataset_summary.setText(f"{count:,} images ready" if count else "No images yet")
 
     def _probe_selected_videos(self) -> tuple[list[tuple[str, int, int]], list[str]]:
         stride = self.stride_spin.value()
@@ -701,6 +849,19 @@ class DistillationDialog(QDialog):
             return
 
         self.log_view.clear()
+        self._run_epochs = 0 if self.resume_check.isChecked() else self.epochs_spin.value()
+        self._last_progress_position = (-1, -1)
+        self._run_started_at = time.monotonic()
+        self._elapsed_timer.start()
+        self._update_elapsed()
+        self.epoch_label.setText("Epoch —")
+        self.loss_label.setText("Batch loss —")
+        self.overall_progress.setRange(0, 0)
+        self.overall_progress.setFormat("Starting…")
+        self.epoch_progress.setRange(0, 100)
+        self.epoch_progress.setValue(0)
+        self.epoch_progress.setFormat("Waiting for batches")
+        self.monitor_tabs.setCurrentIndex(0)
         self._append_log(
             f"Project: {plan.project_root}\n"
             f"Images: {plan.data_dir} ({plan.image_count:,} files)\n"
@@ -719,9 +880,11 @@ class DistillationDialog(QDialog):
         controller.stderr_received.connect(self._handle_process_output)
         controller.terminal.connect(self._handle_process_terminal)
         self.cancel_requested = False
+        self.tabs.setCurrentIndex(1)
         self._active_output_dir = str(plan.output_dir)
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setVisible(True)
         self.create_dataset_btn.setEnabled(False)
         self._set_status("Launching", "running")
 
@@ -753,10 +916,50 @@ class DistillationDialog(QDialog):
         if not text:
             return
         self._append_log(text + "\n")
+        self._update_progress_from_output(text)
         # Output keeps arriving while a cancel winds down; do not flip
         # "Canceling" back to "Running".
         if not self.cancel_requested:
             self._set_status("Running", "running")
+
+    def _update_elapsed(self) -> None:
+        if self._run_started_at is None:
+            return
+        seconds = max(0, int(time.monotonic() - self._run_started_at))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration = (
+            f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+        )
+        self.elapsed_label.setText(f"Elapsed {duration}")
+
+    def _update_progress_from_output(self, text: str) -> None:
+        clean = self.ANSI_ESCAPE_RE.sub("", text)
+        # Lightly prints the resolved configuration, including resumed run settings.
+        configured_epochs = re.search(r'^\s*"epochs"\s*:\s*(\d+)', clean, re.MULTILINE)
+        if configured_epochs:
+            self._run_epochs = int(configured_epochs.group(1))
+        # Lightning uses zero-based epoch numbers. Keep all raw output in Console.
+        for match in re.finditer(r"Epoch\s+(\d+):[^\r\n]*?\|\s*(\d+)/(\d+)([^\r\n]*)", clean):
+            epoch, step, total = map(int, match.group(1, 2, 3))
+            if total <= 0 or step > total or (epoch, step) < self._last_progress_position:
+                continue
+            self._last_progress_position = (epoch, step)
+            epoch_text = f"Epoch {epoch + 1}"
+            if self._run_epochs:
+                epoch_text += f" / {self._run_epochs}"
+                self.overall_progress.setRange(0, 1000)
+                self.overall_progress.setValue(
+                    min(999, int(1000 * (epoch + step / total) / self._run_epochs))
+                )
+                self.overall_progress.setFormat("Overall %p%")
+            self.epoch_label.setText(epoch_text)
+            self.epoch_progress.setRange(0, total)
+            self.epoch_progress.setValue(step)
+            self.epoch_progress.setFormat(f"Batch {step:,} / {total:,}")
+            loss = re.search(r"train_loss=([^,\]\s]+)", match.group(4))
+            if loss:
+                self.loss_label.setText(f"Batch loss {loss.group(1)}")
 
     def _handle_process_event(self, event: dict) -> None:
         self._handle_process_output(json.dumps(event, sort_keys=True))
@@ -815,6 +1018,11 @@ class DistillationDialog(QDialog):
         )
 
     def _finish_process_result(self, result: WorkerJobResult) -> None:
+        self._elapsed_timer.stop()
+        self._update_elapsed()
+        if self.overall_progress.maximum() == 0:
+            self.overall_progress.setRange(0, 1000)
+            self.overall_progress.setValue(0)
         canceled = self.cancel_requested or result.state == "cancelled"
         output_dir = self._active_output_dir or self._output_dir()
         self._active_output_dir = ""
@@ -824,11 +1032,13 @@ class DistillationDialog(QDialog):
         self.cancel_requested = False
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setVisible(False)
         self.create_dataset_btn.setEnabled(True)
         if controller is not None:
             controller.deleteLater()
 
         if canceled:
+            self.overall_progress.setFormat("Canceled")
             self._set_status("Canceled", "canceled")
             self._append_log("\nDistillation canceled.\n")
             return
@@ -836,11 +1046,15 @@ class DistillationDialog(QDialog):
             if result.error_message:
                 self._append_log(f"\nProcess error: {result.error_message}\n")
             exit_code = result.exit_code if result.exit_code is not None else 1
+            self.overall_progress.setFormat("Failed")
+            self.monitor_tabs.setCurrentIndex(1)
             self._set_status("Failed", "failed")
             self._append_log(f"\nDistillation failed with exit code {exit_code}.\n")
             QMessageBox.critical(self, "Distillation failed", "Review the output log for details.")
             return
 
+        self.overall_progress.setValue(1000)
+        self.overall_progress.setFormat("Complete")
         self._set_status("Complete", "complete")
         self._append_log(f"\nDistillation complete. Output: {output_dir}\n")
         QMessageBox.information(
@@ -880,10 +1094,12 @@ class DistillationDialog(QDialog):
 
     def reject(self) -> None:
         if self._confirm_stop_for_close():
+            self._elapsed_timer.stop()
             super().reject()
 
     def closeEvent(self, event) -> None:
         if not self._confirm_stop_for_close():
             event.ignore()
             return
+        self._elapsed_timer.stop()
         super().closeEvent(event)

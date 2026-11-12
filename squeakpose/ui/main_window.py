@@ -80,6 +80,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
     QStatusBar,
     QTabWidget,
     QTextEdit,
@@ -208,6 +209,7 @@ from squeakpose.services.dataset_ops import (
     plan_grouped_train_val_split,
 )
 from squeakpose.services.dataset_yaml import unpaired_sided_keypoints
+from squeakpose.services.depth_cleanup import delete_project_depth_data
 from squeakpose.services.frame_annotations import (
     SegmentationBoxUnavailableError,
     build_pose_save_request,
@@ -1685,7 +1687,7 @@ class LabelingApp(QMainWindow):
         self.normalize_btn.setEnabled(not is_depth)
         self.export_dataset_btn.setEnabled(not is_depth)
         self.train_btn.setEnabled(not is_depth)
-        self.distillation_btn.setEnabled(is_pose)
+        self.distillation_btn.setEnabled(not is_depth)
         self.normalize_btn.setVisible(not is_depth)
         self.export_dataset_btn.setVisible(not is_depth)
         self.train_btn.setVisible(not is_depth)
@@ -2621,7 +2623,7 @@ class LabelingApp(QMainWindow):
         load_enabled = not model_loading and not model_busy and not download_busy
         if hasattr(self, "sam_load_btn"):
             self.sam_load_btn.setEnabled(load_enabled)
-            self.sam_load_btn.setText("Loading SAM…" if model_loading else "Load SAM")
+            self.sam_load_btn.setText("Loading SAM…" if model_loading else "Choose SAM File…")
             self.sam_load_btn.setProperty("tone", "load" if load_enabled else "")
             _refresh_qt_style(self.sam_load_btn)
         if hasattr(self, "sam_download_btn"):
@@ -2638,7 +2640,9 @@ class LabelingApp(QMainWindow):
                 f"Downloading {model.display_name}…"
                 if download_busy
                 else (
-                    f"Load {model.display_name}" if downloaded else f"Download {model.display_name}"
+                    f"Load Downloaded {model.display_name}"
+                    if downloaded
+                    else f"Download {model.display_name}"
                 )
             )
             self.sam_download_btn.setToolTip(
@@ -3929,18 +3933,6 @@ class LabelingApp(QMainWindow):
         self.inference_review_action = videos_menu.addAction("Review Inference Quality…")
         self.inference_review_action.triggered.connect(self.open_inference_quality_review)
 
-        ai_menu = menu_bar.addMenu("&AI")
-        self.chatgpt_connect_action = ai_menu.addAction("Continue with ChatGPT…")
-        self.chatgpt_connect_action.triggered.connect(self.connect_chatgpt)
-        self.openai_autolabel_action = ai_menu.addAction("Auto-label Current Image…")
-        self.openai_autolabel_action.triggered.connect(self.run_openai_autolabel)
-        self.openai_refresh_models_action = ai_menu.addAction("Refresh OpenAI Models")
-        self.openai_refresh_models_action.triggered.connect(self._openai_controller.refresh_models)
-        ai_menu.addSeparator()
-        self.chatgpt_signout_action = ai_menu.addAction("Sign Out of ChatGPT")
-        self.chatgpt_signout_action.triggered.connect(self.sign_out_chatgpt)
-        self._refresh_openai_actions()
-
     def _refresh_openai_actions(self) -> None:
         controller = self.__dict__.get("_openai_controller")
         if controller is None:
@@ -3948,15 +3940,6 @@ class LabelingApp(QMainWindow):
         profile = controller.profile
         connected = bool(profile and profile.access_token and profile.plan_usage_enabled)
         busy = controller.is_busy
-        label = profile.email if profile and profile.email else "ChatGPT"
-        if hasattr(self, "chatgpt_connect_action"):
-            self.chatgpt_connect_action.setText(
-                f"Reconnect {label}…" if connected else "Continue with ChatGPT…"
-            )
-            self.chatgpt_connect_action.setEnabled(not busy)
-            self.openai_autolabel_action.setEnabled(connected and not busy)
-            self.openai_refresh_models_action.setEnabled(connected and not busy)
-            self.chatgpt_signout_action.setEnabled(connected and not busy)
         panel = self.__dict__.get("openai_pose_frame")
         if isinstance(panel, OpenAIPosePanel):
             panel.set_state(
@@ -4363,9 +4346,9 @@ class LabelingApp(QMainWindow):
         self.left_sidebar = QScrollArea()
         self.left_sidebar.setWidgetResizable(True)
         self.left_sidebar.setFrameShape(QFrame.Shape.NoFrame)
-        self.left_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.left_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.left_sidebar.setWidget(self.left_sidebar_content)
-        self.left_sidebar.setFixedWidth(360)
+        self.left_sidebar.setMinimumWidth(300)
 
         self.right_sidebar_content = QWidget()
         self.right_sidebar_content.setObjectName("SidebarContent")
@@ -4376,14 +4359,26 @@ class LabelingApp(QMainWindow):
         self.right_sidebar = QScrollArea()
         self.right_sidebar.setWidgetResizable(True)
         self.right_sidebar.setFrameShape(QFrame.Shape.NoFrame)
-        self.right_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.right_sidebar.setWidget(self.right_sidebar_content)
-        self.right_sidebar.setFixedWidth(360)
+        self.right_sidebar.setMinimumWidth(300)
 
         self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.left_sidebar)
-        layout.addWidget(self.view, 1)
-        layout.addWidget(self.right_sidebar)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setHandleWidth(8)
+        self.workspace_splitter.addWidget(self.left_sidebar)
+        self.workspace_splitter.addWidget(self.view)
+        self.workspace_splitter.addWidget(self.right_sidebar)
+        self.workspace_splitter.setCollapsible(1, False)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setStretchFactor(2, 0)
+        self.workspace_splitter.setSizes([380, 720, 380])
+        for index in (1, 2):
+            self.workspace_splitter.handle(index).setToolTip(
+                "Drag to resize the sidebar; drag to the edge to collapse it."
+            )
+        layout.addWidget(self.workspace_splitter)
         central.setLayout(layout)
 
         # Shared widgets/state
@@ -4519,6 +4514,7 @@ class LabelingApp(QMainWindow):
             DepthModelCallbacks(
                 select_model=self._set_depth_model_path,
                 choose_model=self._choose_depth_model_interactive,
+                delete_data=self._delete_all_depth_data,
             ),
             parent=self.left_sidebar_content,
         )
@@ -5794,6 +5790,55 @@ class LabelingApp(QMainWindow):
         clear_button = getattr(self, "depth_clear_model_btn", None)
         if clear_button is not None:
             clear_button.setEnabled(bool(path))
+
+    def _delete_all_depth_data(self) -> None:
+        if not self._is_depth_layer():
+            return
+
+        def busy() -> bool:
+            return self._instance_operation_busy() or any(
+                controller is not None and controller.is_busy
+                for controller in (
+                    self.__dict__.get("_prediction_coordinator"),
+                    self.__dict__.get("_inference_coordinator"),
+                )
+            )
+
+        if busy():
+            QMessageBox.information(
+                self,
+                "Depth operation running",
+                "Wait for prediction or inference to finish before deleting depth data.",
+            )
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Delete all depth data?",
+            f"Are you sure you want to permanently delete all generated depth data in this project?\n\n"
+            f"{self.project_root}\n\n"
+            "This removes depth maps, previews, metadata, and depth inference/analysis outputs.\n"
+            "Source images, videos, model files, and keypoint/segmentation data are kept.\n\n"
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes or busy():
+            return
+        try:
+            delete_project_depth_data(self.project_root)
+        except (OSError, ProjectPathError) as exc:
+            QMessageBox.critical(
+                self,
+                "Could not delete all depth data",
+                f"Some depth data may remain.\n\n{exc}",
+            )
+        else:
+            self.update_status_bar("All project depth data deleted.")
+        finally:
+            self._clear_depth_probes()
+            self._depth_controller.clear_image()
+            self.load_image()
+            self._update_progress_label()
 
     def _set_depth_model_path(self, path: str) -> None:
         normalized = str(path or "")

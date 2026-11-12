@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(gettempdir(), "squeakpose-mpl-tests"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(gettempdir(), "squeakpose-cache-tests"))
 
-from PyQt6.QtCore import QSize
+from PyQt6.QtCore import QPoint, QSize
 from PyQt6.QtWidgets import QApplication, QDialog, QWidget
 
 from analysis_dialog import AnalysisDialog
@@ -29,6 +29,30 @@ class DialogResizingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(["dialog-resizing-test"])
         cls.app.setQuitOnLastWindowClosed(False)
+
+    def test_analysis_canvas_does_not_overlap_roi_controls_when_resized(self):
+        with TemporaryDirectory() as tmp:
+            dialog = AnalysisDialog(None, project_root=tmp, app_base_dir=tmp)
+            try:
+                dialog.show()
+                for width, height in ((1240, 900), (1040, 680)):
+                    dialog.resize(width, height)
+                    self.app.processEvents()
+                    canvas_bottom = dialog.frame_view.mapTo(
+                        dialog, QPoint(0, dialog.frame_view.height())
+                    ).y()
+                    for widget in (dialog.roi_list, dialog.roi_priority_hint, dialog.raise_roi_btn):
+                        self.assertGreaterEqual(widget.mapTo(dialog, QPoint()).y(), canvas_bottom)
+                    dialog.workspace_scroll.ensureWidgetVisible(dialog.delete_roi_btn)
+                    self.app.processEvents()
+                    button_center = dialog.delete_roi_btn.mapTo(
+                        dialog.workspace_scroll.viewport(), dialog.delete_roi_btn.rect().center()
+                    )
+                    self.assertTrue(
+                        dialog.workspace_scroll.viewport().rect().contains(button_center)
+                    )
+            finally:
+                dialog.close()
 
     def test_all_custom_dialogs_have_a_size_grip_and_can_grow(self):
         with TemporaryDirectory() as tmp:

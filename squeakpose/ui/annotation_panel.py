@@ -194,30 +194,52 @@ class AnnotationPanel(QFrame):
             lambda _checked=False: self.callbacks.manage_classes()
         )
         class_layout.addWidget(self.manage_classes_btn)
+        self.instance_workflow = QFrame()
+        self.instance_workflow.setObjectName("InstanceWorkflow")
+        workflow_layout = QVBoxLayout(self.instance_workflow)
+        workflow_layout.setContentsMargins(12, 12, 12, 12)
+        workflow_layout.setSpacing(8)
         self.multi_animal_check = QCheckBox("Multiple instances")
-        self.multi_animal_check.setStyleSheet("QCheckBox { color: #dce4ec; }")
+        self.multi_animal_check.setObjectName("InstanceWorkflowToggle")
         self.multi_animal_check.setToolTip(
             "Label multiple instances of the same class. Predictions retain all instances."
         )
-        class_layout.addWidget(self.multi_animal_check)
+        workflow_layout.addWidget(self.multi_animal_check)
+        self.instance_hint = QLabel(
+            "Turn on to label multiple animals or objects of the same class."
+        )
+        self.instance_hint.setObjectName("InstanceWorkflowHint")
+        self.instance_hint.setWordWrap(True)
+        workflow_layout.addWidget(self.instance_hint)
         self.instance_controls = QFrame()
         instance_layout = QVBoxLayout(self.instance_controls)
         instance_layout.setContentsMargins(0, 0, 0, 0)
+        instance_layout.setSpacing(7)
+        active_label = QLabel("Editing instance")
+        active_label.setObjectName("fieldLabel")
+        instance_layout.addWidget(active_label)
         self.instance_selector = ThemedComboBox()
+        active_label.setBuddy(self.instance_selector)
         self.instance_selector.setToolTip(
             "Choose an instance of the selected class (I: next instance)"
         )
         instance_layout.addWidget(self.instance_selector)
         instance_buttons = QHBoxLayout()
-        self.add_instance_btn = QPushButton("Add instance")
+        self.add_instance_btn = QPushButton("+ Add instance")
+        self.add_instance_btn.setObjectName("AddInstanceButton")
         self.add_instance_btn.setToolTip("Add another instance of the selected class (Shift+I)")
         self.delete_instance_btn = QPushButton("Delete instance")
         instance_buttons.addWidget(self.add_instance_btn)
         instance_buttons.addWidget(self.delete_instance_btn)
         instance_layout.addLayout(instance_buttons)
-        class_layout.addWidget(self.instance_controls)
+        shortcut_hint = QLabel("Shift+I: add instance · I: next instance")
+        shortcut_hint.setObjectName("InstanceWorkflowHint")
+        shortcut_hint.setWordWrap(True)
+        instance_layout.addWidget(shortcut_hint)
+        workflow_layout.addWidget(self.instance_controls)
+        class_layout.addWidget(self.instance_workflow)
         self.instance_controls.hide()
-        self.multi_animal_check.toggled.connect(self.instance_controls.setVisible)
+        self.multi_animal_check.toggled.connect(self._set_instance_workflow_enabled)
         self.add_instance_btn.clicked.connect(lambda: self.callbacks.add_instance())
         self.delete_instance_btn.clicked.connect(lambda: self.callbacks.delete_instance())
         self.instance_selector.currentIndexChanged.connect(self.callbacks.instance_changed)
@@ -235,6 +257,18 @@ class AnnotationPanel(QFrame):
         self.class_selector.currentIndexChanged.connect(self.callbacks.class_changed)
         self.set_layer(active_layer)
         self.set_active_mode(active_mode)
+
+    def _set_instance_workflow_enabled(self, enabled: bool) -> None:
+        self.instance_controls.setVisible(enabled)
+        self.instance_hint.setText(
+            "Add an instance for each animal or object, then choose which one to edit."
+            if enabled
+            else "Turn on to label multiple animals or objects of the same class."
+        )
+        self.instance_workflow.setProperty("active", enabled)
+        self.instance_workflow.style().unpolish(self.instance_workflow)
+        self.instance_workflow.style().polish(self.instance_workflow)
+        self.instance_workflow.update()
 
     def set_classes(
         self,
@@ -419,7 +453,7 @@ class SegmentationToolsPanel(QFrame):
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(6)
         self.load_btn = _panel_button(
-            "Load SAM",
+            "Choose SAM File…",
             tooltip="Load a SAM model file for segmentation prompts",
         )
         self.download_btn = _panel_button(

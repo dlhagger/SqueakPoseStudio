@@ -101,7 +101,9 @@ class SamModelSelectionTests(unittest.TestCase):
                 target = Path(sam_download_target(root, key))
                 target.touch()
                 window._refresh_sam_controls()
-                self.assertEqual(window.sam_download_btn.text(), f"Load {model.display_name}")
+                self.assertEqual(
+                    window.sam_download_btn.text(), f"Load Downloaded {model.display_name}"
+                )
                 with (
                     patch.object(window, "_warm_sam_model") as warm,
                     patch("squeakpose.ui.main_window.WorkerJobController") as worker,

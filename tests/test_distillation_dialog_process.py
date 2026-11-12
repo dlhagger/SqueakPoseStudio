@@ -50,6 +50,49 @@ class DistillationDialogProcessTests(unittest.TestCase):
         self.assertFalse(self.dialog.model_size_combo.isEnabled())
         self.assertFalse(self.dialog.student_browse_btn.isEnabled())
 
+    def test_initial_task_follows_active_layer(self):
+        for layer, task, suffix in (
+            ("keypoints", "pose", "pose"),
+            ("segmentation", "segment", "seg"),
+        ):
+            with self.subTest(layer=layer):
+                self.parent.active_layer = layer
+                dialog = DistillationDialog(self.parent)
+                try:
+                    self.assertEqual(dialog._selected_task(), task)
+                    self.assertEqual(dialog._current_task, task)
+                    self.assertEqual(dialog.student_edit.text(), f"ultralytics/yolo26n-{suffix}.pt")
+                    self.assertEqual(
+                        dialog.run_name_edit.text(), dialog.TASK_DEFAULTS[task]["run_name"]
+                    )
+                finally:
+                    dialog.deleteLater()
+
+    def test_prepare_step_leads_to_run_settings(self):
+        self.assertFalse(self.dialog.next_btn.isHidden())
+        self.assertTrue(self.dialog.run_btn.isHidden())
+        self.dialog.next_btn.click()
+        self.assertEqual(self.dialog.tabs.currentIndex(), 1)
+        self.assertTrue(self.dialog.next_btn.isHidden())
+        self.assertFalse(self.dialog.run_btn.isHidden())
+        self.dialog.tabs.setCurrentIndex(0)
+        self.assertFalse(self.dialog.next_btn.isHidden())
+        self.assertTrue(self.dialog.run_btn.isHidden())
+
+    def test_video_empty_state_tracks_selection_and_clear(self):
+        self.assertFalse(self.dialog.video_empty_label.isHidden())
+        self.assertFalse(self.dialog.clear_video_btn.isEnabled())
+        self.dialog.video_paths = ["example.mp4"]
+        self.dialog.video_list.addItem("example.mp4")
+        self.assertTrue(self.dialog.video_empty_label.isHidden())
+        self.assertTrue(self.dialog.clear_video_btn.isEnabled())
+        self.dialog.video_list.setCurrentRow(0)
+        self.assertTrue(self.dialog.remove_video_btn.isEnabled())
+        self.dialog.clear_video_btn.click()
+        self.assertEqual(self.dialog.video_paths, [])
+        self.assertFalse(self.dialog.video_empty_label.isHidden())
+        self.assertFalse(self.dialog.remove_video_btn.isEnabled())
+
     def test_effective_batch_hint_tracks_both_controls(self):
         self.dialog.batch_spin.setValue(4)
         self.dialog.accumulation_spin.setValue(8)
@@ -90,6 +133,36 @@ class DistillationDialogProcessTests(unittest.TestCase):
         self.assertIn("plain output", log)
         self.assertIn('"event": "metric"', log)
         self.assertEqual(self.dialog.status_label.text(), "Running")
+
+    def test_monitor_parses_lightning_progress_and_resumed_epoch_count(self):
+        self.dialog._handle_process_output('"epochs": 300,')
+        self.dialog._handle_process_output(
+            "\x1b[32mEpoch 5:  50%|█████     | 125/249 [00:46<00:46, "
+            "2.66it/s, train_loss=1.230, data_wait=8.2%]\x1b[0m"
+        )
+        self.assertEqual(self.dialog.epoch_label.text(), "Epoch 6 / 300")
+        self.assertEqual(self.dialog.epoch_progress.value(), 125)
+        self.assertEqual(self.dialog.epoch_progress.maximum(), 249)
+        self.assertEqual(self.dialog.loss_label.text(), "Batch loss 1.230")
+        self.assertEqual(self.dialog.overall_progress.value(), 18)
+        # Lightning can reset the old epoch's bar before announcing the next epoch.
+        self.dialog._handle_process_output("Epoch 5: 0%| | 0/249 [00:00<?, ?it/s]")
+        self.assertEqual(self.dialog.epoch_progress.value(), 125)
+        self.dialog._handle_process_output("unrecognized diagnostic line")
+        self.assertEqual(self.dialog.epoch_progress.value(), 125)
+        self.assertIn("unrecognized diagnostic line", self.dialog.log_view.toPlainText())
+        self.dialog._handle_process_output("Epoch 6: 0%| | 0/0 [00:00<?, ?it/s]")
+        self.assertEqual(self.dialog.epoch_progress.value(), 125)
+
+    def test_monitor_elapsed_freezes_when_run_finishes(self):
+        self.dialog._run_started_at = 100.0
+        self.dialog._elapsed_timer.start()
+        with patch("squeakpose.ui.distillation_dialog.time.monotonic", return_value=3761.0):
+            with patch("squeakpose.ui.distillation_dialog.QMessageBox.information"):
+                self.dialog._finish_process_result(WorkerJobResult(state="finished", exit_code=0))
+        self.assertEqual(self.dialog.elapsed_label.text(), "Elapsed 1:01:01")
+        self.assertFalse(self.dialog._elapsed_timer.isActive())
+        self.assertEqual(self.dialog.overall_progress.value(), 1000)
 
     def test_process_factory_preserves_merged_terminal_channel(self):
         process = self.dialog._create_distillation_process(self.dialog)

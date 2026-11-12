@@ -7,15 +7,34 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(gettempdir(), "squeakpose-mpl-tests"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(gettempdir(), "squeakpose-cache-tests"))
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from squeakpose.ui.class_manager import ClassManagerDialog
+from squeakpose.ui.class_manager import AddClassDialog, ClassManagerDialog
 
 
 class ClassManagerDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(["class-manager-test"])
+
+    def test_invalid_new_class_stays_open_and_preserves_edits(self):
+        dialog = AddClassDialog(["nose"], existing_classes=["mouse"])
+        dialog.show()
+        dialog.keypoints_edit.setPlainText("nose\ntail")
+        try:
+            for name in ("", "mouse"):
+                dialog.name_edit.setText(name)
+                with patch.object(QMessageBox, "warning") as warning:
+                    dialog.accept()
+                warning.assert_called_once()
+                self.assertTrue(dialog.isVisible())
+                self.assertEqual(dialog.keypoints_edit.toPlainText(), "nose\ntail")
+            dialog.name_edit.setText("rat")
+            dialog.accept()
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            self.assertFalse(dialog.isVisible())
+        finally:
+            dialog.close()
 
     def test_remove_selected_does_not_overwrite_next_class_keypoints(self):
         dialog = ClassManagerDialog(

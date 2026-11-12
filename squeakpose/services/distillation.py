@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from squeakpose.core import stable_path_id, staging_path_for
+from squeakpose.json_io import read_json_file
 from squeakpose.project.distillation import normalize_distillation_task
 
 DISTILLATION_IMAGE_EXTENSIONS = (
@@ -23,12 +24,12 @@ DISTILLATION_IMAGE_EXTENSIONS = (
 DISTILLATION_TASK_DEFAULTS = {
     "pose": {
         "label": "Keypoints",
-        "student": "ultralytics/yolo26s-pose.pt",
+        "student": "ultralytics/yolo26n-pose.pt",
         "run_name": "dinov3-pose",
     },
     "segment": {
         "label": "Segmentation",
-        "student": "ultralytics/yolo26s-seg.pt",
+        "student": "ultralytics/yolo26n-seg.pt",
         "run_name": "dinov3-segmentation",
     },
 }
@@ -205,9 +206,18 @@ def build_distillation_corpus(
             failures.append(f"{os.path.basename(source_path)}: {exc}")
             continue
         try:
-            for sample_number, frame_index in enumerate(range(0, total_frames, plan.stride)):
-                if plan.maximum_per_video > 0 and sample_number >= plan.maximum_per_video:
-                    break
+            candidates = range(0, total_frames, plan.stride)
+            indices: Iterable[int] = candidates
+            if 0 < source_samples < len(candidates):
+                indices = (
+                    [candidates[len(candidates) // 2]]
+                    if source_samples == 1
+                    else [
+                        candidates[i * (len(candidates) - 1) // (source_samples - 1)]
+                        for i in range(source_samples)
+                    ]
+                )
+            for sample_number, frame_index in enumerate(indices):
                 if is_canceled():
                     break
 
@@ -287,8 +297,32 @@ def build_distillation_run_plan(
     batch_size: int,
     precision: str,
     overwrite: bool = False,
+    resume_interrupted: bool = False,
+    gradient_accumulation_steps: int = 2,
 ) -> DistillationRunPlan:
     """Validate a run and construct the worker's existing CLI envelope."""
+
+    if resume_interrupted and _RUN_NAME_RE.fullmatch(str(run_name).strip()):
+        resume_dir = os.path.join(os.path.abspath(runs_root), str(run_name).strip())
+        manifest = resume_dir + ".squeakpose.json"
+        if not os.path.isfile(manifest):
+            manifest = os.path.join(resume_dir, "squeakpose_distillation.json")
+        try:
+            saved = read_json_file(manifest, max_bytes=1024 * 1024, require_object=True)
+            if saved.get("status") == "complete":
+                raise ValueError("This run is complete; choose a new run name.")
+            config = saved["config"]
+            data_dir, student, teacher, task = (
+                config[key] for key in ("data", "model", "teacher", "task")
+            )
+            epochs, batch_size, precision = (
+                config[key] for key in ("epochs", "batch_size", "precision")
+            )
+            gradient_accumulation_steps = config["gradient_accumulation_steps"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise DistillationPlanError(
+                "resume_config", "Cannot resume run", f"Saved settings are unavailable: {exc}"
+            ) from exc
 
     normalized_data_dir = os.path.abspath(data_dir) if data_dir else ""
     image_count = count_distillation_images(normalized_data_dir)
@@ -308,6 +342,8 @@ def build_distillation_run_plan(
         )
 
     clean_student = str(student).strip()
+    if os.path.isfile(clean_student):
+        clean_student = os.path.abspath(clean_student)
     clean_teacher = str(teacher).strip()
     if not clean_student or not clean_teacher:
         raise DistillationPlanError(
@@ -335,7 +371,21 @@ def build_distillation_run_plan(
         )
 
     output_dir = os.path.join(os.path.abspath(runs_root), clean_run_name)
-    if os.path.exists(output_dir) and not overwrite:
+    if resume_interrupted and overwrite:
+        raise DistillationPlanError(
+            "resume_overwrite", "Choose one mode", "Resume and overwrite cannot be combined."
+        )
+    if resume_interrupted and not os.path.isfile(
+        os.path.join(output_dir, "checkpoints", "last.ckpt")
+    ):
+        raise DistillationPlanError(
+            "resume_missing",
+            "Checkpoint required",
+            "This run has no checkpoints/last.ckpt to resume.",
+        )
+    if (os.path.exists(output_dir) or os.path.exists(output_dir + ".squeakpose.json")) and not (
+        overwrite or resume_interrupted
+    ):
         raise DistillationPlanError(
             "run_exists",
             "Run directory exists",
@@ -353,6 +403,8 @@ def build_distillation_run_plan(
         normalized_data_dir,
         "--run-name",
         clean_run_name,
+        "--out-dir",
+        output_dir,
         "--model",
         clean_student,
         "--task",
@@ -365,9 +417,13 @@ def build_distillation_run_plan(
         str(int(batch_size)),
         "--precision",
         str(precision),
+        "--gradient-accumulation-steps",
+        str(int(gradient_accumulation_steps)),
     ]
     if overwrite:
         arguments.append("--overwrite")
+    if resume_interrupted:
+        arguments.append("--resume-interrupted")
 
     return DistillationRunPlan(
         project_root=normalized_project,

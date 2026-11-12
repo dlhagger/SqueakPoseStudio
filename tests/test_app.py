@@ -9,10 +9,42 @@ from squeakpose.app import (
     _save_last_project_best_effort,
     load_bundled_fonts,
     make_console_output_lossless,
+    set_windows_app_id,
 )
 
 
 class AppStartupTests(unittest.TestCase):
+    def test_windows_taskbar_identity_is_set(self):
+        with (
+            patch("sys.platform", "win32"),
+            patch("ctypes.OleDLL", create=True) as dll,
+            patch("ctypes.HRESULT", create=True),
+        ):
+            set_windows_app_id()
+
+        dll.assert_called_once_with("shell32")
+        dll.return_value.SetCurrentProcessExplicitAppUserModelID.assert_called_once_with(
+            "SqueakPoseStudio.Desktop"
+        )
+
+    def test_taskbar_identity_is_windows_only(self):
+        for platform in ("linux", "darwin"):
+            with (
+                self.subTest(platform=platform),
+                patch("sys.platform", platform),
+                patch("ctypes.OleDLL", create=True) as dll,
+            ):
+                set_windows_app_id()
+                dll.assert_not_called()
+
+    def test_taskbar_identity_failure_does_not_block_startup(self):
+        with (
+            patch("sys.platform", "win32"),
+            patch("ctypes.OleDLL", create=True, side_effect=OSError("shell failure")),
+            self.assertLogs("squeakpose.app", level="WARNING"),
+        ):
+            set_windows_app_id()
+
     def test_last_project_persistence_failure_does_not_escape(self):
         project_root = "/valid/project"
 

@@ -23,6 +23,23 @@ from squeakpose.ui.style import app_stylesheet
 logger = logging.getLogger(__name__)
 
 
+def set_windows_app_id() -> None:
+    """Give the taskbar an app identity instead of inheriting Python's icon."""
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+
+    try:
+        # OleDLL checks HRESULT failures and raises OSError automatically.
+        set_app_id = ctypes.OleDLL("shell32").SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = [ctypes.c_wchar_p]
+        set_app_id.restype = ctypes.HRESULT
+        set_app_id("SqueakPoseStudio.Desktop")
+    except OSError:
+        logger.warning("Could not set the Windows taskbar identity", exc_info=True)
+
+
 def _save_last_project_best_effort(project_root: str) -> bool:
     """Remember *project_root* without making optional state block startup."""
     try:
@@ -84,6 +101,8 @@ def make_console_output_lossless() -> None:
 def run(argv: list[str] | None = None) -> int:
     """Launch the desktop application and return its Qt exit code."""
     make_console_output_lossless()
+    # Windows needs this before Qt creates any windows, including the launcher.
+    set_windows_app_id()
     # Imported lazily so ``squeakpose_studio.py`` remains a compatible module
     # for integrations and tests while this module owns application startup.
     from squeakpose.ui.main_window import (

@@ -516,6 +516,23 @@ YOLO pose or segmentation student is selected automatically, and the resulting
 export appears only in the compatible layer's Train Model dialog. The
 project-aware command-line entry point is `distillation/distiller.py`.
 
+Capped video sampling spreads frames across the full recording. Precision defaults
+to `auto`; batch size 64 with two accumulation steps gives an effective batch size
+of 128. Local YOLO checkpoint/config files can be used as the student.
+The **YOLO26 size** selector offers Nano (default), Small, Medium, Large, and
+Extra Large for both tasks. Select **Custom model** to enter a model identifier
+or browse for a local file. The effective batch size updates as you change the
+batch and accumulation controls; batch size is not automatically tuned to GPU memory.
+
+For interrupted runs created with this version, select the same run name and
+enable **Resume** (CLI: `--resume-interrupted`). This restores the saved settings
+and requires `checkpoints/last.ckpt`; keep the original corpus unchanged. Runs
+created before settings were saved cannot be resumed through this interface.
+**Overwrite** starts fresh and preserves the previous run in a `.backup-...`
+directory. Interrupted exports remain available for supervised training. Keep
+the adjacent `.squeakpose.json` file with an interrupted run: it stores its task
+and resume settings until the run completes.
+
 ## Prediction and Video Review
 
 Use **Project Models…** to assign `.pt`, `.yaml`, or `.onnx` prediction models

@@ -29,6 +29,43 @@ class _VideoCapture:
 
 
 class DistillationDialogProcessTests(unittest.TestCase):
+    def test_model_sizes_follow_task_and_custom_model_survives_task_switch(self):
+        for size in ("n", "s", "m", "l", "x"):
+            for task, suffix in (("pose", "pose"), ("segment", "seg")):
+                self.dialog.model_size_combo.setCurrentIndex(
+                    self.dialog.model_size_combo.findData(size)
+                )
+                self.dialog.task_combo.setCurrentIndex(self.dialog.task_combo.findData(task))
+                self.assertEqual(
+                    self.dialog.student_edit.text(), f"ultralytics/yolo26{size}-{suffix}.pt"
+                )
+        self.dialog.model_size_combo.setCurrentIndex(
+            self.dialog.model_size_combo.findData("custom")
+        )
+        self.dialog.student_edit.setText("/models/custom.pt")
+        self.dialog.task_combo.setCurrentIndex(0)
+        self.assertEqual(self.dialog.student_edit.text(), "/models/custom.pt")
+        self.assertFalse(self.dialog.student_edit.isReadOnly())
+        self.dialog.resume_check.setChecked(True)
+        self.assertFalse(self.dialog.model_size_combo.isEnabled())
+        self.assertFalse(self.dialog.student_browse_btn.isEnabled())
+
+    def test_effective_batch_hint_tracks_both_controls(self):
+        self.dialog.batch_spin.setValue(4)
+        self.dialog.accumulation_spin.setValue(8)
+        self.assertIn("32 images", self.dialog.batch_hint.text())
+
+    def test_resume_and_restart_are_exclusive_and_precision_is_automatic(self):
+        self.assertEqual(self.dialog.precision_combo.currentText(), "auto")
+        self.assertEqual(self.dialog.accumulation_spin.value(), 2)
+        self.dialog.overwrite_check.setChecked(True)
+        self.dialog.resume_check.setChecked(True)
+        self.assertFalse(self.dialog.overwrite_check.isChecked())
+        self.assertFalse(self.dialog.epochs_spin.isEnabled())
+        self.dialog.overwrite_check.setChecked(True)
+        self.assertFalse(self.dialog.resume_check.isChecked())
+        self.assertTrue(self.dialog.epochs_spin.isEnabled())
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

@@ -26,6 +26,8 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -271,7 +273,32 @@ class DistillationDialog(QDialog):
         form.addRow("Run name:", self.run_name_edit)
 
         self.student_edit = QLineEdit(self.TASK_DEFAULTS["pose"]["student"])
-        form.addRow("Student model:", self.student_edit)
+        self.model_size_combo = ThemedComboBox()
+        for label, size in (
+            ("Nano (n) ? default", "n"),
+            ("Small (s) — default", "s"),
+            ("Medium (m)", "m"),
+            ("Large (l)", "l"),
+            ("Extra Large (x)", "x"),
+            ("Custom model", "custom"),
+        ):
+            self.model_size_combo.addItem(label, size)
+        self.model_size_combo.setCurrentIndex(0)
+        self.model_size_combo.setToolTip(
+            "Larger students generally need more memory and inference time. "
+            "Size does not guarantee better accuracy on your dataset."
+        )
+        style_combo_popup(self.model_size_combo.view())
+        form.addRow("YOLO26 size:", self.model_size_combo)
+        student_row = QHBoxLayout()
+        student_row.addWidget(self.student_edit, 1)
+        self.student_browse_btn = QPushButton("Browse…")
+        self.student_browse_btn.clicked.connect(self._browse_student_model)
+        student_row.addWidget(self.student_browse_btn)
+        form.addRow("Student model:", student_row)
+        self.student_edit.setReadOnly(True)
+        self.student_browse_btn.setEnabled(False)
+        self.model_size_combo.currentIndexChanged.connect(self._on_model_size_changed)
 
         self.teacher_edit = QLineEdit("dinov3/vitb16")
         form.addRow("Teacher model:", self.teacher_edit)
@@ -286,19 +313,53 @@ class DistillationDialog(QDialog):
         self.batch_spin.setValue(64)
         form.addRow("Batch size:", self.batch_spin)
 
+        self.accumulation_spin = QSpinBox()
+        self.accumulation_spin.setRange(1, 128)
+        self.accumulation_spin.setValue(2)
+        self.accumulation_spin.setToolTip("Effective batch size = batch size × accumulation steps.")
+        form.addRow("Accumulation steps:", self.accumulation_spin)
+        self.batch_hint = QLabel()
+        self.batch_hint.setWordWrap(True)
+        self.batch_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.batch_hint.setObjectName("TrainHintLabel")
+        form.addRow("", self.batch_hint)
+        self.batch_spin.valueChanged.connect(self._update_batch_hint)
+        self.accumulation_spin.valueChanged.connect(self._update_batch_hint)
+        self._update_batch_hint()
+
         self.precision_combo = ThemedComboBox()
-        self.precision_combo.addItems(["bf16-mixed", "16-mixed", "32-true"])
+        self.precision_combo.addItems(["auto", "bf16-mixed", "16-mixed", "32-true"])
         style_combo_popup(self.precision_combo.view())
         form.addRow("Precision:", self.precision_combo)
+        auto_hint = QLabel(
+            "Device: automatic (CUDA, then Apple MPS, then CPU). Auto precision uses "
+            "BF16 on supported CUDA hardware; otherwise FP32. Batch size is manual."
+        )
+        auto_hint.setWordWrap(True)
+        auto_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        auto_hint.setObjectName("TrainHintLabel")
+        form.addRow("", auto_hint)
 
-        self.overwrite_check = QCheckBox("Allow replacing an existing run directory")
+        self.resume_check = QCheckBox("Resume using this run's saved settings and image corpus")
+        form.addRow("Resume:", self.resume_check)
+        self.overwrite_check = QCheckBox(
+            "Restart this run, preserving the previous run as a backup"
+        )
         form.addRow("Overwrite:", self.overwrite_check)
+        self.resume_check.toggled.connect(self._on_resume_changed)
+        self.overwrite_check.toggled.connect(
+            lambda checked: self.resume_check.setChecked(False) if checked else None
+        )
 
-        self.output_path_label = QLabel("")
-        self.output_path_label.setWordWrap(True)
-        self.output_path_label.setObjectName("TrainHintLabel")
+        self.output_path_label = QLineEdit("")
+        self.output_path_label.setReadOnly(True)
         form.addRow("Output:", self.output_path_label)
-        layout.addLayout(form)
+        settings_widget = QWidget()
+        settings_widget.setLayout(form)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setWidget(settings_widget)
+        layout.addWidget(settings_scroll, 3)
 
         output_title = QLabel("Distillation Output")
         output_title.setObjectName("TrainPanelTitle")
@@ -316,6 +377,50 @@ class DistillationDialog(QDialog):
         self.task_combo.currentIndexChanged.connect(self._on_task_changed)
         return tab
 
+    def _update_batch_hint(self) -> None:
+        effective = self.batch_spin.value() * self.accumulation_spin.value()
+        self.batch_hint.setText(
+            f"Effective batch: {effective:,} images per optimizer step. "
+            "If memory runs out, lower batch size; increase accumulation to preserve this total."
+        )
+
+    def _on_model_size_changed(self, _index: int = 0) -> None:
+        size = self.model_size_combo.currentData()
+        custom = size == "custom"
+        self.student_edit.setReadOnly(not custom)
+        self.student_browse_btn.setEnabled(custom)
+        if not custom:
+            suffix = "seg" if self._selected_task() == "segment" else "pose"
+            self.student_edit.setText(f"ultralytics/yolo26{size}-{suffix}.pt")
+
+    def _browse_student_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO student",
+            self.project_root,
+            "YOLO models (*.pt *.yaml *.yml)",
+        )
+        if path:
+            self.student_edit.setText(path)
+
+    def _on_resume_changed(self, checked: bool) -> None:
+        if checked:
+            self.overwrite_check.setChecked(False)
+        for widget in (
+            self.task_combo,
+            self.model_size_combo,
+            self.student_edit,
+            self.teacher_edit,
+            self.epochs_spin,
+            self.batch_spin,
+            self.accumulation_spin,
+            self.precision_combo,
+        ):
+            widget.setEnabled(not checked)
+        self.student_browse_btn.setEnabled(
+            not checked and self.model_size_combo.currentData() == "custom"
+        )
+
     def _selected_task(self) -> str:
         task = self.task_combo.currentData()
         return task if task in self.TASK_DEFAULTS else "pose"
@@ -329,11 +434,8 @@ class DistillationDialog(QDialog):
             or self.run_name_edit.text() == old_defaults["run_name"]
         ):
             self.run_name_edit.setText(new_defaults["run_name"])
-        if (
-            not self.student_edit.text().strip()
-            or self.student_edit.text() == old_defaults["student"]
-        ):
-            self.student_edit.setText(new_defaults["student"])
+        if self.model_size_combo.currentData() != "custom":
+            self._on_model_size_changed()
         self._current_task = new_task
         self._update_output_path()
 
@@ -461,6 +563,7 @@ class DistillationDialog(QDialog):
             f"This will sample up to {estimated:,} frame(s) from {len(probes)} video(s) into:\n"
             f"{data_dir}\n\n"
             f"Sampling interval: every {self.stride_spin.value():,} frame(s)\n"
+            "When capped, samples are spread across the full recording.\n"
             f"Existing matching images will be skipped."
         )
         if errors:
@@ -587,6 +690,8 @@ class DistillationDialog(QDialog):
                 batch_size=self.batch_spin.value(),
                 precision=self.precision_combo.currentText(),
                 overwrite=self.overwrite_check.isChecked(),
+                resume_interrupted=self.resume_check.isChecked(),
+                gradient_accumulation_steps=self.accumulation_spin.value(),
             )
         except DistillationPlanError as exc:
             presenter = (

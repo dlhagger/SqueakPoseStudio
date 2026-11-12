@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -31,6 +32,68 @@ class FakeVideoReader:
 
 
 class DistillationServiceTests(unittest.TestCase):
+    def test_capped_sampling_covers_full_video(self):
+        with TemporaryDirectory() as tmp:
+            plan = plan_distillation_corpus([("video.mp4", 100)], stride=10, maximum_per_video=3)
+            reader = FakeVideoReader({i: b"frame" for i in range(100)})
+
+            def write(path, frame, _quality):
+                Path(path).write_bytes(frame)
+                return True
+
+            result = build_distillation_corpus(
+                plan, data_dir=tmp, jpeg_quality=90, open_video=lambda _: reader, write_image=write
+            )
+            self.assertEqual(reader.requested, [0, 40, 90])
+            self.assertEqual(result.saved, 3)
+
+    def test_resume_plan_uses_saved_corpus_and_settings(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "images"
+            data.mkdir()
+            (data / "frame.jpg").write_bytes(b"image")
+            out = root / "run"
+            (out / "checkpoints").mkdir(parents=True)
+            (out / "checkpoints" / "last.ckpt").write_bytes(b"checkpoint")
+            Path(str(out) + ".squeakpose.json").write_text(
+                json.dumps(
+                    {
+                        "status": "interrupted",
+                        "config": {
+                            "data": str(data),
+                            "model": "ultralytics/yolo26s-seg.pt",
+                            "teacher": "dinov3/vitb16",
+                            "task": "segment",
+                            "epochs": 10,
+                            "batch_size": 8,
+                            "precision": "auto",
+                            "gradient_accumulation_steps": 4,
+                        },
+                    }
+                )
+            )
+            plan = build_distillation_run_plan(
+                program=sys.executable,
+                script_path=__file__,
+                app_base_dir=tmp,
+                project_root=tmp,
+                runs_root=tmp,
+                data_dir="missing",
+                run_name="run",
+                student="wrong",
+                teacher="wrong",
+                task="pose",
+                epochs=1,
+                batch_size=1,
+                precision="16-mixed",
+                resume_interrupted=True,
+            )
+            self.assertEqual(plan.data_dir, str(data))
+            self.assertEqual(plan.task, "segment")
+            self.assertIn("--resume-interrupted", plan.arguments)
+            self.assertNotIn("wrong", plan.arguments)
+
     def test_sample_count_normalizes_stride_and_cap(self):
         self.assertEqual(distillation_sample_count(61, 30), 3)
         self.assertEqual(distillation_sample_count(100, 0), 100)
@@ -125,10 +188,10 @@ class DistillationServiceTests(unittest.TestCase):
 
             self.assertTrue(result.canceled)
             self.assertEqual((result.saved, result.handled), (2, 2))
-            self.assertEqual(reader.requested, [0, 1])
+            self.assertEqual(reader.requested, [0, 2])
             self.assertTrue(reader.closed)
             self.assertTrue(Path(tmp, distillation_frame_filename(source, 0)).is_file())
-            self.assertTrue(Path(tmp, distillation_frame_filename(source, 1)).is_file())
+            self.assertTrue(Path(tmp, distillation_frame_filename(source, 2)).is_file())
 
     def test_failed_writer_cleans_staged_image(self):
         with TemporaryDirectory() as tmp:
@@ -198,6 +261,8 @@ class DistillationServiceTests(unittest.TestCase):
                     str(data_dir),
                     "--run-name",
                     "my-run",
+                    "--out-dir",
+                    str(runs / "my-run"),
                     "--model",
                     "ultralytics/yolo26s-seg.pt",
                     "--task",
@@ -210,6 +275,8 @@ class DistillationServiceTests(unittest.TestCase):
                     "8",
                     "--precision",
                     "bf16-mixed",
+                    "--gradient-accumulation-steps",
+                    "2",
                     "--overwrite",
                 ],
             )

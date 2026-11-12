@@ -30,6 +30,9 @@ def distillation_run_task(run_dir: str) -> str:
         normalized_run_dir,
         DISTILLATION_MANIFEST_FILENAME,
     )
+    pending_path = normalized_run_dir + ".squeakpose.json"
+    if os.path.isfile(pending_path):
+        manifest_path = pending_path
     try:
         payload = read_json_file(manifest_path, max_bytes=1024 * 1024, require_object=True)
         task = normalize_distillation_task(payload.get("task"))

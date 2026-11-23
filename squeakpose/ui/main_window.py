@@ -3930,6 +3930,8 @@ class LabelingApp(QMainWindow):
         )
 
         videos_menu.addSeparator()
+        self.behavior_labeling_action = videos_menu.addAction("Label Behaviors…")
+        self.behavior_labeling_action.triggered.connect(self.open_behavior_labeler)
         self.inference_review_action = videos_menu.addAction("Review Inference Quality…")
         self.inference_review_action.triggered.connect(self.open_inference_quality_review)
 
@@ -8135,6 +8137,12 @@ class LabelingApp(QMainWindow):
             QSettings().setValue("analysis_window/geometry", dialog.saveGeometry())
         self._analysis_dialog = None
         self._set_analysis_read_only(False)
+
+    def open_behavior_labeler(self, _checked: bool = False):
+        from squeakpose.ui.behavior_labeler import BehaviorLabelerDialog
+
+        dialog = BehaviorLabelerDialog(self.project_root, self)
+        dialog.exec()
 
     def open_video_reviewer(self):
         if _cv2 is None:

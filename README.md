@@ -31,6 +31,8 @@ block the main interface.
   optional DINO-distilled backbones.
 - Single-image prediction and a video reviewer for finding and exporting useful
   frames back into the labeling queue.
+- Human behavior labeling with frame-accurate video playback, editable bouts,
+  per-animal timelines, autosave, and versioned JSON/CSV exports.
 - Video inference across project videos with per-class tracking and per-frame
   CSV output; depth passes also save a colorized MP4 preview.
 - Inference quality review that ranks suspicious frames for export back to labeling.
@@ -596,6 +598,120 @@ missing/extra detections, track-count mismatches, and track changes. Preview a
 candidate, then use **Export Selected to Labeler** or **Export All Shown** to add
 original frames to the labeling queue for correction. This is separate from
 Video Reviewer's **Predict Range** workflow.
+
+## Human Behavior Labeling
+
+For installation, labeling instructions, and submitting work, see the
+[behavior annotation guide](docs/behavior-labeling/README.md).
+
+Open **Videos > Label Behaviors…** to annotate behavior without a behavior model.
+On first open, **Define behaviors** lets you enter your target behaviors and optional
+start/stop criteria. Add at least one behavior, then select **Save behaviors & continue**.
+The dropdown contains only your defined behaviors. Unmarked frames remain unlabeled. Projects with the earlier default list get a one-time review step.
+Use **Behaviors…** in the toolbar to review or change the list later.
+
+Choose a linked project video or **Browse…** to open a recording. Behavior labels
+use **zero-based source frame indices**, matching inference and per-frame analysis
+outputs. The playhead and start/stop controls show frames; timestamps are supplementary.
+
+Opening reads the compressed video samples' presentation timestamps to establish
+the frame lookup, without decoding every image. B-frame samples are put in
+presentation order. The lookup is rebuilt on each opening and held only in memory;
+no persistent frame cache is read or written. Saved behavior labels remain separate.
+Images are decoded on demand for playback and seeking.
+The reader verifies the displayed frame's timestamp against the lookup. This fast
+path supports MP4/MOV, MKV/WebM, and AVI with the supported frame-packet codecs
+(H.264, HEVC, AV1, VP8/9, MJPEG, FFV1). Unsupported or ambiguous layouts report an
+error rather than guessing frame numbers from time × FPS. Incomplete MP4 copies
+are rejected before indexing. Playback is silent.
+
+Video decoding runs in a separate process to avoid the macOS OpenCV/PyAV library
+conflict. The source video is never modified. Timestamp-only labels from the
+previous MVP are mapped back to exact frame boundaries on reopening; mismatches
+are reported without rewriting the labels.
+
+1. Choose an animal and one of your defined behaviors.
+2. Play, scrub, or step to the first frame and select **Mark Start** (`I`).
+3. Move to the final included frame and select **Mark End** (`O`).
+4. Select **Add Interval**. A colored interval and timestamped table row appear;
+   the change is saved immediately to the project.
+
+`Space` toggles playback, left/right arrows step one frame, and keys `1`–`9`
+select behaviors. Shortcuts do not intercept typing in text or frame fields.
+Click a table row or colored interval to seek to it and edit it. Adjust the first
+and last included frames, change the label or notes, and select **Update Interval**.
+You can also drag timeline edges, zoom around the playhead, delete intervals, or
+split a selected interval at the current frame. **Undo** and **Redo** save their
+changes as well. Unapplied editor changes are drafts, and closing or replacing
+them asks before discarding them.
+
+Annotations are exclusive per animal. Overlapping labels are rejected rather than
+silently trimmed. Mark the start and end of your target behaviors; gaps remain
+**unlabeled** and are not automatically treated as negative training examples.
+Previously saved Other or Unscorable intervals remain available for review and editing.
+Animal names are assigned manually and do not
+establish a relationship with inference track IDs. This MVP displays the source
+video; model overlays and behavior prediction are not part of this workspace.
+
+The behavior dropdown uses the project list, including when reopening an already
+annotated recording. Removed behaviors remain attached to their saved intervals;
+they appear as **(saved label)** only when editing one of those intervals.
+**Behaviors…** edits the active project list. Existing intervals keep their frame
+boundaries and notes. Updated project definitions are applied when a recording opens.
+Animal IDs are local to each recording. Reopening the same source restores its labels and playback position.
+New sources use a bounded head/tail sample hash plus file size and modification
+time, avoiding a full-file hash in addition to the frame lookup. Renames and
+moves preserving those attributes retain the identity. Changing the contents or
+modification time may create a new source. This is explicitly recorded as
+`sampled_sha256_stat_v1`, not a full-file checksum. Existing full-SHA-256 label
+files for the same path/name are verified and reused; that legacy verification
+can still require reading the file, but does not decode it.
+
+### Behavior annotation files
+
+Autosave uses `behavior labels/<video_id>.json`; reusable definitions live in
+`behavior labels/catalog.json`. Writes are atomic. Malformed or unsupported saved
+files produce an error and are not replaced with empty labels.
+
+**Export JSON…** writes the complete, model-independent record. **Export CSV…**
+writes one row per interval, including behavior definitions and subject names.
+Exports include unscorable intervals explicitly; filter `kind == "behavior"`
+before treating rows as behavior targets. An empty CSV still includes its header.
+The MVP exports annotations; external annotation import is not yet supported.
+
+The version 2 JSON contract is (version 1 files remain readable):
+
+- `format`: `squeakpose.behavior_annotations`; `schema_version`: `2`.
+- `video`: ID and `identity_method`, source filename/path, frame count,
+  source time-base numerator/denominator, first PTS, source endpoint,
+  and the method used to determine the endpoint.
+- `behaviors`: stable IDs, names, colors, and operational definitions.
+- `subjects`: recording-local IDs and human-assigned names.
+- `intervals`: annotation ID, subject ID, behavior ID (null for unscorable),
+  `kind`, frame boundaries, supplementary PTS boundaries and seconds/duration,
+  `end_time_method`, and notes.
+- `resume_frame`: last saved playback frame, with supplementary `resume_pts`.
+  Unannotated time is `unreviewed`.
+
+Frame indices are **zero-based**, with `start_frame` inclusive and
+`end_frame_exclusive` exclusive. New labels always include frame numbers.
+Legacy timestamp-only records remain readable but require exact frame resolution
+before further editing in the frame-based workspace. The GUI marks the last *included* frame; the exported
+end is the boundary after that frame. End timestamps represent that boundary, not the
+start time of the last included frame. For a PTS value `p`, video-relative seconds
+are `(p - first_pts) * time_base_num / time_base_den`. PTS and the rational time
+base preserve source timing; decimal seconds are convenience fields. This works
+with variable-frame-rate video without deriving time from nominal FPS. When a
+final-frame duration is absent, the stream endpoint is used; failing that, the
+preceding frame duration is used and flagged in the interval's `end_time_method`.
+Missing or non-increasing timestamps encountered during playback produce an error;
+the tool does not skip them and silently renumber frames.
+
+The CSV includes `schema_version`, `video_id`, `video_filename`, `subject_id`,
+`subject_name`, `annotation_id`, `kind`, `behavior_id`, `behavior_name`,
+`behavior_definition`, `start_frame`, `end_frame_exclusive`, `start_time_s`,
+`end_time_s`, `duration_s`, `start_pts`, `end_pts`, `time_base_num`,
+`time_base_den`, `first_pts`, `notes`, and `end_time_method`.
 
 ## Video Inference
 
